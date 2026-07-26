@@ -22,10 +22,13 @@ for elf in "$dir"/$filter.elf; do
   host="$("$hostexe")"
   if [ $code -ne 0 ]; then
     echo "FAIL $(basename "$elf"): guest exit $code"
-    "$ppcrun" --max 200000000 "$elf" 2>&1 >/dev/null | tail -5
+    "$ppcrun" --max 200000000 "$elf" 2>&1 >/dev/null | head -12
+    echo "-- disassembly ($(basename "$elf")):"
+    "$ppcrun" --disasm "$elf"
     fail=$((fail + 1))
   elif [ "$guest" != "$host" ]; then
     echo "FAIL $(basename "$elf"): output differs"
+    diff <(echo "$host") <(echo "$guest") | head -20
     fail=$((fail + 1))
   else
     echo "PASS $(basename "$elf")"

@@ -255,6 +255,7 @@ int main(int argc, char** argv)
 
     char text[128];
     u64 executed = 0;
+    int excLogged = 0;
     while (executed < maxInsns && !bus.exited) {
         if (trace) {
             const u32 w = bus.read32(cpu.st.pc);
@@ -263,6 +264,14 @@ int main(int argc, char** argv)
         }
         cpu.step();
         ++executed;
+        // First few exception entries, for diagnosing vector run-offs.
+        if (cpu.raisedThisStep && excLogged < 8) {
+            ++excLogged;
+            fprintf(stderr,
+                    "-- exc -> %08x srr0=%08x srr1=%08x dsisr=%08x dar=%08x\n",
+                    cpu.st.pc, cpu.st.srr0, cpu.st.srr1, cpu.st.dsisr,
+                    cpu.st.dar);
+        }
     }
 
     fflush(stdout);

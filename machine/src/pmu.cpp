@@ -5,6 +5,18 @@ namespace opm {
 // 6522 register index from the cell offset (stride 0x200).
 static u32 regOf(u32 off) { return (off >> 9) & 0xFu; }
 
+// The 6522 timers count down at the classic VIA rate (~783 kHz); with
+// the instruction-per-cycle model that is one tick every ~128
+// instructions. The Toolbox calibrates its Time Manager against T1/T2
+// at boot — dead timers spin it forever.
+static constexpr u64 kInsnsPerViaTick = 128;
+
+u16 PmuVia::timerNow(u16 loaded, u64 loadedAt, u64 now) const
+{
+    const u64 ticks = (now - loadedAt) / kInsnsPerViaTick;
+    return static_cast<u16>(loaded - static_cast<u16>(ticks));
+}
+
 u8 PmuVia::read(u32 off, u64 now)
 {
     switch (regOf(off)) {
@@ -19,19 +31,33 @@ u8 PmuVia::read(u32 off, u64 now)
         return static_cast<u8>((ora_ & ddra_) | (0x00u & ~ddra_));
     case 2: return ddrb_;
     case 3: return ddra_;
-    case 4: return t1cl_;
-    case 5: return t1ch_;
+    case 4:
+        ifr_ = static_cast<u8>(ifr_ & ~0x40u); // T1 low read clears T1 int
+        return static_cast<u8>(timerNow(t1Load_, t1At_, now));
+    case 5: return static_cast<u8>(timerNow(t1Load_, t1At_, now) >> 8);
     case 6: return t1ll_;
     case 7: return t1lh_;
-    case 8: return t2cl_;
-    case 9: return t2ch_;
+    case 8:
+        ifr_ = static_cast<u8>(ifr_ & ~0x20u); // T2 low read clears T2 int
+        return static_cast<u8>(timerNow(t2Load_, t2At_, now));
+    case 9: return static_cast<u8>(timerNow(t2Load_, t2At_, now) >> 8);
     case 10:
         if (log.size() < 65536)
             log.push_back({now, 'r', sr_});
         return sr_;
     case 11: return acr_;
     case 12: return pcr_;
-    case 13: return ifr_;
+    case 13: {
+        // expiry flags computed from the free-running counts
+        u8 f = ifr_;
+        if (now - t1At_ >= u64(t1Load_ + 1) * kInsnsPerViaTick)
+            f |= 0x40u;
+        if (now - t2At_ >= u64(t2Load_ + 1) * kInsnsPerViaTick)
+            f |= 0x20u;
+        if (f & ier_ & 0x7Fu)
+            f |= 0x80u;
+        return f;
+    }
     default: return ier_;
     }
 }
@@ -54,12 +80,20 @@ void PmuVia::write(u32 off, u8 v, u64 now)
     case 15: ora_ = v; break;
     case 2: ddrb_ = v; break;
     case 3: ddra_ = v; break;
-    case 4: t1cl_ = v; break;
-    case 5: t1ch_ = v; break;
+    case 4: t1ll_ = v; break; // T1CL write = latch low
+    case 5: // T1CH write loads and starts T1
+        t1Load_ = static_cast<u16>((u16(v) << 8) | t1ll_);
+        t1At_ = now;
+        ifr_ = static_cast<u8>(ifr_ & ~0x40u);
+        break;
     case 6: t1ll_ = v; break;
     case 7: t1lh_ = v; break;
-    case 8: t2cl_ = v; break;
-    case 9: t2ch_ = v; break;
+    case 8: t2cl_ = v; break; // latch low
+    case 9: // T2CH write loads and starts T2
+        t2Load_ = static_cast<u16>((u16(v) << 8) | t2cl_);
+        t2At_ = now;
+        ifr_ = static_cast<u8>(ifr_ & ~0x20u);
+        break;
     case 10: sr_ = v; break;
     case 11: acr_ = v; break;
     case 12: pcr_ = v; break;

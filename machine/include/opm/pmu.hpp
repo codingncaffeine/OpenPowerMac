@@ -39,7 +39,10 @@ private:
 
     // VIA registers
     u8 orb_ = 0, ora_ = 0, ddrb_ = 0, ddra_ = 0;
-    u8 t1cl_ = 0, t1ch_ = 0, t1ll_ = 0, t1lh_ = 0, t2cl_ = 0, t2ch_ = 0;
+    u8 t1ll_ = 0, t1lh_ = 0, t2cl_ = 0;
+    u16 t1Load_ = 0xFFFF, t2Load_ = 0xFFFF;
+    u64 t1At_ = 0, t2At_ = 0;
+    u16 timerNow(u16 loaded, u64 loadedAt, u64 now) const;
     u8 sr_ = 0, acr_ = 0, pcr_ = 0, ifr_ = 0, ier_ = 0;
 
     // PMU engine

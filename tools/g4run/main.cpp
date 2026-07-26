@@ -213,6 +213,21 @@ int main(int argc, char** argv)
             }
         }
         static int lockTrace = -1;
+        static u64 spin68Last = 0;
+        if (cpu.st.pc == 0x68067ECCu && executed - spin68Last > 300000000ull) {
+            spin68Last = executed;
+            printf("-- 68k spin @%llu r8-r15: ",
+                   static_cast<unsigned long long>(executed));
+            for (u32 k = 8; k < 16; ++k)
+                printf("%08x ", cpu.st.gpr[k]);
+            printf("\n   r16-r23: ");
+            for (u32 k = 16; k < 24; ++k)
+                printf("%08x ", cpu.st.gpr[k]);
+            printf("\n   r24-r31: ");
+            for (u32 k = 24; k < 32; ++k)
+                printf("%08x ", cpu.st.gpr[k]);
+            printf("\n");
+        }
         if (lockTrace < 0 && cpu.st.pc == 0x00F25350u)
             lockTrace = 300;
         if (lockTrace > 0) {

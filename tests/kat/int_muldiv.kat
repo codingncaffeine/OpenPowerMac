@@ -1,0 +1,56 @@
+# Multiply high/low and divide edges. Divide undefined cases pinned to the
+# documented RECEIPT choice (rD = 0).
+
+test mulhw_minus1_squared
+r2=FFFFFFFF r3=FFFFFFFF
+insn 7C221896                     # mulhw r1,r2,r3
+expect r1=00000000
+end
+
+test mulhw_minint_squared
+r2=80000000 r3=80000000
+insn 7C221896
+expect r1=40000000
+end
+
+test mulhwu_max
+r2=FFFFFFFF r3=FFFFFFFF
+insn 7C221816                     # mulhwu r1,r2,r3
+expect r1=FFFFFFFE
+end
+
+test mullwo_overflow
+r2=00010000 r3=00010000
+insn 7C221DD6                     # mullwo r1,r2,r3
+expect r1=00000000 xer=C0000000
+end
+
+test mullw_no_overflow
+r2=0000FFFF r3=00000002
+insn 7C2219D6                     # mullw r1,r2,r3
+expect r1=0001FFFE xer=00000000
+end
+
+test divwo_minint_by_minus1
+r2=80000000 r3=FFFFFFFF
+insn 7C221FD6                     # divwo r1,r2,r3
+expect r1=00000000 xer=C0000000
+end
+
+test divw_trunc_negative
+r2=FFFFFFF9 r3=00000002
+insn 7C221BD6                     # divw r1,r2,r3 : -7/2 = -3
+expect r1=FFFFFFFD
+end
+
+test divwuo_by_zero
+r2=00000007 r3=00000000
+insn 7C221F96                     # divwuo r1,r2,r3
+expect r1=00000000 xer=C0000000
+end
+
+test divwu_simple
+r2=00000007 r3=00000002
+insn 7C221B96                     # divwu r1,r2,r3
+expect r1=00000003
+end

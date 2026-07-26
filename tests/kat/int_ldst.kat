@@ -1,0 +1,68 @@
+# Loads/stores: sign extension, byte reversal, multiple, string wrap,
+# reservation semantics, dcbz block clear.
+
+test lha_sign_extends
+r2=00002000 mem@2008=FFF0
+insn A8220008                     # lha r1,8(r2)
+expect r1=FFFFFFF0
+end
+
+test lwbrx_swaps
+r2=00003000 mem@3000=11223344
+insn 7C20142C                     # lwbrx r1,0,r2
+expect r1=44332211
+end
+
+test sthbrx_swaps
+r1=0000AABB r2=00003000
+insn 7C20172C                     # sthbrx r1,0,r2
+expect mem@3000=BBAA
+end
+
+test lmw_tail
+r2=00004000 mem@4000=AAAAAAAABBBBBBBBCCCCCCCC
+insn BBA20000                     # lmw r29,0(r2)
+expect r29=AAAAAAAA r30=BBBBBBBB r31=CCCCCCCC
+end
+
+test stmw_tail
+r30=11111111 r31=22222222 r2=00004000
+insn BFC20004                     # stmw r30,4(r2)
+expect mem@4004=1111111122222222
+end
+
+test lswi_wraps_r31_to_r0
+r2=00005000 mem@5000=1122334455
+insn 7FE22CAA                     # lswi r31,r2,5
+expect r31=11223344 r0=55000000
+end
+
+test lwarx_sets_reservation
+r2=00002000 mem@2000=DEADBEEF
+insn 7C201028                     # lwarx r1,0,r2
+expect r1=DEADBEEF resv=1
+end
+
+test stwcx_succeeds_with_reservation
+r4=CAFEBABE r5=00002000 resv=00002000
+insn 7C85312D                     # stwcx. r4,r5,r6 (r6=0)
+expect mem@2000=CAFEBABE cr=20000000 resv=0
+end
+
+test stwcx_fails_without_reservation
+r4=CAFEBABE r5=00002000
+insn 7C85312D
+expect mem@2000=00000000 cr=00000000
+end
+
+test stwcx_regardless_of_address
+r4=CAFEBABE r5=00002000 resv=00007000
+insn 7C85312D                     # reservation at a different granule still succeeds
+expect mem@2000=CAFEBABE cr=20000000 resv=0
+end
+
+test dcbz_clears_block
+r2=00002010 mem@2000=FF mem@201F=EE
+insn 7C0017EC                     # dcbz 0,r2
+expect mem@2000=00 mem@201F=00
+end

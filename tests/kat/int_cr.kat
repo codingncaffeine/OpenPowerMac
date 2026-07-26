@@ -1,0 +1,31 @@
+# CR field and XER transfer operations.
+
+test crclr_bit0
+cr=FFFFFFFF
+insn 4C000182                     # crxor 0,0,0
+expect cr=7FFFFFFF
+end
+
+test crset_bit4
+cr=00000000
+insn 4C842242                     # creqv 4,4,4
+expect cr=08000000
+end
+
+test mcrxr_moves_and_clears
+xer=E0000007
+insn 7D000400                     # mcrxr cr2
+expect cr=00E00000 xer=00000007
+end
+
+test mtcrf_partial_mask
+r1=DEADBEEF cr=00000000
+insn 7C281120                     # mtcrf 0x81,r1
+expect cr=D000000F
+end
+
+test mfcr_reads_all
+cr=CAFEBABE
+insn 7C200026                     # mfcr r1
+expect r1=CAFEBABE
+end

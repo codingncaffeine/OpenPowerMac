@@ -11,3 +11,4 @@ if(MSVC)
 endif()
 
 add_test(NAME unit COMMAND opm_unit)
+add_test(NAME kat COMMAND ppcrun --kat ${CMAKE_CURRENT_SOURCE_DIR}/kat)

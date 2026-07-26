@@ -1,0 +1,97 @@
+# Integer arithmetic: carry, overflow, and CR0 edges (PEM semantics).
+
+test addc_carry_out
+r2=FFFFFFFF r3=00000001
+insn 7C221814                     # addc r1,r2,r3
+expect r1=00000000 xer=20000000
+end
+
+test addco_overflow
+r2=7FFFFFFF r3=00000001
+insn 7C221C14                     # addco
+expect r1=80000000 xer=C0000000
+end
+
+test adde_consumes_ca
+r2=00000000 r3=00000000 xer=20000000
+insn 7C221914                     # adde r1,r2,r3
+expect r1=00000001 xer=00000000
+end
+
+test adde_chains_ca
+r2=FFFFFFFF r3=00000000 xer=20000000
+insn 7C221914
+expect r1=00000000 xer=20000000
+end
+
+test subfic_no_borrow
+r2=00000001
+insn 20220010                     # subfic r1,r2,0x10
+expect r1=0000000F xer=20000000
+end
+
+test subfic_borrow
+r2=00000020
+insn 20220010
+expect r1=FFFFFFF0 xer=00000000
+end
+
+test subfc_zero_zero
+r2=00000000 r3=00000000
+insn 7C221810                     # subfc r1,r2,r3 = r3-r2
+expect r1=00000000 xer=20000000
+end
+
+test subfc_borrow
+r2=00000001 r3=00000000
+insn 7C221810
+expect r1=FFFFFFFF xer=00000000
+end
+
+test subfe_minus_one
+r2=00000000 r3=00000000
+insn 7C221910                     # subfe, CA=0
+expect r1=FFFFFFFF xer=00000000
+end
+
+test addme_zero_ca
+r2=00000001
+insn 7C2201D4                     # addme r1,r2 (CA=0): 1 + 0xFFFFFFFF
+expect r1=00000000 xer=20000000
+end
+
+test addze_wrap
+r2=FFFFFFFF xer=20000000
+insn 7C220194                     # addze r1,r2
+expect r1=00000000 xer=20000000
+end
+
+test subfme_all_ones
+r2=00000000 xer=20000000
+insn 7C2201D0                     # subfme r1,r2
+expect r1=FFFFFFFF xer=20000000
+end
+
+test subfze_not
+r2=00000000
+insn 7C220190                     # subfze r1,r2 (CA=0)
+expect r1=FFFFFFFF xer=00000000
+end
+
+test nego_min_int
+r2=80000000
+insn 7C2204D0                     # nego r1,r2
+expect r1=80000000 xer=C0000000
+end
+
+test addic_rc_so_sticky
+r2=00000001 xer=80000000
+insn 3422FFFF                     # addic. r1,r2,-1
+expect r1=00000000 xer=A0000000 cr=30000000
+end
+
+test cmpwi_lt_field1
+r2=FFFFFFF6
+insn 2C82FFFB                     # cmpwi cr1, r2, -5
+expect cr=08000000
+end

@@ -1,0 +1,48 @@
+# Branch matrix: CTR decrement forms, condition forms, LR write rules.
+
+test bdnz_taken
+ctr=00000002
+insn 42000008                     # bdnz +8
+expect pc=00001008 ctr=00000001
+end
+
+test bdnz_falls_through
+ctr=00000001
+insn 42000008
+expect pc=00001004 ctr=00000000
+end
+
+test beq_taken
+cr=20000000
+insn 4182000C                     # beq +12
+expect pc=0000100C
+end
+
+test beq_not_taken
+cr=00000000
+insn 4182000C
+expect pc=00001004
+end
+
+test bl_writes_lr
+insn 48000009                     # bl +8
+expect pc=00001008 lr=00001004
+end
+
+test blr_jumps
+lr=00002000
+insn 4E800020                     # blr
+expect pc=00002000
+end
+
+test bcctrl_taken
+ctr=00003000 cr=20000000
+insn 4D820421                     # beqctrl
+expect pc=00003000 lr=00001004
+end
+
+test bcl_not_taken_still_writes_lr
+cr=20000000
+insn 40820009                     # bnel +8 (EQ set -> not taken)
+expect pc=00001004 lr=00001004
+end

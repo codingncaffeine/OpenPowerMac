@@ -1,0 +1,73 @@
+# Shifts and rotates: srawi/sraw carry, >=32 cases, wrapped rlwinm masks.
+
+test srawi_ca_set
+r2=FFFFFFF1
+insn 7C412670                     # srawi r1,r2,4
+expect r1=FFFFFFFF xer=20000000
+end
+
+test srawi_ca_clear_exact
+r2=FFFFFFF0
+insn 7C412670
+expect r1=FFFFFFFF xer=00000000
+end
+
+test srawi_positive
+r2=000000F1
+insn 7C412670
+expect r1=0000000F xer=00000000
+end
+
+test sraw_shift32_negative
+r2=80000000 r3=00000020
+insn 7C411E30                     # sraw r1,r2,r3 (rS in the rt slot!)
+expect r1=FFFFFFFF xer=20000000
+end
+
+test sraw_shift64_wraps_to_zero
+r2=80000000 r3=00000040
+insn 7C411E30                     # rb&63 == 0 -> no shift
+expect r1=80000000 xer=00000000
+end
+
+test slw_shift32
+r2=FFFFFFFF r3=00000020
+insn 7C411830                     # slw r1,r2,r3
+expect r1=00000000
+end
+
+test slw_one
+r2=80000001 r3=00000001
+insn 7C411830
+expect r1=00000002
+end
+
+test srw_31
+r2=80000000 r3=0000001F
+insn 7C411C30                     # srw r1,r2,r3
+expect r1=00000001
+end
+
+test cntlzw_zero
+r2=00000000
+insn 7C410034                     # cntlzw r1,r2
+expect r1=00000020
+end
+
+test cntlzw_bit16
+r2=00010000
+insn 7C410034
+expect r1=0000000F
+end
+
+test rlwinm_wrapped_mask
+r2=FFFFFFFF
+insn 54410744                     # rlwinm r1,r2,0,29,2
+expect r1=E0000007
+end
+
+test rlwimi_insert_byte
+r1=11111111 r2=000000AB
+insn 5041442E                     # rlwimi r1,r2,8,16,23
+expect r1=1111AB11
+end

@@ -27,11 +27,7 @@ GossamerBus::GossamerBus(size_t ramBytes, std::vector<u8> rom)
 // honored); refine per-geometry when the sizer demands it.
 bool GossamerBus::ramClaim(u32 pa, u32& off)
 {
-    if (bankGen_ != pci_.memGeneration()) {
-        bankGen_ = pci_.memGeneration();
-        pci_.ramBanks(banks_);
-        memGo_ = pci_.memGo();
-    }
+    memCfgRefresh();
     if (!memGo_)
         return false;
     for (const auto& b : banks_) {
@@ -41,6 +37,69 @@ bool GossamerBus::ramClaim(u32 pa, u32& off)
         }
     }
     return false;
+}
+
+void GossamerBus::memCfgRefresh()
+{
+    if (bankGen_ == pci_.memGeneration())
+        return;
+    bankGen_ = pci_.memGeneration();
+    pci_.ramBanks(banks_);
+    memGo_ = pci_.memGo();
+    // MPC106 internally-controlled L2: PICR1[CF_L2_MP] names an internal
+    // write-through(01)/write-back(10) L2 with CF_EXTERNAL_L2 clear, and
+    // PICR2[L2_EN] turns it on. Size per PICR2[CF_L2_SIZE].
+    const u8* c = pci_.cfgBytes(0);
+    if (!c) {
+        ml2On_ = false;
+        return;
+    }
+    const u32 picr1 = u32(c[0xA8]) | (u32(c[0xA9]) << 8) |
+                      (u32(c[0xAA]) << 16) | (u32(c[0xAB]) << 24);
+    const u32 picr2 = u32(c[0xAC]) | (u32(c[0xAD]) << 8) |
+                      (u32(c[0xAE]) << 16) | (u32(c[0xAF]) << 24);
+    const u32 mp = picr1 & 3u;
+    const bool internal = (mp == 1u || mp == 2u) && !((picr1 >> 8) & 1u);
+    ml2On_ = internal && (picr2 & 0x40000000u) != 0;
+    if (ml2On_) {
+        const u32 lines = (0x40000u << ((picr2 >> 4) & 3u)) / 32u;
+        if (lines != ml2Lines_) {
+            ml2Lines_ = lines;
+            ml2_.assign(lines, Ml2Line{});
+        }
+    }
+}
+
+// The inline L2 fronts the 60x memory space: hits never touch DRAM (which
+// is how the boot's pre-DRAM world survives), misses cast out and fill
+// from whatever the banks decode (all-ones where nothing does).
+GossamerBus::Ml2Line* GossamerBus::ml2Route(u32 pa)
+{
+    memCfgRefresh();
+    if (!ml2On_ || pa >= 0x40000000u)
+        return nullptr;
+    const u32 idx = (pa >> 5) % ml2Lines_;
+    const u32 tag = pa >> 5;
+    Ml2Line& e = ml2_[idx];
+    if (e.v && e.tag == tag)
+        return &e;
+    if (e.v && e.d) {
+        const u32 vbase = e.tag << 5;
+        for (u32 k = 0; k < 32; ++k) {
+            u32 off;
+            if (ramClaim(vbase + k, off))
+                ram_[off] = e.b[k];
+        }
+    }
+    const u32 base = pa & ~31u;
+    for (u32 k = 0; k < 32; ++k) {
+        u32 off;
+        e.b[k] = ramClaim(base + k, off) ? ram_[off] : 0xFF;
+    }
+    e.tag = tag;
+    e.v = true;
+    e.d = false;
+    return &e;
 }
 
 bool GossamerBus::atiWindow(u32 pa, u32& off) const
@@ -99,9 +158,13 @@ void GossamerBus::logStub(u32 pa, bool write, u32 v)
 
 u8 GossamerBus::read8(u32 pa)
 {
-    u32 ro;
-    if (pa < 0x40000000u && ramClaim(pa, ro))
-        return ram_[ro];
+    if (pa < 0x40000000u) {
+        if (Ml2Line* e = ml2Route(pa))
+            return e->b[pa & 31u];
+        u32 ro;
+        if (ramClaim(pa, ro))
+            return ram_[ro];
+    }
     if (pa >= kRomAlias)
         return rom_[pa & kRomMask];
     if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize)
@@ -119,10 +182,17 @@ u8 GossamerBus::read8(u32 pa)
 
 u16 GossamerBus::read16(u32 pa)
 {
-    u32 ro;
-    if (pa < 0x40000000u && ramClaim(pa, ro)) {
-        const u32 m = static_cast<u32>(ram_.size()) - 1u;
-        return static_cast<u16>((ram_[ro] << 8) | ram_[(ro + 1) & m]);
+    if (pa < 0x40000000u) {
+        if ((pa & 31u) > 30u) // crosses a line: route per byte
+            return static_cast<u16>((read8(pa) << 8) | read8(pa + 1));
+        if (Ml2Line* e = ml2Route(pa))
+            return static_cast<u16>((e->b[pa & 31u] << 8) |
+                                    e->b[(pa & 31u) + 1]);
+        u32 ro;
+        if (ramClaim(pa, ro)) {
+            const u32 m = static_cast<u32>(ram_.size()) - 1u;
+            return static_cast<u16>((ram_[ro] << 8) | ram_[(ro + 1) & m]);
+        }
     }
     if (pa >= kRomAlias)
         return static_cast<u16>((rom_[pa & kRomMask] << 8) |
@@ -136,11 +206,21 @@ u16 GossamerBus::read16(u32 pa)
 
 u32 GossamerBus::read32(u32 pa)
 {
-    u32 ro;
-    if (pa < 0x40000000u && ramClaim(pa, ro)) {
-        const u32 m = static_cast<u32>(ram_.size()) - 1u;
-        return (u32(ram_[ro]) << 24) | (u32(ram_[(ro + 1) & m]) << 16) |
-               (u32(ram_[(ro + 2) & m]) << 8) | u32(ram_[(ro + 3) & m]);
+    if (pa < 0x40000000u) {
+        if ((pa & 31u) > 28u)
+            return (u32(read8(pa)) << 24) | (u32(read8(pa + 1)) << 16) |
+                   (u32(read8(pa + 2)) << 8) | u32(read8(pa + 3));
+        if (Ml2Line* e = ml2Route(pa)) {
+            const u32 o = pa & 31u;
+            return (u32(e->b[o]) << 24) | (u32(e->b[o + 1]) << 16) |
+                   (u32(e->b[o + 2]) << 8) | u32(e->b[o + 3]);
+        }
+        u32 ro;
+        if (ramClaim(pa, ro)) {
+            const u32 m = static_cast<u32>(ram_.size()) - 1u;
+            return (u32(ram_[ro]) << 24) | (u32(ram_[(ro + 1) & m]) << 16) |
+                   (u32(ram_[(ro + 2) & m]) << 8) | u32(ram_[(ro + 3) & m]);
+        }
     }
     if (pa >= kRomAlias) {
         const u32 off = pa & kRomMask;
@@ -175,14 +255,21 @@ u64 GossamerBus::read64(u32 pa)
 
 void GossamerBus::write8(u32 pa, u8 v)
 {
-    u32 ro;
-    if (pa < 0x40000000u && ramClaim(pa, ro)) {
-        if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
-            ram_[ro] != v && htabLog_.size() < 65536)
-            htabLog_.push_back({stamp ? *stamp : 0, ro | 0x80000000u,
-                                ram_[ro], v});
-        ram_[ro] = v;
-        return;
+    if (pa < 0x40000000u) {
+        if (Ml2Line* e = ml2Route(pa)) {
+            e->b[pa & 31u] = v;
+            e->d = true;
+            return;
+        }
+        u32 ro;
+        if (ramClaim(pa, ro)) {
+            if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
+                ram_[ro] != v && htabLog_.size() < 65536)
+                htabLog_.push_back({stamp ? *stamp : 0, ro | 0x80000000u,
+                                    ram_[ro], v});
+            ram_[ro] = v;
+            return;
+        }
     }
     if (pa >= kRomAlias) {
         ++romWrites_;
@@ -211,19 +298,32 @@ void GossamerBus::write8(u32 pa, u8 v)
 
 void GossamerBus::write16(u32 pa, u16 v)
 {
-    u32 ro;
-    if (pa < 0x40000000u && ramClaim(pa, ro)) {
-        const u32 m = static_cast<u32>(ram_.size()) - 1u;
-        if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
-            htabLog_.size() < 65536) {
-            const u32 old = (u32(ram_[ro]) << 8) | ram_[(ro + 1) & m];
-            if (old != v)
-                htabLog_.push_back({stamp ? *stamp : 0, ro | 0x40000000u,
-                                    old, v});
+    if (pa < 0x40000000u) {
+        if ((pa & 31u) > 30u) {
+            write8(pa, static_cast<u8>(v >> 8));
+            write8(pa + 1, static_cast<u8>(v));
+            return;
         }
-        ram_[ro] = static_cast<u8>(v >> 8);
-        ram_[(ro + 1) & m] = static_cast<u8>(v);
-        return;
+        if (Ml2Line* e = ml2Route(pa)) {
+            e->b[pa & 31u] = static_cast<u8>(v >> 8);
+            e->b[(pa & 31u) + 1] = static_cast<u8>(v);
+            e->d = true;
+            return;
+        }
+        u32 ro;
+        if (ramClaim(pa, ro)) {
+            const u32 m = static_cast<u32>(ram_.size()) - 1u;
+            if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
+                htabLog_.size() < 65536) {
+                const u32 old = (u32(ram_[ro]) << 8) | ram_[(ro + 1) & m];
+                if (old != v)
+                    htabLog_.push_back({stamp ? *stamp : 0,
+                                        ro | 0x40000000u, old, v});
+            }
+            ram_[ro] = static_cast<u8>(v >> 8);
+            ram_[(ro + 1) & m] = static_cast<u8>(v);
+            return;
+        }
     }
     if (pa >= kRomAlias) {
         ++romWrites_;
@@ -239,23 +339,41 @@ void GossamerBus::write16(u32 pa, u16 v)
 
 void GossamerBus::write32(u32 pa, u32 v)
 {
-    u32 ro;
-    if (pa < 0x40000000u && ramClaim(pa, ro)) {
-        const u32 m = static_cast<u32>(ram_.size()) - 1u;
-        if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
-            htabLog_.size() < 65536) {
-            const u32 old = (u32(ram_[ro]) << 24) |
-                            (u32(ram_[(ro + 1) & m]) << 16) |
-                            (u32(ram_[(ro + 2) & m]) << 8) |
-                            u32(ram_[(ro + 3) & m]);
-            if (old != v)
-                htabLog_.push_back({stamp ? *stamp : 0, ro, old, v});
+    if (pa < 0x40000000u) {
+        if ((pa & 31u) > 28u) {
+            write8(pa, static_cast<u8>(v >> 24));
+            write8(pa + 1, static_cast<u8>(v >> 16));
+            write8(pa + 2, static_cast<u8>(v >> 8));
+            write8(pa + 3, static_cast<u8>(v));
+            return;
         }
-        ram_[ro] = static_cast<u8>(v >> 24);
-        ram_[(ro + 1) & m] = static_cast<u8>(v >> 16);
-        ram_[(ro + 2) & m] = static_cast<u8>(v >> 8);
-        ram_[(ro + 3) & m] = static_cast<u8>(v);
-        return;
+        if (Ml2Line* e = ml2Route(pa)) {
+            const u32 o = pa & 31u;
+            e->b[o] = static_cast<u8>(v >> 24);
+            e->b[o + 1] = static_cast<u8>(v >> 16);
+            e->b[o + 2] = static_cast<u8>(v >> 8);
+            e->b[o + 3] = static_cast<u8>(v);
+            e->d = true;
+            return;
+        }
+        u32 ro;
+        if (ramClaim(pa, ro)) {
+            const u32 m = static_cast<u32>(ram_.size()) - 1u;
+            if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
+                htabLog_.size() < 65536) {
+                const u32 old = (u32(ram_[ro]) << 24) |
+                                (u32(ram_[(ro + 1) & m]) << 16) |
+                                (u32(ram_[(ro + 2) & m]) << 8) |
+                                u32(ram_[(ro + 3) & m]);
+                if (old != v)
+                    htabLog_.push_back({stamp ? *stamp : 0, ro, old, v});
+            }
+            ram_[ro] = static_cast<u8>(v >> 24);
+            ram_[(ro + 1) & m] = static_cast<u8>(v >> 16);
+            ram_[(ro + 2) & m] = static_cast<u8>(v >> 8);
+            ram_[(ro + 3) & m] = static_cast<u8>(v);
+            return;
+        }
     }
     if (pa >= kRomAlias) {
         ++romWrites_;

@@ -89,6 +89,22 @@ private:
     u32 bankGen_ = ~0u;
     bool memGo_ = false;
 
+    // MPC106 internally-controlled L2 (UM ch.5 / PICR1[CF_L2_MP] +
+    // PICR2[L2_EN]): a direct-mapped write-back lookaside cache on the 60x
+    // memory space. Load-bearing pre-DRAM: HWInit enables it right before
+    // the memory-init module runs, and the module's page tables and
+    // workspace live in it (dcbf pushes land here) before any bank exists.
+    struct Ml2Line {
+        bool v = false, d = false;
+        u32 tag = 0;
+        u8 b[32] = {};
+    };
+    std::vector<Ml2Line> ml2_;
+    u32 ml2Lines_ = 0;
+    bool ml2On_ = false;
+    void memCfgRefresh(); // banks + MEMGO + inline-L2 state from config
+    Ml2Line* ml2Route(u32 pa); // line for a memory-space access (or null)
+
     bool atiWindow(u32 pa, u32& off) const;
     bool atiIoWindow(u32 pa, u32& off) const;
 

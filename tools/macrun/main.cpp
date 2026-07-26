@@ -266,6 +266,11 @@ int main(int argc, char** argv)
         cpu.mmuProbe = false;
     };
     bool vdumped = false, wildCaught = false, mqProbed = false;
+    struct InsRec {
+        u64 at;
+        u32 r8, r9, r10, r12, r13;
+    };
+    std::vector<InsRec> inserterLog;
     u64 lastGpioOps = 0;
     struct Dispatch {
         u64 at;
@@ -494,6 +499,10 @@ int main(int argc, char** argv)
             vdumped = true;
             vdump("at first GP_IO touch");
         }
+        if (pc == 0xFFF22464u && inserterLog.size() < 256)
+            inserterLog.push_back({executed, cpu.st.gpr[8], cpu.st.gpr[9],
+                                   cpu.st.gpr[10], cpu.st.gpr[12],
+                                   cpu.st.gpr[13]});
         if (!wildCaught && (cpu.st.pc < 0x100u ||
                             (cpu.st.pc >= 0x60000000u &&
                              cpu.st.pc < 0x70000000u))) {
@@ -627,6 +636,14 @@ int main(int argc, char** argv)
         const auto& e = ring.e[(ring.n - count + k) & 31u];
         disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
         printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
+    }
+
+    if (!inserterLog.empty()) {
+        printf("-- pte ring-inserter consumes (%zu):\n", inserterLog.size());
+        for (const auto& r : inserterLog)
+            printf("   @%-9llu r8=%08x r9=%08x r10=%08x r12=%08x r13=%08x\n",
+                   static_cast<unsigned long long>(r.at), r.r8, r.r9, r.r10,
+                   r.r12, r.r13);
     }
 
     if (vdisStart && vdisEnd > vdisStart)

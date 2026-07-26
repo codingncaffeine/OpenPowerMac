@@ -907,6 +907,13 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
             c.l2WipeAll(); // L2I global invalidate
         if (v & 0x80000000u)
             c.l2Resize(); // L2E: size the model per L2SIZ
+        { // TEMP-DEBUG: L2 bring-up timeline
+            static int n = 0;
+            if (n < 40)
+                fprintf(stderr, "l2cr <= %08x tb=%llu\n", v,
+                        static_cast<unsigned long long>(c.st.tb)),
+                    ++n;
+        }
         return;
     }
     if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception

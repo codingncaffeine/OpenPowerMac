@@ -48,6 +48,7 @@ constexpr u32 f_xo5(u32 i)     { return ppcbits(i, 26, 30); }
 constexpr u32 f_xo6v(u32 i)    { return ppcbits(i, 26, 31); }  // VA-form
 constexpr u32 f_xo11v(u32 i)   { return ppcbits(i, 21, 31); }  // VX-form
 constexpr u32 f_rcbit(u32 i)   { return ppcbit(i, 31); }
+constexpr u32 f_vrcbit(u32 i)  { return ppcbit(i, 21); }  // VXR-form Rc
 constexpr u32 f_oebit(u32 i)   { return ppcbit(i, 21); }
 constexpr u32 f_lkbit(u32 i)   { return ppcbit(i, 31); }
 constexpr u32 f_aabit(u32 i)   { return ppcbit(i, 30); }

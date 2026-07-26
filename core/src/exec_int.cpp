@@ -1060,6 +1060,7 @@ void bindHandlers()
     setHandler("tlbsync", h_nop);
 
     bindFpuHandlers();
+    bindVecHandlers();
 }
 
 } // namespace opm

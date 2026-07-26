@@ -149,7 +149,37 @@ bool isIndexedMem(const InsnDesc& d)
     const char* m = d.mnem;
     return (m[0] == 'l' || (m[0] == 's' && m[1] == 't')) && d.kind == Xk::X31 &&
            (d.pat == Pat::RT_RA_RB || d.pat == Pat::RS_RA_RB ||
-            d.pat == Pat::FRT_RA_RB || d.pat == Pat::FRS_RA_RB);
+            d.pat == Pat::FRT_RA_RB || d.pat == Pat::FRS_RA_RB ||
+            d.pat == Pat::VD_RA_RB || d.pat == Pat::VS_RA_RB);
+}
+
+// Vector register seeds: random bytes with a bias toward single-precision
+// special values in word lanes.
+V128 vecVal(Rng& r)
+{
+    V128 v;
+    if (r.chance(40)) {
+        for (int k = 0; k < 16; ++k)
+            v.b[k] = static_cast<u8>(r.word());
+        return v;
+    }
+    for (int w = 0; w < 4; ++w) {
+        u32 x;
+        switch (r.u(0, 7)) {
+        case 0: x = 0; break;
+        case 1: x = 0x80000000u; break;
+        case 2: x = r.chance(50) ? 0x7F800000u : 0xFF800000u; break;
+        case 3: x = 0x7FC00000u | (r.word() & 0x3FFFFFu); break;   // QNaN
+        case 4: x = (r.word() & 0x807FFFFFu); break;               // denorm
+        case 5: x = 0x3F800000u + (r.word() & 0xFFFFFu); break;    // near one
+        default: x = r.word(); break;
+        }
+        v.b[4 * w] = static_cast<u8>(x >> 24);
+        v.b[4 * w + 1] = static_cast<u8>(x >> 16);
+        v.b[4 * w + 2] = static_cast<u8>(x >> 8);
+        v.b[4 * w + 3] = static_cast<u8>(x);
+    }
+    return v;
 }
 
 // Interesting FPR seeds: specials, denorms, single-representable values,
@@ -374,6 +404,33 @@ u32 synth(GenCtx& g, const InsnDesc& d)
     case Pat::MFFS:
         w |= (rt << 21) | (r.chance(40) ? 1u : 0u);
         break;
+    case Pat::VX3:
+        w |= (rt << 21) | (ra << 16) | (rb << 11);
+        if (d.flags & FL_VRC)
+            w |= r.chance(40) ? 0x400u : 0u;
+        break;
+    case Pat::VX2B:
+        w |= (rt << 21) | (rb << 11);
+        break;
+    case Pat::VX_SPLAT:
+        w |= (rt << 21) | (r.u(0, 31) << 16) | (rb << 11);
+        break;
+    case Pat::VX_SPLATIS:
+        w |= (rt << 21) | (r.u(0, 31) << 16);
+        break;
+    case Pat::VA4P:
+    case Pat::VA_MADD:
+        w |= (rt << 21) | (ra << 16) | (rb << 11) | (r.u(0, 31) << 6);
+        break;
+    case Pat::VSLDOI:
+        w |= (rt << 21) | (ra << 16) | (rb << 11) | (r.u(0, 15) << 6);
+        break;
+    case Pat::MFVSCR:
+        w |= rt << 21;
+        break;
+    case Pat::MTVSCR:
+        w |= rb << 11;
+        break;
     default:
         w |= (rt << 21) | (ra << 16) | (rb << 11);
         break;
@@ -397,10 +454,24 @@ void emitState(FILE* f, const CpuState& s, const std::map<u32, u8>& ram)
     for (int i = 0; i < 32; ++i)
         fprintf(f, "%llu%s", static_cast<unsigned long long>(s.fpr[i]),
                 i == 31 ? "" : ",");
+    fprintf(f, "],\"vrs\":[");
+    for (int i = 0; i < 32; ++i) {
+        fprintf(f, "[");
+        for (int w = 0; w < 4; ++w) {
+            const u32 x = (u32(s.vr[i].b[4 * w]) << 24) |
+                          (u32(s.vr[i].b[4 * w + 1]) << 16) |
+                          (u32(s.vr[i].b[4 * w + 2]) << 8) |
+                          u32(s.vr[i].b[4 * w + 3]);
+            fprintf(f, "%u%s", x, w == 3 ? "" : ",");
+        }
+        fprintf(f, "]%s", i == 31 ? "" : ",");
+    }
     fprintf(f,
-            "],\"fpscr\":%u,\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"msr\":%u,"
+            "],\"vscr\":%u,\"vrsave\":%u,"
+            "\"fpscr\":%u,\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"msr\":%u,"
             "\"srr0\":%u,\"srr1\":%u,\"dec\":%u,\"tb\":%llu,"
             "\"resv\":[%u,%u],\"ram\":[",
+            s.vscr, s.vrsave,
             s.fpscr, s.cr, s.xer, s.lr, s.ctr, s.msr, s.srr0, s.srr1, s.dec,
             static_cast<unsigned long long>(s.tb), s.resvValid ? 1u : 0u,
             s.resvAddr);
@@ -464,6 +535,12 @@ int generate(const char* mnem, const fs::path& outDir, u32 count)
         g.cpu.st.fpscr = g.rng.word() & 0x9FFFF7FFu;
         if (isFpInsn(*d) && g.rng.chance(85))
             g.cpu.st.msr |= 0x00002000u; // most FP-family vectors run with FP on
+        for (int i = 0; i < 32; ++i)
+            g.cpu.st.vr[i] = vecVal(g.rng);
+        g.cpu.st.vscr = g.rng.word() & 0x00010001u; // NJ | SAT
+        g.cpu.st.vrsave = g.rng.word();
+        if (isVecInsn(*d) && g.rng.chance(85))
+            g.cpu.st.msr |= 0x02000000u; // most vector chapters run with VEC on
         g.cpu.st.cr = g.rng.word();
         g.cpu.st.xer = (g.rng.word() & 0xE0000000u) | g.rng.u(0, 16);
         g.cpu.st.lr = g.rng.word() & ~3u;
@@ -546,6 +623,38 @@ const char* kV0[] = {
     "fsel", "fmr", "fneg", "fabs", "fnabs",
     "fcmpu", "fcmpo",
     "mffs", "mcrfs", "mtfsf", "mtfsfi", "mtfsb0", "mtfsb1",
+    // AltiVec chapters (P5): VRs (word quads) + VSCR + VRSAVE in the state
+    "lvebx", "lvehx", "lvewx", "lvsl", "lvsr", "lvx", "lvxl",
+    "stvebx", "stvehx", "stvewx", "stvx", "stvxl",
+    "mfvscr", "mtvscr",
+    "vaddcuw", "vaddfp", "vaddsbs", "vaddshs", "vaddsws", "vaddubm",
+    "vaddubs", "vadduhm", "vadduhs", "vadduwm", "vadduws",
+    "vand", "vandc", "vor", "vnor", "vxor",
+    "vavgsb", "vavgsh", "vavgsw", "vavgub", "vavguh", "vavguw",
+    "vcfsx", "vcfux", "vctsxs", "vctuxs",
+    "vcmpbfp", "vcmpeqfp", "vcmpequb", "vcmpequh", "vcmpequw", "vcmpgefp",
+    "vcmpgtfp", "vcmpgtsb", "vcmpgtsh", "vcmpgtsw", "vcmpgtub", "vcmpgtuh",
+    "vcmpgtuw",
+    "vexptefp", "vlogefp", "vmaddfp", "vnmsubfp", "vmaxfp", "vminfp",
+    "vmaxsb", "vmaxsh", "vmaxsw", "vmaxub", "vmaxuh", "vmaxuw",
+    "vminsb", "vminsh", "vminsw", "vminub", "vminuh", "vminuw",
+    "vmhaddshs", "vmhraddshs", "vmladduhm",
+    "vmrghb", "vmrghh", "vmrghw", "vmrglb", "vmrglh", "vmrglw",
+    "vmsummbm", "vmsumshm", "vmsumshs", "vmsumubm", "vmsumuhm", "vmsumuhs",
+    "vmulesb", "vmulesh", "vmuleub", "vmuleuh", "vmulosb", "vmulosh",
+    "vmuloub", "vmulouh",
+    "vperm", "vsel", "vsldoi",
+    "vpkpx", "vpkshss", "vpkshus", "vpkswss", "vpkswus", "vpkuhum",
+    "vpkuhus", "vpkuwum", "vpkuwus",
+    "vrefp", "vrsqrtefp", "vrfim", "vrfin", "vrfip", "vrfiz",
+    "vrlb", "vrlh", "vrlw",
+    "vsl", "vslb", "vslh", "vslo", "vslw",
+    "vsr", "vsrab", "vsrah", "vsraw", "vsrb", "vsrh", "vsro", "vsrw",
+    "vspltb", "vsplth", "vspltisb", "vspltish", "vspltisw", "vspltw",
+    "vsubcuw", "vsubfp", "vsubsbs", "vsubshs", "vsubsws", "vsububm",
+    "vsububs", "vsubuhm", "vsubuhs", "vsubuwm", "vsubuws",
+    "vsum2sws", "vsum4sbs", "vsum4shs", "vsum4ubs", "vsumsws",
+    "vupkhpx", "vupkhsb", "vupkhsh", "vupklpx", "vupklsb", "vupklsh",
 };
 
 } // namespace

@@ -1,6 +1,7 @@
 #include "kat.hpp"
 #include "opm/bits.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -81,6 +82,14 @@ bool applyKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
         return true;
     }
     if (key == "fpscr") { c.st.fpscr = static_cast<u32>(hexval(val)); return true; }
+    if (key.size() >= 2 && key[0] == 'v' && isdigit(static_cast<unsigned char>(key[1]))) {
+        V128& vr = c.st.vr[std::stoul(key.substr(1)) & 31u];
+        const std::string s = std::string(32 - std::min<size_t>(32, val.size()), '0') + val;
+        for (int k = 0; k < 16; ++k)
+            vr.b[k] = static_cast<u8>(std::stoul(s.substr(2 * static_cast<size_t>(k), 2), nullptr, 16));
+        return true;
+    }
+    if (key == "vscr") { c.st.vscr = static_cast<u32>(hexval(val)); return true; }
     if (key == "xer") { c.st.xer = static_cast<u32>(hexval(val)); return true; }
     if (key == "cr")  { c.st.cr = static_cast<u32>(hexval(val)); return true; }
     if (key == "lr")  { c.st.lr = static_cast<u32>(hexval(val)); return true; }
@@ -149,6 +158,24 @@ bool checkKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
     if (key.size() >= 2 && key[0] == 'f' && isdigit(static_cast<unsigned char>(key[1])))
         return expectU64(c.st.fpr[std::stoul(key.substr(1)) & 31u]);
     if (key == "fpscr") return expectU32(c.st.fpscr);
+    if (key.size() >= 2 && key[0] == 'v' && isdigit(static_cast<unsigned char>(key[1]))) {
+        const V128& vr = c.st.vr[std::stoul(key.substr(1)) & 31u];
+        const std::string s = std::string(32 - std::min<size_t>(32, val.size()), '0') + val;
+        char gotHex[33], wantHex[33];
+        bool same = true;
+        for (int k = 0; k < 16; ++k) {
+            const u8 want = static_cast<u8>(std::stoul(s.substr(2 * static_cast<size_t>(k), 2), nullptr, 16));
+            snprintf(&wantHex[2 * k], 3, "%02x", want);
+            snprintf(&gotHex[2 * k], 3, "%02x", vr.b[k]);
+            if (want != vr.b[k])
+                same = false;
+        }
+        if (same)
+            return true;
+        diff += "  " + key + ": want " + wantHex + " got " + gotHex + "\n";
+        return false;
+    }
+    if (key == "vscr") return expectU32(c.st.vscr);
     if (key == "xer") return expectU32(c.st.xer);
     if (key == "cr")  return expectU32(c.st.cr);
     if (key == "lr")  return expectU32(c.st.lr);

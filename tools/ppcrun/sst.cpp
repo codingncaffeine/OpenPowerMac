@@ -150,6 +150,20 @@ void applyState(Cpu& c, MapBus& bus, const JVal& s)
             c.st.fpr[i] = fp->arr[static_cast<size_t>(i)].num;
     if (const JVal* fs = s.get("fpscr"))
         c.st.fpscr = static_cast<u32>(fs->num);
+    if (const JVal* vr = s.get("vrs"))
+        for (int i = 0; i < 32; ++i)
+            for (int w = 0; w < 4; ++w) {
+                const u32 x = static_cast<u32>(
+                    vr->arr[static_cast<size_t>(i)].arr[static_cast<size_t>(w)].num);
+                c.st.vr[i].b[4 * w] = static_cast<u8>(x >> 24);
+                c.st.vr[i].b[4 * w + 1] = static_cast<u8>(x >> 16);
+                c.st.vr[i].b[4 * w + 2] = static_cast<u8>(x >> 8);
+                c.st.vr[i].b[4 * w + 3] = static_cast<u8>(x);
+            }
+    if (const JVal* vs = s.get("vscr"))
+        c.st.vscr = static_cast<u32>(vs->num);
+    if (const JVal* vv = s.get("vrsave"))
+        c.st.vrsave = static_cast<u32>(vv->num);
     c.st.cr = static_cast<u32>(s.get("cr")->num);
     c.st.xer = static_cast<u32>(s.get("xer")->num);
     c.st.lr = static_cast<u32>(s.get("lr")->num);
@@ -203,6 +217,25 @@ bool checkState(Cpu& c, MapBus& bus, const JVal& s, std::string& diff)
         }
     if (const JVal* fs = s.get("fpscr"))
         chk("fpscr", static_cast<u32>(fs->num), c.st.fpscr);
+    if (const JVal* vr = s.get("vrs"))
+        for (int i = 0; i < 32; ++i)
+            for (int w = 0; w < 4; ++w) {
+                char nm[12];
+                snprintf(nm, sizeof nm, "v%d.%d", i, w);
+                const u32 got = (u32(c.st.vr[i].b[4 * w]) << 24) |
+                                (u32(c.st.vr[i].b[4 * w + 1]) << 16) |
+                                (u32(c.st.vr[i].b[4 * w + 2]) << 8) |
+                                u32(c.st.vr[i].b[4 * w + 3]);
+                chk(nm,
+                    static_cast<u32>(vr->arr[static_cast<size_t>(i)]
+                                         .arr[static_cast<size_t>(w)]
+                                         .num),
+                    got);
+            }
+    if (const JVal* vs = s.get("vscr"))
+        chk("vscr", static_cast<u32>(vs->num), c.st.vscr);
+    if (const JVal* vv = s.get("vrsave"))
+        chk("vrsave", static_cast<u32>(vv->num), c.st.vrsave);
     chk("cr", static_cast<u32>(s.get("cr")->num), c.st.cr);
     chk("xer", static_cast<u32>(s.get("xer")->num), c.st.xer);
     chk("lr", static_cast<u32>(s.get("lr")->num), c.st.lr);

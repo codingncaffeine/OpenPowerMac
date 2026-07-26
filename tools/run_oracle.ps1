@@ -3,7 +3,7 @@
 param(
   [string]$OracleDir = "$PSScriptRoot\..\build\oracle",
   [string]$Ppcrun = "$PSScriptRoot\..\build\tools\ppcrun\Release\ppcrun.exe",
-  [string]$Filter = '[fi]*' # int* + fp* by default; mix* waits for P5
+  [string]$Filter = '[fim]*' # int* + fp* + mix* (scalar and vector corpus)
 )
 
 $fail = 0

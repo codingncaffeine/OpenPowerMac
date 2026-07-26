@@ -8,6 +8,7 @@ add_library(opmcore STATIC
   src/mmu.cpp
   src/softfp.cpp
   src/fpu.cpp
+  src/altivec.cpp
 )
 
 target_include_directories(opmcore PUBLIC include)

@@ -41,4 +41,4 @@ jobs:
       - name: Build oracle corpus (GNU cross gcc — second toolchain)
         run: bash tests/oracle/build.sh build/oracle
       - name: Run differential oracle
-        run: bash tools/run_oracle.sh build/oracle build/tools/ppcrun/ppcrun '[fi]*'
+        run: bash tools/run_oracle.sh build/oracle build/tools/ppcrun/ppcrun '[fim]*'

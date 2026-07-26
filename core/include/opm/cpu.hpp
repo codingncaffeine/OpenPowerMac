@@ -205,6 +205,7 @@ struct Cpu {
 // Idempotent; called from the Cpu constructor.
 void bindHandlers();
 void bindFpuHandlers(); // fpu.cpp's registrations, called by bindHandlers()
+void bindVecHandlers(); // altivec.cpp's registrations, called by bindHandlers()
 
 // Handler slot for an ISA row (parallel to kIsa; see decode()).
 Handler handlerFor(const InsnDesc* d);

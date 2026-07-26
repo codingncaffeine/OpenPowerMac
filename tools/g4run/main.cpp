@@ -145,6 +145,27 @@ int main(int argc, char** argv)
         }
         if (fastTb)
             cpu.tick(fastTb);
+        static u32 blinkShown = 0;
+        if ((cpu.st.pc == 0xFFF82960u || cpu.st.pc == 0xFFF829D0u) &&
+            blinkShown < 2) {
+            ++blinkShown;
+            printf("-- blink-%c @%llu code=r1&15=%u (r1=%08x) lr=%08x\n",
+                   cpu.st.pc == 0xFFF82960u ? 'A' : 'B',
+                   static_cast<unsigned long long>(executed),
+                   cpu.st.gpr[1] & 15u, cpu.st.gpr[1], cpu.st.lr);
+        }
+        static bool code3Shown = false;
+        if (cpu.st.pc == 0xFFF80144u && !code3Shown) {
+            code3Shown = true;
+            printf("-- code-3 entry @%llu; ring into it:\n",
+                   static_cast<unsigned long long>(executed));
+            const u32 cnt = ring.n < 24 ? ring.n : 24;
+            for (u32 k = 0; k < cnt; ++k) {
+                const auto& e = ring.e[(ring.n - cnt + k) & 31u];
+                disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
+                printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
+            }
+        }
         ++executed;
         if (cpu.raisedThisStep) {
             if (excLogged < excShow)
@@ -205,6 +226,24 @@ int main(int argc, char** argv)
                    ul[k].val, ul[k].pc);
     }
     {
+        const auto& il = bus.i2cLog();
+        printf("-- i2c transactions (%zu; addr|sub -> byte):\n", il.size());
+        for (size_t k = 0; k < il.size() && k < 80; ++k)
+            printf("   %02x|%02x -> %s%02x pc=%08x @%llu\n",
+                   (il[k].pa >> 8) & 0xFF, il[k].pa & 0xFF,
+                   il[k].val == 0xFFFFFFFFu ? "nack " : "",
+                   il[k].val & 0xFF, il[k].pc,
+                   static_cast<unsigned long long>(il[k].at));
+    }
+    {
+        const auto& sz = bus.sizeLog();
+        printf("-- sizing-window probes (%zu; r/w pa val pc):\n", sz.size());
+        for (size_t k = 0; k < sz.size() && k < 120; ++k)
+            printf("   %c %08x %08x pc=%08x @%llu\n",
+                   (sz[k].pa & 1u) ? 'r' : 'w', sz[k].pa & ~1u, sz[k].val,
+                   sz[k].pc, static_cast<unsigned long long>(sz[k].at));
+    }
+    {
         const std::string& con = bus.console();
         printf("-- serial console (%zu bytes):\n", con.size());
         if (!con.empty()) {
@@ -217,19 +256,20 @@ int main(int argc, char** argv)
     }
     {
         const auto& pl = bus.pmu().log;
-        printf("-- pmu conversation (%zu events; c=cmd d=data r=srRead "
-               "e=reqEdge):\n   ",
+        u64 cmdCount[256] = {};
+        for (const auto& ev : pl)
+            if (ev.kind == 'c')
+                ++cmdCount[ev.val];
+        printf("-- pmu commands seen:");
+        for (u32 c = 0; c < 256; ++c)
+            if (cmdCount[c])
+                printf(" %02x:%llu", c,
+                       static_cast<unsigned long long>(cmdCount[c]));
+        printf("\n-- pmu conversation tail (of %zu events):\n   ",
                pl.size());
-        size_t shown = 0;
-        for (const auto& ev : pl) {
-            if (ev.kind == 'r' && shown && pl[shown - 1].kind == 'r')
-                { ++shown; continue; } // collapse SR-read runs
-            if (shown++ > 160) {
-                printf("...");
-                break;
-            }
-            printf("%c%02x ", ev.kind, ev.val);
-        }
+        const size_t start = pl.size() > 120 ? pl.size() - 120 : 0;
+        for (size_t k = start; k < pl.size(); ++k)
+            printf("%c%02x ", pl[k].kind, pl[k].val);
         printf("\n");
     }
     {

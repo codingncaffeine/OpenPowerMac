@@ -43,6 +43,10 @@ public:
         kl_[0x14021] = 0x31;
         kl_[0x14022] = 0x40;
         kl_[0x14023] = 0x00;
+        // Uni-North VERSION (+0x00): Sawtooth silicon reports the 1.0.x
+        // family; 0x07 = "1.0.10", the post-fix revision (Linux-validated
+        // constant table).
+        unin_[3] = 0x07;
     }
 
     u8 read8(u32 pa) override { return static_cast<u8>(read(pa, 1)); }
@@ -62,6 +66,13 @@ public:
         write(pa + 4, static_cast<u32>(v), 4);
     }
 
+    struct RegWr {
+        u64 at;
+        u32 pa, val, pc;
+    };
+    const std::vector<RegWr>& sizeLog() const { return szLog_; }
+    const std::vector<RegWr>& i2cLog() const { return i2cLog_; }
+
     // Uni-North host-bridge register block at 0xF8000000: a plain
     // word-register store, all-zero at power-on. Zero in HWINIT_STATE
     // (+0x70) is what tells the ROM this is a cold boot rather than a
@@ -69,12 +80,8 @@ public:
     // ROM put the machine back to sleep. Individual registers earn real
     // semantics as the boot demands them.
     static constexpr u32 kUniNBase = 0xF8000000u;
-    static constexpr u32 kUniNSize = 0x1000u;
+    static constexpr u32 kUniNSize = 0x3000u;
 
-    struct RegWr {
-        u64 at;
-        u32 pa, val, pc;
-    };
     const std::vector<RegWr>& uninLog() const { return uninLog_; }
 
     struct Acc {
@@ -102,6 +109,18 @@ public:
     // capture the ROM's serial console log verbatim.
     const std::string& console() const { return console_; }
 
+    // Uni-North "Keywest" I2C at 0xF8001000 — the DIMM SPD bus. Byte
+    // registers at +3 of each 0x10-strided word, protocol as the ROM's
+    // own polled driver at fff86a00 spells it out:
+    //   +0x00 MODE   (sel<<4 | mode; 0xC = combined read, 0x8 = sub write)
+    //   +0x10 CONTROL bit1 = launch address phase, bit0 = AAK
+    //   +0x20 STATUS  bit1 = slave acked
+    //   +0x30 ISR     bit1 = addr done, bit0 = data ready, bit2 = stop
+    //                 done; write-1-to-clear, each clear advances the
+    //                 transaction chain
+    //   +0x50 ADDR (dev|1 = read), +0x60 SUBADDR, +0x70 DATA
+    static constexpr u32 kI2cBase = 0xF8001000u;
+
     // Unclaimed + ROM-write traffic, keyed by physical address.
     const std::map<u32, Acc>& accessLog() const { return log_; }
     std::vector<u32> logOrder; // first-touch order
@@ -112,12 +131,33 @@ public:
     size_t ramBytes() const { return ram_.size(); }
 
 private:
+    // During memory sizing the RAM controller exposes each DIMM slot in a
+    // temporary wide-open decode (0x78000000..0x98000000 all aliasing the
+    // DIMM under test modulo its size; the ROM probes with its rotating
+    // "Mary" pattern at row-bit offsets and finds the size from where the
+    // wrap aliasing begins). Slots whose SPD probe answered nothing are
+    // never probed at all — absence is decided at the SPD stage.
+    static constexpr u32 kSizeWin = 0x78000000u;
+    static constexpr u32 kDimmBytes = 64u << 20;
+    std::vector<RegWr> szLog_; // sizing-window probe traffic (val=data)
+    std::vector<RegWr> i2cLog_; // one entry per launched transaction
+
     u32 read(u32 pa, u32 len)
     {
+        if (pa - kSizeWin < 0x20000000u) {
+            const u32 v =
+                get(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), len);
+            if (szLog_.size() < 4000)
+                szLog_.push_back({stamp ? *stamp : 0, pa | 1u, v,
+                                  pcRef ? *pcRef : 0});
+            return v;
+        }
         if (pa < ram_.size() && pa + len <= ram_.size())
             return get(ram_.data() + pa, len);
         if (pa >= kRomBase && pa - kRomBase + len <= rom_.size())
             return get(rom_.data() + (pa - kRomBase), len);
+        if (pa >= kI2cBase && pa + len <= kI2cBase + 0x100u)
+            return i2cRead(pa - kI2cBase);
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize)
             return get(unin_ + (pa - kUniNBase), len);
         if (pa >= kMacIoBase && pa + len <= kMacIoBase + kMacIoSize) {
@@ -141,8 +181,19 @@ private:
 
     void write(u32 pa, u32 v, u32 len)
     {
+        if (pa - kSizeWin < 0x20000000u) {
+            put(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), v, len);
+            if (szLog_.size() < 4000)
+                szLog_.push_back({stamp ? *stamp : 0, pa, v,
+                                  pcRef ? *pcRef : 0});
+            return;
+        }
         if (pa < ram_.size() && pa + len <= ram_.size()) {
             put(ram_.data() + pa, v, len);
+            return;
+        }
+        if (pa >= kI2cBase && pa + len <= kI2cBase + 0x100u) {
+            i2cWrite(pa - kI2cBase, static_cast<u8>(v));
             return;
         }
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize) {
@@ -171,6 +222,61 @@ private:
         }
         note(pa, v, true); // ROM/flash writes land here too, unapplied
     }
+
+    // Keywest engine. The SPD EEPROM answers for DIMM slot 1; a slave
+    // that isn't populated simply never acks (STATUS bit1 stays clear),
+    // which is the ROM's own not-present path.
+    u32 i2cRead(u32 off)
+    {
+        if ((off & 0xFu) != 3u)
+            return 0;
+        switch (off >> 4) {
+        case 0: return i2cMode_;
+        case 1: return i2cCtrl_;
+        case 2: return i2cAcked_ ? 0x02u : 0x00u;
+        case 3: return i2cIsr_;
+        case 5: return i2cAddr_;
+        case 6: return i2cSub_;
+        case 7: return i2cAcked_ ? spdByte() : 0xFFu;
+        default: return 0;
+        }
+    }
+    void i2cWrite(u32 off, u8 v)
+    {
+        if ((off & 0xFu) != 3u)
+            return;
+        switch (off >> 4) {
+        case 0: i2cMode_ = v; break;
+        case 1:
+            i2cCtrl_ = v;
+            if ((v & 0x02u) && !(v & 0x01u)) { // launch address phase
+                i2cAcked_ = spdPresent();      // (|1 = AAK continuation)
+                i2cIsr_ |= 0x02u;
+                if (i2cLog_.size() < 512)
+                    i2cLog_.push_back({stamp ? *stamp : 0,
+                                       (u32(i2cAddr_) << 8) | i2cSub_,
+                                       i2cAcked_ ? spdByte() : 0xFFFFFFFFu,
+                                       pcRef ? *pcRef : 0});
+            }
+            break;
+        case 3: // W1C; each clear advances the polled chain
+            if ((v & 0x02u) && (i2cIsr_ & 0x02u))
+                i2cIsr_ |= i2cAcked_ ? 0x01u  // acked: data byte ready
+                                     : 0x04u; // nacked: auto-stop done
+            if (v & 0x01u)
+                i2cIsr_ |= 0x04u; // data consumed -> stop completes
+            i2cIsr_ &= static_cast<u8>(~v);
+            break;
+        case 5: i2cAddr_ = v; break;
+        case 6: i2cSub_ = v; break;
+        default: break;
+        }
+    }
+    bool spdPresent() const
+    {
+        return (i2cAddr_ & 0xFEu) == 0xA0u; // one DIMM, slot 1
+    }
+    u8 spdByte() const;
 
     // Z8530, just enough for a polled console: pointer-register protocol
     // per channel, RR0 reports TX-empty always, data writes append to the
@@ -265,6 +371,8 @@ private:
     u8 sccWr_[2][16] = {};
     u8 sccRr_[2][16] = {};
     std::string console_;
+    u8 i2cMode_ = 0, i2cCtrl_ = 0, i2cIsr_ = 0, i2cAddr_ = 0, i2cSub_ = 0;
+    bool i2cAcked_ = false;
 };
 
 } // namespace opm

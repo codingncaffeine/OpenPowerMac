@@ -26,7 +26,7 @@ u8 PmuVia::read(u32 off, u64 now)
     case 8: return t2cl_;
     case 9: return t2ch_;
     case 10:
-        if (log.size() < 4096)
+        if (log.size() < 65536)
             log.push_back({now, 'r', sr_});
         return sr_;
     case 11: return acr_;
@@ -44,7 +44,7 @@ void PmuVia::write(u32 off, u8 v, u64 now)
         const bool req = (v & 0x10u) != 0;
         if (req != lastReq_) {
             lastReq_ = req;
-            if (log.size() < 4096)
+            if (log.size() < 65536)
                 log.push_back({now, 'e', static_cast<u8>(req ? 1 : 0)});
             reqEdge(!req, now); // asserted = line driven low
         }
@@ -84,7 +84,7 @@ void PmuVia::reqEdge(bool asserted, u64 now)
             if (lastDirIn_)
                 frame_.clear(); // a receive phase ended: new command frame
             frame_.push_back(sr_);
-            if (log.size() < 4096)
+            if (log.size() < 65536)
                 log.push_back({now, frame_.size() == 1 ? 'c' : 'd', sr_});
         } else {
             sr_ = nextReply();
@@ -120,6 +120,16 @@ void PmuVia::buildReply()
     switch (frame_[0]) {
     case 0xEA: // GET_VERSION lineage: a PMU99-class version byte
         reply_ = {0x0C};
+        break;
+    case 0xDF:
+        // Observed framing: DF 03 00 <data> <clock> cycling through the
+        // four line combinations — a 2-wire bus bit-banged through the
+        // PMU. With no slave modeled yet, the lines read back as driven
+        // (open bus, pull-ups): echo them.
+        if (frame_.size() >= 5)
+            reply_ = {frame_[3], frame_[4]};
+        else
+            reply_ = {0x00, 0x00};
         break;
     default:
         reply_ = {0x00};

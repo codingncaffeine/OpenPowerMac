@@ -5,6 +5,7 @@ add_library(opmmachine STATIC
   src/cuda.cpp
   src/pci.cpp
   src/pmu.cpp
+  src/sawtooth.cpp
 )
 
 target_include_directories(opmmachine PUBLIC include)

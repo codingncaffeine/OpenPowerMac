@@ -14,8 +14,10 @@ else()
 endif()
 
 add_subdirectory(core)
+add_subdirectory(machine)
 add_subdirectory(tools/ppcrun)
 add_subdirectory(tools/sstgen)
+add_subdirectory(tools/macrun)
 
 if(OPM_BUILD_TESTS)
   enable_testing()

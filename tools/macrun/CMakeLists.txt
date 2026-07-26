@@ -1,0 +1,5 @@
+add_executable(macrun main.cpp)
+target_link_libraries(macrun PRIVATE opmmachine)
+if(MSVC)
+  target_compile_definitions(macrun PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

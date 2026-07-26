@@ -1,4 +1,5 @@
 #pragma once
+#include "opm/ata.hpp"
 #include "opm/bus.hpp"
 #include "opm/pmu.hpp"
 #include "opm/types.hpp"
@@ -124,10 +125,12 @@ public:
     PmuVia& pmu() { return pmu_; }
 
     // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
-    // with a /disk node). Register traffic is logged bus-tagged while
-    // the cells serve empty-bus semantics; the atapi-disk open sequence
-    // defines the contract the real device model must meet.
+    // with a /disk node). The CD lives on ata-3@20000 device 0 when an
+    // ISO is attached; the other buses stay empty. Non-data register
+    // traffic is logged bus-tagged.
     const std::vector<RegWr>& ataLog() const { return ataLog_; }
+    bool attachCd(const char* path) { return cd_.attachIso(path); }
+    AtaCell& cd() { return cd_; }
 
     // SCC (+0x13000): MacRISC layout — ctrl B/A at +0x00/+0x20, data B/A
     // at +0x10/+0x30. Enough Z8530 to drain transmit (RR0 TX-empty) and
@@ -207,10 +210,15 @@ private:
             if (off >= 0x18000u && off < 0x18100u)
                 return i2cRead(1, off - 0x18000u);
             if (off - 0x1F000u < 0x3000u) {
-                if (ataLog_.size() < 3000)
-                    ataLog_.push_back({stamp ? *stamp : 0, off | 1u, 0,
+                const bool isCd =
+                    off - 0x20000u < 0x1000u && cd_.present();
+                u32 v = 0;
+                if (isCd)
+                    v = cd_.read(off - 0x20000u, len);
+                if ((off & 0xFF0u) != 0 && ataLog_.size() < 3000)
+                    ataLog_.push_back({stamp ? *stamp : 0, off | 1u, v,
                                        pcRef ? *pcRef : 0});
-                return 0; // empty bus: no BSY, no DRDY, zero signature
+                return v; // empty buses: no BSY, no DRDY, zero signature
             }
             const u32 v = get(kl_.data() + off, len);
             klNote(kMacIoBase + off, 0, false);
@@ -258,9 +266,11 @@ private:
                 return;
             }
             if (off - 0x1F000u < 0x3000u) {
-                if (ataLog_.size() < 3000)
+                if ((off & 0xFF0u) != 0 && ataLog_.size() < 3000)
                     ataLog_.push_back({stamp ? *stamp : 0, off, v,
                                        pcRef ? *pcRef : 0});
+                if (off - 0x20000u < 0x1000u && cd_.present())
+                    cd_.write(off - 0x20000u, v, len);
                 return;
             }
             put(kl_.data() + off, v, len);
@@ -551,6 +561,7 @@ private:
     std::map<u32, u32> cfgSpace_; // (bus<<28|latch&~3) -> native-LE word
     std::vector<RegWr> cfgLog_;
     std::vector<RegWr> ataLog_;
+    AtaCell cd_;
 };
 
 } // namespace opm

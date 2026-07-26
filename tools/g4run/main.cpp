@@ -64,6 +64,7 @@ int main(int argc, char** argv)
                     // truth — timings scale, ordering is preserved)
     const char* ramDumpPath = nullptr;
     bool serialCr = false;
+    const char* cdPath = nullptr;
     const char* serialInput = nullptr; // ';' separates lines
     u64 serialAt = 240000000ull;       // inject once the prompt is up
 
@@ -92,6 +93,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--serial-input")) serialInput = next();
         else if (!strcmp(a, "--serial-at"))
             serialAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--cd")) cdPath = next();
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -120,6 +122,13 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cdPath) {
+        if (bus.attachCd(cdPath))
+            printf("-- cd attached: %s\n", cdPath);
+        else
+            printf("-- cd attach FAILED: %s\n", cdPath);
+    }
+
     if (serialCr)
         bus.injectSerial("\r"); // CR in the escape window -> serial console
 
@@ -129,6 +138,7 @@ int main(int argc, char** argv)
     u64 executed = 0;
     bus.pcRef = &cpu.st.pc;
     bus.stamp = &executed;
+    bus.cd().stamp = &executed;
 
     Ring ring;
     int excLogged = 0;

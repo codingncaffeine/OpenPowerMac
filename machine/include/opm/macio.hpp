@@ -46,6 +46,8 @@ public:
     };
     const std::vector<XferByte>& xferLog() const { return xferLog_; }
 
+    void debugState(char* out, size_t cap) const;
+
 private:
     // VIA registers (offset 0x16000, stride 0x200).
     enum {
@@ -73,6 +75,7 @@ private:
     // Cuda transport state.
     std::vector<u8> hostPkt_;
     u32 respIndex_ = 0;
+    u32 respDelay_ = 0; // VIA ticks before a queued response asserts TREQ
     bool sending_ = false;   // Cuda -> host transfer in progress
     bool receiving_ = false; // host -> Cuda transfer in progress
     bool syncing_ = false;   // null transaction: TIP asserted while idle

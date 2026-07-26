@@ -11,9 +11,11 @@
 #include "opm/bits.hpp"
 #include "opm/gossamer.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -96,9 +98,19 @@ int main(int argc, char** argv)
     char text[128];
     u64 executed = 0;
     int excLogged = 0;
+    std::map<u32, u64> pcHist; // sampled every 64 steps
+    // Coverage timeline: first execution in each 1 KB region, timestamped —
+    // the boot's macro story, ending at its last new territory.
+    std::map<u32, u64> seen;
+    std::vector<std::pair<u64, u32>> firsts;
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
         cpu.step();
+        const u32 region = pc >> 10;
+        if (seen.emplace(region, executed).second)
+            firsts.push_back({executed, pc});
+        if ((executed & 63u) == 0)
+            ++pcHist[pc];
         ring.push(pc, cpu.curInsn); // the word actually fetched (translated)
         if (trace) {
             disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
@@ -118,6 +130,32 @@ int main(int argc, char** argv)
     printf("-- executed %llu instructions; stop pc=%08x%s\n",
            static_cast<unsigned long long>(executed), cpu.st.pc,
            cpu.halted ? " (halted)" : "");
+    {
+        char st[160];
+        bus.macio().debugState(st, sizeof st);
+        printf("-- %s\n", st);
+        printf("-- msr=%08x dec=%08x extLine=%d\n", cpu.st.msr, cpu.st.dec,
+               cpu.extIrqLine ? 1 : 0);
+    }
+    {
+        std::vector<std::pair<u64, u32>> top;
+        for (const auto& [pc, n] : pcHist)
+            top.push_back({n, pc});
+        std::sort(top.rbegin(), top.rend());
+        printf("-- hottest sampled pcs:\n");
+        for (size_t k = 0; k < top.size() && k < 16; ++k)
+            printf("   %08x  samples=%llu\n", top[k].second,
+                   static_cast<unsigned long long>(top[k].first));
+    }
+    {
+        printf("-- coverage timeline (%zu regions; last 40 first-entries):\n",
+               firsts.size());
+        const size_t start = firsts.size() > 40 ? firsts.size() - 40 : 0;
+        for (size_t k = start; k < firsts.size(); ++k)
+            printf("   @%-12llu %08x\n",
+                   static_cast<unsigned long long>(firsts[k].first),
+                   firsts[k].second);
+    }
     if (cpu.halted)
         printf("-- halt: %s\n", cpu.haltReason.c_str());
 

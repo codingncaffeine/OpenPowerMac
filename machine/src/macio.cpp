@@ -1,5 +1,7 @@
 #include "opm/macio.hpp"
 
+#include <cstdio>
+
 namespace opm {
 
 namespace {
@@ -37,15 +39,9 @@ MacIo::MacIo() : store_(0x100000, 0)
 
 bool MacIo::irqAsserted() const
 {
-    // VIA master interrupt: any enabled IFR bit.
-    const bool viaIrq = (ifr_ & ier_ & 0x7F) != 0;
-    const u32 events = viaIrq ? kIrqVia : 0;
-    // Mask register lives in the store (read-back semantics) — the OS
-    // programs it; during ROM boot it is typically zero and the ROM polls.
-    const u32 mask = (u32(store_[kIntMask]) << 24) |
-                     (u32(store_[kIntMask + 1]) << 16) |
-                     (u32(store_[kIntMask + 2]) << 8) | u32(store_[kIntMask + 3]);
-    return (events & mask) != 0;
+    // Real chain: the VIA's IRQ output is IFR&IER; premature delivery sends
+    // the ROM through not-yet-installed vectors (observed: NULL dispatch).
+    return (ifr_ & ier_ & 0x7F) != 0;
 }
 
 void MacIo::setIfr(u8 bits)
@@ -59,10 +55,15 @@ void MacIo::clearIfr(u8 bits)
 
 void MacIo::updateTreq()
 {
+    const u8 old = via_[vORB];
     if (treq_)
         via_[vORB] &= static_cast<u8>(~bTREQ); // asserted = low
     else
         via_[vORB] |= bTREQ;
+    // TREQ also drives a VIA control pin: its falling (assert) edge latches
+    // an IFR flag the ROM's service task can poll (PCR=0: negative edges).
+    if ((old & bTREQ) && !(via_[vORB] & bTREQ))
+        setIfr(0x10); // CB1
 }
 
 // One byte moves between the SR and the Cuda, paced by a TACK transition
@@ -202,10 +203,10 @@ void MacIo::viaWrite(u32 reg, u8 v)
                 if (!hostPkt_.empty()) {
                     cuda_.hostPacket(hostPkt_);
                     hostPkt_.clear();
-                    if (cuda_.hasResponse()) {
-                        treq_ = true; // response ready: request the bus
-                        updateTreq();
-                    }
+                    if (cuda_.hasResponse())
+                        respDelay_ = 256; // RECEIPT: the MCU "thinks" for a
+                                          // while; the host wants to see the
+                                          // bus idle before the response TREQ
                 }
             }
             if (sending_) {
@@ -226,7 +227,7 @@ void MacIo::viaWrite(u32 reg, u8 v)
                 cudaClockByte();
             }
         } else if (!tipNow && tackFlipped && !sending_ && !receiving_ &&
-                   !cuda_.hasResponse()) {
+                   (!cuda_.hasResponse() || respDelay_ != 0)) {
             // Sync stepping (observed in the boot ROM): with TIP negated,
             // TACK edges are acknowledged by mirroring TREQ. The final
             // TACK-assert of cuda_init parks here until the host releases.
@@ -302,6 +303,11 @@ void MacIo::tick()
     if (++viaDivider_ < 8)
         return;
     viaDivider_ = 0;
+    if (respDelay_ && --respDelay_ == 0 && !sending_ && !receiving_ &&
+        cuda_.hasResponse()) {
+        treq_ = true; // the delayed response now requests the bus
+        updateTreq();
+    }
     if (t1Running_) {
         if (t1_ == 0) {
             setIfr(iT1);
@@ -326,15 +332,34 @@ void MacIo::tick()
     }
 }
 
+void MacIo::debugState(char* out, size_t cap) const
+{
+    snprintf(out, cap,
+             "via: ORB=%02x DDRB=%02x ACR=%02x IFR=%02x IER=%02x SR=%02x "
+             "treq=%d send=%d recv=%d respPending=%d",
+             via_[vORB], via_[vDDRB], via_[vACR], ifr_, ier_, via_[vSR],
+             treq_ ? 1 : 0, sending_ ? 1 : 0, receiving_ ? 1 : 0,
+             cuda_.hasResponse() ? 1 : 0);
+}
+
 u8 MacIo::read8(u32 off)
 {
     if (off >= kViaBase && off < kViaEnd) {
         const u32 reg = (off - kViaBase) >> 9;
-        const u8 v = viaRead(reg);
-        // ORB polls flood; log state-changing traffic only, capped.
-        if (reg != vORB && viaTrace_.size() < 400)
-            viaTrace_.push_back({0, static_cast<u8>(reg), v});
-        return v;
+        return viaRead(reg); // reads flood; the write timeline tells the story
+    }
+    // Interrupt-controller events: expose the VIA source in both candidate
+    // banks (+0x10 and +0x20 event words) and both candidate bits (LE 18
+    // and 31) so the wake handler's reads pin the real layout empirically.
+    if (off >= 0x10 && off < 0x30) {
+        if (log_.size() < kLogCap || log_.count(off))
+            ++log_[off].reads;
+        const bool pend = (ifr_ & 0x04) != 0;
+        if (pend && (off == 0x12 || off == 0x22))
+            return 0x04; // LE byte 2: bit 18
+        if (pend && (off == 0x13 || off == 0x23))
+            return 0x80; // LE byte 3: bit 31
+        return store_[off];
     }
     if (log_.size() < kLogCap || log_.count(off))
         ++log_[off].reads;
@@ -345,7 +370,7 @@ void MacIo::write8(u32 off, u8 v)
 {
     if (off >= kViaBase && off < kViaEnd) {
         const u32 reg = (off - kViaBase) >> 9;
-        if (viaTrace_.size() < 400)
+        if (viaTrace_.size() < 2000)
             viaTrace_.push_back({1, static_cast<u8>(reg), v});
         viaWrite(reg, v);
         return;

@@ -8,10 +8,6 @@ namespace {
 
 inline constexpr u32 kViaBase = 0x16000u;
 inline constexpr u32 kViaEnd = 0x18000u;
-inline constexpr u32 kIntEvents = 0x20u; // second-cell events/mask/clear/levels
-inline constexpr u32 kIntMask = 0x24u;
-inline constexpr u32 kIntClear = 0x28u;
-inline constexpr u32 kIntLevels = 0x2Cu;
 
 // Port B Cuda lines.
 inline constexpr u8 bTREQ = 0x08;
@@ -37,16 +33,175 @@ MacIo::MacIo() : store_(0x100000, 0)
     via_[vORB] = bTREQ; // TREQ negated (high) at rest
 }
 
+// The mac-io INT line to the CPU: any latched event whose enable bit is
+// set, in either 32-source block. Until the OS programs an enable mask,
+// nothing is delivered — which is also why the early ROM (which only ever
+// polls the VIA directly) sees a quiet line.
 bool MacIo::irqAsserted() const
 {
-    // Real chain: the VIA's IRQ output is IFR&IER; premature delivery sends
-    // the ROM through not-yet-installed vectors (observed: NULL dispatch).
-    return (ifr_ & ier_ & 0x7F) != 0;
+    return ((picEvent_[0] & picEnable_[0]) |
+            (picEvent_[1] & picEnable_[1])) != 0;
+}
+
+// Live level per block: sources that hold their line while asserted.
+u32 MacIo::picLevels(u32 blk) const
+{
+    if (blk != 0)
+        return 0;
+    u32 lvl = 0;
+    if ((ifr_ & ier_ & 0x7Fu) != 0)
+        lvl |= 1u << kIrqVia; // the VIA's IRQ output feeds source 18
+    return lvl;
+}
+
+// A held level keeps its event bit latched: acking while the source is
+// still asserted re-latches immediately (level-triggered input).
+void MacIo::picLatch()
+{
+    picEvent_[0] |= picLevels(0);
+    picEvent_[1] |= picLevels(1);
+}
+
+// Register file: 32-bit little-endian words served per byte lane.
+//   +0x10 event[1]  +0x14 enable[1]  +0x18 ack[1]  +0x1C level[1]
+//   +0x20 event[0]  +0x24 enable[0]  +0x28 ack[0]  +0x2C level[0]
+u8 MacIo::picRead(u32 off)
+{
+    const u32 blk = off < 0x20u ? 1u : 0u;
+    const u32 reg = (off >> 2) & 3u; // 0 event, 1 enable, 2 ack, 3 level
+    const u32 lane = off & 3u;
+    u32 v = 0;
+    switch (reg) {
+    case 0: v = picEvent_[blk]; break;
+    case 1: v = picEnable_[blk]; break;
+    case 2: v = 0; break; // ack is write-only
+    default: v = picLevels(blk); break;
+    }
+    return static_cast<u8>(v >> (8 * lane));
+}
+
+bool MacIo::picWrite(u32 off, u8 v)
+{
+    const u32 blk = off < 0x20u ? 1u : 0u;
+    const u32 reg = (off >> 2) & 3u;
+    const u32 lane = off & 3u;
+    const u32 bits = u32(v) << (8 * lane);
+    if (picTrace_.size() < 512)
+        picTrace_.push_back({stamp ? *stamp : 0, 1, static_cast<u8>(off), v});
+    switch (reg) {
+    case 1:
+        picEnable_[blk] =
+            (picEnable_[blk] & ~(0xFFu << (8 * lane))) | bits;
+        return true;
+    case 2:
+        picEvent_[blk] &= ~bits; // write-1-to-clear
+        picLatch();              // held levels re-assert at once
+        return true;
+    default:
+        return true; // event/level are read-only; writes are absorbed
+    }
+}
+
+// DBDMA register file: 32-bit little-endian words served per byte lane.
+// channelControl writes carry a mask in bits 31:16 and values in 15:0
+// (Apple DBDMA convention); channelStatus reflects the run state — RUN
+// implies ACTIVE here (the modeled engine "keeps up" instantly). FLUSH
+// and WAKE complete immediately and read back clear.
+u8 MacIo::dbdmaRead(u32 off)
+{
+    Dbdma& ch = dbdma_[(off >> 8) & 15u];
+    const u32 reg = (off >> 2) & 0x3Fu;
+    const u32 lane = off & 3u;
+    u32 v = 0;
+    switch (reg) {
+    case 1: v = ch.status; break;      // +0x04 channelStatus
+    case 3: v = ch.cmdPtr; break;      // +0x0C commandPtrLo
+    case 4: v = ch.intSel; break;      // +0x10 interruptSelect
+    case 5: v = ch.brSel; break;       // +0x14 branchSelect
+    case 6: v = ch.waitSel; break;     // +0x18 waitSelect
+    default: break;
+    }
+    return static_cast<u8>(v >> (8 * lane));
+}
+
+bool MacIo::dbdmaWrite(u32 off, u8 v)
+{
+    Dbdma& ch = dbdma_[(off >> 8) & 15u];
+    const u32 reg = (off >> 2) & 0x3Fu;
+    const u32 lane = off & 3u;
+    const u32 bits = u32(v) << (8 * lane);
+    const u32 clear = 0xFFu << (8 * lane);
+    switch (reg) {
+    case 0: { // channelControl: assemble the LE word lane by lane, apply
+              // when the high (mask) half has been written (lane 3).
+        u32& w = ctrlPend_[(off >> 8) & 15u];
+        w = (w & ~clear) | bits;
+        if (lane == 3u) {
+            const u32 mask = w >> 16, val = w & 0xFFFFu;
+            const u32 wasRun = ch.status & 0x8000u;
+            ch.status = (ch.status & ~mask) | (val & mask);
+            ch.status &= ~0x3000u; // FLUSH/WAKE self-complete
+            if (ch.status & 0x8000u) {
+                ch.status |= 0x0400u; // RUN -> ACTIVE
+                if (!wasRun)
+                    dbdmaRun((off >> 8) & 15u); // engine starts now
+            } else {
+                ch.status &= ~0x0400u;
+            }
+            w = 0;
+        }
+        return true;
+    }
+    case 3: ch.cmdPtr = (ch.cmdPtr & ~clear) | bits; return true;
+    case 4: ch.intSel = (ch.intSel & ~clear) | bits; return true;
+    case 5: ch.brSel = (ch.brSel & ~clear) | bits; return true;
+    case 6: ch.waitSel = (ch.waitSel & ~clear) | bits; return true;
+    default: return true; // status is read-only; others absorbed
+    }
+}
+
+// The DBDMA engine proper: walk the little-endian command list from
+// cmdPtr, executing until STOP. Descriptors are 16 bytes: word0 holds the
+// operation in bits 31:28 (0/1 OUTPUT, 2/3 INPUT, 4 STORE_QUAD,
+// 5 LOAD_QUAD, 6 NOP, 7 STOP) with reqCount in 15:0; word1 = address;
+// word3 receives {xferStatus, resCount} writeback. Sound output data has
+// no audio backend yet — samples are consumed into the void, which is
+// exactly what the boot beep needs to complete. RECEIPT: branches, waits
+// and interrupt-select conditions are not yet honored (none appear in the
+// ROM's beep list); revisit when a driver uses them.
+void MacIo::dbdmaRun(u32 chan)
+{
+    Dbdma& ch = dbdma_[chan];
+    if (!dmaBus)
+        return;
+    auto rd32le = [&](u32 pa) {
+        const u32 be = dmaBus->read32(pa);
+        return ((be & 0xFFu) << 24) | ((be & 0xFF00u) << 8) |
+               ((be >> 8) & 0xFF00u) | (be >> 24);
+    };
+    auto wr32le = [&](u32 pa, u32 v) {
+        dmaBus->write32(pa, ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+                                ((v >> 8) & 0xFF00u) | (v >> 24));
+    };
+    for (u32 steps = 0; steps < 4096; ++steps) {
+        const u32 w0 = rd32le(ch.cmdPtr);
+        const u32 op = w0 >> 28;
+        if (op == 7) { // STOP: the list is done, the channel goes idle
+            ch.status &= ~0x0400u;
+            return;
+        }
+        // OUTPUT/INPUT/NOP/QUAD ops: data movement is absorbed; report the
+        // transfer complete in the descriptor's status word.
+        wr32le(ch.cmdPtr + 12, (0x8400u << 16) | 0u);
+        ch.cmdPtr += 16;
+    }
+    // List never reached STOP within bounds: leave ACTIVE standing.
 }
 
 void MacIo::setIfr(u8 bits)
 {
     ifr_ |= bits & 0x7F;
+    picLatch(); // the VIA IRQ level feeds interrupt source 18
 }
 void MacIo::clearIfr(u8 bits)
 {
@@ -107,8 +262,15 @@ u8 MacIo::viaRead(u32 reg)
         return via_[vORB];
     }
     case vORA:
-    case vORAnh:
-        return via_[vORA];
+    case vORAnh: {
+        // Port A: output bits echo the latch, input bits are board straps
+        // (machine identification). RECEIPT: strap value under empirical
+        // pinning — the 68K hardware census reads these to choose its
+        // per-board config table.
+        const u8 straps = 0xFF;
+        return static_cast<u8>((via_[vORA] & via_[vDDRA]) |
+                               (straps & ~via_[vDDRA]));
+    }
     case vDDRB:
         return via_[vDDRB];
     case vDDRA:
@@ -204,9 +366,14 @@ void MacIo::viaWrite(u32 reg, u8 v)
                     cuda_.hostPacket(hostPkt_);
                     hostPkt_.clear();
                     if (cuda_.hasResponse())
-                        respDelay_ = 256; // RECEIPT: the MCU "thinks" for a
-                                          // while; the host wants to see the
-                                          // bus idle before the response TREQ
+                        respDelay_ = 65536; // RECEIPT: MCU think time. The
+                                            // original 256 raced the
+                                            // interrupt-driven era: the
+                                            // reply's TREQ fired before the
+                                            // requester registered its wait
+                                            // record (null-context resume).
+                                            // ~ms-scale latency is also what
+                                            // the real 68HC05 exhibits.
                 }
             }
             if (sending_) {
@@ -295,6 +462,7 @@ void MacIo::viaWrite(u32 reg, u8 v)
             ier_ |= v & 0x7F;
         else
             ier_ &= static_cast<u8>(~(v & 0x7F));
+        picLatch(); // unmasking with a flag pending raises source 18
         return;
     default:
         return;
@@ -374,19 +542,33 @@ u8 MacIo::read8(u32 off)
         default: return esccWr_[ch][p]; // benign read-back of the WR file
         }
     }
-    // Interrupt-controller events: expose the VIA source in both candidate
-    // banks (+0x10 and +0x20 event words) and both candidate bits (LE 18
-    // and 31) so the wake handler's reads pin the real layout empirically.
     if (off >= 0x10 && off < 0x30) {
         if (log_.size() < kLogCap || log_.count(off))
             ++log_[off].reads;
-        const bool pend = (ifr_ & 0x04) != 0;
-        if (pend && (off == 0x12 || off == 0x22))
-            return 0x04; // LE byte 2: bit 18
-        if (pend && (off == 0x13 || off == 0x23))
-            return 0x80; // LE byte 3: bit 31
-        return store_[off];
+        return picRead(off);
     }
+    // AWACS/Screamer codec status (+0x14020, LE dword): the revision field
+    // in bits 15:12 identifies the codec — 3 = Screamer, which is what the
+    // sound init probes for before bringing the driver up. RECEIPT: value
+    // pinned to the revision check; the rest of the status reads zero.
+    if (off >= 0x14020 && off < 0x14024) {
+        const u32 codecStat = 0x00403100u;
+        const u8 v = static_cast<u8>(codecStat >> (8 * (off - 0x14020)));
+        if ((stamp && *stamp > 100000000ull) && sndTrace_.size() < 512)
+            sndTrace_.push_back(
+                {*stamp, 0, off, v, pcRef ? *pcRef : 0});
+        return v;
+    }
+    if (off >= 0x8000 && off < 0x9000) {
+        const u8 v = dbdmaRead(off);
+        if (sndTrace_.size() < 512)
+            sndTrace_.push_back(
+                {stamp ? *stamp : 0, 0, off, v, pcRef ? *pcRef : 0});
+        return v;
+    }
+    if (off >= 0x14000 && off < 0x15000) // sound codec space
+        if (sndTrace_.size() < 512)
+            sndTrace_.push_back({stamp ? *stamp : 0, 0, off, store_[off], pcRef ? *pcRef : 0});
     if (log_.size() < kLogCap || log_.count(off))
         ++log_[off].reads;
     return store_[off];
@@ -401,9 +583,21 @@ void MacIo::write8(u32 off, u8 v)
         viaWrite(reg, v);
         return;
     }
-    if (off == kIntClear || off == kIntClear + 1 || off == kIntClear + 2 ||
-        off == kIntClear + 3) {
-        return; // write-only clear; events are derived live
+    if (off >= 0x10 && off < 0x30) {
+        if (log_.size() < kLogCap || log_.count(off)) {
+            Touch& t = log_[off];
+            ++t.writes;
+            t.lastWrite = v;
+        }
+        picWrite(off, v);
+        return;
+    }
+    if (off >= 0x8000 && off < 0x9000) {
+        if (sndTrace_.size() < 512)
+            sndTrace_.push_back(
+                {stamp ? *stamp : 0, 1, off, v, pcRef ? *pcRef : 0});
+        dbdmaWrite(off, v);
+        return;
     }
     if (off >= 0x13000 && off < 0x13040) {
         const u32 ch = (off >> 5) & 1u;
@@ -420,6 +614,10 @@ void MacIo::write8(u32 off, u8 v)
         }
         return;
     }
+    if ((off >= 0x14000 && off < 0x15000) ||
+        (off >= 0x8000 && off < 0x9000))
+        if (sndTrace_.size() < 512)
+            sndTrace_.push_back({stamp ? *stamp : 0, 1, off, v, pcRef ? *pcRef : 0});
     if (log_.size() < kLogCap || log_.count(off)) {
         Touch& t = log_[off];
         ++t.writes;

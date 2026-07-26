@@ -5,6 +5,7 @@ add_executable(opm_unit
   unit/test_mmu.cpp
   unit/test_chip.cpp
   unit/test_ati.cpp
+  unit/test_macio.cpp
 )
 target_link_libraries(opm_unit PRIVATE opmcore opmmachine)
 target_include_directories(opm_unit SYSTEM PRIVATE vendor)

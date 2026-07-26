@@ -233,6 +233,7 @@ int main(int argc, char** argv)
     cpu.reset(); // pc = 0xFFF00100, MSR[IP] set: vectors in ROM — authentic
     bus.ati().pcRef = &cpu.st.pc;
     bus.ati().lrRef = &cpu.st.lr;
+    bus.macio().pcRef = &cpu.st.pc;
     if (pvrOverride) { // experiment: present as a different CPU to HWInit
         cpu.st.pvr = pvrOverride;
         printf("-- pvr override: %08x\n", pvrOverride);
@@ -249,6 +250,7 @@ int main(int argc, char** argv)
     u64 executed = 0;
     int excLogged = 0;
     bus.stamp = &executed;
+    bus.macio().stamp = &executed;
     // Virtual-window disassembler: safe to run mid-step, snapshots and
     // restores the whole CPU state around the translate probes.
     auto vdump = [&](const char* when) {
@@ -272,7 +274,9 @@ int main(int argc, char** argv)
         cpu.mmuProbe = false;
     };
     bool vdumped = false, wildCaught = false, mqProbed = false;
-    u32 late300Shown = 0;
+    u32 late300Shown = 0, ext500Shown = 0;
+    bool ctx500Seen = false, chimeEntryShown = false;
+    u32 prev68kPc = 0, ring68k[128] = {}, ring68kAt = 0;
     struct InsRec {
         u64 at;
         u32 r8, r9, r10, r12, r13;
@@ -501,6 +505,42 @@ int main(int argc, char** argv)
         bus.ati().tick();
         cpu.setExternalIrq(bus.macio().irqAsserted());
         ++executed;
+        if (cpu.st.gpr[24] != prev68kPc) {
+            prev68kPc = cpu.st.gpr[24];
+            ring68k[ring68kAt++ & 127u] = prev68kPc;
+            if (!chimeEntryShown && (prev68kPc & 0xFFFFFF00u) == 0xFFCCE100u) {
+                chimeEntryShown = true;
+                printf("-- 68k trail into the chime (last 128 pcs):\n   ");
+                for (u32 k = 0; k < 128; ++k)
+                    printf("%08x ", ring68k[(ring68kAt + k) & 127u]);
+                printf("\n-- at entry: A0=%08x A1=%08x A2=%08x A6=%08x "
+                       "D0=%08x @%llu\n",
+                       cpu.st.gpr[16], cpu.st.gpr[17], cpu.st.gpr[18],
+                       cpu.st.gpr[22], cpu.st.gpr[8],
+                       static_cast<unsigned long long>(executed));
+            }
+        }
+        if ((executed % 10000000) == 0 && executed > 150000000) {
+            printf("-- 68k probe @%llu: pc68=%08x",
+                   static_cast<unsigned long long>(executed),
+                   cpu.st.gpr[24]);
+            for (u32 r = 8; r < 24; ++r)
+                printf(" %s%u=%08x", r < 16 ? "D" : "A", (r - 8) & 7,
+                       cpu.st.gpr[r]);
+            printf("\n");
+        }
+        if (!ctx500Seen && (executed % 100000) == 0 && executed > 400000 &&
+            cpu.st.sprg[3]) {
+            u32 w = 0;
+            const u32 a = cpu.st.sprg[3] + 0x500u;
+            if (!cpu.l1dPeek32(a, w) && !cpu.l2Peek32(a, w))
+                w = bus.read32(a);
+            if (w != 0 && w != 0xFFFFFFFFu && w != 0xDEADBEEFu) {
+                ctx500Seen = true;
+                printf("-- [sprg3+0x500] registered: %08x by @%llu\n", w,
+                       static_cast<unsigned long long>(executed));
+            }
+        }
         if (vdisEnd && !vdumped && bus.ati().gpioOps() != lastGpioOps) {
             lastGpioOps = bus.ati().gpioOps();
             vdumped = true;
@@ -575,6 +615,29 @@ int main(int argc, char** argv)
             if (!probed && cpu.st.dar == 0xFF808180u) {
                 probed = true;
                 probeDump();
+            }
+            if ((cpu.st.pc & 0xFFFu) == 0x500u && ext500Shown < 8) {
+                ++ext500Shown;
+                u32 slot = 0;
+                const u32 sa = cpu.st.sprg[3] + 0x14u;
+                if (!cpu.l1dPeek32(sa, slot) && !cpu.l2Peek32(sa, slot))
+                    slot = bus.read32(sa);
+                printf("-- ext irq #%u @%llu srr0=%08x srr1=%08x "
+                       "[sprg3+14]=%08x\n",
+                       ext500Shown,
+                       static_cast<unsigned long long>(executed),
+                       cpu.st.srr0, cpu.st.srr1, slot);
+                if (ext500Shown == 1) {
+                    printf("-- 0x500 handler body (phys, cache-aware):\n");
+                    for (u32 k = 0; k < 40; ++k) {
+                        const u32 a = (slot & ~3u) + 4 * k;
+                        u32 w = 0;
+                        if (!cpu.l1dPeek32(a, w) && !cpu.l2Peek32(a, w))
+                            w = bus.read32(a);
+                        disassemble(w, a, text, sizeof text, Style::Gnu);
+                        printf("   %08x: %08x  %s\n", a, w, text);
+                    }
+                }
             }
             if (executed > 500000ull && cpu.st.pc == 0xFFF00300u &&
                 late300Shown < 6) {
@@ -861,6 +924,20 @@ int main(int argc, char** argv)
             printf("%c%02x ", tag[b.toCuda & 3], b.val);
         }
         printf("\n");
+    }
+    if (!bus.macio().sndTrace().empty()) {
+        printf("-- sound-region conversation (%zu):\n",
+               bus.macio().sndTrace().size());
+        for (const auto& s : bus.macio().sndTrace())
+            printf("   @%-11llu %s +%05x %02x pc=%08x\n",
+                   static_cast<unsigned long long>(s.at),
+                   s.write ? "wr" : "rd", s.off, s.val, s.pc);
+    }
+    if (!bus.macio().picTrace().empty()) {
+        printf("-- pic writes:\n");
+        for (const auto& p : bus.macio().picTrace())
+            printf("   @%-11llu +%02x <= %02x\n",
+                   static_cast<unsigned long long>(p.at), p.off, p.val);
     }
     if (!bus.macio().unmodeledLog().empty()) {
         printf("-- mac-io unmodeled register traffic (%zu unique):\n",

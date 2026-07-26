@@ -16,6 +16,7 @@ GossamerBus::GossamerBus(size_t ramBytes, std::vector<u8> rom)
     // The DIMM-wrap aliasing mask requires a power-of-two module.
     if (ramBytes == 0 || (ramBytes & (ramBytes - 1)) != 0)
         ram_.assign(0x04000000u, 0);
+    macio_.dmaBus = this; // DBDMA descriptor fetches ride the system bus
 }
 
 // Grackle 60x-memory decode (MPC106 UM 3.2.8): a physical address is RAM

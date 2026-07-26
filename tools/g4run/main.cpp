@@ -64,6 +64,8 @@ int main(int argc, char** argv)
                     // truth — timings scale, ordering is preserved)
     const char* ramDumpPath = nullptr;
     bool serialCr = false;
+    const char* serialInput = nullptr; // ';' separates lines
+    u64 serialAt = 240000000ull;       // inject once the prompt is up
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -87,6 +89,9 @@ int main(int argc, char** argv)
             fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--dump-ram")) ramDumpPath = next();
         else if (!strcmp(a, "--serial-cr")) serialCr = true;
+        else if (!strcmp(a, "--serial-input")) serialInput = next();
+        else if (!strcmp(a, "--serial-at"))
+            serialAt = strtoull(next(), nullptr, 0);
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -116,7 +121,7 @@ int main(int argc, char** argv)
     }
 
     if (serialCr)
-        bus.injectSerial(""); // CR in the escape window -> serial console
+        bus.injectSerial("\r"); // CR in the escape window -> serial console
 
     Cpu cpu;
     cpu.attach(bus);
@@ -152,6 +157,15 @@ int main(int argc, char** argv)
         }
         if (fastTb)
             cpu.tick(fastTb);
+        if (serialInput && executed == serialAt) {
+            std::string s(serialInput);
+            for (char& c : s)
+                if (c == ';')
+                    c = '\r';
+            bus.injectSerial(s + "\r");
+            printf("-- serial input injected @%llu: %s\n",
+                   static_cast<unsigned long long>(executed), serialInput);
+        }
         static u64 lastFetchSample = 0;
         if (cpu.st.pc == 0xFF80B640u &&
             executed - lastFetchSample > 20000000ull) {

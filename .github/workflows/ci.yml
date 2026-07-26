@@ -27,3 +27,18 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  linux-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PowerPC cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc-linux-gnu
+      - name: Build core tools
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPM_BUILD_TESTS=OFF
+          cmake --build build
+      - name: Build oracle corpus (GNU cross gcc — second toolchain)
+        run: bash tests/oracle/build.sh build/oracle
+      - name: Run differential oracle
+        run: bash tools/run_oracle.sh build/oracle build/tools/ppcrun/ppcrun 'int*'

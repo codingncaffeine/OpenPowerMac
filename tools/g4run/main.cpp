@@ -59,6 +59,9 @@ int main(int argc, char** argv)
     bool trace = false;
     int excShow = 16;
     u32 disStart = 0, disEnd = 0;
+    u32 fastTb = 0; // extra TB cycles per instruction: compresses the
+                    // ROM's wall-clock waits (harness lever, not machine
+                    // truth — timings scale, ordering is preserved)
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -78,6 +81,8 @@ int main(int argc, char** argv)
             disStart = static_cast<u32>(strtoul(next(), nullptr, 0));
             disEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         }
+        else if (!strcmp(a, "--fast-tb"))
+            fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -138,6 +143,8 @@ int main(int argc, char** argv)
             disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
             fprintf(stderr, "%08x: %s\n", pc, text);
         }
+        if (fastTb)
+            cpu.tick(fastTb);
         ++executed;
         if (cpu.raisedThisStep) {
             if (excLogged < excShow)
@@ -196,6 +203,34 @@ int main(int argc, char** argv)
             printf("   @%-11llu %08x <- %08x pc=%08x\n",
                    static_cast<unsigned long long>(ul[k].at), ul[k].pa,
                    ul[k].val, ul[k].pc);
+    }
+    {
+        const std::string& con = bus.console();
+        printf("-- serial console (%zu bytes):\n", con.size());
+        if (!con.empty()) {
+            printf("%.*s\n", static_cast<int>(con.size() > 8192 ? 8192
+                                                                : con.size()),
+                   con.c_str());
+            if (con.size() > 8192)
+                printf("   ... (%zu more bytes)\n", con.size() - 8192);
+        }
+    }
+    {
+        const auto& pl = bus.pmu().log;
+        printf("-- pmu conversation (%zu events; c=cmd d=data r=srRead "
+               "e=reqEdge):\n   ",
+               pl.size());
+        size_t shown = 0;
+        for (const auto& ev : pl) {
+            if (ev.kind == 'r' && shown && pl[shown - 1].kind == 'r')
+                { ++shown; continue; } // collapse SR-read runs
+            if (shown++ > 160) {
+                printf("...");
+                break;
+            }
+            printf("%c%02x ", ev.kind, ev.val);
+        }
+        printf("\n");
     }
     {
         const auto& kl = bus.macioLog();

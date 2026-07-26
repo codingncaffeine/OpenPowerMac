@@ -1,8 +1,10 @@
 #pragma once
 #include "opm/bus.hpp"
+#include "opm/pmu.hpp"
 #include "opm/types.hpp"
 
 #include <map>
+#include <string>
 #include <vector>
 
 namespace opm {
@@ -32,6 +34,15 @@ public:
         // init — a ready/level input, high at power-on. (Semantic name
         // still to be pinned from the KeyLargo GPIO map.)
         kl_[0x61] = 0x02;
+        // Sound codec status (+0x14020, accessed via lwbrx — the block is
+        // byte-swapped on the 60x side): native value carries the same
+        // Screamer-lineage fields the Gossamer receipts pinned — READY =
+        // bit 22, revision in bits 15:12 (3 = Screamer class). Stored
+        // here as the swapped image so the ROM's lwbrx sees 0x00403100.
+        kl_[0x14020] = 0x00;
+        kl_[0x14021] = 0x31;
+        kl_[0x14022] = 0x40;
+        kl_[0x14023] = 0x00;
     }
 
     u8 read8(u32 pa) override { return static_cast<u8>(read(pa, 1)); }
@@ -83,6 +94,14 @@ public:
     const std::map<u32, Acc>& macioLog() const { return klLog_; }
     std::vector<u32> macioOrder;
 
+    // The VIA cell (+0x16000..+0x17FFF) routes to the PMU99 model.
+    PmuVia& pmu() { return pmu_; }
+
+    // SCC (+0x13000): MacRISC layout — ctrl B/A at +0x00/+0x20, data B/A
+    // at +0x10/+0x30. Enough Z8530 to drain transmit (RR0 TX-empty) and
+    // capture the ROM's serial console log verbatim.
+    const std::string& console() const { return console_; }
+
     // Unclaimed + ROM-write traffic, keyed by physical address.
     const std::map<u32, Acc>& accessLog() const { return log_; }
     std::vector<u32> logOrder; // first-touch order
@@ -102,7 +121,17 @@ private:
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize)
             return get(unin_ + (pa - kUniNBase), len);
         if (pa >= kMacIoBase && pa + len <= kMacIoBase + kMacIoSize) {
-            const u32 v = get(kl_.data() + (pa - kMacIoBase), len);
+            const u32 off = pa - kMacIoBase;
+            if (off >= 0x16000u && off < 0x18000u) {
+                u32 v = 0;
+                for (u32 k = 0; k < len; ++k)
+                    v = (v << 8) |
+                        pmu_.read(off - 0x16000u + k, stamp ? *stamp : 0);
+                return v;
+            }
+            if (off >= 0x13000u && off < 0x14000u)
+                return sccRead(off - 0x13000u);
+            const u32 v = get(kl_.data() + off, len);
             klNote(pa, 0, false);
             return v;
         }
@@ -124,11 +153,59 @@ private:
             return;
         }
         if (pa >= kMacIoBase && pa + len <= kMacIoBase + kMacIoSize) {
-            put(kl_.data() + (pa - kMacIoBase), v, len);
+            const u32 off = pa - kMacIoBase;
+            if (off >= 0x16000u && off < 0x18000u) {
+                for (u32 k = 0; k < len; ++k)
+                    pmu_.write(off - 0x16000u + k,
+                               static_cast<u8>(v >> (8 * (len - 1 - k))),
+                               stamp ? *stamp : 0);
+                return;
+            }
+            if (off >= 0x13000u && off < 0x14000u) {
+                sccWrite(off - 0x13000u, static_cast<u8>(v));
+                return;
+            }
+            put(kl_.data() + off, v, len);
             klNote(pa, v, true);
             return;
         }
         note(pa, v, true); // ROM/flash writes land here too, unapplied
+    }
+
+    // Z8530, just enough for a polled console: pointer-register protocol
+    // per channel, RR0 reports TX-empty always, data writes append to the
+    // captured console text.
+    u32 sccRead(u32 off)
+    {
+        const u32 ch = (off >> 5) & 1u; // 0 = B (+0x00), 1 = A (+0x20)
+        if (off & 0x10u)
+            return 0; // data read: nothing buffered
+        const u32 r = sccPtr_[ch];
+        sccPtr_[ch] = 0;
+        if (r == 0)
+            return 0x04u; // RR0: TX buffer empty
+        return sccRr_[ch][r & 15u];
+    }
+    void sccWrite(u32 off, u8 v)
+    {
+        const u32 ch = (off >> 5) & 1u;
+        if (off & 0x10u) {
+            console_ += static_cast<char>(v);
+            return;
+        }
+        if (sccPtr_[ch] == 0) {
+            const u32 lo = v & 7u;
+            if (lo == 0 && (v & 0x38u) == 0x08u)
+                sccPtr_[ch] = 8; // point-high alone selects reg 8+
+            else if (lo != 0)
+                sccPtr_[ch] = lo | (((v & 0x38u) == 0x08u) ? 8u : 0u);
+            // command/reset bits in WR0 are accepted and ignored
+            return;
+        }
+        sccWr_[ch][sccPtr_[ch] & 15u] = v;
+        if (sccPtr_[ch] == 8)
+            console_ += static_cast<char>(v); // WR8 = data register
+        sccPtr_[ch] = 0;
     }
 
     void klNote(u32 pa, u32 v, bool wr)
@@ -183,6 +260,11 @@ private:
     std::vector<u8> kl_ = std::vector<u8>(kMacIoSize, 0);
     std::vector<RegWr> uninLog_;
     std::map<u32, Acc> log_, klLog_;
+    PmuVia pmu_;
+    u32 sccPtr_[2] = {0, 0};
+    u8 sccWr_[2][16] = {};
+    u8 sccRr_[2][16] = {};
+    std::string console_;
 };
 
 } // namespace opm

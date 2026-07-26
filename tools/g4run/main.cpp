@@ -212,6 +212,16 @@ int main(int argc, char** argv)
                 slotPrev[1] = v1;
             }
         }
+        static int lockTrace = -1;
+        if (lockTrace < 0 && cpu.st.pc == 0x00F25350u)
+            lockTrace = 300;
+        if (lockTrace > 0) {
+            --lockTrace;
+            disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
+            printf("-- lk %08x: %s  [r8=%08x r9=%08x r28=%08x r29=%08x]\n",
+                   pc, text, cpu.st.gpr[8], cpu.st.gpr[9],
+                   cpu.st.gpr[28], cpu.st.gpr[29]);
+        }
         static u32 romPollShown = 0;
         if (cpu.st.pc == 0x00F12700u && romPollShown < 3 &&
             executed > 1000000000ull) {

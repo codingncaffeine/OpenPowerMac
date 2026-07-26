@@ -32,6 +32,14 @@ public:
     SawtoothBus(size_t ramBytes, std::vector<u8> rom)
         : ram_(ramBytes, 0), rom_(std::move(rom))
     {
+        // Power-on DRAM is not zeroed on real hardware, and boot code
+        // relies on that: the nanokernel reads a spinlock-timeout word
+        // through a not-yet-set config pointer (landing in page zero) -
+        // junk there gives a patient wait, zero gives an instant-timeout
+        // complaint spiral. A deterministic non-zero fill models the
+        // physical truth while keeping runs reproducible.
+        for (size_t i = 0; i < ram_.size(); ++i)
+            ram_[i] = static_cast<u8>(0x5Au ^ (i * 0x21u) ^ (i >> 11));
         // GPIO-region byte +0x61: the ROM polls bit 1 (TB-bounded) right
         // after arming the VIA/PMU cell and before continuing hardware
         // init — a ready/level input, high at power-on. (Semantic name

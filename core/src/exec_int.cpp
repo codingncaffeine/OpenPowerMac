@@ -688,9 +688,15 @@ void h_lwarx(Cpu& c, u32 i, const InsnDesc&)
     u32 pa;
     if (!c.translate(ea, false, false, pa))
         return; // faulting lwarx establishes no reservation
+    // The data read goes through the cache like any load - a bus-direct
+    // read would see stale memory behind a dirty write-back line (the
+    // nanokernel console lock deadlocked on exactly that).
+    u32 v;
+    if (!c.readV32(ea, v))
+        return;
     c.st.resvValid = true;
     c.st.resvAddr = pa & ~31u; // reservation granule is physical (bus-snooped)
-    c.st.gpr[f_rt(i)] = c.bus->read32(pa);
+    c.st.gpr[f_rt(i)] = v;
 }
 void h_stwcx(Cpu& c, u32 i, const InsnDesc&)
 {
@@ -710,9 +716,10 @@ void h_stwcx(Cpu& c, u32 i, const InsnDesc&)
     // UM: the reservation is non-specific with respect to this processor —
     // a stwcx. succeeds (and always clears) regardless of address match.
     const bool ok = c.st.resvValid;
-    if (ok)
-        c.bus->write32(pa, c.st.gpr[f_rt(i)]);
+    if (ok && !c.writeV32(ea, c.st.gpr[f_rt(i)]))
+        return; // raised mid-store: reservation stands, insn restarts
     c.st.resvValid = false;
+    (void)pa;
     c.setCrField(0, (ok ? 2u : 0u) | ((c.st.xer >> 31) & 1u));
 }
 

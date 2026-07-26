@@ -98,13 +98,14 @@ int main(int argc, char** argv)
     int excLogged = 0;
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
-        ring.push(pc, bus.read32(pc));
+        cpu.step();
+        ring.push(pc, cpu.curInsn); // the word actually fetched (translated)
         if (trace) {
-            disassemble(ring.e[(ring.n - 1) & 31u].insn, pc, text, sizeof text,
-                        Style::Gnu);
+            disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
             fprintf(stderr, "%08x: %s\n", pc, text);
         }
-        cpu.step();
+        bus.macio().tick();
+        cpu.setExternalIrq(bus.macio().irqAsserted());
         ++executed;
         if (cpu.raisedThisStep && excLogged < excShow) {
             ++excLogged;
@@ -138,6 +139,47 @@ int main(int argc, char** argv)
             printf("   %08x  reads=%-8llu writes=%-8llu lastWrite=%08x\n", pa,
                    static_cast<unsigned long long>(t.reads),
                    static_cast<unsigned long long>(t.writes), t.lastWrite);
+    }
+    if (!bus.macio().viaTrace().empty()) {
+        static const char* rn[16] = {"ORB", "ORA", "DDRB", "DDRA", "T1CL",
+                                     "T1CH", "T1LL", "T1LH", "T2CL", "T2CH",
+                                     "SR",  "ACR", "PCR",  "IFR",  "IER",
+                                     "ORAnh"};
+        printf("-- via trace (%zu ops, ORB reads elided):\n",
+               bus.macio().viaTrace().size());
+        for (const auto& op : bus.macio().viaTrace())
+            printf("   %s %-5s %02x\n", op.write ? "wr" : "rd", rn[op.reg & 15],
+                   op.val);
+    }
+    if (!bus.macio().cuda().commandLog().empty()) {
+        printf("-- cuda packets (type:cmd -> count):\n");
+        for (const auto& [key, cnt] : bus.macio().cuda().commandLog())
+            printf("   %02x:%02x x%llu\n", key >> 8, key & 0xFFu,
+                   static_cast<unsigned long long>(cnt));
+    }
+    if (!bus.macio().xferLog().empty()) {
+        printf("-- cuda transport (>[to cuda] <[to host] s[SR write] "
+               "b[portB edge]):\n   ");
+        for (const auto& b : bus.macio().xferLog()) {
+            const char tag[] = {'<', '>', 's', 'b'};
+            printf("%c%02x ", tag[b.toCuda & 3], b.val);
+        }
+        printf("\n");
+    }
+    if (!bus.macio().unmodeledLog().empty()) {
+        printf("-- mac-io unmodeled register traffic (%zu unique):\n",
+               bus.macio().unmodeledLog().size());
+        size_t shown = 0;
+        for (const auto& [off, t] : bus.macio().unmodeledLog()) {
+            if (++shown > 48) {
+                printf("   ... (%zu more)\n",
+                       bus.macio().unmodeledLog().size() - 48);
+                break;
+            }
+            printf("   +%06x  reads=%-8llu writes=%-8llu lastWrite=%02x\n", off,
+                   static_cast<unsigned long long>(t.reads),
+                   static_cast<unsigned long long>(t.writes), t.lastWrite);
+        }
     }
     if (!cpu.unimplemented.empty()) {
         printf("-- unimplemented hits:\n");

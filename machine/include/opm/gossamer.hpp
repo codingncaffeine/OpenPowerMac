@@ -16,6 +16,7 @@
 // stub address is logged (deduped, capped) — the log IS the M0 deliverable.
 
 #include "opm/bus.hpp"
+#include "opm/macio.hpp"
 
 #include <cstddef>
 #include <map>
@@ -33,6 +34,7 @@ public:
     };
     const std::map<u32, Touch>& stubLog() const { return stubLog_; }
     u64 romWrites() const { return romWrites_; }
+    MacIo& macio() { return macio_; }
 
     u8 read8(u32 pa) override;
     u16 read16(u32 pa) override;
@@ -45,6 +47,8 @@ public:
 
 private:
     static constexpr u32 kRomBase = 0xFFC00000u;
+    static constexpr u32 kRomAlias = 0xFF800000u; // 8 MB decode mirrors the 4 MB ROM
+    static constexpr u32 kRomMask = 0x003FFFFFu;
     static constexpr u32 kMacIoBase = 0xF3000000u;
     static constexpr u32 kMacIoSize = 0x00100000u;
     static constexpr u32 kConfigAddr = 0xFEC00000u;
@@ -56,6 +60,7 @@ private:
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;
+    MacIo macio_;
     u32 configAddr_ = 0;
     std::map<u32, Touch> stubLog_;
     u64 romWrites_ = 0;

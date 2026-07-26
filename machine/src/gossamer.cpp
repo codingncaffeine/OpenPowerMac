@@ -33,8 +33,10 @@ u8 GossamerBus::read8(u32 pa)
 {
     if (pa < ram_.size())
         return ram_[pa];
-    if (pa >= kRomBase)
-        return rom_[pa - kRomBase];
+    if (pa >= kRomAlias)
+        return rom_[pa & kRomMask];
+    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize)
+        return macio_.read8(pa - kMacIoBase);
     const u32 w = readWord(pa & ~3u);
     return static_cast<u8>(w >> (8 * (3 - (pa & 3u))));
 }
@@ -43,9 +45,12 @@ u16 GossamerBus::read16(u32 pa)
 {
     if (pa + 1 < ram_.size())
         return static_cast<u16>((ram_[pa] << 8) | ram_[pa + 1]);
-    if (pa >= kRomBase)
-        return static_cast<u16>((rom_[pa - kRomBase] << 8) |
-                                rom_[pa - kRomBase + 1]);
+    if (pa >= kRomAlias)
+        return static_cast<u16>((rom_[pa & kRomMask] << 8) |
+                                rom_[(pa + 1) & kRomMask]);
+    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize)
+        return static_cast<u16>((macio_.read8(pa - kMacIoBase) << 8) |
+                                macio_.read8(pa - kMacIoBase + 1));
     const u32 w = readWord(pa & ~3u);
     return static_cast<u16>(w >> ((pa & 2u) ? 0 : 16));
 }
@@ -55,10 +60,16 @@ u32 GossamerBus::read32(u32 pa)
     if (pa + 3 < ram_.size())
         return (u32(ram_[pa]) << 24) | (u32(ram_[pa + 1]) << 16) |
                (u32(ram_[pa + 2]) << 8) | u32(ram_[pa + 3]);
-    if (pa >= kRomBase) {
-        const u32 off = pa - kRomBase;
+    if (pa >= kRomAlias) {
+        const u32 off = pa & kRomMask;
         return (u32(rom_[off]) << 24) | (u32(rom_[off + 1]) << 16) |
                (u32(rom_[off + 2]) << 8) | u32(rom_[off + 3]);
+    }
+    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize) {
+        const u32 off = pa - kMacIoBase;
+        return (u32(macio_.read8(off)) << 24) |
+               (u32(macio_.read8(off + 1)) << 16) |
+               (u32(macio_.read8(off + 2)) << 8) | u32(macio_.read8(off + 3));
     }
     return readWord(pa);
 }
@@ -74,8 +85,12 @@ void GossamerBus::write8(u32 pa, u8 v)
         ram_[pa] = v;
         return;
     }
-    if (pa >= kRomBase) {
+    if (pa >= kRomAlias) {
         ++romWrites_;
+        return;
+    }
+    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize) {
+        macio_.write8(pa - kMacIoBase, v);
         return;
     }
     writeWord(pa & ~3u, static_cast<u32>(v) << (8 * (3 - (pa & 3u))));
@@ -88,8 +103,13 @@ void GossamerBus::write16(u32 pa, u16 v)
         ram_[pa + 1] = static_cast<u8>(v);
         return;
     }
-    if (pa >= kRomBase) {
+    if (pa >= kRomAlias) {
         ++romWrites_;
+        return;
+    }
+    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize) {
+        macio_.write8(pa - kMacIoBase, static_cast<u8>(v >> 8));
+        macio_.write8(pa - kMacIoBase + 1, static_cast<u8>(v));
         return;
     }
     writeWord(pa & ~3u, static_cast<u32>(v) << ((pa & 2u) ? 0 : 16));
@@ -104,8 +124,16 @@ void GossamerBus::write32(u32 pa, u32 v)
         ram_[pa + 3] = static_cast<u8>(v);
         return;
     }
-    if (pa >= kRomBase) {
+    if (pa >= kRomAlias) {
         ++romWrites_;
+        return;
+    }
+    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize) {
+        const u32 off = pa - kMacIoBase;
+        macio_.write8(off, static_cast<u8>(v >> 24));
+        macio_.write8(off + 1, static_cast<u8>(v >> 16));
+        macio_.write8(off + 2, static_cast<u8>(v >> 8));
+        macio_.write8(off + 3, static_cast<u8>(v));
         return;
     }
     writeWord(pa, v);
@@ -126,10 +154,6 @@ u32 GossamerBus::readWord(u32 pa)
     if (pa == kConfigData) {
         logStub(pa, false, 0);
         return 0xFFFFFFFFu; // master abort: no PCI devices yet
-    }
-    if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize) {
-        logStub(pa, false, 0);
-        return 0; // quiet device registers until M2
     }
     logStub(pa, false, 0);
     return 0xFFFFFFFFu; // unmapped: all-ones

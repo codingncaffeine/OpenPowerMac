@@ -76,6 +76,7 @@ private:
     std::vector<u8> hostPkt_;
     u32 respIndex_ = 0;
     u32 respDelay_ = 0; // VIA ticks before a queued response asserts TREQ
+    u32 syncPulse_ = 0; // VIA ticks before the sync-negate SR pulse lands
     bool sending_ = false;   // Cuda -> host transfer in progress
     bool receiving_ = false; // host -> Cuda transfer in progress
     bool syncing_ = false;   // null transaction: TIP asserted while idle

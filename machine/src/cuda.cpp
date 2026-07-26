@@ -31,8 +31,9 @@ inline constexpr u8 cCombinedIic = 0x25;
 // zero-DIMM machine). One 64 MB SDRAM module: 12 row bits, 9 column bits,
 // 4 internal banks, 64-bit wide, PC100-class timing, non-ECC, JEDEC
 // checksum in byte 63. RECEIPT: authored here to describe the machine's
-// backing RAM; slot address matches the ROM's first probe.
-inline constexpr u8 kSpdAddr = 0xA6;
+// backing RAM; 0xA0 = DIMM slot 1, the first of the three slots the
+// cold-path memory-init module scans (observed probe order A0, A2, A4).
+inline constexpr u8 kSpdAddr = 0xA0;
 inline constexpr u8 kSpd[64] = {
     0x80, 0x08, 0x04, 0x0C, 0x09, 0x01, 0x40, 0x00, // written/size/type/geom
     0x01, 0x0A, 0x07, 0x00, 0x80, 0x08, 0x00, 0x01, // volt/cycle/refresh

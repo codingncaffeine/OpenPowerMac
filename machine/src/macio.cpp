@@ -229,11 +229,16 @@ void MacIo::viaWrite(u32 reg, u8 v)
         } else if (!tipNow && tackFlipped && !sending_ && !receiving_ &&
                    (!cuda_.hasResponse() || respDelay_ != 0)) {
             // Sync stepping (observed in the boot ROM): with TIP negated,
-            // TACK edges are acknowledged by mirroring TREQ. The final
-            // TACK-assert of cuda_init parks here until the host releases.
+            // TACK edges are acknowledged by mirroring TREQ. The assert
+            // edge answers immediately; the negate edge's SR pulse arrives
+            // a little later, like the MCU it models — the host drains the
+            // shift register first and then polls IFR for that pulse.
             treq_ = (via_[vORB] & bTACK) == 0;
             updateTreq();
-            setIfr(iSR);
+            if (treq_)
+                setIfr(iSR);
+            else
+                syncPulse_ = 64; // deferred completion pulse
         }
         return;
     }
@@ -308,6 +313,9 @@ void MacIo::tick()
         treq_ = true; // the delayed response now requests the bus
         updateTreq();
     }
+    if (syncPulse_ && --syncPulse_ == 0)
+        setIfr(iSR); // the sync-negate completion pulse lands
+
     if (t1Running_) {
         if (t1_ == 0) {
             setIfr(iT1);

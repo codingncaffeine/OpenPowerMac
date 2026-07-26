@@ -214,14 +214,16 @@ int main(int argc, char** argv)
     }
 
     if (ledger) {
+        bindHandlers(); // handlers live in the dispatch slots, not the table
         size_t total = 0, bound = 0, ill = 0;
         for (size_t n = 0; n < kIsaCount; ++n) {
             const InsnDesc& d = kIsa[n];
             ++total;
-            if (d.fn) ++bound;
+            const bool impl = handlerFor(&d) != nullptr;
+            if (impl) ++bound;
             if (d.flags & FL_ILL7400) ++ill;
             printf("%-12s op=%2u xo=%4u %s%s\n", d.mnem, d.primary, d.xo,
-                   d.fn ? "IMPL" : "decode-only",
+                   impl ? "IMPL" : "decode-only",
                    (d.flags & FL_ILL7400) ? " [illegal-on-7400]" : "");
         }
         printf("-- %zu instructions, %zu implemented, %zu illegal-on-7400\n",

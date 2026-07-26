@@ -104,3 +104,22 @@ msr=00004000 bamr=FFFFFFF8
 insn 7C67EAA6                     # mfspr r3,935 (UBAMR): user-readable
 expect r3=FFFFFFF8 pc=00001004
 end
+
+test eciwx_ear_disabled_dsi
+msr=00000000 r4=00003000
+insn 7C60226C                     # eciwx r3,0,r4 with EAR[E]=0
+expect pc=00000300 srr0=00001000 dar=00003000 dsisr=00100000
+end
+
+test ecowx_ear_disabled_dsi
+msr=00000000 r3=DEADBEEF r4=00003000
+insn 7C60236C                     # ecowx r3,0,r4 with EAR[E]=0
+expect pc=00000300 srr0=00001000 dar=00003000 dsisr=02100000 mem@00003000=00000000
+end
+
+test eciwx_ear_enabled_reads
+msr=00000000 r4=00003000 ear=80000000
+mem@00003000=12345678
+insn 7C60226C                     # eciwx r3,0,r4
+expect r3=12345678 pc=00001004
+end

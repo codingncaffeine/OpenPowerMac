@@ -94,6 +94,7 @@ bool applyKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
     if (key == "iabr") { c.st.iabr = static_cast<u32>(hexval(val)); return true; }
     if (key == "dabr") { c.st.dabr = static_cast<u32>(hexval(val)); return true; }
     if (key == "bamr") { c.st.bamr = static_cast<u32>(hexval(val)); return true; }
+    if (key == "ear") { c.st.ear = static_cast<u32>(hexval(val)); return true; }
     if (key == "xer") { c.st.xer = static_cast<u32>(hexval(val)); return true; }
     if (key == "cr")  { c.st.cr = static_cast<u32>(hexval(val)); return true; }
     if (key == "lr")  { c.st.lr = static_cast<u32>(hexval(val)); return true; }

@@ -716,6 +716,44 @@ void h_stwcx(Cpu& c, u32 i, const InsnDesc&)
     c.setCrField(0, (ok ? 2u : 0u) | ((c.st.xer >> 31) & 1u));
 }
 
+// External control: word-aligned only (UM 4.6.6); EAR[E]=0 raises a DSI
+// with DSISR[11] (UM Table 5-4). RECEIPT: with EAR[E]=1 the access behaves
+// as a normal translated load/store — there is no external-control device
+// at the core level, so the system bus is the device.
+void h_eciwx(Cpu& c, u32 i, const InsnDesc&)
+{
+    const u32 ea = eaX(c, i);
+    if (ea & 3u) {
+        raiseAlign(c, i, ea);
+        return;
+    }
+    if (!(c.st.ear & 0x80000000u)) {
+        c.st.dar = ea;
+        c.st.dsisr = 0x00100000u;
+        c.raiseExc(Exc::Dsi, c.st.pc - 4, 0);
+        return;
+    }
+    u32 v;
+    if (!c.readV32(ea, v))
+        return;
+    c.st.gpr[f_rt(i)] = v;
+}
+void h_ecowx(Cpu& c, u32 i, const InsnDesc&)
+{
+    const u32 ea = eaX(c, i);
+    if (ea & 3u) {
+        raiseAlign(c, i, ea);
+        return;
+    }
+    if (!(c.st.ear & 0x80000000u)) {
+        c.st.dar = ea;
+        c.st.dsisr = 0x00100000u | 0x02000000u;
+        c.raiseExc(Exc::Dsi, c.st.pc - 4, 0);
+        return;
+    }
+    c.writeV32(ea, c.st.gpr[f_rt(i)]);
+}
+
 // ---- CR field ops ----------------------------------------------------------
 
 void h_mcrf(Cpu& c, u32 i, const InsnDesc&) { c.setCrField(f_crfd(i), c.crField(f_crfs(i))); }
@@ -1038,6 +1076,8 @@ void bindHandlers()
     setHandler("stswx", h_stswx);
     setHandler("lwarx", h_lwarx);
     setHandler("stwcx.", h_stwcx);
+    setHandler("eciwx", h_eciwx);
+    setHandler("ecowx", h_ecowx);
 
     setHandler("lfs", h_lfs);
     setHandler("lfsu", h_lfsu);

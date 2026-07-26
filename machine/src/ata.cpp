@@ -44,6 +44,8 @@ u32 AtaCell::read(u32 off, u32 len)
     case 0x050: return bcHi_;
     case 0x060: return dev_;
     case 0x070:
+        irq_ = false; // status read acknowledges INTRQ
+        return status_;
     case 0x160: return status_;
     default: return 0;
     }
@@ -72,6 +74,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
     case 0x050: bcHi_ = b; break;
     case 0x060: dev_ = b; break;
     case 0x070:
+        irq_ = false;
         if (!(dev_ & 0x10u))
             ataCommand(b);
         break;
@@ -122,6 +125,7 @@ void AtaCell::ataCommand(u8 cmd)
         text(23, 4, "1.0");                  // firmware
         text(27, 20, "OpenPowerMac CD-ROM"); // model
         w16(49, 0x0200);                     // LBA supported
+        irq_ = true;
         dataAt_ = 0;
         nsect_ = kIo | kCoD;
         bcLo_ = 512 & 0xFF;
@@ -137,6 +141,7 @@ void AtaCell::ataCommand(u8 cmd)
         break;
     case 0xEF: // SET FEATURES
         status_ = kDrdy;
+        irq_ = true;
         break;
     default:
         if (log.size() < 2048)
@@ -149,6 +154,7 @@ void AtaCell::ataCommand(u8 cmd)
 
 void AtaCell::packet(const u8* cdb)
 {
+    irq_ = true; // every packet resolution interrupts
     if (log.size() < 2048)
         log.push_back({stamp ? *stamp : 0, 'p', cdb[0]});
     error_ = 0;
@@ -257,6 +263,7 @@ void AtaCell::finishPio(bool chunkDrained)
     if (chunkDrained && readLeft_ == 0) { // non-read transfers end here
         nsect_ = kIo | kCoD;
         status_ = kDrdy;
+        irq_ = true;
         return;
     }
     if (readLeft_ == 0)
@@ -285,6 +292,7 @@ void AtaCell::finishPio(bool chunkDrained)
     bcHi_ = static_cast<u8>(bytes >> 8);
     nsect_ = kIo;
     status_ = kDrq | kDrdy;
+    irq_ = true;
 }
 
 } // namespace opm

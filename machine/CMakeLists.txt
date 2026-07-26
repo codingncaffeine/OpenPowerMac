@@ -7,6 +7,7 @@ add_library(opmmachine STATIC
   src/pmu.cpp
   src/sawtooth.cpp
   src/ata.cpp
+  src/openpic.cpp
 )
 
 target_include_directories(opmmachine PUBLIC include)

@@ -62,6 +62,9 @@ int main(int argc, char** argv)
     u32 fastTb = 0; // extra TB cycles per instruction: compresses the
                     // ROM's wall-clock waits (harness lever, not machine
                     // truth — timings scale, ordering is preserved)
+    u64 fastTbUntil = ~0ull; // compression cutoff: the OS era runs its
+                             // scheduler off the DEC and livelocks if
+                             // the timebase runs tens of times fast
     const char* ramDumpPath = nullptr;
     bool serialCr = false;
     const char* cdPath = nullptr;
@@ -88,6 +91,8 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--fast-tb"))
             fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--fast-tb-until"))
+            fastTbUntil = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-ram")) ramDumpPath = next();
         else if (!strcmp(a, "--serial-cr")) serialCr = true;
         else if (!strcmp(a, "--serial-input")) serialInput = next();
@@ -139,6 +144,7 @@ int main(int argc, char** argv)
     bus.pcRef = &cpu.st.pc;
     bus.stamp = &executed;
     bus.cd().stamp = &executed;
+    bus.pic().stamp = &executed;
 
     Ring ring;
     int excLogged = 0;
@@ -165,8 +171,10 @@ int main(int argc, char** argv)
             disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
             fprintf(stderr, "%08x: %s\n", pc, text);
         }
-        if (fastTb)
+        if (fastTb && executed < fastTbUntil)
             cpu.tick(fastTb);
+        bus.syncIrqs();
+        cpu.setExternalIrq(bus.pic().cpuLine());
         if (serialInput && executed == serialAt) {
             std::string s(serialInput);
             for (char& c : s)
@@ -188,6 +196,33 @@ int main(int argc, char** argv)
                        cpu.st.gpr[21] & 0xFFu);
             else if (cpu.st.pc == 0xFF80B1C0u)
                 printf("-- post-nsect C@ a=%08x\n", cpu.st.gpr[20]);
+        }
+        static u32 slotPrev[2] = {0xEE00EE00u, 0xEE00EE00u};
+        if (executed > 1030000000ull && (executed & 0x7FFFFu) == 0) {
+            u32 v0 = 0, v1 = 0;
+            if (cpu.l1dPeek32(0x03EFD500u, v0) == false)
+                v0 = bus.read32(0x03EFD500u);
+            if (cpu.l1dPeek32(0x03EFD540u, v1) == false)
+                v1 = bus.read32(0x03EFD540u);
+            if (v0 != slotPrev[0] || v1 != slotPrev[1]) {
+                printf("-- slots @%llu [d500]=%08x [d540]=%08x pc=%08x\n",
+                       static_cast<unsigned long long>(executed), v0, v1,
+                       cpu.st.pc);
+                slotPrev[0] = v0;
+                slotPrev[1] = v1;
+            }
+        }
+        static u32 romPollShown = 0;
+        if (cpu.st.pc == 0x00F12700u && romPollShown < 3 &&
+            executed > 1000000000ull) {
+            ++romPollShown;
+            cpu.l1dFlushAll(true);
+            const u32 r22 = cpu.st.gpr[22], r31 = cpu.st.gpr[31];
+            printf("-- rom poll #%u @%llu r31=%08x [r31]=%08x r22=%08x "
+                   "[r22-832]=%08x lr=%08x r8=%08x r9=%08x\n",
+                   romPollShown, static_cast<unsigned long long>(executed),
+                   r31, bus.read32(r31), r22, bus.read32(r22 - 832u),
+                   cpu.st.lr, cpu.st.gpr[8], cpu.st.gpr[9]);
         }
         static u64 lastFetchSample = 0;
         if (cpu.st.pc == 0xFF80B640u &&

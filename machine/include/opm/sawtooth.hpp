@@ -1,9 +1,11 @@
 #pragma once
 #include "opm/ata.hpp"
 #include "opm/bus.hpp"
+#include "opm/openpic.hpp"
 #include "opm/pmu.hpp"
 #include "opm/types.hpp"
 
+#include <cstdio>
 #include <map>
 #include <string>
 #include <vector>
@@ -124,6 +126,11 @@ public:
     // The VIA cell (+0x16000..+0x17FFF) routes to the PMU99 model.
     PmuVia& pmu() { return pmu_; }
 
+    // OpenPIC at +0x40000 (the tree's interrupt-controller@40000).
+    // Device level lines: ata-3@20000 = source 20, its DBDMA = 12.
+    OpenPic& pic() { return pic_; }
+    void syncIrqs() { pic_.setLine(20, cd_.irqLine()); }
+
     // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
     // with a /disk node). The CD lives on ata-3@20000 device 0 when an
     // ISO is attached; the other buses stay empty. Non-data register
@@ -209,6 +216,8 @@ private:
                 return sccRead(off - 0x13000u);
             if (off >= 0x18000u && off < 0x18100u)
                 return i2cRead(1, off - 0x18000u);
+            if (off - 0x40000u < 0x40000u)
+                return pic_.read(off - 0x40000u, len);
             if (off - 0x1F000u < 0x3000u) {
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
@@ -263,6 +272,10 @@ private:
             }
             if (off >= 0x18000u && off < 0x18100u) {
                 i2cWrite(1, off - 0x18000u, static_cast<u8>(v));
+                return;
+            }
+            if (off - 0x40000u < 0x40000u) {
+                pic_.write(off - 0x40000u, v, len);
                 return;
             }
             if (off - 0x1F000u < 0x3000u) {
@@ -463,18 +476,25 @@ private:
     u32 sccRead(u32 off)
     {
         const u32 ch = (off >> 5) & 1u; // 0 = B (+0x00), 1 = A (+0x20)
+        // Injected input is paced like a real serial line: one byte
+        // becomes visible every few million instructions, matching the
+        // console editor's per-keystroke processing. Un-paced delivery
+        // overflows the firmware's small input ring and drops the tail.
+        const bool rxReady = ch == 1 && !rxQueue_.empty() && stamp &&
+                             *stamp >= rxNextAt_;
         if (off & 0x10u) { // data: serve queued RX on channel A
-            if (ch == 1 && !rxQueue_.empty()) {
+            if (rxReady) {
                 const u8 b = static_cast<u8>(rxQueue_.front());
                 rxQueue_.erase(rxQueue_.begin());
+                rxNextAt_ = *stamp + 3000000ull;
                 return b;
             }
             return 0;
         }
         const u32 r = sccPtr_[ch];
         sccPtr_[ch] = 0;
-        if (r == 0) // RR0: TX empty, RX-avail while channel A has data
-            return 0x04u | ((ch == 1 && !rxQueue_.empty()) ? 0x01u : 0x00u);
+        if (r == 0) // RR0: TX empty, RX-avail as pacing allows
+            return 0x04u | (rxReady ? 0x01u : 0x00u);
         return sccRr_[ch][r & 15u];
     }
     void sccWrite(u32 off, u8 v)
@@ -556,12 +576,14 @@ private:
     u8 sccWr_[2][16] = {};
     u8 sccRr_[2][16] = {};
     std::string console_, rxQueue_;
+    u64 rxNextAt_ = 0;
     Keywest i2c_[2]; // 0 = Uni-North SPD bus, 1 = mac-io cell
     u32 cfgAddr_[3] = {0, 0, 0};
     std::map<u32, u32> cfgSpace_; // (bus<<28|latch&~3) -> native-LE word
     std::vector<RegWr> cfgLog_;
     std::vector<RegWr> ataLog_;
     AtaCell cd_;
+    OpenPic pic_;
 };
 
 } // namespace opm

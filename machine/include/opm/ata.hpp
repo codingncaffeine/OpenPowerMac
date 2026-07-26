@@ -20,6 +20,7 @@ class AtaCell {
 public:
     bool attachIso(const char* path);
     bool present() const { return iso_ != nullptr; }
+    bool irqLine() const { return irq_; }
 
     u32 read(u32 off, u32 len);
     void write(u32 off, u32 v, u32 len);
@@ -59,6 +60,7 @@ private:
     u64 readLba_ = 0;
     u32 readLeft_ = 0;
     u8 sense_ = 0; // last sense key
+    bool irq_ = false;
 };
 
 } // namespace opm

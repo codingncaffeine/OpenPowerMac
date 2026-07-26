@@ -56,6 +56,7 @@ struct Ring {
 int main(int argc, char** argv)
 {
     const char* romPath = nullptr;
+    const char* fbPath = nullptr;
     u64 maxInsns = 50000000ull;
     size_t ramMb = 64;
     bool trace = false;
@@ -74,6 +75,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ram")) ramMb = strtoul(next(), nullptr, 0);
         else if (!strcmp(a, "--max")) maxInsns = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace")) trace = true;
+        else if (!strcmp(a, "--fb")) fbPath = next();
         else if (!strcmp(a, "--exc")) excShow = atoi(next());
         else {
             fprintf(stderr,
@@ -188,6 +190,38 @@ int main(int argc, char** argv)
         for (const auto& op : bus.macio().viaTrace())
             printf("   %s %-5s %02x\n", op.write ? "wr" : "rd", rn[op.reg & 15],
                    op.val);
+    }
+    if (!bus.pci().probeLog().empty()) {
+        printf("-- pci config probes (dev:reg -> reads/writes):\n");
+        for (const auto& [key, p] : bus.pci().probeLog())
+            printf("   %02x:%02x  r=%llu w=%llu\n", key >> 8, key & 0xFFu,
+                   static_cast<unsigned long long>(p.reads),
+                   static_cast<unsigned long long>(p.writes));
+        printf("-- ati aperture base: %08x\n", bus.pci().atiBase());
+    }
+    if (!bus.atiRegLog().empty()) {
+        printf("-- ati register-block traffic:\n");
+        for (const auto& [off, t] : bus.atiRegLog())
+            printf("   +%06x  reads=%-8llu writes=%-8llu lastWrite=%02x\n", off,
+                   static_cast<unsigned long long>(t.reads),
+                   static_cast<unsigned long long>(t.writes), t.lastWrite);
+    }
+    {
+        u64 nonzero = 0;
+        for (u8 b : bus.atiMem())
+            if (b)
+                ++nonzero;
+        printf("-- ati aperture: %llu nonzero bytes\n",
+               static_cast<unsigned long long>(nonzero));
+        if (fbPath && nonzero) {
+            FILE* f = fopen(fbPath, "wb");
+            if (f) { // 640x480 8bpp assumed until the CRTC says otherwise
+                fprintf(f, "P5\n640 480\n255\n");
+                fwrite(bus.atiMem().data(), 1, 640 * 480, f);
+                fclose(f);
+                printf("-- framebuffer written: %s\n", fbPath);
+            }
+        }
     }
     if (!bus.macio().cuda().commandLog().empty()) {
         printf("-- cuda packets (type:cmd -> count):\n");

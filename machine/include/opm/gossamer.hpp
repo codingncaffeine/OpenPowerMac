@@ -17,6 +17,7 @@
 
 #include "opm/bus.hpp"
 #include "opm/macio.hpp"
+#include "opm/pci.hpp"
 
 #include <cstddef>
 #include <map>
@@ -35,6 +36,9 @@ public:
     const std::map<u32, Touch>& stubLog() const { return stubLog_; }
     u64 romWrites() const { return romWrites_; }
     MacIo& macio() { return macio_; }
+    PciConfig& pci() { return pci_; }
+    const std::map<u32, Touch>& atiRegLog() const { return atiRegLog_; }
+    const std::vector<u8>& atiMem() const { return atiMem_; }
 
     u8 read8(u32 pa) override;
     u16 read16(u32 pa) override;
@@ -58,9 +62,18 @@ private:
     void writeWord(u32 pa, u32 v);
     void logStub(u32 pa, bool write, u32 v);
 
+    bool atiWindow(u32 pa, u32& off) const;
+    u8 atiRead8(u32 off);
+    void atiWrite8(u32 off, u8 v);
+    bool atiIoWindow(u32 pa, u32& off) const;
+
     std::vector<u8> ram_;
     std::vector<u8> rom_;
     MacIo macio_;
+    PciConfig pci_;
+    std::vector<u8> atiMem_;
+    u8 atiIo_[256] = {}; // I/O-space registers: read-back store (PLL etc.)
+    std::map<u32, Touch> atiRegLog_;
     u32 configAddr_ = 0;
     std::map<u32, Touch> stubLog_;
     u64 romWrites_ = 0;

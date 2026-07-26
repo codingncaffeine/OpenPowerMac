@@ -7,9 +7,50 @@ inline constexpr size_t kStubLogCap = 512;
 }
 
 GossamerBus::GossamerBus(size_t ramBytes, std::vector<u8> rom)
-    : ram_(ramBytes, 0), rom_(std::move(rom))
+    : ram_(ramBytes, 0), rom_(std::move(rom)),
+      atiMem_(PciConfig::kAtiAperture, 0)
 {
     rom_.resize(0x00400000u, 0xFF); // 4 MB window, unprogrammed bytes read FF
+}
+
+bool GossamerBus::atiWindow(u32 pa, u32& off) const
+{
+    const u32 base = pci_.atiBase();
+    if (base == 0 || pa < base || pa - base >= PciConfig::kAtiAperture)
+        return false;
+    off = pa - base;
+    return true;
+}
+
+// Grackle maps PCI I/O space at 0xFE000000; the ATI's I/O BAR lands inside.
+bool GossamerBus::atiIoWindow(u32 pa, u32& off) const
+{
+    const u32 io = pci_.atiIoBase();
+    if (io == 0 || pa < 0xFE000000u + io || pa - (0xFE000000u + io) >= 0x100u)
+        return false;
+    off = pa - (0xFE000000u + io);
+    return true;
+}
+
+u8 GossamerBus::atiRead8(u32 off)
+{
+    // The mach64-family register file lives in the top of the aperture;
+    // log that traffic so polled status registers announce themselves.
+    if (off >= PciConfig::kAtiAperture - 0x1000 &&
+        (atiRegLog_.size() < 256 || atiRegLog_.count(off)))
+        ++atiRegLog_[off].reads;
+    return atiMem_[off];
+}
+
+void GossamerBus::atiWrite8(u32 off, u8 v)
+{
+    if (off >= PciConfig::kAtiAperture - 0x1000 &&
+        (atiRegLog_.size() < 256 || atiRegLog_.count(off))) {
+        Touch& t = atiRegLog_[off];
+        ++t.writes;
+        t.lastWrite = v;
+    }
+    atiMem_[off] = v;
 }
 
 void GossamerBus::logStub(u32 pa, bool write, u32 v)
@@ -37,6 +78,13 @@ u8 GossamerBus::read8(u32 pa)
         return rom_[pa & kRomMask];
     if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize)
         return macio_.read8(pa - kMacIoBase);
+    if ((pa & ~3u) == kConfigData)
+        return pci_.readData(pa & 3u);
+    u32 off;
+    if (atiWindow(pa, off))
+        return atiRead8(off);
+    if (atiIoWindow(pa, off))
+        return atiIo_[off];
     const u32 w = readWord(pa & ~3u);
     return static_cast<u8>(w >> (8 * (3 - (pa & 3u))));
 }
@@ -71,6 +119,16 @@ u32 GossamerBus::read32(u32 pa)
                (u32(macio_.read8(off + 1)) << 16) |
                (u32(macio_.read8(off + 2)) << 8) | u32(macio_.read8(off + 3));
     }
+    if ((pa & ~3u) == kConfigData)
+        return (u32(pci_.readData(0)) << 24) | (u32(pci_.readData(1)) << 16) |
+               (u32(pci_.readData(2)) << 8) | u32(pci_.readData(3));
+    u32 off;
+    if (atiWindow(pa, off))
+        return (u32(atiRead8(off)) << 24) | (u32(atiRead8(off + 1)) << 16) |
+               (u32(atiRead8(off + 2)) << 8) | u32(atiRead8(off + 3));
+    if (atiIoWindow(pa, off))
+        return (u32(atiIo_[off]) << 24) | (u32(atiIo_[off + 1]) << 16) |
+               (u32(atiIo_[off + 2]) << 8) | u32(atiIo_[off + 3]);
     return readWord(pa);
 }
 
@@ -91,6 +149,19 @@ void GossamerBus::write8(u32 pa, u8 v)
     }
     if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize) {
         macio_.write8(pa - kMacIoBase, v);
+        return;
+    }
+    if ((pa & ~3u) == kConfigData) {
+        pci_.writeData(pa & 3u, v);
+        return;
+    }
+    u32 off;
+    if (atiWindow(pa, off)) {
+        atiWrite8(off, v);
+        return;
+    }
+    if (atiIoWindow(pa, off)) {
+        atiIo_[off] = v;
         return;
     }
     writeWord(pa & ~3u, static_cast<u32>(v) << (8 * (3 - (pa & 3u))));
@@ -136,6 +207,28 @@ void GossamerBus::write32(u32 pa, u32 v)
         macio_.write8(off + 3, static_cast<u8>(v));
         return;
     }
+    if ((pa & ~3u) == kConfigData) {
+        pci_.writeData(0, static_cast<u8>(v >> 24));
+        pci_.writeData(1, static_cast<u8>(v >> 16));
+        pci_.writeData(2, static_cast<u8>(v >> 8));
+        pci_.writeData(3, static_cast<u8>(v));
+        return;
+    }
+    u32 off;
+    if (atiWindow(pa, off)) {
+        atiWrite8(off, static_cast<u8>(v >> 24));
+        atiWrite8(off + 1, static_cast<u8>(v >> 16));
+        atiWrite8(off + 2, static_cast<u8>(v >> 8));
+        atiWrite8(off + 3, static_cast<u8>(v));
+        return;
+    }
+    if (atiIoWindow(pa, off)) {
+        atiIo_[off] = static_cast<u8>(v >> 24);
+        atiIo_[off + 1] = static_cast<u8>(v >> 16);
+        atiIo_[off + 2] = static_cast<u8>(v >> 8);
+        atiIo_[off + 3] = static_cast<u8>(v);
+        return;
+    }
     writeWord(pa, v);
 }
 
@@ -163,10 +256,14 @@ void GossamerBus::writeWord(u32 pa, u32 v)
 {
     if (pa == kConfigAddr) {
         configAddr_ = v;
+        // The CPU stores the config address with a byte-reversed store; the
+        // bytes arrive here in memory order, so the LE meaning is the swap.
+        pci_.setAddr(((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+                     ((v >> 8) & 0xFF00u) | (v >> 24));
         logStub(pa, true, v);
         return;
     }
-    logStub(pa, true, v); // CONFIG_DATA / mac-io / unmapped: dropped, logged
+    logStub(pa, true, v); // unmapped: dropped, logged
 }
 
 } // namespace opm

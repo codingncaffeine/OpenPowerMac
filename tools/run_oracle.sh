@@ -5,7 +5,7 @@ set -uo pipefail
 
 dir="${1:-build/oracle}"
 ppcrun="${2:-build/tools/ppcrun/ppcrun}"
-filter="${3:-int*}"
+filter="${3:-[fi]*}" # int* + fp* by default; mix* waits for P5
 
 fail=0
 ran=0

@@ -1,0 +1,184 @@
+# P4 FPU arithmetic: add/sub/mul/div/fused, overflow/underflow, NI.
+# All vectors run with MSR[FP]=0x2000. FPSCR expectations computed by hand
+# from PEM 3.3.6 flows (FX on 0->1 transitions, FR/FI per rounding, FPRF
+# from the delivered result).
+
+test fadd_basic
+msr=00002000 f1=3FF8000000000000 f2=4002000000000000
+insn FC61102A                     # fadd f3,f1,f2: 1.5+2.25=3.75
+expect f3=400E000000000000 fpscr=00004000
+end
+
+test fadd_inexact_tie_even
+msr=00002000 f1=3FF0000000000000 f2=3CA0000000000000
+insn FC61102A                     # 1.0 + 2^-53: halfway, ties to even 1.0
+expect f3=3FF0000000000000 fpscr=82024000
+end
+
+test fadd_inf_minus_inf_vxisi
+msr=00002000 f1=7FF0000000000000 f2=FFF0000000000000
+insn FC61102A
+expect f3=7FF8000000000000 fpscr=A0811000
+end
+
+test fadd_snan_quiets
+msr=00002000 f1=7FF0000000000001 f2=3FF0000000000000
+insn FC61102A
+expect f3=7FF8000000000001 fpscr=A1011000
+end
+
+test fadd_zero_signs_rn
+msr=00002000 f1=0000000000000000 f2=8000000000000000
+insn FC61102A                     # (+0)+(-0) = +0 in RN
+expect f3=0000000000000000 fpscr=00002000
+end
+
+test fadd_zero_signs_rm
+msr=00002000 f1=0000000000000000 f2=8000000000000000 fpscr=00000003
+insn FC61102A                     # (+0)+(-0) = -0 toward -inf
+expect f3=8000000000000000 fpscr=00012003
+end
+
+test fsub_cancel_exact_zero
+msr=00002000 f1=3FF8000000000000 f2=3FF8000000000000
+insn FC611028                     # fsub f3,f1,f2: 1.5-1.5 = +0
+expect f3=0000000000000000 fpscr=00002000
+end
+
+test fadds_rounds_single
+msr=00002000 f1=3FF0000000000000 f2=3E10000000000000
+insn EC61102A                     # fadds: 1.0 + 2^-30 -> 1.0f
+expect f3=3FF0000000000000 fpscr=82024000
+end
+
+test fmul_basic
+msr=00002000 f1=4008000000000000 f2=3FE0000000000000
+insn FC6100B2                     # fmul f3,f1,f2: 3*0.5=1.5
+expect f3=3FF8000000000000 fpscr=00004000
+end
+
+test fmul_inf_zero_vximz
+msr=00002000 f1=7FF0000000000000 f2=0000000000000000
+insn FC6100B2
+expect f3=7FF8000000000000 fpscr=A0111000
+end
+
+test fmul_underflow_to_zero
+msr=00002000 f1=0170000000000000 f2=39B0000000000000
+insn FC6100B2                     # 2^-1000 * 2^-100: far below denorm range
+expect f3=0000000000000000 fpscr=8A022000
+end
+
+test fmul_exact_min_denorm_no_ux
+msr=00002000 f1=1E60000000000000 f2=1E60000000000000
+insn FC6100B2                     # 2^-537 * 2^-537 = 2^-1074 exactly
+expect f3=0000000000000001 fpscr=00014000
+end
+
+test fmul_overflow_rn_inf
+msr=00002000 f1=7E70000000000000 f2=4630000000000000
+insn FC6100B2                     # 2^1000 * 2^100 -> +inf, OX
+expect f3=7FF0000000000000 fpscr=92065000
+end
+
+test fmul_overflow_rz_max
+msr=00002000 f1=7E70000000000000 f2=4630000000000000 fpscr=00000001
+insn FC6100B2                     # same, toward zero -> max double, FR=0
+expect f3=7FEFFFFFFFFFFFFF fpscr=92024001
+end
+
+test fmul_ni_flushes_denorm
+msr=00002000 f1=1E60000000000000 f2=1E60000000000000 fpscr=00000004
+insn FC6100B2                     # NI=1: exact denorm result flushes to +0
+expect f3=0000000000000000 fpscr=00002004
+end
+
+test fdiv_basic_exact
+msr=00002000 f1=3FF0000000000000 f2=4010000000000000
+insn FC611024                     # fdiv f3,f1,f2: 1/4
+expect f3=3FD0000000000000 fpscr=00004000
+end
+
+test fdiv_third_inexact
+msr=00002000 f1=3FF0000000000000 f2=4008000000000000
+insn FC611024                     # 1/3
+expect f3=3FD5555555555555 fpscr=82024000
+end
+
+test fdiv_by_zero_zx
+msr=00002000 f1=3FF0000000000000 f2=0000000000000000
+insn FC611024
+expect f3=7FF0000000000000 fpscr=84005000
+end
+
+test fdiv_zero_by_zero_vxzdz
+msr=00002000 f1=0000000000000000 f2=0000000000000000
+insn FC611024
+expect f3=7FF8000000000000 fpscr=A0211000
+end
+
+test fdiv_inf_by_inf_vxidi
+msr=00002000 f1=7FF0000000000000 f2=7FF0000000000000
+insn FC611024
+expect f3=7FF8000000000000 fpscr=A0411000
+end
+
+test fmadd_fused_exact
+msr=00002000 f1=3FF0000002000000 f2=3FF0000002000000 f4=BFF0000000000000
+insn FC6120BA                     # (1+2^-27)^2 - 1 = 2^-26 + 2^-54, exact fused
+expect f3=3E50000001000000 fpscr=00004000
+end
+
+test fmadds_single_rounding
+msr=00002000 f1=3FF0010000000000 f2=3FF0010000000000 f4=3E60000000000000
+insn EC6120BA                     # (1+2^-12)^2 + 2^-25 rounds up in single
+expect f3=3FF0020020000000 fpscr=82064000
+end
+
+test fnmadd_negates_zero
+msr=00002000 f1=3FF0000000000000 f2=3FF0000000000000 f4=BFF0000000000000
+insn FC6120BE                     # -(1*1 + (-1)) = -(+0) = -0
+expect f3=8000000000000000 fpscr=00012000
+end
+
+test fnmsub_basic
+msr=00002000 f1=4000000000000000 f2=4008000000000000 f4=3FF0000000000000
+insn FC6120BC                     # -(2*3 - 1) = -5
+expect f3=C014000000000000 fpscr=00008000
+end
+
+test fmadd_nan_addend_priority
+msr=00002000 f1=7FF0000000000000 f2=0000000000000000 f4=7FF8000000000BAD
+insn FC6120BA                     # inf*0 sets VXIMZ, but frB's NaN is the result
+expect f3=7FF8000000000BAD fpscr=A0111000
+end
+
+test fres_exact_quarter
+msr=00002000 f2=4010000000000000
+insn EC601030                     # fres f3,f2: 1/4
+expect f3=3FD0000000000000 fpscr=00004000
+end
+
+test fres_zero_zx
+msr=00002000 f2=8000000000000000
+insn EC601030                     # fres of -0 -> -inf, ZX
+expect f3=FFF0000000000000 fpscr=84009000
+end
+
+test frsqrte_four
+msr=00002000 f2=4010000000000000
+insn FC601034                     # frsqrte f3,f2: 1/sqrt(4) = 0.5
+expect f3=3FE0000000000000 fpscr=00004000
+end
+
+test frsqrte_quarter
+msr=00002000 f2=3FD0000000000000
+insn FC601034                     # 1/sqrt(0.25) = 2
+expect f3=4000000000000000 fpscr=00004000
+end
+
+test frsqrte_negative_vxsqrt
+msr=00002000 f2=BFF0000000000000
+insn FC601034
+expect f3=7FF8000000000000 fpscr=A0011200
+end

@@ -252,6 +252,8 @@ int main(int argc, char** argv)
     cpu.attach(bus);
     cpu.reset();
     cpu.st.pc = haveEntry ? entry : img.entry;
+    cpu.st.msr |= msr::FP; // the rig hands programs a usable FPU, as
+                           // firmware would (KAT/SST paths set MSR themselves)
 
     char text[128];
     u64 executed = 0;

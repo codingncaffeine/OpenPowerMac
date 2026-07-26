@@ -15,11 +15,13 @@ $ld = "$PSScriptRoot\link.ld"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 foreach ($c in Get-ChildItem $src -Filter *.c) {
-  $vecFlag = if ($c.BaseName -like 'int*') { '-mno-altivec' } else { '-maltivec' }
+  # int*/fp* are scalar phases: vector codegen off until P5. fp results must
+  # not be contracted into fmadd on either leg.
+  $vecFlag = if ($c.BaseName -match '^(int|fp)') { '-mno-altivec' } else { '-maltivec' }
   foreach ($opt in '-O0', '-O2') {
     $name = "$($c.BaseName)$opt"
     $elf = Join-Path $OutDir "$name.elf"
-    & $clang --target=powerpc-none-eabi -mcpu=7400 $vecFlag `
+    & $clang --target=powerpc-none-eabi -mcpu=7400 $vecFlag -ffp-contract=off `
         -ffreestanding -nostdlib -fno-builtin -fuse-ld=lld `
         "-Wl,-T,$ld" '-Wl,--build-id=none' $opt $c.FullName -o $elf
     if ($LASTEXITCODE -ne 0) { throw "clang failed on $name" }
@@ -28,7 +30,7 @@ foreach ($c in Get-ChildItem $src -Filter *.c) {
     Write-Host "built $name"
   }
   $hostExe = Join-Path $OutDir "$($c.BaseName)-host.exe"
-  & $gcc -DHOST -O2 $c.FullName -o $hostExe
+  & $gcc -DHOST -O2 -ffp-contract=off $c.FullName -o $hostExe
   if ($LASTEXITCODE -ne 0) { throw "host gcc failed on $($c.BaseName)" }
   Write-Host "built $($c.BaseName)-host"
 }

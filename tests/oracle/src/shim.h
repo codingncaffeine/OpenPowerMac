@@ -20,6 +20,22 @@ int main(void)
 #define MMIO_EXIT (*(volatile unsigned int*)0xF0000004u)
 static void putc1(char c) { MMIO_PUTC = (unsigned char)c; }
 static void done(unsigned code) { MMIO_EXIT = code; }
+/* Freestanding: the compiler lowers aggregate inits/copies to these. */
+void* memset(void* d, int c, __SIZE_TYPE__ n)
+{
+    unsigned char* p = (unsigned char*)d;
+    while (n--)
+        *p++ = (unsigned char)c;
+    return d;
+}
+void* memcpy(void* d, const void* s, __SIZE_TYPE__ n)
+{
+    unsigned char* p = (unsigned char*)d;
+    const unsigned char* q = (const unsigned char*)s;
+    while (n--)
+        *p++ = *q++;
+    return d;
+}
 __asm__(".globl _start\n"
         "_start:\n"
         "  lis 1, 0x00F0\n"

@@ -3,12 +3,12 @@
 param(
   [string]$OracleDir = "$PSScriptRoot\..\build\oracle",
   [string]$Ppcrun = "$PSScriptRoot\..\build\tools\ppcrun\Release\ppcrun.exe",
-  [string]$Filter = 'int*'
+  [string]$Filter = '[fi]*' # int* + fp* by default; mix* waits for P5
 )
 
 $fail = 0
 $ran = 0
-foreach ($elf in Get-ChildItem $OracleDir -Filter "$Filter.elf") {
+foreach ($elf in Get-ChildItem $OracleDir -File | Where-Object { $_.Name -like "$Filter.elf" }) {
   $base = $elf.BaseName -replace '-O[02]$', ''
   $hostExe = Join-Path $OracleDir "$base-host.exe"
   if (-not (Test-Path $hostExe)) { continue }

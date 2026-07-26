@@ -76,6 +76,11 @@ bool applyKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
         c.st.gpr[std::stoul(key.substr(1))] = static_cast<u32>(hexval(val));
         return true;
     }
+    if (key.size() >= 2 && key[0] == 'f' && isdigit(static_cast<unsigned char>(key[1]))) {
+        c.st.fpr[std::stoul(key.substr(1)) & 31u] = hexval(val);
+        return true;
+    }
+    if (key == "fpscr") { c.st.fpscr = static_cast<u32>(hexval(val)); return true; }
     if (key == "xer") { c.st.xer = static_cast<u32>(hexval(val)); return true; }
     if (key == "cr")  { c.st.cr = static_cast<u32>(hexval(val)); return true; }
     if (key == "lr")  { c.st.lr = static_cast<u32>(hexval(val)); return true; }
@@ -128,8 +133,22 @@ bool checkKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
         diff += b;
         return false;
     };
+    auto expectU64 = [&](u64 actual) {
+        const u64 want = hexval(val);
+        if (actual == want)
+            return true;
+        char b[128];
+        snprintf(b, sizeof b, "  %s: want %016llx got %016llx\n", key.c_str(),
+                 static_cast<unsigned long long>(want),
+                 static_cast<unsigned long long>(actual));
+        diff += b;
+        return false;
+    };
     if (key.size() >= 2 && key[0] == 'r' && isdigit(static_cast<unsigned char>(key[1])))
         return expectU32(c.st.gpr[std::stoul(key.substr(1))]);
+    if (key.size() >= 2 && key[0] == 'f' && isdigit(static_cast<unsigned char>(key[1])))
+        return expectU64(c.st.fpr[std::stoul(key.substr(1)) & 31u]);
+    if (key == "fpscr") return expectU32(c.st.fpscr);
     if (key == "xer") return expectU32(c.st.xer);
     if (key == "cr")  return expectU32(c.st.cr);
     if (key == "lr")  return expectU32(c.st.lr);

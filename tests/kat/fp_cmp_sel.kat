@@ -1,0 +1,85 @@
+# P4 FPU compares, fsel, moves.
+
+test fcmpu_less
+msr=00002000 f1=3FF0000000000000 f2=4000000000000000
+insn FD011000                     # fcmpu cr2,f1,f2: 1 < 2
+expect cr=00800000 fpscr=00008000
+end
+
+test fcmpu_greater_negative
+msr=00002000 f1=BFF0000000000000 f2=C000000000000000
+insn FD011000                     # -1 > -2
+expect cr=00400000 fpscr=00004000
+end
+
+test fcmpu_equal_zeros
+msr=00002000 f1=0000000000000000 f2=8000000000000000
+insn FD011000                     # +0 == -0
+expect cr=00200000 fpscr=00002000
+end
+
+test fcmpu_snan_vxsnan
+msr=00002000 f1=7FF0000000000001 f2=3FF0000000000000
+insn FD011000                     # unordered + VXSNAN (no VXVC for fcmpu)
+expect cr=00100000 fpscr=A1001000
+end
+
+test fcmpu_qnan_quiet
+msr=00002000 f1=7FF8000000000000 f2=3FF0000000000000
+insn FD011000                     # unordered, no exception bits
+expect cr=00100000 fpscr=00001000
+end
+
+test fcmpo_qnan_vxvc
+msr=00002000 f1=7FF8000000000000 f2=3FF0000000000000
+insn FD011040                     # fcmpo cr2: QNaN -> VXVC
+expect cr=00100000 fpscr=A0081000
+end
+
+test fcmpo_snan_ve0_both_bits
+msr=00002000 f1=7FF0000000000001 f2=3FF0000000000000
+insn FD011040                     # SNaN with VE=0 -> VXSNAN + VXVC
+expect cr=00100000 fpscr=A1081000
+end
+
+test fsel_negzero_takes_c
+msr=00002000 f1=8000000000000000 f2=3FF0000000000000 f4=4000000000000000
+insn FC6120AE                     # fsel f3,f1,f2,f4: -0 counts as >= 0
+expect f3=3FF0000000000000 fpscr=00000000
+end
+
+test fsel_negative_takes_b
+msr=00002000 f1=BFF0000000000000 f2=3FF0000000000000 f4=4000000000000000
+insn FC6120AE
+expect f3=4000000000000000 fpscr=00000000
+end
+
+test fsel_nan_takes_b
+msr=00002000 f1=7FF8000000000000 f2=3FF0000000000000 f4=4000000000000000
+insn FC6120AE                     # NaN selects frB; no FPSCR effects
+expect f3=4000000000000000 fpscr=00000000
+end
+
+test fmr_moves
+msr=00002000 f2=C123456789ABCDEF
+insn FC601090                     # fmr f3,f2
+expect f3=C123456789ABCDEF fpscr=00000000
+end
+
+test fneg_flips_nan_sign
+msr=00002000 f2=7FF8000000000000
+insn FC601050                     # fneg may alter a NaN's sign (PEM 4.2.2.6)
+expect f3=FFF8000000000000 fpscr=00000000
+end
+
+test fabs_clears_sign
+msr=00002000 f2=C000000000000000
+insn FC601210
+expect f3=4000000000000000 fpscr=00000000
+end
+
+test fnabs_sets_sign
+msr=00002000 f2=4000000000000000
+insn FC601110
+expect f3=C000000000000000 fpscr=00000000
+end

@@ -204,6 +204,7 @@ struct Cpu {
 // Binds every implemented handler into the dispatch used by Cpu::step.
 // Idempotent; called from the Cpu constructor.
 void bindHandlers();
+void bindFpuHandlers(); // fpu.cpp's registrations, called by bindHandlers()
 
 // Handler slot for an ISA row (parallel to kIsa; see decode()).
 Handler handlerFor(const InsnDesc* d);

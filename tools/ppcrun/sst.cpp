@@ -145,6 +145,11 @@ void applyState(Cpu& c, MapBus& bus, const JVal& s)
     const JVal* g = s.get("gprs");
     for (int i = 0; i < 32; ++i)
         c.st.gpr[i] = static_cast<u32>(g->arr[static_cast<size_t>(i)].num);
+    if (const JVal* fp = s.get("fprs"))
+        for (int i = 0; i < 32; ++i)
+            c.st.fpr[i] = fp->arr[static_cast<size_t>(i)].num;
+    if (const JVal* fs = s.get("fpscr"))
+        c.st.fpscr = static_cast<u32>(fs->num);
     c.st.cr = static_cast<u32>(s.get("cr")->num);
     c.st.xer = static_cast<u32>(s.get("xer")->num);
     c.st.lr = static_cast<u32>(s.get("lr")->num);
@@ -173,6 +178,16 @@ bool checkState(Cpu& c, MapBus& bus, const JVal& s, std::string& diff)
             ok = false;
         }
     };
+    auto chk64 = [&](const char* name, u64 want, u64 got) {
+        if (want != got) {
+            char b[112];
+            snprintf(b, sizeof b, "  %s: want %016llx got %016llx\n", name,
+                     static_cast<unsigned long long>(want),
+                     static_cast<unsigned long long>(got));
+            diff += b;
+            ok = false;
+        }
+    };
     chk("pc", static_cast<u32>(s.get("pc")->num), c.st.pc);
     const JVal* g = s.get("gprs");
     for (int i = 0; i < 32; ++i) {
@@ -180,6 +195,14 @@ bool checkState(Cpu& c, MapBus& bus, const JVal& s, std::string& diff)
         snprintf(nm, sizeof nm, "r%d", i);
         chk(nm, static_cast<u32>(g->arr[static_cast<size_t>(i)].num), c.st.gpr[i]);
     }
+    if (const JVal* fp = s.get("fprs"))
+        for (int i = 0; i < 32; ++i) {
+            char nm[8];
+            snprintf(nm, sizeof nm, "f%d", i);
+            chk64(nm, fp->arr[static_cast<size_t>(i)].num, c.st.fpr[i]);
+        }
+    if (const JVal* fs = s.get("fpscr"))
+        chk("fpscr", static_cast<u32>(fs->num), c.st.fpscr);
     chk("cr", static_cast<u32>(s.get("cr")->num), c.st.cr);
     chk("xer", static_cast<u32>(s.get("xer")->num), c.st.xer);
     chk("lr", static_cast<u32>(s.get("lr")->num), c.st.lr);

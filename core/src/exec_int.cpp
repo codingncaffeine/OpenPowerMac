@@ -7,6 +7,7 @@
 
 #include "opm/cpu.hpp"
 #include "opm/bits.hpp"
+#include "softfp.hpp"
 #include <bit>
 #include <string>
 
@@ -616,6 +617,62 @@ void h_stswx(Cpu& c, u32 i, const InsnDesc&)
     storeString(c, f_rt(i), eaX(c, i), c.st.xer & 0x7Fu);
 }
 
+// ---- FP loads / stores -----------------------------------------------------
+// The 7400 raises an alignment exception for any FP load/store whose EA is
+// not word-aligned (UM 4.6.6); a word-aligned lfd/stfd splits in hardware.
+// Single forms convert via the PEM D.6/D.7 models.
+
+#define FLOAD(NAME, EAKIND, CONV, LEN, UPD)                                   \
+    void NAME(Cpu& c, u32 i, const InsnDesc&)                                 \
+    {                                                                         \
+        const u32 ea = EAKIND(c, i);                                          \
+        if (ea & 3u) {                                                        \
+            raiseAlign(c, i, ea);                                             \
+            return;                                                           \
+        }                                                                     \
+        u64 v;                                                                \
+        if (!c.readV(ea, LEN, v))                                             \
+            return;                                                           \
+        c.st.fpr[f_rt(i)] = CONV;                                             \
+        if (UPD)                                                              \
+            updRa(c, i, ea);                                                  \
+    }
+
+FLOAD(h_lfs, eaD, sf::loadSingle(static_cast<u32>(v)), 4, false)
+FLOAD(h_lfsu, eaD, sf::loadSingle(static_cast<u32>(v)), 4, true)
+FLOAD(h_lfsx, eaX, sf::loadSingle(static_cast<u32>(v)), 4, false)
+FLOAD(h_lfsux, eaX, sf::loadSingle(static_cast<u32>(v)), 4, true)
+FLOAD(h_lfd, eaD, v, 8, false)
+FLOAD(h_lfdu, eaD, v, 8, true)
+FLOAD(h_lfdx, eaX, v, 8, false)
+FLOAD(h_lfdux, eaX, v, 8, true)
+#undef FLOAD
+
+#define FSTORE(NAME, EAKIND, VAL, LEN, UPD)                                   \
+    void NAME(Cpu& c, u32 i, const InsnDesc&)                                 \
+    {                                                                         \
+        const u32 ea = EAKIND(c, i);                                          \
+        if (ea & 3u) {                                                        \
+            raiseAlign(c, i, ea);                                             \
+            return;                                                           \
+        }                                                                     \
+        if (!c.writeV(ea, LEN, VAL))                                          \
+            return;                                                           \
+        if (UPD)                                                              \
+            updRa(c, i, ea);                                                  \
+    }
+
+FSTORE(h_stfs, eaD, sf::storeSingle(c.st.fpr[f_rt(i)]), 4, false)
+FSTORE(h_stfsu, eaD, sf::storeSingle(c.st.fpr[f_rt(i)]), 4, true)
+FSTORE(h_stfsx, eaX, sf::storeSingle(c.st.fpr[f_rt(i)]), 4, false)
+FSTORE(h_stfsux, eaX, sf::storeSingle(c.st.fpr[f_rt(i)]), 4, true)
+FSTORE(h_stfd, eaD, c.st.fpr[f_rt(i)], 8, false)
+FSTORE(h_stfdu, eaD, c.st.fpr[f_rt(i)], 8, true)
+FSTORE(h_stfdx, eaX, c.st.fpr[f_rt(i)], 8, false)
+FSTORE(h_stfdux, eaX, c.st.fpr[f_rt(i)], 8, true)
+FSTORE(h_stfiwx, eaX, c.st.fpr[f_rt(i)] & 0xFFFFFFFFull, 4, false)
+#undef FSTORE
+
 void h_lwarx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 ea = eaX(c, i);
@@ -944,6 +1001,24 @@ void bindHandlers()
     setHandler("lwarx", h_lwarx);
     setHandler("stwcx.", h_stwcx);
 
+    setHandler("lfs", h_lfs);
+    setHandler("lfsu", h_lfsu);
+    setHandler("lfsx", h_lfsx);
+    setHandler("lfsux", h_lfsux);
+    setHandler("lfd", h_lfd);
+    setHandler("lfdu", h_lfdu);
+    setHandler("lfdx", h_lfdx);
+    setHandler("lfdux", h_lfdux);
+    setHandler("stfs", h_stfs);
+    setHandler("stfsu", h_stfsu);
+    setHandler("stfsx", h_stfsx);
+    setHandler("stfsux", h_stfsux);
+    setHandler("stfd", h_stfd);
+    setHandler("stfdu", h_stfdu);
+    setHandler("stfdx", h_stfdx);
+    setHandler("stfdux", h_stfdux);
+    setHandler("stfiwx", h_stfiwx);
+
     setHandler("mcrf", h_mcrf);
     setHandler("crand", h_crand);
     setHandler("cror", h_cror);
@@ -983,6 +1058,8 @@ void bindHandlers()
     setHandler("dss", h_nop);
     setHandler("tlbie", h_nop);
     setHandler("tlbsync", h_nop);
+
+    bindFpuHandlers();
 }
 
 } // namespace opm

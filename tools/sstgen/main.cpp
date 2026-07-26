@@ -136,7 +136,7 @@ bool isMemOp(Pat p)
 {
     switch (p) {
     case Pat::RT_D_RA: case Pat::RS_D_RA: case Pat::LSWI:
-    case Pat::RA_RB:
+    case Pat::RA_RB: case Pat::FRT_D_RA: case Pat::FRS_D_RA:
         return true;
     default:
         return false;
@@ -148,7 +148,33 @@ bool isIndexedMem(const InsnDesc& d)
     // touch memory; detect by mnemonic prefix.
     const char* m = d.mnem;
     return (m[0] == 'l' || (m[0] == 's' && m[1] == 't')) && d.kind == Xk::X31 &&
-           (d.pat == Pat::RT_RA_RB || d.pat == Pat::RS_RA_RB);
+           (d.pat == Pat::RT_RA_RB || d.pat == Pat::RS_RA_RB ||
+            d.pat == Pat::FRT_RA_RB || d.pat == Pat::FRS_RA_RB);
+}
+
+// Interesting FPR seeds: specials, denorms, single-representable values,
+// and wide-range normals.
+u64 fpVal(Rng& r)
+{
+    const u64 sign = r.chance(50) ? 0x8000000000000000ull : 0;
+    switch (r.u(0, 9)) {
+    case 0: return sign;                                   // ±0
+    case 1: return sign | 0x7FF0000000000000ull;           // ±inf
+    case 2: return 0x7FF8000000000000ull | (r.word() & 0x7FFFFFFFull); // QNaN
+    case 3: return sign | 0x7FF0000000000001ull | ((r.word() & 0xFFFFull) << 4); // SNaN
+    case 4: return sign | (r.next() & 0x000FFFFFFFFFFFFFull); // denorm
+    case 5: { // single-representable
+        const u64 e = 1023u - 60u + r.u(0, 120);
+        return sign | (e << 52) | (static_cast<u64>(r.word() & 0x7FFFFFu) << 29);
+    }
+    case 6: { // near one
+        return sign | 0x3FF0000000000000ull | (r.next() & 0xFFFFFull);
+    }
+    default: { // wide-range normal
+        const u64 e = r.u(1, 2046);
+        return sign | (e << 52) | (r.next() & 0x000FFFFFFFFFFFFFull);
+    }
+    }
 }
 
 // Builds one instruction + machine state; returns the word.
@@ -174,8 +200,13 @@ u32 synth(GenCtx& g, const InsnDesc& d)
     }
 
     // Alignment constraints until the P2 exception model records faults.
+    // FP loads/stores stay word-aligned for most vectors; the misaligned
+    // minority records the alignment-exception outcome.
+    const bool fpMem = (d.mnem[0] == 'l' && d.mnem[1] == 'f') ||
+                       !std::strncmp(d.mnem, "stf", 3);
     const bool needAlign4 = !std::strcmp(d.mnem, "lmw") || !std::strcmp(d.mnem, "stmw") ||
-                            !std::strcmp(d.mnem, "lwarx") || !std::strcmp(d.mnem, "stwcx.");
+                            !std::strcmp(d.mnem, "lwarx") || !std::strcmp(d.mnem, "stwcx.") ||
+                            (fpMem && !r.chance(20));
 
     switch (d.pat) {
     case Pat::RT_RA_SI:
@@ -183,7 +214,9 @@ u32 synth(GenCtx& g, const InsnDesc& d)
         w |= (rt << 21) | (ra << 16) | (r.word() & 0xFFFFu);
         break;
     case Pat::RT_D_RA:
-    case Pat::RS_D_RA: {
+    case Pat::RS_D_RA:
+    case Pat::FRT_D_RA:
+    case Pat::FRS_D_RA: {
         i32 disp = static_cast<i32>(r.u(0, 0x1FF)) - 0x100;
         if (needAlign4)
             disp &= ~3;
@@ -196,6 +229,8 @@ u32 synth(GenCtx& g, const InsnDesc& d)
     }
     case Pat::RT_RA_RB:
     case Pat::RS_RA_RB:
+    case Pat::FRT_RA_RB:
+    case Pat::FRS_RA_RB:
         if (isIndexedMem(d)) {
             u32 disp = r.u(0, 0x1FF);
             if (needAlign4)
@@ -307,6 +342,38 @@ u32 synth(GenCtx& g, const InsnDesc& d)
         g.cpu.st.gpr[rb] = r.u(0, 0x1FF);
         w |= (ra << 16) | (rb << 11);
         break;
+    case Pat::FP2:
+        w |= (rt << 21) | (rb << 11) | (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::FP3:
+        w |= (rt << 21) | (ra << 16) | (rb << 11) | (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::FP3C:
+        w |= (rt << 21) | (ra << 16) | (r.u(0, 31) << 6) |
+             (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::FP4:
+        w |= (rt << 21) | (ra << 16) | (rb << 11) | (r.u(0, 31) << 6) |
+             (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::FCMP:
+        w |= (r.u(0, 7) << 23) | (ra << 16) | (rb << 11);
+        break;
+    case Pat::MTFSF:
+        w |= (r.u(1, 255) << 17) | (rb << 11) | (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::MTFSFI:
+        w |= (r.u(0, 7) << 23) | (r.u(0, 15) << 12) | (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::MTFSB:
+        w |= (r.u(0, 31) << 21) | (r.chance(40) ? 1u : 0u);
+        break;
+    case Pat::MCRFS:
+        w |= (r.u(0, 7) << 23) | (r.u(0, 7) << 18);
+        break;
+    case Pat::MFFS:
+        w |= (rt << 21) | (r.chance(40) ? 1u : 0u);
+        break;
     default:
         w |= (rt << 21) | (ra << 16) | (rb << 11);
         break;
@@ -326,11 +393,15 @@ void emitState(FILE* f, const CpuState& s, const std::map<u32, u8>& ram)
     fprintf(f, "{\"pc\":%u,\"gprs\":[", s.pc);
     for (int i = 0; i < 32; ++i)
         fprintf(f, "%u%s", s.gpr[i], i == 31 ? "" : ",");
+    fprintf(f, "],\"fprs\":[");
+    for (int i = 0; i < 32; ++i)
+        fprintf(f, "%llu%s", static_cast<unsigned long long>(s.fpr[i]),
+                i == 31 ? "" : ",");
     fprintf(f,
-            "],\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"msr\":%u,"
+            "],\"fpscr\":%u,\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"msr\":%u,"
             "\"srr0\":%u,\"srr1\":%u,\"dec\":%u,\"tb\":%llu,"
             "\"resv\":[%u,%u],\"ram\":[",
-            s.cr, s.xer, s.lr, s.ctr, s.msr, s.srr0, s.srr1, s.dec,
+            s.fpscr, s.cr, s.xer, s.lr, s.ctr, s.msr, s.srr0, s.srr1, s.dec,
             static_cast<unsigned long long>(s.tb), s.resvValid ? 1u : 0u,
             s.resvAddr);
     bool first = true;
@@ -386,6 +457,13 @@ int generate(const char* mnem, const fs::path& outDir, u32 count)
         g.cpu.st.tb = g.rng.u(0, 0xFFFF);
         for (int i = 0; i < 32; ++i)
             g.cpu.st.gpr[i] = g.rng.word();
+        for (int i = 0; i < 32; ++i)
+            g.cpu.st.fpr[i] = fpVal(g.rng);
+        // FEX/VX are derived and bit 20 is reserved; the tested op refreshes
+        // them, so raw random values here stay replay-consistent.
+        g.cpu.st.fpscr = g.rng.word() & 0x9FFFF7FFu;
+        if (isFpInsn(*d) && g.rng.chance(85))
+            g.cpu.st.msr |= 0x00002000u; // most FP-family vectors run with FP on
         g.cpu.st.cr = g.rng.word();
         g.cpu.st.xer = (g.rng.word() & 0xE0000000u) | g.rng.u(0, 16);
         g.cpu.st.lr = g.rng.word() & ~3u;
@@ -457,6 +535,17 @@ const char* kV0[] = {
     "mfspr", "mtspr", "mftb",
     "mtsr", "mfsr", "mtsrin", "mfsrin",
     "tlbia", "fsqrt", "fsqrts",
+    // FPU chapters (P4): FPRs as bit patterns + full FPSCR in the state
+    "lfs", "lfsu", "lfsx", "lfsux", "lfd", "lfdu", "lfdx", "lfdux",
+    "stfs", "stfsu", "stfsx", "stfsux", "stfd", "stfdu", "stfdx", "stfdux",
+    "stfiwx",
+    "fadd", "fadds", "fsub", "fsubs", "fmul", "fmuls", "fdiv", "fdivs",
+    "fmadd", "fmadds", "fmsub", "fmsubs", "fnmadd", "fnmadds", "fnmsub",
+    "fnmsubs",
+    "frsp", "fctiw", "fctiwz", "fres", "frsqrte",
+    "fsel", "fmr", "fneg", "fabs", "fnabs",
+    "fcmpu", "fcmpo",
+    "mffs", "mcrfs", "mtfsf", "mtfsfi", "mtfsb0", "mtfsb1",
 };
 
 } // namespace

@@ -28,6 +28,10 @@ GossamerBus::GossamerBus(size_t ramBytes, std::vector<u8> rom)
 bool GossamerBus::ramClaim(u32 pa, u32& off)
 {
     memCfgRefresh();
+    if (forceBank0 && pa < ram_.size()) {
+        off = pa;
+        return true;
+    }
     if (!memGo_)
         return false;
     for (const auto& b : banks_) {
@@ -70,9 +74,43 @@ void GossamerBus::memCfgRefresh()
     }
 }
 
+GossamerBus::Ml2Line* GossamerBus::ml2Lookup(u32 pa)
+{
+    memCfgRefresh();
+    if (!ml2On_ || pa >= 0x40000000u)
+        return nullptr;
+    Ml2Line& e = ml2_[(pa >> 5) % ml2Lines_];
+    return (e.v && e.tag == (pa >> 5)) ? &e : nullptr;
+}
+
+void GossamerBus::readLine32(u32 pa, u8* out)
+{
+    if (pa < 0x40000000u) {
+        if (Ml2Line* e = ml2Route(pa)) {
+            for (u32 k = 0; k < 32; ++k)
+                out[k] = e->b[k];
+            return;
+        }
+    }
+    Bus::readLine32(pa, out);
+}
+
+void GossamerBus::writeLine32(u32 pa, const u8* b)
+{
+    if (pa < 0x40000000u) {
+        if (Ml2Line* e = ml2Route(pa)) {
+            for (u32 k = 0; k < 32; ++k)
+                e->b[k] = b[k];
+            e->d = true;
+            return;
+        }
+    }
+    Bus::writeLine32(pa, b);
+}
+
 // The inline L2 fronts the 60x memory space: hits never touch DRAM (which
-// is how the boot's pre-DRAM world survives), misses cast out and fill
-// from whatever the banks decode (all-ones where nothing does).
+// is how the boot's pre-DRAM world survives), burst misses cast out and
+// fill from whatever the banks decode (all-ones where nothing does).
 GossamerBus::Ml2Line* GossamerBus::ml2Route(u32 pa)
 {
     memCfgRefresh();
@@ -85,12 +123,19 @@ GossamerBus::Ml2Line* GossamerBus::ml2Route(u32 pa)
         return &e;
     if (e.v && e.d) {
         const u32 vbase = e.tag << 5;
+        u32 off0;
+        if (!ramClaim(vbase, off0)) {
+            ++ml2LostCastouts;
+            if (ml2LossLog.size() < 64)
+                ml2LossLog.push_back({stamp ? *stamp : 0, vbase});
+        }
         for (u32 k = 0; k < 32; ++k) {
             u32 off;
             if (ramClaim(vbase + k, off))
                 ram_[off] = e.b[k];
         }
     }
+    ++ml2Fills;
     const u32 base = pa & ~31u;
     for (u32 k = 0; k < 32; ++k) {
         u32 off;
@@ -159,7 +204,7 @@ void GossamerBus::logStub(u32 pa, bool write, u32 v)
 u8 GossamerBus::read8(u32 pa)
 {
     if (pa < 0x40000000u) {
-        if (Ml2Line* e = ml2Route(pa))
+        if (Ml2Line* e = ml2Lookup(pa))
             return e->b[pa & 31u];
         u32 ro;
         if (ramClaim(pa, ro))
@@ -185,7 +230,7 @@ u16 GossamerBus::read16(u32 pa)
     if (pa < 0x40000000u) {
         if ((pa & 31u) > 30u) // crosses a line: route per byte
             return static_cast<u16>((read8(pa) << 8) | read8(pa + 1));
-        if (Ml2Line* e = ml2Route(pa))
+        if (Ml2Line* e = ml2Lookup(pa))
             return static_cast<u16>((e->b[pa & 31u] << 8) |
                                     e->b[(pa & 31u) + 1]);
         u32 ro;
@@ -210,7 +255,7 @@ u32 GossamerBus::read32(u32 pa)
         if ((pa & 31u) > 28u)
             return (u32(read8(pa)) << 24) | (u32(read8(pa + 1)) << 16) |
                    (u32(read8(pa + 2)) << 8) | u32(read8(pa + 3));
-        if (Ml2Line* e = ml2Route(pa)) {
+        if (Ml2Line* e = ml2Lookup(pa)) {
             const u32 o = pa & 31u;
             return (u32(e->b[o]) << 24) | (u32(e->b[o + 1]) << 16) |
                    (u32(e->b[o + 2]) << 8) | u32(e->b[o + 3]);
@@ -256,7 +301,7 @@ u64 GossamerBus::read64(u32 pa)
 void GossamerBus::write8(u32 pa, u8 v)
 {
     if (pa < 0x40000000u) {
-        if (Ml2Line* e = ml2Route(pa)) {
+        if (Ml2Line* e = ml2Lookup(pa)) {
             e->b[pa & 31u] = v;
             e->d = true;
             return;
@@ -304,7 +349,7 @@ void GossamerBus::write16(u32 pa, u16 v)
             write8(pa + 1, static_cast<u8>(v));
             return;
         }
-        if (Ml2Line* e = ml2Route(pa)) {
+        if (Ml2Line* e = ml2Lookup(pa)) {
             e->b[pa & 31u] = static_cast<u8>(v >> 8);
             e->b[(pa & 31u) + 1] = static_cast<u8>(v);
             e->d = true;
@@ -347,7 +392,7 @@ void GossamerBus::write32(u32 pa, u32 v)
             write8(pa + 3, static_cast<u8>(v));
             return;
         }
-        if (Ml2Line* e = ml2Route(pa)) {
+        if (Ml2Line* e = ml2Lookup(pa)) {
             const u32 o = pa & 31u;
             e->b[o] = static_cast<u8>(v >> 24);
             e->b[o + 1] = static_cast<u8>(v >> 16);

@@ -26,10 +26,7 @@ inline constexpr u32 kWimgI = 4u;
 
 static void busWriteLine(Cpu& c, u32 base, const u8* b)
 {
-    for (u32 k = 0; k < 32; k += 4)
-        c.bus->write32(base + k,
-                       (u32(b[k]) << 24) | (u32(b[k + 1]) << 16) |
-                           (u32(b[k + 2]) << 8) | u32(b[k + 3]));
+    c.bus->writeLine32(base, b); // burst write: chipset caches may allocate
 }
 
 // L1 castout on replacement: allocates into an enabled L2, else memory.
@@ -62,13 +59,7 @@ static void lineFill(Cpu& c, Cpu::DLine& e, u32 pa)
 {
     const u32 base = pa & ~31u;
     if (!c.l2ReadLine(base, e.b)) {
-        for (u32 k = 0; k < 32; k += 4) {
-            const u32 w = c.bus->read32(base + k);
-            e.b[k] = static_cast<u8>(w >> 24);
-            e.b[k + 1] = static_cast<u8>(w >> 16);
-            e.b[k + 2] = static_cast<u8>(w >> 8);
-            e.b[k + 3] = static_cast<u8>(w);
-        }
+        c.bus->readLine32(base, e.b); // burst read
         if (c.l2On())
             c.l2Install(base, e.b, false); // reloads allocate clean
     }

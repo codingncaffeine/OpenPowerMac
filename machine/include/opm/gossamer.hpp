@@ -89,6 +89,13 @@ private:
     u32 bankGen_ = ~0u;
     bool memGo_ = false;
 
+public:
+    // Experiment lever: pretend bank 0 spans the DIMM regardless of the
+    // config registers (counterfactual isolation of the enable question).
+    bool forceBank0 = false;
+
+private:
+
     // MPC106 internally-controlled L2 (UM ch.5 / PICR1[CF_L2_MP] +
     // PICR2[L2_EN]): a direct-mapped write-back lookaside cache on the 60x
     // memory space. Load-bearing pre-DRAM: HWInit enables it right before
@@ -102,8 +109,25 @@ private:
     std::vector<Ml2Line> ml2_;
     u32 ml2Lines_ = 0;
     bool ml2On_ = false;
+
+public:
+    // Instrumentation: dirty inline-L2 castouts that had no DRAM to land in
+    // (data genuinely lost), plus the touched-line census.
+    u64 ml2LostCastouts = 0, ml2Fills = 0;
+    std::vector<std::pair<u64, u32>> ml2LossLog; // (stamp, line PA)
+
+private:
     void memCfgRefresh(); // banks + MEMGO + inline-L2 state from config
-    Ml2Line* ml2Route(u32 pa); // line for a memory-space access (or null)
+    Ml2Line* ml2Route(u32 pa);  // burst path: hit or allocate-with-fill
+    Ml2Line* ml2Lookup(u32 pa); // single-beat path: hit only, no allocate
+
+public:
+    // Burst transactions allocate in the inline L2; single-beat accesses
+    // (the plain accessors) only hit it (MPC106 UM Table 5-2).
+    void readLine32(u32 pa, u8* out) override;
+    void writeLine32(u32 pa, const u8* b) override;
+
+private:
 
     bool atiWindow(u32 pa, u32& off) const;
     bool atiIoWindow(u32 pa, u32& off) const;

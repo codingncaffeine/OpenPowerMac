@@ -176,6 +176,7 @@ int main(int argc, char** argv)
     u32 disStart = 0, disEnd = 0;
     u32 vdisStart = 0, vdisEnd = 0;
     u32 pvrOverride = 0;
+    bool forceBank0 = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -201,6 +202,7 @@ int main(int argc, char** argv)
             vdisEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         }
         else if (!strcmp(a, "--pvr")) pvrOverride = strtoul(next(), nullptr, 0);
+        else if (!strcmp(a, "--force-bank0")) forceBank0 = true;
         else {
             fprintf(stderr,
                     "usage: macrun --rom FILE [--ram MB] [--max N] [--trace] [--exc N]\n");
@@ -235,6 +237,10 @@ int main(int argc, char** argv)
         cpu.st.pvr = pvrOverride;
         printf("-- pvr override: %08x\n", pvrOverride);
     }
+    if (forceBank0) {
+        bus.forceBank0 = true;
+        printf("-- experiment: bank 0 forced live\n");
+    }
     bus.htabWatchBase = 0x00009000u; // the 68K-side handler page
     bus.htabWatchSize = 0x1000u;
 
@@ -266,6 +272,7 @@ int main(int argc, char** argv)
         cpu.mmuProbe = false;
     };
     bool vdumped = false, wildCaught = false, mqProbed = false;
+    u32 late300Shown = 0;
     struct InsRec {
         u64 at;
         u32 r8, r9, r10, r12, r13;
@@ -569,19 +576,43 @@ int main(int argc, char** argv)
                 probed = true;
                 probeDump();
             }
-            if (!mqProbed && cpu.st.srr0 >= 0xFFF10000u &&
-                cpu.st.srr0 < 0xFFF20000u && cpu.st.pc == 0xFFF00700u) {
+            if (executed > 500000ull && cpu.st.pc == 0xFFF00300u &&
+                late300Shown < 6) {
+                ++late300Shown;
+                u32 slot = 0;
+                const u32 sa = cpu.st.sprg[3] + 12u;
+                if (!cpu.l1dPeek32(sa, slot) && !cpu.l2Peek32(sa, slot))
+                    slot = bus.read32(sa);
+                printf("-- late dsi #%u @%llu srr0=%08x dar=%08x "
+                       "sprg3=%08x [sprg3+12]=%08x\n",
+                       late300Shown,
+                       static_cast<unsigned long long>(executed),
+                       cpu.st.srr0, cpu.st.dar, cpu.st.sprg[3], slot);
+            }
+            if (!mqProbed && executed > 500000ull &&
+                cpu.st.pc == 0xFFF00800u) {
                 mqProbed = true;
-                const u32 r1v = cpu.st.gpr[1];
-                printf("-- mq trap: srr0=%08x r1=%08x sprg3=%08x\n",
-                       cpu.st.srr0, r1v, cpu.st.sprg[3]);
-                printf("-- mq trap: [r1+0x640..0x658]:");
-                for (u32 k = 0; k < 7; ++k)
-                    printf(" %08x", bus.read32(r1v + 0x640u + 4 * k));
-                printf("\n-- mq trap: [sprg3+0..0x20]:");
-                for (u32 k = 0; k < 9; ++k)
-                    printf(" %08x", bus.read32(cpu.st.sprg[3] + 4 * k));
-                printf("\n");
+                printf("-- first late 0x800 @%llu: srr0=%08x srr1=%08x "
+                       "lr=%08x r1=%08x\n",
+                       static_cast<unsigned long long>(executed),
+                       cpu.st.srr0, cpu.st.srr1, cpu.st.lr, cpu.st.gpr[1]);
+                printf("-- sprg: %08x %08x %08x %08x\n", cpu.st.sprg[0],
+                       cpu.st.sprg[1], cpu.st.sprg[2], cpu.st.sprg[3]);
+                printf("-- [sprg3+0..0x3c]:");
+                for (u32 k = 0; k < 16; ++k) {
+                    const u32 a = cpu.st.sprg[3] + 4 * k;
+                    u32 w = 0;
+                    if (!cpu.l1dPeek32(a, w) && !cpu.l2Peek32(a, w))
+                        w = bus.read32(a);
+                    printf(" %08x", w);
+                }
+                printf("\n-- ring into it:\n");
+                const u32 cnt = ring.n < 16 ? ring.n : 16;
+                for (u32 k = 0; k < cnt; ++k) {
+                    const auto& e = ring.e[(ring.n - cnt + k) & 31u];
+                    disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
+                    printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
+                }
             }
         }
     }
@@ -677,6 +708,14 @@ int main(int argc, char** argv)
             printf("   @%-9llu %02x <= %02x\n",
                    static_cast<unsigned long long>(c.at), c.reg, c.val);
         }
+    }
+    if (bus.ml2Fills) {
+        printf("-- inline L2: fills=%llu lost dirty castouts=%llu\n",
+               static_cast<unsigned long long>(bus.ml2Fills),
+               static_cast<unsigned long long>(bus.ml2LostCastouts));
+        for (const auto& [at, pa2] : bus.ml2LossLog)
+            printf("   @%-9llu lost line %08x\n",
+                   static_cast<unsigned long long>(at), pa2);
     }
     if (const u8* g = bus.pci().cfgBytes(0)) {
         printf("-- grackle mem banks (cfg 0x80..0xA3):");

@@ -90,7 +90,9 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
     if (!on) {
         pa = ea;
         if (wimg)
-            *wimg = kWimgReal;
+            *wimg = (realModeInhibitBase && ea >= realModeInhibitBase)
+                        ? (kWimgReal | kWimgI)
+                        : kWimgReal;
         return true;
     }
     const bool user = userMode();

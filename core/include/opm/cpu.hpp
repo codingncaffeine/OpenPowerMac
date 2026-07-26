@@ -183,6 +183,12 @@ struct Cpu {
     TlbEntry itlb[64][2], dtlb[64][2];
     u8 itlbLru[64] = {}, dtlbLru[64] = {};
     bool mmuProbe = false; // instrumentation: bypass TLB and R/C writeback
+    // Harness convention (ppcrun flat rig only — never the machine): treat
+    // real-mode accesses at/above this base as cache-inhibited so MMIO
+    // (putc/exit) keeps device semantics with the caches enabled. The
+    // architecture makes real mode cacheable (WIMG 0b0011); real software
+    // must map I/O with I=1, and the machine path models exactly that.
+    u32 realModeInhibitBase = 0;
     void tlbInvalidateClass(u32 ea); // tlbie: both ways, both TLBs
     void tlbFlushAll();
 

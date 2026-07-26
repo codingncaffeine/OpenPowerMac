@@ -51,13 +51,63 @@ struct Cpu {
     std::map<std::string, u64> unimplemented;
     std::map<u32, u64> unknownWords;
 
+    // Set when execution cannot continue (pre-P2 stand-in for the exception
+    // model: traps, sc, illegal ops halt with a reason instead of vectoring).
+    bool halted = false;
+    std::string haltReason;
+
+    Cpu();
     void attach(Bus& b) { bus = &b; }
-    void reset() { st = CpuState{}; }
+    void reset()
+    {
+        st = CpuState{};
+        halted = false;
+        haltReason.clear();
+    }
+    void halt(std::string reason)
+    {
+        halted = true;
+        haltReason = std::move(reason);
+    }
 
     // Execute up to n instructions; returns the number actually executed.
-    // (P0: decode + census only; handlers land per implementation phase.)
     u64 run(u64 n);
     void step();
+
+    // --- state helpers shared by executors ---
+    void setCr0(u32 val)
+    {
+        const i32 s = static_cast<i32>(val);
+        u32 f = (s < 0) ? 8u : (s > 0) ? 4u : 2u;
+        f |= (st.xer >> 31) & 1u; // SO
+        st.cr = (st.cr & 0x0FFFFFFFu) | (f << 28);
+    }
+    void setCrField(u32 field, u32 nibble)
+    {
+        const u32 sh = (7u - field) * 4u;
+        st.cr = (st.cr & ~(0xFu << sh)) | ((nibble & 0xFu) << sh);
+    }
+    u32 crField(u32 field) const { return (st.cr >> ((7u - field) * 4u)) & 0xFu; }
+    void setCa(bool ca)
+    {
+        st.xer = ca ? (st.xer | 0x20000000u) : (st.xer & ~0x20000000u);
+    }
+    bool ca() const { return (st.xer & 0x20000000u) != 0; }
+    void setOv(bool ov)
+    {
+        if (ov)
+            st.xer |= 0xC0000000u; // OV + sticky SO
+        else
+            st.xer &= ~0x40000000u;
+    }
 };
+
+// Binds every implemented handler into the dispatch used by Cpu::step.
+// Idempotent; called from the Cpu constructor.
+void bindHandlers();
+
+// Handler slot for an ISA row (parallel to kIsa; see decode()).
+Handler handlerFor(const InsnDesc* d);
+void setHandler(const char* mnem, Handler fn);
 
 } // namespace opm

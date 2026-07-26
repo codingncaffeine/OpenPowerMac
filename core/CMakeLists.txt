@@ -3,6 +3,7 @@ add_library(opmcore STATIC
   src/decode.cpp
   src/disasm.cpp
   src/cpu.cpp
+  src/exec_int.cpp
 )
 
 target_include_directories(opmcore PUBLIC include)

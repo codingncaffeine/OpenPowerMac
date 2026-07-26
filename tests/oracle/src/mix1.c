@@ -1,29 +1,10 @@
-/* Oracle corpus #1 — a grab-bag of integer, float, and AltiVec code shapes.
- * Compiled freestanding for ppc32be; also runs under ppcrun from P1 on:
- * prints results via the MMIO console and exits via the MMIO exit port. */
-
+/* Oracle corpus #1 — integer, float, and AltiVec code shapes together.
+ * Guest-runnable once P4 (FPU) and P5 (AltiVec) land; disassembler corpus
+ * from P0 on. */
+#ifndef HOST
 #include <altivec.h>
-
-#define MMIO_PUTC (*(volatile unsigned char*)0xF0000000u)
-#define MMIO_EXIT (*(volatile unsigned int*)0xF0000004u)
-
-__asm__(".globl _start\n"
-        "_start:\n"
-        "  lis 1, 0x00F0\n"
-        "  li 0, 0\n"
-        "  bl cmain\n"
-        "1: b 1b\n");
-
-static void putc1(char c) { MMIO_PUTC = (unsigned char)c; }
-
-static void puthex(unsigned int v)
-{
-    for (int i = 28; i >= 0; i -= 4) {
-        unsigned d = (v >> i) & 0xF;
-        putc1((char)(d < 10 ? '0' + d : 'a' + d - 10));
-    }
-    putc1('\n');
-}
+#endif
+#include "shim.h"
 
 static unsigned int crc32(const unsigned char* p, unsigned n)
 {
@@ -70,6 +51,20 @@ static double fmix(double x, float y)
 
 static int vsum(void)
 {
+#ifdef HOST
+    /* Scalar reference of the AltiVec kernel below. */
+    int acc[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 64; i++)
+        for (int l = 0; l < 4; l++)
+            acc[l] += 3;
+    int t[4];
+    for (int l = 0; l < 4; l++)
+        t[l] = acc[l] + acc[(l + 2) & 3];
+    int r[4];
+    for (int l = 0; l < 4; l++)
+        r[l] = t[l] + t[(l + 1) & 3];
+    return r[0];
+#else
     vector signed int acc = vec_splat_s32(0);
     vector signed int step = vec_splat_s32(3);
     for (int i = 0; i < 64; i++)
@@ -79,6 +74,7 @@ static int vsum(void)
     sh = vec_sld(acc, acc, 4);
     acc = vec_add(acc, sh);
     return vec_extract(acc, 0);
+#endif
 }
 
 void cmain(void)
@@ -99,5 +95,5 @@ void cmain(void)
     puthex((unsigned)fb);
     puthex((unsigned)vsum());
 
-    MMIO_EXIT = 0;
+    done(0);
 }

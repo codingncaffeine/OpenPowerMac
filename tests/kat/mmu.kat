@@ -1,0 +1,221 @@
+# P3 MMU: BAT and hashed-page-table translation, R/C writeback, fault status.
+# Fault bits verified against UM Tables 5-3/5-4 + PEM Tables 6-12/6-13/6-14.
+#
+# Conventions: harness puts the test insn at physical 0x1000 and steps once.
+# MSR 0x10 = DR (data translation on, fetch real), 0x20 = IR, 0x4000 = PR.
+# PTE w0 = 0x80000000|vsid<<7|H<<6|API; w1 = RPN|R(0x100)|C(0x80)|WIMG<<3|PP.
+
+# ---- BAT path --------------------------------------------------------------
+
+test bat_translate_hit_nonidentity
+msr=00000010 r4=10000000
+dbatu0=10000002 dbatl0=00060002
+mem@00060004=11223344
+insn 80640004                     # lwz r3,4(r4): EA 10000004 -> PA 00060004
+expect r3=11223344 pc=00001004 msr=00000010
+end
+
+test bat_256mb_block_bl_mask
+msr=00000010 r4=000F0000
+dbatu0=00001FFE dbatl0=00000002   # BEPI 0, BL=0x7FF (256MB), Vs; BRPN 0, RW
+mem@000F0000=CAFED00D
+insn 80640000                     # lwz r3,0(r4): hits only because BL masks EA[4-14]
+expect r3=CAFED00D pc=00001004
+end
+
+test bat_readonly_store_dsi
+msr=00000010 r3=DEADBEEF r4=10000000
+dbatu0=10000002 dbatl0=00060001   # PP=01 read-only
+insn 90640000                     # stw r3,0(r4)
+expect pc=00000300 srr0=00001000 srr1=00000010 msr=00000000 dar=10000000 dsisr=0A000000 mem@00060000=00000000
+end
+
+test bat_vs_only_ignored_in_user_mode
+msr=00004010 r4=00020000
+dbatu0=00001FFE dbatl0=00000002   # Vs only: invisible to user mode
+insn 80640000                     # lwz r3,0(r4) -> page walk vs empty table -> miss DSI
+expect pc=00000300 srr0=00001000 srr1=00004010 msr=00000000 dar=00020000 dsisr=40000000
+end
+
+test bat_vp_hit_in_user_mode
+msr=00004010 r4=000F0000
+dbatu0=00001FFD dbatl0=00000002   # Vp only
+mem@000F0000=0BADF00D
+insn 80640000                     # lwz r3,0(r4)
+expect r3=0BADF00D pc=00001004
+end
+
+test bat_priority_over_page
+msr=00000010 r4=00003000
+sr0=00000005 sdr1=00090000
+mem@00090180=8000028000005002     # PTE would map 0x3000 -> 0x5000
+dbatu0=00001FFE dbatl0=00000002   # but the identity BAT wins
+mem@00003000=BA7BA7BA mem@00005000=0BADF00D
+insn 80640000                     # lwz r3,0(r4)
+expect r3=BA7BA7BA pc=00001004 mem@00090184=00005002
+end
+
+# ---- hashed page table path ------------------------------------------------
+
+test page_hit_sets_r
+msr=00000010 r4=00003000
+sr0=00000005 sdr1=00090000        # vsid 5; pageIndex 3; hash 6 -> PTEG 0x90180
+mem@00090180=8000028000005002
+mem@00005000=FEEDC0DE
+insn 80640000                     # lwz r3,0(r4)
+expect r3=FEEDC0DE pc=00001004 mem@00090184=00005102
+end
+
+test page_store_sets_c
+msr=00000010 r3=0000BEEF r4=00003000
+sr0=00000005 sdr1=00090000
+mem@00090180=8000028000005002
+insn 90640004                     # stw r3,4(r4) -> PA 00005004
+expect pc=00001004 mem@00005004=0000BEEF mem@00090184=00005182
+end
+
+test page_prot_dsi_sets_r_not_c
+msr=00000010 r3=DEADBEEF r4=00003000
+sr0=40000005 sdr1=00090000        # Ks=1: supervisor key=1, PP=01 -> read-only
+mem@00090180=8000028000005001
+insn 90640000                     # stw r3,0(r4)
+expect pc=00000300 srr0=00001000 srr1=00000010 dar=00003000 dsisr=0A000000 mem@00090184=00005101 mem@00005000=00000000
+end
+
+test page_user_kp_read_ok
+msr=00004010 r4=00003000
+sr0=20000005 sdr1=00090000        # Kp=1, PP=01: user read-only
+mem@00090180=8000028000005001
+mem@00005000=00C0FFEE
+insn 80640000                     # lwz r3,0(r4)
+expect r3=00C0FFEE pc=00001004 mem@00090184=00005101
+end
+
+test page_user_kp_store_dsi
+msr=00004010 r3=DEADBEEF r4=00003000
+sr0=20000005 sdr1=00090000
+mem@00090180=8000028000005001
+insn 90640000                     # stw r3,0(r4)
+expect pc=00000300 srr0=00001000 srr1=00004010 dar=00003000 dsisr=0A000000 mem@00090184=00005101
+end
+
+test page_super_ks0_store_ok
+msr=00000010 r3=0000CAFE r4=00003000
+sr0=20000005 sdr1=00090000        # same SR: supervisor key=Ks=0 -> PP=01 is RW
+mem@00090180=8000028000005001
+insn 90640004                     # stw r3,4(r4)
+expect pc=00001004 mem@00005004=0000CAFE mem@00090184=00005181
+end
+
+test page_miss_dsi
+msr=00000010 r4=00004000
+sr0=00000005 sdr1=00090000        # pageIndex 4: PTEG 0x90040 is empty
+insn 80640000                     # lwz r3,0(r4)
+expect pc=00000300 srr0=00001000 srr1=00000010 dar=00004000 dsisr=40000000
+end
+
+test page_cross_reads_both_pages
+msr=00000010 r4=00003FFE
+sr0=00000005 sdr1=00090000
+mem@00090180=8000028000005002     # page 3 -> 0x5000
+mem@00090040=8000028000006002     # page 4 -> 0x6000
+mem@00005FFE=1122 mem@00006000=3344
+insn 80640000                     # lwz r3,0(r4) spans the page boundary
+expect r3=11223344 pc=00001004 mem@00090184=00005102 mem@00090044=00006102
+end
+
+test page_secondary_hash_hit
+msr=00000010 r4=00003000
+sr0=00000005 sdr1=00090000        # primary PTEG 0x90180 empty; secondary 0x9FE40, H=1
+mem@0009FE40=800002C000005002
+mem@00005000=5EC04DA1
+insn 80640000                     # lwz r3,0(r4)
+expect r3=5EC04DA1 pc=00001004 mem@0009FE44=00005102
+end
+
+test page_htabmask_indexing
+msr=00000010 r4=00003000
+sr0=00000403 sdr1=000A0001        # vsid 0x403: hash 0x400 -> mask selects PTEG 0xB0000
+mem@000B0000=8002018000005002
+mem@00005000=CAFE0403
+insn 80640000                     # lwz r3,0(r4)
+expect r3=CAFE0403 pc=00001004 mem@000B0004=00005102
+end
+
+# ---- instruction-side faults -----------------------------------------------
+
+test fetch_miss_isi
+msr=00000020
+insn 60000000                     # never fetched: empty table -> ISI
+expect pc=00000400 srr0=00001000 srr1=40000020 msr=00000000
+end
+
+test fetch_noexec_segment_isi
+msr=00000020
+sr0=10000000                      # N=1
+insn 60000000
+expect pc=00000400 srr0=00001000 srr1=10000020 msr=00000000
+end
+
+test fetch_via_ibat_executes
+msr=00000020
+ibatu0=00000002 ibatl0=00000002   # identity 128KB, supervisor, RW
+insn 3860002A                     # li r3,42
+expect r3=0000002A pc=00001004
+end
+
+test fetch_guarded_ibat_isi
+msr=00000020
+ibatu0=00000002 ibatl0=0000000A   # G=1
+insn 60000000
+expect pc=00000400 srr0=00001000 srr1=10000020 msr=00000000
+end
+
+test fetch_guarded_pte_isi_no_r
+msr=00000020
+sr0=00000005 sdr1=00090000        # pc 0x1000: pageIndex 1, hash 4 -> PTEG 0x90100
+mem@00090100=800002800000200A     # G=1 in WIMG
+insn 60000000
+expect pc=00000400 srr0=00001000 srr1=10000020 mem@00090104=0000200A
+end
+
+# ---- direct-store (T=1) — unsupported on the 7400 --------------------------
+
+test direct_store_data_dsi
+msr=00000010 r4=00003000
+sr0=80000000
+insn 80640000                     # lwz r3,0(r4)
+expect pc=00000300 srr0=00001000 srr1=00000010 dar=00003000 dsisr=04000000
+end
+
+test direct_store_store_dsi
+msr=00000010 r3=DEADBEEF r4=00003000
+sr0=80000000
+insn 90640000                     # stw r3,0(r4)
+expect pc=00000300 srr0=00001000 srr1=00000010 dar=00003000 dsisr=06000000
+end
+
+test direct_store_fetch_isi
+msr=00000020
+sr0=80000000
+insn 60000000
+expect pc=00000400 srr0=00001000 srr1=10000020 msr=00000000
+end
+
+# ---- dcbz WIMG rule --------------------------------------------------------
+
+test dcbz_cache_inhibited_alignment
+msr=00000010 r4=00003010
+dbatu0=00001FFE dbatl0=00000022   # I=1 in WIMG
+mem@00003010=AABBCCDD
+insn 7C0027EC                     # dcbz 0,r4 -> block 0x3000
+expect pc=00000600 srr0=00001000 srr1=00000010 dar=00003000 dsisr=00017C00 mem@00003010=AABBCCDD
+end
+
+test dcbz_zeroes_translated_block
+msr=00000010 r4=00003010
+dbatu0=00001FFE dbatl0=00000002
+mem@00003010=AABBCCDD mem@0000301C=EEFF0011
+insn 7C0027EC                     # dcbz 0,r4
+expect pc=00001004 mem@00003010=00000000 mem@0000301C=00000000
+end

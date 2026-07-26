@@ -66,7 +66,11 @@ void Cpu::step()
     }
 
     const u32 cia = st.pc;
-    const u32 insn = bus->read32(cia);
+    u32 insn;
+    if (!fetch32(cia, insn)) { // ISI raised by translate()
+        tick(1);
+        return;
+    }
     const InsnDesc* d = decode(insn);
     if (!d) {
         ++unknownWords[insn];

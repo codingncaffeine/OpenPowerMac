@@ -5,6 +5,7 @@ add_library(opmcore STATIC
   src/cpu.cpp
   src/exec_int.cpp
   src/exceptions.cpp
+  src/mmu.cpp
 )
 
 target_include_directories(opmcore PUBLIC include)

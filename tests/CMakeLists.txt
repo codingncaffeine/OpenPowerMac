@@ -2,6 +2,7 @@ add_executable(opm_unit
   unit/main.cpp
   unit/test_bits.cpp
   unit/test_decode.cpp
+  unit/test_mmu.cpp
 )
 target_link_libraries(opm_unit PRIVATE opmcore)
 target_include_directories(opm_unit SYSTEM PRIVATE vendor)

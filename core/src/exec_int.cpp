@@ -423,102 +423,142 @@ void h_extsh(Cpu& c, u32 i, const InsnDesc&)
 
 // ---- loads / stores --------------------------------------------------------
 
-#define LOADD(NAME, EXPR)                                                     \
+// EAKIND is eaD or eaX; READER a readV* member; XF maps the raw value v to
+// the register value. A translation fault bails before any register write.
+#define LOAD(NAME, EAKIND, READER, XF)                                        \
     void NAME(Cpu& c, u32 i, const InsnDesc&)                                 \
     {                                                                         \
-        const u32 ea = eaD(c, i);                                             \
-        c.st.gpr[f_rt(i)] = (EXPR);                                           \
-    }
-#define LOADX(NAME, EXPR)                                                     \
-    void NAME(Cpu& c, u32 i, const InsnDesc&)                                 \
-    {                                                                         \
-        const u32 ea = eaX(c, i);                                             \
-        c.st.gpr[f_rt(i)] = (EXPR);                                           \
+        u32 v;                                                                \
+        if (!c.READER(EAKIND(c, i), v))                                       \
+            return;                                                           \
+        c.st.gpr[f_rt(i)] = (XF);                                             \
     }
 
-LOADD(h_lwz, c.bus->read32(ea))
-LOADD(h_lbz, c.bus->read8(ea))
-LOADD(h_lhz, c.bus->read16(ea))
-LOADD(h_lha, static_cast<u32>(sext16(c.bus->read16(ea))))
-LOADX(h_lwzx, c.bus->read32(ea))
-LOADX(h_lbzx, c.bus->read8(ea))
-LOADX(h_lhzx, c.bus->read16(ea))
-LOADX(h_lhax, static_cast<u32>(sext16(c.bus->read16(ea))))
-#undef LOADD
-#undef LOADX
+LOAD(h_lwz, eaD, readV32, v)
+LOAD(h_lbz, eaD, readV8, v)
+LOAD(h_lhz, eaD, readV16, v)
+LOAD(h_lha, eaD, readV16, static_cast<u32>(sext16(v)))
+LOAD(h_lwzx, eaX, readV32, v)
+LOAD(h_lbzx, eaX, readV8, v)
+LOAD(h_lhzx, eaX, readV16, v)
+LOAD(h_lhax, eaX, readV16, static_cast<u32>(sext16(v)))
+#undef LOAD
 
 void updRa(Cpu& c, u32 insn, u32 ea) { c.st.gpr[f_ra(insn)] = ea; }
 
-void raiseAlign(Cpu& c, u32 ea)
+// Alignment-exception DSISR opcode image per PEM Table 6-14 (cross-checked
+// against the Table 6-15 inverse mapping for stwcx./dcbz/lswi/lmw rows):
+// [15-16]=insn[29-30] X-form else 0, [17]=insn[25] X / insn[5] D,
+// [18-21]=insn[21-24] X / insn[1-4] D, [22-26]=insn[6-10], [27-31]=insn[11-15].
+// RECEIPT: [22-26] is architecturally undefined for dcbz and [27-31] for
+// non-update non-string forms — we fill both from the image anyway.
+u32 alignDsisr(u32 i)
 {
-    c.st.dar = ea; // DSISR opcode-image bits land with the P3 MMU work
+    u32 d = (ppcbits(i, 6, 10) << 5) | ppcbits(i, 11, 15);
+    if (f_primary(i) == 31u)
+        d |= (ppcbits(i, 29, 30) << 15) | (ppcbit(i, 25) << 14) |
+             (ppcbits(i, 21, 24) << 10);
+    else
+        d |= (ppcbit(i, 5) << 14) | (ppcbits(i, 1, 4) << 10);
+    return d;
+}
+
+void raiseAlign(Cpu& c, u32 insn, u32 ea)
+{
+    c.st.dar = ea;
+    c.st.dsisr = alignDsisr(insn);
     c.raiseExc(Exc::Alignment, c.st.pc - 4, 0);
 }
 
-void h_lwzu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = c.bus->read32(ea); updRa(c, i, ea); }
-void h_lbzu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = c.bus->read8(ea); updRa(c, i, ea); }
-void h_lhzu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = c.bus->read16(ea); updRa(c, i, ea); }
-void h_lhau(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = static_cast<u32>(sext16(c.bus->read16(ea))); updRa(c, i, ea); }
-void h_lwzux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.st.gpr[f_rt(i)] = c.bus->read32(ea); updRa(c, i, ea); }
-void h_lbzux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.st.gpr[f_rt(i)] = c.bus->read8(ea); updRa(c, i, ea); }
-void h_lhzux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.st.gpr[f_rt(i)] = c.bus->read16(ea); updRa(c, i, ea); }
-void h_lhaux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.st.gpr[f_rt(i)] = static_cast<u32>(sext16(c.bus->read16(ea))); updRa(c, i, ea); }
+// Update forms write neither rD nor rA when the access faults.
+#define LOADU(NAME, EAKIND, READER, XF)                                       \
+    void NAME(Cpu& c, u32 i, const InsnDesc&)                                 \
+    {                                                                         \
+        const u32 ea = EAKIND(c, i);                                          \
+        u32 v;                                                                \
+        if (!c.READER(ea, v))                                                 \
+            return;                                                           \
+        c.st.gpr[f_rt(i)] = (XF);                                             \
+        updRa(c, i, ea);                                                      \
+    }
 
-void h_stw(Cpu& c, u32 i, const InsnDesc&)   { c.bus->write32(eaD(c, i), c.st.gpr[f_rt(i)]); }
-void h_stb(Cpu& c, u32 i, const InsnDesc&)   { c.bus->write8(eaD(c, i), static_cast<u8>(c.st.gpr[f_rt(i)])); }
-void h_sth(Cpu& c, u32 i, const InsnDesc&)   { c.bus->write16(eaD(c, i), static_cast<u16>(c.st.gpr[f_rt(i)])); }
-void h_stwx(Cpu& c, u32 i, const InsnDesc&)  { c.bus->write32(eaX(c, i), c.st.gpr[f_rt(i)]); }
-void h_stbx(Cpu& c, u32 i, const InsnDesc&)  { c.bus->write8(eaX(c, i), static_cast<u8>(c.st.gpr[f_rt(i)])); }
-void h_sthx(Cpu& c, u32 i, const InsnDesc&)  { c.bus->write16(eaX(c, i), static_cast<u16>(c.st.gpr[f_rt(i)])); }
-void h_stwu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.bus->write32(ea, c.st.gpr[f_rt(i)]); updRa(c, i, ea); }
-void h_stbu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.bus->write8(ea, static_cast<u8>(c.st.gpr[f_rt(i)])); updRa(c, i, ea); }
-void h_sthu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.bus->write16(ea, static_cast<u16>(c.st.gpr[f_rt(i)])); updRa(c, i, ea); }
-void h_stwux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.bus->write32(ea, c.st.gpr[f_rt(i)]); updRa(c, i, ea); }
-void h_stbux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.bus->write8(ea, static_cast<u8>(c.st.gpr[f_rt(i)])); updRa(c, i, ea); }
-void h_sthux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); c.bus->write16(ea, static_cast<u16>(c.st.gpr[f_rt(i)])); updRa(c, i, ea); }
+LOADU(h_lwzu, eaD, readV32, v)
+LOADU(h_lbzu, eaD, readV8, v)
+LOADU(h_lhzu, eaD, readV16, v)
+LOADU(h_lhau, eaD, readV16, static_cast<u32>(sext16(v)))
+LOADU(h_lwzux, eaX, readV32, v)
+LOADU(h_lbzux, eaX, readV8, v)
+LOADU(h_lhzux, eaX, readV16, v)
+LOADU(h_lhaux, eaX, readV16, static_cast<u32>(sext16(v)))
+#undef LOADU
+
+void h_stw(Cpu& c, u32 i, const InsnDesc&)   { c.writeV32(eaD(c, i), c.st.gpr[f_rt(i)]); }
+void h_stb(Cpu& c, u32 i, const InsnDesc&)   { c.writeV8(eaD(c, i), c.st.gpr[f_rt(i)]); }
+void h_sth(Cpu& c, u32 i, const InsnDesc&)   { c.writeV16(eaD(c, i), c.st.gpr[f_rt(i)]); }
+void h_stwx(Cpu& c, u32 i, const InsnDesc&)  { c.writeV32(eaX(c, i), c.st.gpr[f_rt(i)]); }
+void h_stbx(Cpu& c, u32 i, const InsnDesc&)  { c.writeV8(eaX(c, i), c.st.gpr[f_rt(i)]); }
+void h_sthx(Cpu& c, u32 i, const InsnDesc&)  { c.writeV16(eaX(c, i), c.st.gpr[f_rt(i)]); }
+void h_stwu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); if (c.writeV32(ea, c.st.gpr[f_rt(i)])) updRa(c, i, ea); }
+void h_stbu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); if (c.writeV8(ea, c.st.gpr[f_rt(i)])) updRa(c, i, ea); }
+void h_sthu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); if (c.writeV16(ea, c.st.gpr[f_rt(i)])) updRa(c, i, ea); }
+void h_stwux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); if (c.writeV32(ea, c.st.gpr[f_rt(i)])) updRa(c, i, ea); }
+void h_stbux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); if (c.writeV8(ea, c.st.gpr[f_rt(i)])) updRa(c, i, ea); }
+void h_sthux(Cpu& c, u32 i, const InsnDesc&) { const u32 ea = eaX(c, i); if (c.writeV16(ea, c.st.gpr[f_rt(i)])) updRa(c, i, ea); }
 
 void h_lwbrx(Cpu& c, u32 i, const InsnDesc&)
 {
-    const u32 v = c.bus->read32(eaX(c, i));
+    u32 v;
+    if (!c.readV32(eaX(c, i), v))
+        return;
     c.st.gpr[f_rt(i)] = ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
                         ((v >> 8) & 0xFF00u) | (v >> 24);
 }
 void h_lhbrx(Cpu& c, u32 i, const InsnDesc&)
 {
-    const u16 v = c.bus->read16(eaX(c, i));
-    c.st.gpr[f_rt(i)] = static_cast<u32>(((v & 0xFFu) << 8) | (v >> 8));
+    u32 v;
+    if (!c.readV16(eaX(c, i), v))
+        return;
+    c.st.gpr[f_rt(i)] = ((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu);
 }
 void h_stwbrx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 v = c.st.gpr[f_rt(i)];
-    c.bus->write32(eaX(c, i), ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
-                                  ((v >> 8) & 0xFF00u) | (v >> 24));
+    c.writeV32(eaX(c, i), ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+                              ((v >> 8) & 0xFF00u) | (v >> 24));
 }
 void h_sthbrx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 v = c.st.gpr[f_rt(i)];
-    c.bus->write16(eaX(c, i), static_cast<u16>(((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu)));
+    c.writeV16(eaX(c, i), ((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu));
 }
 
+// Multi-access instructions perform their accesses in sequence; a fault
+// partway leaves earlier accesses done (architecturally permitted — the
+// instruction restarts from scratch after the handler resolves the fault).
 void h_lmw(Cpu& c, u32 i, const InsnDesc&)
 {
     u32 ea = eaD(c, i);
     if (ea & 3u) {
-        raiseAlign(c, ea);
+        raiseAlign(c, i, ea);
         return;
     }
-    for (u32 r = f_rt(i); r <= 31; ++r, ea += 4)
-        c.st.gpr[r] = c.bus->read32(ea);
+    for (u32 r = f_rt(i); r <= 31; ++r, ea += 4) {
+        u32 v;
+        if (!c.readV32(ea, v))
+            return;
+        c.st.gpr[r] = v;
+    }
 }
 void h_stmw(Cpu& c, u32 i, const InsnDesc&)
 {
     u32 ea = eaD(c, i);
     if (ea & 3u) {
-        raiseAlign(c, ea);
+        raiseAlign(c, i, ea);
         return;
     }
     for (u32 r = f_rt(i); r <= 31; ++r, ea += 4)
-        c.bus->write32(ea, c.st.gpr[r]);
+        if (!c.writeV32(ea, c.st.gpr[r]))
+            return;
 }
 
 void loadString(Cpu& c, u32 rt, u32 ea, u32 n)
@@ -528,7 +568,10 @@ void loadString(Cpu& c, u32 rt, u32 ea, u32 n)
     if (n)
         c.st.gpr[r] = 0;
     while (n--) {
-        c.st.gpr[r] |= static_cast<u32>(c.bus->read8(ea++)) << sh;
+        u32 v;
+        if (!c.readV8(ea++, v))
+            return;
+        c.st.gpr[r] |= v << sh;
         if (sh == 0) {
             sh = 24;
             r = (r + 1) & 31u;
@@ -544,7 +587,8 @@ void storeString(Cpu& c, u32 rs, u32 ea, u32 n)
     u32 r = rs;
     u32 sh = 24;
     while (n--) {
-        c.bus->write8(ea++, static_cast<u8>(c.st.gpr[r] >> sh));
+        if (!c.writeV8(ea++, c.st.gpr[r] >> sh))
+            return;
         if (sh == 0) {
             sh = 24;
             r = (r + 1) & 31u;
@@ -576,25 +620,36 @@ void h_lwarx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 ea = eaX(c, i);
     if (ea & 3u) {
-        raiseAlign(c, ea);
+        raiseAlign(c, i, ea);
         return;
     }
+    u32 pa;
+    if (!c.translate(ea, false, false, pa))
+        return; // faulting lwarx establishes no reservation
     c.st.resvValid = true;
-    c.st.resvAddr = ea & ~31u;
-    c.st.gpr[f_rt(i)] = c.bus->read32(ea);
+    c.st.resvAddr = pa & ~31u; // reservation granule is physical (bus-snooped)
+    c.st.gpr[f_rt(i)] = c.bus->read32(pa);
 }
 void h_stwcx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 ea = eaX(c, i);
     if (ea & 3u) {
-        raiseAlign(c, ea);
+        raiseAlign(c, i, ea);
         return;
     }
+    // Translation/protection is checked even when no reservation exists (PEM
+    // 7.6.3: the protection-violation row applies to a non-storing stwcx.).
+    // A DSI here leaves the reservation intact — the instruction restarts.
+    // RECEIPT: a translating-but-not-storing stwcx. sets R and C via the
+    // table walk; Table 7-17 row 8 permits this ("Maybe").
+    u32 pa;
+    if (!c.translate(ea, true, false, pa))
+        return;
     // UM: the reservation is non-specific with respect to this processor —
     // a stwcx. succeeds (and always clears) regardless of address match.
     const bool ok = c.st.resvValid;
     if (ok)
-        c.bus->write32(ea, c.st.gpr[f_rt(i)]);
+        c.bus->write32(pa, c.st.gpr[f_rt(i)]);
     c.st.resvValid = false;
     c.setCrField(0, (ok ? 2u : 0u) | ((c.st.xer >> 31) & 1u));
 }
@@ -762,9 +817,20 @@ void h_mfsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.sr[c.st
 void h_nop(Cpu&, u32, const InsnDesc&) {}
 void h_dcbz(Cpu& c, u32 i, const InsnDesc&)
 {
-    const u32 ea = eaX(c, i) & ~31u;
+    // dcbz to a write-through or cache-inhibited page/block raises an
+    // alignment exception (UM 4.6.6 / Table 5-4; xnu relies on this).
+    // The HID0[DCE]=0 "cache disabled" alignment condition is a P6 item —
+    // the cache model does not exist yet (ledger row).
+    const u32 ea = eaX(c, i) & ~31u; // 32-byte block: never crosses a page
+    u32 pa, wimg;
+    if (!c.translate(ea, true, false, pa, &wimg))
+        return;
+    if (wimg & 0xCu) { // W or I
+        raiseAlign(c, i, ea);
+        return;
+    }
     for (u32 k = 0; k < 32; k += 4)
-        c.bus->write32(ea + k, 0);
+        c.bus->write32(pa + k, 0);
 }
 
 } // namespace

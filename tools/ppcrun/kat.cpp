@@ -86,6 +86,22 @@ bool applyKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
     if (key == "srr1") { c.st.srr1 = static_cast<u32>(hexval(val)); return true; }
     if (key == "dec") { c.st.dec = static_cast<u32>(hexval(val)); return true; }
     if (key == "dar") { c.st.dar = static_cast<u32>(hexval(val)); return true; }
+    if (key == "dsisr") { c.st.dsisr = static_cast<u32>(hexval(val)); return true; }
+    if (key == "sdr1") { c.st.sdr1 = static_cast<u32>(hexval(val)); return true; }
+    if (key.size() >= 3 && key.compare(0, 2, "sr") == 0 &&
+        isdigit(static_cast<unsigned char>(key[2]))) {
+        c.st.sr[std::stoul(key.substr(2)) & 15u] = static_cast<u32>(hexval(val));
+        return true;
+    }
+    if (key.size() == 6 && key.compare(1, 3, "bat") == 0 &&
+        (key[0] == 'i' || key[0] == 'd') && (key[4] == 'u' || key[4] == 'l') &&
+        key[5] >= '0' && key[5] <= '3') { // [id]bat[ul][0-3]
+        const u32 n = static_cast<u32>(key[5] - '0');
+        u32* reg = key[0] == 'i' ? (key[4] == 'u' ? c.st.ibatu : c.st.ibatl)
+                                 : (key[4] == 'u' ? c.st.dbatu : c.st.dbatl);
+        reg[n] = static_cast<u32>(hexval(val));
+        return true;
+    }
     if (key == "resv") {
         c.st.resvValid = true;
         c.st.resvAddr = static_cast<u32>(hexval(val)) & ~31u;
@@ -124,6 +140,7 @@ bool checkKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
     if (key == "srr1") return expectU32(c.st.srr1);
     if (key == "dec") return expectU32(c.st.dec);
     if (key == "dar") return expectU32(c.st.dar);
+    if (key == "dsisr") return expectU32(c.st.dsisr);
     if (key == "resv") {
         const bool want = hexval(val) != 0;
         if (c.st.resvValid == want)

@@ -373,9 +373,13 @@ int generate(const char* mnem, const fs::path& outDir, u32 count)
         g.bus.rng = &g.rng;
         g.cpu.attach(g.bus);
         g.cpu.reset();
-        // Supervisor-ish random MSR: PR/FP/ME/FE0/FE1/IR/DR/RI/PM mix;
-        // EE/SE/BE/IP kept 0 so single-step vectors stay self-contained.
-        g.cpu.st.msr = g.rng.word() & 0x00007936u;
+        // Supervisor-ish random MSR: PR/FP/ME/FE0/FE1/RI/PM mix; EE/SE/BE/IP
+        // kept 0 so single-step vectors stay self-contained, and IR/DR kept 0
+        // because translation is live from P3 — untranslated random states
+        // would fetch-fault. Dedicated MMU chapters come once mmu.kat and the
+        // demand-paging kernel are proven (they need BAT/SR/SDR1 in the state
+        // record).
+        g.cpu.st.msr = g.rng.word() & 0x00007906u;
         g.cpu.st.srr0 = g.rng.word() & ~3u;
         g.cpu.st.srr1 = g.rng.word() & 0x0000FF73u;
         g.cpu.st.dec = g.rng.word();

@@ -158,6 +158,21 @@ struct Cpu {
 
     bool userMode() const { return (st.msr & msr::PR) != 0; }
 
+    // MMU (mmu.cpp). translate() raises ISI/DSI itself on failure. wimg, if
+    // requested, receives the access's WIMG nibble (W=8,I=4,M=2,G=1; real
+    // mode reads as 0b0011 per PEM 7.2).
+    bool translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg = nullptr);
+    bool readV(u32 ea, u32 len, u64& out);
+    bool writeV(u32 ea, u32 len, u64 v);
+    bool fetch32(u32 ea, u32& insn);
+
+    bool readV8(u32 ea, u32& v)  { u64 t; if (!readV(ea, 1, t)) return false; v = static_cast<u32>(t); return true; }
+    bool readV16(u32 ea, u32& v) { u64 t; if (!readV(ea, 2, t)) return false; v = static_cast<u32>(t); return true; }
+    bool readV32(u32 ea, u32& v) { u64 t; if (!readV(ea, 4, t)) return false; v = static_cast<u32>(t); return true; }
+    bool writeV8(u32 ea, u32 v)  { return writeV(ea, 1, v & 0xFFu); }
+    bool writeV16(u32 ea, u32 v) { return writeV(ea, 2, v & 0xFFFFu); }
+    bool writeV32(u32 ea, u32 v) { return writeV(ea, 4, v); }
+
     // --- state helpers shared by executors ---
     void setCr0(u32 val)
     {

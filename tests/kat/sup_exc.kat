@@ -1,52 +1,54 @@
 # Exception model: vectoring, SRR0/SRR1 composition, MSR transitions.
-# Init MSR 0x9032 = EE|ME|IR|DR|RI (no SE/BE, IP=0 -> vectors at 0x00000000).
+# Init MSR 0x9002 = EE|ME|RI (no SE/BE, IP=0 -> vectors at 0x00000000).
+# IR/DR stay off here — translation has its own suite (mmu.kat); with them
+# set these single-step tests would fetch-fault against empty BATs/PTEGs.
 
 test sc_vectors
-msr=00009032
+msr=00009002
 insn 44000002                     # sc
-expect pc=00000C00 srr0=00001004 srr1=00009032 msr=00001000
+expect pc=00000C00 srr0=00001004 srr1=00009002 msr=00001000
 end
 
 test sc_with_ip_high_vectors
-msr=00009072
+msr=00009042
 insn 44000002                     # sc, MSR[IP]=1
-expect pc=FFF00C00 srr0=00001004 srr1=00009072 msr=00001040
+expect pc=FFF00C00 srr0=00001004 srr1=00009042 msr=00001040
 end
 
 test trap_always
-msr=00009032
+msr=00009002
 insn 0FE00000                     # twi 31,0,0
-expect pc=00000700 srr0=00001000 srr1=00029032 msr=00001000
+expect pc=00000700 srr0=00001000 srr1=00029002 msr=00001000
 end
 
 test illegal_tlbia
-msr=00009032
+msr=00009002
 insn 7C0002E4                     # tlbia — not implemented on the 7400
-expect pc=00000700 srr0=00001000 srr1=00089032 msr=00001000
+expect pc=00000700 srr0=00001000 srr1=00089002 msr=00001000
 end
 
 test privileged_mfmsr_in_user_mode
-msr=0000D032
+msr=0000D002
 insn 7C0000A6                     # mfmsr r0 with MSR[PR]=1
-expect pc=00000700 srr0=00001000 srr1=0004D032 msr=00001000
+expect pc=00000700 srr0=00001000 srr1=0004D002 msr=00001000
 end
 
 test fp_unavailable
-msr=00009032
+msr=00009002
 insn FC201090                     # fmr f1,f2 with MSR[FP]=0
-expect pc=00000800 srr0=00001000 srr1=00009032 msr=00001000
+expect pc=00000800 srr0=00001000 srr1=00009002 msr=00001000
 end
 
 test vec_unavailable
-msr=00009032
+msr=00009002
 insn 10221800                     # vaddubm with MSR[VEC]=0
-expect pc=00000F20 srr0=00001000 srr1=00009032 msr=00001000
+expect pc=00000F20 srr0=00001000 srr1=00009002 msr=00001000
 end
 
 test dssall_runs_without_vec
-msr=00009032
+msr=00009002
 insn 7E00066C                     # dssall — stream hints are never VEC-gated
-expect pc=00001004 msr=00009032
+expect pc=00001004 msr=00009002
 end
 
 test rfi_restores
@@ -56,7 +58,7 @@ expect pc=00002000 msr=0000FF73
 end
 
 test alignment_stwcx_odd_ea
-msr=00009032 r4=CAFEBABE r5=00002001 resv=00002000
+msr=00009002 r4=CAFEBABE r5=00002001 resv=00002000
 insn 7C85312D                     # stwcx. to odd address
-expect pc=00000600 srr0=00001000 srr1=00009032 msr=00001000 dar=00002001
+expect pc=00000600 srr0=00001000 srr1=00009002 msr=00001000 dar=00002001 dsisr=00010885
 end

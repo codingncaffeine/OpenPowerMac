@@ -292,6 +292,11 @@ u32 synth(GenCtx& g, const InsnDesc& d)
     case Pat::LSWI:
         w |= (rt << 21) | (ra << 16) | (r.u(1, 16) << 11);
         break;
+    case Pat::SC:
+        w |= 2u; // canonical sc form (bit 30 set)
+        break;
+    case Pat::NONE:
+        break;
     case Pat::RA_RB: // dcbz
         if (ra == 0)
             ra = 7;
@@ -321,8 +326,13 @@ void emitState(FILE* f, const CpuState& s, const std::map<u32, u8>& ram)
     fprintf(f, "{\"pc\":%u,\"gprs\":[", s.pc);
     for (int i = 0; i < 32; ++i)
         fprintf(f, "%u%s", s.gpr[i], i == 31 ? "" : ",");
-    fprintf(f, "],\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"resv\":[%u,%u],\"ram\":[",
-            s.cr, s.xer, s.lr, s.ctr, s.resvValid ? 1u : 0u, s.resvAddr);
+    fprintf(f,
+            "],\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"msr\":%u,"
+            "\"srr0\":%u,\"srr1\":%u,\"dec\":%u,\"tb\":%llu,"
+            "\"resv\":[%u,%u],\"ram\":[",
+            s.cr, s.xer, s.lr, s.ctr, s.msr, s.srr0, s.srr1, s.dec,
+            static_cast<unsigned long long>(s.tb), s.resvValid ? 1u : 0u,
+            s.resvAddr);
     bool first = true;
     for (const auto& [a, v] : ram) {
         fprintf(f, "%s[%u,%u]", first ? "" : ",", a, v);
@@ -363,7 +373,13 @@ int generate(const char* mnem, const fs::path& outDir, u32 count)
         g.bus.rng = &g.rng;
         g.cpu.attach(g.bus);
         g.cpu.reset();
-        g.cpu.st.msr = 0;
+        // Supervisor-ish random MSR: PR/FP/ME/FE0/FE1/IR/DR/RI/PM mix;
+        // EE/SE/BE/IP kept 0 so single-step vectors stay self-contained.
+        g.cpu.st.msr = g.rng.word() & 0x00007936u;
+        g.cpu.st.srr0 = g.rng.word() & ~3u;
+        g.cpu.st.srr1 = g.rng.word() & 0x0000FF73u;
+        g.cpu.st.dec = g.rng.word();
+        g.cpu.st.tb = g.rng.u(0, 0xFFFF);
         for (int i = 0; i < 32; ++i)
             g.cpu.st.gpr[i] = g.rng.word();
         g.cpu.st.cr = g.rng.word();
@@ -432,6 +448,11 @@ const char* kV0[] = {
     "lwbrx", "lhbrx", "stwbrx", "sthbrx",
     "lmw", "stmw", "lswi", "stswi", "lswx", "stswx",
     "lwarx", "stwcx.", "dcbz",
+    // supervisor / exception chapters (P2): vectored outcomes recorded
+    "sc", "tw", "twi", "rfi", "mfmsr", "mtmsr",
+    "mfspr", "mtspr", "mftb",
+    "mtsr", "mfsr", "mtsrin", "mfsrin",
+    "tlbia", "fsqrt", "fsqrts",
 };
 
 } // namespace

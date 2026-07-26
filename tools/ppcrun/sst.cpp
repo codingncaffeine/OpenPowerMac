@@ -149,6 +149,11 @@ void applyState(Cpu& c, MapBus& bus, const JVal& s)
     c.st.xer = static_cast<u32>(s.get("xer")->num);
     c.st.lr = static_cast<u32>(s.get("lr")->num);
     c.st.ctr = static_cast<u32>(s.get("ctr")->num);
+    c.st.msr = static_cast<u32>(s.get("msr")->num);
+    c.st.srr0 = static_cast<u32>(s.get("srr0")->num);
+    c.st.srr1 = static_cast<u32>(s.get("srr1")->num);
+    c.st.dec = static_cast<u32>(s.get("dec")->num);
+    c.st.tb = s.get("tb")->num;
     const JVal* rv = s.get("resv");
     c.st.resvValid = rv->arr[0].num != 0;
     c.st.resvAddr = static_cast<u32>(rv->arr[1].num);
@@ -179,6 +184,11 @@ bool checkState(Cpu& c, MapBus& bus, const JVal& s, std::string& diff)
     chk("xer", static_cast<u32>(s.get("xer")->num), c.st.xer);
     chk("lr", static_cast<u32>(s.get("lr")->num), c.st.lr);
     chk("ctr", static_cast<u32>(s.get("ctr")->num), c.st.ctr);
+    chk("msr", static_cast<u32>(s.get("msr")->num), c.st.msr);
+    chk("srr0", static_cast<u32>(s.get("srr0")->num), c.st.srr0);
+    chk("srr1", static_cast<u32>(s.get("srr1")->num), c.st.srr1);
+    chk("dec", static_cast<u32>(s.get("dec")->num), c.st.dec);
+    chk("tb.lo", static_cast<u32>(s.get("tb")->num), static_cast<u32>(c.st.tb));
     const JVal* rv = s.get("resv");
     chk("resv.valid", static_cast<u32>(rv->arr[0].num), c.st.resvValid ? 1u : 0u);
     if (rv->arr[0].num)

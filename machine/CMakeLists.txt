@@ -1,4 +1,5 @@
 add_library(opmmachine STATIC
+  src/ati.cpp
   src/gossamer.cpp
   src/macio.cpp
   src/cuda.cpp

@@ -45,7 +45,7 @@ PciConfig::PciConfig()
         put16(a, 0x06, 0x0280);
         a.cfg[0x08] = 0x5C;
         put16(a, 0x0A, 0x0300); // VGA-compatible display
-        a.barMask[0] = ~(kAtiAperture - 1); // 16 MB memory aperture
+        a.barMask[0] = ~(kAtiAperture - 1); // 8 MB memory aperture
         a.barMask[1] = 0xFFFFFF00u | 1u;    // 256 B I/O
         a.cfg[0x14] = 0x01;                 // io space bit
         a.barMask[2] = 0xFFFFF000u;         // 4 KB register aperture
@@ -105,6 +105,44 @@ void PciConfig::writeData(u32 lane, u8 v)
     if (reg < 0x08)
         return; // IDs and command/status simplified: read-only
     d->cfg[reg] = v;
+    if (devNum == 0 && reg >= 0x80)
+        ++memGen_; // memory-interface state changed
+}
+
+// MPC106 UM 3.2.8.1: lower boundary = ext<<28 | start<<20; upper boundary =
+// extEnd<<28 | end<<20 | 0xFFFFF; enables are the 0xA0 byte; the whole
+// interface answers only after MCCR1[MEMGO] (bit 19) is set.
+void PciConfig::ramBanks(RamBank out[8]) const
+{
+    auto it = devs_.find(0x00);
+    if (it == devs_.end())
+        return;
+    const u8* c = it->second.cfg;
+    for (u32 n = 0; n < 8; ++n) {
+        const u32 lowBank = n & 3u;
+        const u32 base = n < 4 ? 0x80u : 0x84u;
+        const u32 extBase = n < 4 ? 0x88u : 0x8Cu;
+        const u32 endBase = n < 4 ? 0x90u : 0x94u;
+        const u32 extEndBase = n < 4 ? 0x98u : 0x9Cu;
+        const u32 start = c[base + lowBank];
+        const u32 ext = c[extBase + lowBank] & 3u;
+        const u32 end = c[endBase + lowBank];
+        const u32 extEnd = c[extEndBase + lowBank] & 3u;
+        out[n].lo = (ext << 28) | (start << 20);
+        out[n].hi = (extEnd << 28) | (end << 20) | 0xFFFFFu;
+        out[n].en = (c[0xA0] >> n) & 1u;
+    }
+}
+
+bool PciConfig::memGo() const
+{
+    auto it = devs_.find(0x00);
+    if (it == devs_.end())
+        return false;
+    const u8* c = it->second.cfg;
+    const u32 mccr1 = u32(c[0xF0]) | (u32(c[0xF1]) << 8) |
+                      (u32(c[0xF2]) << 16) | (u32(c[0xF3]) << 24);
+    return (mccr1 & (1u << 19)) != 0;
 }
 
 u32 PciConfig::atiBase() const

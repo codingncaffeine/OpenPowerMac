@@ -5,8 +5,11 @@
 //             stored with read-back so the ROM's PICR-style programming
 //             sticks;
 //   dev 0x10  "Heathrow" mac-io (106B:0010), BAR0 preset to 0xF3000000;
-//   dev 0x12  ATI 3D Rage Pro (1002:4750), a 16 MB memory aperture BAR the
-//             firmware sizes and assigns — the route to first light.
+//   dev 0x12  ATI 3D Rage Pro (1002:4750), an 8 MB memory aperture BAR the
+//             firmware sizes and assigns — the route to first light. The
+//             size is pinned by the ROM driver's register probe at
+//             aperture+0x7FF800 (mach64 layout: register file in the top
+//             2 KB of an 8 MB aperture).
 // Config registers are little-endian bytes; CONFIG_DATA is a 4-byte window
 // (the CPU reads it with byte-reversed loads). BAR sizing implements the
 // write-ones-read-mask protocol. RECEIPT: device numbers follow the common
@@ -35,12 +38,30 @@ public:
     // The ATI memory aperture as currently programmed (0 = not assigned).
     u32 atiBase() const;
     u32 atiIoBase() const; // BAR1 (I/O), 0 = not assigned
-    static constexpr u32 kAtiAperture = 0x01000000u; // 16 MB
+    static constexpr u32 kAtiAperture = 0x00800000u; // 8 MB
+
+    // Grackle memory interface (MPC106 UM 3.2.8): per-bank boundaries from
+    // the starting/ending address registers, enables from 0xA0, all gated
+    // by MCCR1[MEMGO]. The bus consults these to decode 60x RAM accesses.
+    struct RamBank {
+        u32 lo = 0, hi = 0;
+        bool en = false;
+    };
+    void ramBanks(RamBank out[8]) const;
+    bool memGo() const;
+    u32 memGeneration() const { return memGen_; }
 
     struct Probe {
         u64 reads = 0, writes = 0;
     };
     const std::map<u32, Probe>& probeLog() const { return probeLog_; }
+
+    // Debug: raw config bytes of a device (nullptr if absent).
+    const u8* cfgBytes(u32 devNum) const
+    {
+        auto it = devs_.find(devNum);
+        return it == devs_.end() ? nullptr : it->second.cfg;
+    }
 
 private:
     struct Dev {
@@ -53,6 +74,7 @@ private:
 
     std::map<u32, Dev> devs_;
     u32 addr_ = 0;
+    u32 memGen_ = 0; // bumped on any memory-interface register write
     std::map<u32, Probe> probeLog_;
 };
 

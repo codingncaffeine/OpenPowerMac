@@ -15,6 +15,7 @@
 // deterministic stubs to be replaced by real models in M1/M2. Every touched
 // stub address is logged (deduped, capped) — the log IS the M0 deliverable.
 
+#include "opm/ati.hpp"
 #include "opm/bus.hpp"
 #include "opm/macio.hpp"
 #include "opm/pci.hpp"
@@ -37,8 +38,26 @@ public:
     u64 romWrites() const { return romWrites_; }
     MacIo& macio() { return macio_; }
     PciConfig& pci() { return pci_; }
-    const std::map<u32, Touch>& atiRegLog() const { return atiRegLog_; }
-    const std::vector<u8>& atiMem() const { return atiMem_; }
+    AtiRage& ati() { return ati_; }
+
+    // Debug instrument: watch a physical window (the OS's hash table) and
+    // record every word write into it, stamped with *stamp.
+    struct HtabWr {
+        u64 at;
+        u32 pa, oldW, newW;
+    };
+    u32 htabWatchBase = 0, htabWatchSize = 0;
+    const u64* stamp = nullptr;
+    const std::vector<HtabWr>& htabLog() const { return htabLog_; }
+
+    // Debug instrument: every byte written into Grackle (dev 0) config
+    // space, stamped — the memory-init story in write order.
+    struct CfgWr {
+        u64 at;
+        u32 reg;
+        u8 val;
+    };
+    const std::vector<CfgWr>& cfgLog() const { return cfgLog_; }
 
     u8 read8(u32 pa) override;
     u16 read16(u32 pa) override;
@@ -62,20 +81,28 @@ private:
     void writeWord(u32 pa, u32 v);
     void logStub(u32 pa, bool write, u32 v);
 
+    // Grackle 60x memory decode: banks from the config registers, gated by
+    // MEMGO; a claimed access yields an offset into the backing DIMM with
+    // wrap aliasing. Unclaimed 60x-memory accesses master-abort.
+    bool ramClaim(u32 pa, u32& off);
+    PciConfig::RamBank banks_[8];
+    u32 bankGen_ = ~0u;
+    bool memGo_ = false;
+
     bool atiWindow(u32 pa, u32& off) const;
-    u8 atiRead8(u32 off);
-    void atiWrite8(u32 off, u8 v);
     bool atiIoWindow(u32 pa, u32& off) const;
 
     std::vector<u8> ram_;
     std::vector<u8> rom_;
     MacIo macio_;
     PciConfig pci_;
-    std::vector<u8> atiMem_;
-    u8 atiIo_[256] = {}; // I/O-space registers: read-back store (PLL etc.)
-    std::map<u32, Touch> atiRegLog_;
+    AtiRage ati_;
+    void logCfgWrite(u32 lane, u8 v);
+
     u32 configAddr_ = 0;
     std::map<u32, Touch> stubLog_;
+    std::vector<HtabWr> htabLog_;
+    std::vector<CfgWr> cfgLog_;
     u64 romWrites_ = 0;
 };
 

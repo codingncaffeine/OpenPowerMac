@@ -348,6 +348,24 @@ u8 MacIo::read8(u32 off)
         const u32 reg = (off - kViaBase) >> 9;
         return viaRead(reg); // reads flood; the write timeline tells the story
     }
+    // ESCC (Z8530), MacRISC layout: ch B ctrl/data +0x13000/+0x13010,
+    // ch A ctrl/data +0x13020/+0x13030. RR0 is live STATUS, not a latch —
+    // serving the written byte back made OF's console drain read a stale
+    // WR command with bit 0 set: an endless phantom-input stream its boot
+    // script treated as a break -> abort (pinned empirically). Rx idle +
+    // Tx always-empty is the honest quiet-line answer.
+    if (off >= 0x13000 && off < 0x13040) {
+        const u32 ch = (off >> 5) & 1u; // 0 = B, 1 = A
+        if (off & 0x10u)
+            return 0; // data: Rx FIFO empty (undefined byte; RECEIPT zeros)
+        const u32 p = esccPtr_[ch] & 15u;
+        esccPtr_[ch] = 0; // any ctrl access resets the pointer
+        switch (p) {
+        case 0: return 0x04; // RR0: Tx buffer empty, no Rx char, no breaks
+        case 1: return 0x01; // RR1: all sent
+        default: return esccWr_[ch][p]; // benign read-back of the WR file
+        }
+    }
     // Interrupt-controller events: expose the VIA source in both candidate
     // banks (+0x10 and +0x20 event words) and both candidate bits (LE 18
     // and 31) so the wake handler's reads pin the real layout empirically.
@@ -378,6 +396,21 @@ void MacIo::write8(u32 off, u8 v)
     if (off == kIntClear || off == kIntClear + 1 || off == kIntClear + 2 ||
         off == kIntClear + 3) {
         return; // write-only clear; events are derived live
+    }
+    if (off >= 0x13000 && off < 0x13040) {
+        const u32 ch = (off >> 5) & 1u;
+        if (off & 0x10u)
+            return; // Tx data: swallowed, transmitter is always ready
+        u32& ptr = esccPtr_[ch];
+        if (ptr == 0) {
+            ptr = v & 7u;
+            if (((v >> 3) & 7u) == 1u)
+                ptr |= 8u; // WR0 "point high" command
+        } else {
+            esccWr_[ch][ptr & 15u] = v;
+            ptr = 0;
+        }
+        return;
     }
     if (log_.size() < kLogCap || log_.count(off)) {
         Touch& t = log_[off];

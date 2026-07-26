@@ -4,8 +4,9 @@ add_executable(opm_unit
   unit/test_decode.cpp
   unit/test_mmu.cpp
   unit/test_chip.cpp
+  unit/test_ati.cpp
 )
-target_link_libraries(opm_unit PRIVATE opmcore)
+target_link_libraries(opm_unit PRIVATE opmcore opmmachine)
 target_include_directories(opm_unit SYSTEM PRIVATE vendor)
 if(MSVC)
   # Vendored doctest is third-party; exempt it from new-compiler warnings.

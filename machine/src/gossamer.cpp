@@ -6,20 +6,59 @@ namespace {
 inline constexpr size_t kStubLogCap = 512;
 }
 
+static_assert(PciConfig::kAtiAperture == AtiRage::kAperture,
+              "config-space BAR sizing must match the device aperture");
+
 GossamerBus::GossamerBus(size_t ramBytes, std::vector<u8> rom)
-    : ram_(ramBytes, 0), rom_(std::move(rom)),
-      atiMem_(PciConfig::kAtiAperture, 0)
+    : ram_(ramBytes, 0), rom_(std::move(rom))
 {
     rom_.resize(0x00400000u, 0xFF); // 4 MB window, unprogrammed bytes read FF
+    // The DIMM-wrap aliasing mask requires a power-of-two module.
+    if (ramBytes == 0 || (ramBytes & (ramBytes - 1)) != 0)
+        ram_.assign(0x04000000u, 0);
+}
+
+// Grackle 60x-memory decode (MPC106 UM 3.2.8): a physical address is RAM
+// only while MEMGO is set and a configured, enabled bank claims it. The
+// claimed offset wraps modulo the backing DIMM — the address-line aliasing
+// a real undersized DIMM exhibits, and exactly the signal the ROM's memory
+// sizing algorithm measures. RECEIPT: wrap-modulo-DIMM approximates the
+// row/column aliasing of the real array (MCCR1 bank-row fields not yet
+// honored); refine per-geometry when the sizer demands it.
+bool GossamerBus::ramClaim(u32 pa, u32& off)
+{
+    if (bankGen_ != pci_.memGeneration()) {
+        bankGen_ = pci_.memGeneration();
+        pci_.ramBanks(banks_);
+        memGo_ = pci_.memGo();
+    }
+    if (!memGo_)
+        return false;
+    for (const auto& b : banks_) {
+        if (b.en && pa >= b.lo && pa <= b.hi) {
+            off = (pa - b.lo) & (static_cast<u32>(ram_.size()) - 1u);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool GossamerBus::atiWindow(u32 pa, u32& off) const
 {
     const u32 base = pci_.atiBase();
-    if (base == 0 || pa < base || pa - base >= PciConfig::kAtiAperture)
-        return false;
-    off = pa - base;
-    return true;
+    if (base != 0 && pa - base < AtiRage::kAperture) {
+        off = pa - base;
+        return true;
+    }
+    // Personality alias: the ROM's video driver addresses the onboard chip
+    // at 0x8F800000 regardless of where enumeration parked BAR0 (observed
+    // register probes at 0x8FFFF800 while BAR0 held 0x82000000). RECEIPT:
+    // fixed decode kept until the real ROM's BAR-assignment story is pinned.
+    if (pa - 0x8F800000u < AtiRage::kAperture) {
+        off = pa - 0x8F800000u;
+        return true;
+    }
+    return false;
 }
 
 // Grackle maps PCI I/O space at 0xFE000000; the ATI's I/O BAR lands inside.
@@ -32,25 +71,13 @@ bool GossamerBus::atiIoWindow(u32 pa, u32& off) const
     return true;
 }
 
-u8 GossamerBus::atiRead8(u32 off)
+void GossamerBus::logCfgWrite(u32 lane, u8 v)
 {
-    // The mach64-family register file lives in the top of the aperture;
-    // log that traffic so polled status registers announce themselves.
-    if (off >= PciConfig::kAtiAperture - 0x1000 &&
-        (atiRegLog_.size() < 256 || atiRegLog_.count(off)))
-        ++atiRegLog_[off].reads;
-    return atiMem_[off];
-}
-
-void GossamerBus::atiWrite8(u32 off, u8 v)
-{
-    if (off >= PciConfig::kAtiAperture - 0x1000 &&
-        (atiRegLog_.size() < 256 || atiRegLog_.count(off))) {
-        Touch& t = atiRegLog_[off];
-        ++t.writes;
-        t.lastWrite = v;
-    }
-    atiMem_[off] = v;
+    const u32 a = pci_.addr();
+    if (!(a & 0x80000000u) || ((a >> 11) & 0x1Fu) != 0)
+        return; // only Grackle itself
+    if (cfgLog_.size() < 4096)
+        cfgLog_.push_back({stamp ? *stamp : 0, (a & 0xFCu) | lane, v});
 }
 
 void GossamerBus::logStub(u32 pa, bool write, u32 v)
@@ -72,8 +99,9 @@ void GossamerBus::logStub(u32 pa, bool write, u32 v)
 
 u8 GossamerBus::read8(u32 pa)
 {
-    if (pa < ram_.size())
-        return ram_[pa];
+    u32 ro;
+    if (pa < 0x40000000u && ramClaim(pa, ro))
+        return ram_[ro];
     if (pa >= kRomAlias)
         return rom_[pa & kRomMask];
     if (pa >= kMacIoBase && pa < kMacIoBase + kMacIoSize)
@@ -82,17 +110,20 @@ u8 GossamerBus::read8(u32 pa)
         return pci_.readData(pa & 3u);
     u32 off;
     if (atiWindow(pa, off))
-        return atiRead8(off);
+        return ati_.apRead8(off);
     if (atiIoWindow(pa, off))
-        return atiIo_[off];
+        return ati_.ioRead8(off);
     const u32 w = readWord(pa & ~3u);
     return static_cast<u8>(w >> (8 * (3 - (pa & 3u))));
 }
 
 u16 GossamerBus::read16(u32 pa)
 {
-    if (pa + 1 < ram_.size())
-        return static_cast<u16>((ram_[pa] << 8) | ram_[pa + 1]);
+    u32 ro;
+    if (pa < 0x40000000u && ramClaim(pa, ro)) {
+        const u32 m = static_cast<u32>(ram_.size()) - 1u;
+        return static_cast<u16>((ram_[ro] << 8) | ram_[(ro + 1) & m]);
+    }
     if (pa >= kRomAlias)
         return static_cast<u16>((rom_[pa & kRomMask] << 8) |
                                 rom_[(pa + 1) & kRomMask]);
@@ -105,9 +136,12 @@ u16 GossamerBus::read16(u32 pa)
 
 u32 GossamerBus::read32(u32 pa)
 {
-    if (pa + 3 < ram_.size())
-        return (u32(ram_[pa]) << 24) | (u32(ram_[pa + 1]) << 16) |
-               (u32(ram_[pa + 2]) << 8) | u32(ram_[pa + 3]);
+    u32 ro;
+    if (pa < 0x40000000u && ramClaim(pa, ro)) {
+        const u32 m = static_cast<u32>(ram_.size()) - 1u;
+        return (u32(ram_[ro]) << 24) | (u32(ram_[(ro + 1) & m]) << 16) |
+               (u32(ram_[(ro + 2) & m]) << 8) | u32(ram_[(ro + 3) & m]);
+    }
     if (pa >= kRomAlias) {
         const u32 off = pa & kRomMask;
         return (u32(rom_[off]) << 24) | (u32(rom_[off + 1]) << 16) |
@@ -124,11 +158,13 @@ u32 GossamerBus::read32(u32 pa)
                (u32(pci_.readData(2)) << 8) | u32(pci_.readData(3));
     u32 off;
     if (atiWindow(pa, off))
-        return (u32(atiRead8(off)) << 24) | (u32(atiRead8(off + 1)) << 16) |
-               (u32(atiRead8(off + 2)) << 8) | u32(atiRead8(off + 3));
+        return (u32(ati_.apRead8(off)) << 24) |
+               (u32(ati_.apRead8(off + 1)) << 16) |
+               (u32(ati_.apRead8(off + 2)) << 8) | u32(ati_.apRead8(off + 3));
     if (atiIoWindow(pa, off))
-        return (u32(atiIo_[off]) << 24) | (u32(atiIo_[off + 1]) << 16) |
-               (u32(atiIo_[off + 2]) << 8) | u32(atiIo_[off + 3]);
+        return (u32(ati_.ioRead8(off)) << 24) |
+               (u32(ati_.ioRead8(off + 1)) << 16) |
+               (u32(ati_.ioRead8(off + 2)) << 8) | u32(ati_.ioRead8(off + 3));
     return readWord(pa);
 }
 
@@ -139,8 +175,13 @@ u64 GossamerBus::read64(u32 pa)
 
 void GossamerBus::write8(u32 pa, u8 v)
 {
-    if (pa < ram_.size()) {
-        ram_[pa] = v;
+    u32 ro;
+    if (pa < 0x40000000u && ramClaim(pa, ro)) {
+        if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
+            ram_[ro] != v && htabLog_.size() < 65536)
+            htabLog_.push_back({stamp ? *stamp : 0, ro | 0x80000000u,
+                                ram_[ro], v});
+        ram_[ro] = v;
         return;
     }
     if (pa >= kRomAlias) {
@@ -152,16 +193,17 @@ void GossamerBus::write8(u32 pa, u8 v)
         return;
     }
     if ((pa & ~3u) == kConfigData) {
+        logCfgWrite(pa & 3u, v);
         pci_.writeData(pa & 3u, v);
         return;
     }
     u32 off;
     if (atiWindow(pa, off)) {
-        atiWrite8(off, v);
+        ati_.apWrite8(off, v);
         return;
     }
     if (atiIoWindow(pa, off)) {
-        atiIo_[off] = v;
+        ati_.ioWrite8(off, v);
         return;
     }
     writeWord(pa & ~3u, static_cast<u32>(v) << (8 * (3 - (pa & 3u))));
@@ -169,9 +211,18 @@ void GossamerBus::write8(u32 pa, u8 v)
 
 void GossamerBus::write16(u32 pa, u16 v)
 {
-    if (pa + 1 < ram_.size()) {
-        ram_[pa] = static_cast<u8>(v >> 8);
-        ram_[pa + 1] = static_cast<u8>(v);
+    u32 ro;
+    if (pa < 0x40000000u && ramClaim(pa, ro)) {
+        const u32 m = static_cast<u32>(ram_.size()) - 1u;
+        if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
+            htabLog_.size() < 65536) {
+            const u32 old = (u32(ram_[ro]) << 8) | ram_[(ro + 1) & m];
+            if (old != v)
+                htabLog_.push_back({stamp ? *stamp : 0, ro | 0x40000000u,
+                                    old, v});
+        }
+        ram_[ro] = static_cast<u8>(v >> 8);
+        ram_[(ro + 1) & m] = static_cast<u8>(v);
         return;
     }
     if (pa >= kRomAlias) {
@@ -188,11 +239,22 @@ void GossamerBus::write16(u32 pa, u16 v)
 
 void GossamerBus::write32(u32 pa, u32 v)
 {
-    if (pa + 3 < ram_.size()) {
-        ram_[pa] = static_cast<u8>(v >> 24);
-        ram_[pa + 1] = static_cast<u8>(v >> 16);
-        ram_[pa + 2] = static_cast<u8>(v >> 8);
-        ram_[pa + 3] = static_cast<u8>(v);
+    u32 ro;
+    if (pa < 0x40000000u && ramClaim(pa, ro)) {
+        const u32 m = static_cast<u32>(ram_.size()) - 1u;
+        if (htabWatchSize && ro - htabWatchBase < htabWatchSize &&
+            htabLog_.size() < 65536) {
+            const u32 old = (u32(ram_[ro]) << 24) |
+                            (u32(ram_[(ro + 1) & m]) << 16) |
+                            (u32(ram_[(ro + 2) & m]) << 8) |
+                            u32(ram_[(ro + 3) & m]);
+            if (old != v)
+                htabLog_.push_back({stamp ? *stamp : 0, ro, old, v});
+        }
+        ram_[ro] = static_cast<u8>(v >> 24);
+        ram_[(ro + 1) & m] = static_cast<u8>(v >> 16);
+        ram_[(ro + 2) & m] = static_cast<u8>(v >> 8);
+        ram_[(ro + 3) & m] = static_cast<u8>(v);
         return;
     }
     if (pa >= kRomAlias) {
@@ -208,6 +270,10 @@ void GossamerBus::write32(u32 pa, u32 v)
         return;
     }
     if ((pa & ~3u) == kConfigData) {
+        logCfgWrite(0, static_cast<u8>(v >> 24));
+        logCfgWrite(1, static_cast<u8>(v >> 16));
+        logCfgWrite(2, static_cast<u8>(v >> 8));
+        logCfgWrite(3, static_cast<u8>(v));
         pci_.writeData(0, static_cast<u8>(v >> 24));
         pci_.writeData(1, static_cast<u8>(v >> 16));
         pci_.writeData(2, static_cast<u8>(v >> 8));
@@ -216,17 +282,17 @@ void GossamerBus::write32(u32 pa, u32 v)
     }
     u32 off;
     if (atiWindow(pa, off)) {
-        atiWrite8(off, static_cast<u8>(v >> 24));
-        atiWrite8(off + 1, static_cast<u8>(v >> 16));
-        atiWrite8(off + 2, static_cast<u8>(v >> 8));
-        atiWrite8(off + 3, static_cast<u8>(v));
+        ati_.apWrite8(off, static_cast<u8>(v >> 24));
+        ati_.apWrite8(off + 1, static_cast<u8>(v >> 16));
+        ati_.apWrite8(off + 2, static_cast<u8>(v >> 8));
+        ati_.apWrite8(off + 3, static_cast<u8>(v));
         return;
     }
     if (atiIoWindow(pa, off)) {
-        atiIo_[off] = static_cast<u8>(v >> 24);
-        atiIo_[off + 1] = static_cast<u8>(v >> 16);
-        atiIo_[off + 2] = static_cast<u8>(v >> 8);
-        atiIo_[off + 3] = static_cast<u8>(v);
+        ati_.ioWrite8(off, static_cast<u8>(v >> 24));
+        ati_.ioWrite8(off + 1, static_cast<u8>(v >> 16));
+        ati_.ioWrite8(off + 2, static_cast<u8>(v >> 8));
+        ati_.ioWrite8(off + 3, static_cast<u8>(v));
         return;
     }
     writeWord(pa, v);

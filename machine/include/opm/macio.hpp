@@ -81,6 +81,10 @@ private:
     bool syncing_ = false;   // null transaction: TIP asserted while idle
     bool treq_ = false;      // Cuda asserting TREQ (active state, not wire level)
 
+    // ESCC (Z8530) channels B/A: register pointer + WR file per channel.
+    u32 esccPtr_[2] = {};
+    u8 esccWr_[2][16] = {};
+
     std::map<u32, Touch> log_;
     std::vector<ViaOp> viaTrace_;
     std::vector<XferByte> xferLog_;

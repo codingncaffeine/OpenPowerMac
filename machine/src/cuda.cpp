@@ -22,6 +22,27 @@ inline constexpr u8 cSetAutoRate = 0x14;
 inline constexpr u8 cSetDeviceList = 0x19;
 inline constexpr u8 cGetDeviceList = 0x1A;
 inline constexpr u8 cOneSecond = 0x1B;
+inline constexpr u8 cGetSetIic = 0x22;
+inline constexpr u8 cCombinedIic = 0x25;
+
+// The DIMM's SPD EEPROM, reachable over the Cuda's I2C (the ROM sizes
+// memory from it — pinned empirically: HWInit's combined-format read of
+// device 0xA6 sub 0 is the memory probe, and an empty answer becomes a
+// zero-DIMM machine). One 64 MB SDRAM module: 12 row bits, 9 column bits,
+// 4 internal banks, 64-bit wide, PC100-class timing, non-ECC, JEDEC
+// checksum in byte 63. RECEIPT: authored here to describe the machine's
+// backing RAM; slot address matches the ROM's first probe.
+inline constexpr u8 kSpdAddr = 0xA6;
+inline constexpr u8 kSpd[64] = {
+    0x80, 0x08, 0x04, 0x0C, 0x09, 0x01, 0x40, 0x00, // written/size/type/geom
+    0x01, 0x0A, 0x07, 0x00, 0x80, 0x08, 0x00, 0x01, // volt/cycle/refresh
+    0x0F, 0x04, 0x0C, 0x01, 0x01, 0x00, 0x0E, 0x0A, // burst/banks/CAS
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, // ... density 64 MB
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, // SPD rev / checksum
+};
 
 // RECEIPT: the RTC base is a fixed instant (2000-01-01 00:00:00 in the
 // Mac 1904 epoch) plus whatever SET_TIME establishes — deterministic runs,
@@ -85,6 +106,42 @@ void Cuda::pseudo(const std::vector<u8>& pkt)
     case cAutopoll:
         autopoll_ = pkt.size() > 2 && pkt[2] != 0;
         break;
+    case cCombinedIic: {
+        // {01, 25, writeAddr, subaddr, readAddr}: I2C combined-format read.
+        // Serve the SPD EEPROM; anything else answers as an absent device.
+        const u8 wa = pkt.size() > 2 ? pkt[2] : 0;
+        const u8 sub = pkt.size() > 3 ? pkt[3] : 0;
+        if (wa == kSpdAddr) {
+            u32 sum = 0;
+            for (u32 k = 0; k < 63; ++k)
+                sum += kSpd[k];
+            for (u32 k = sub; k < 64; ++k)
+                r.push_back(k == 63 ? static_cast<u8>(sum) : kSpd[k]);
+        } else {
+            reply({kError, 0, cmd}); // I2C NACK: no such device
+            return;
+        }
+        break;
+    }
+    case cGetSetIic: {
+        // {01, 22, addr, sub, [data]}: plain I2C. Read direction when the
+        // address has the read bit; SPD only, absent otherwise.
+        const u8 wa = pkt.size() > 2 ? pkt[2] : 0;
+        if ((wa & 0xFEu) == (kSpdAddr & 0xFEu)) {
+            if (wa & 1u) {
+                const u8 sub = pkt.size() > 3 ? pkt[3] : 0;
+                u32 sum = 0;
+                for (u32 k = 0; k < 63; ++k)
+                    sum += kSpd[k];
+                for (u32 k = sub; k < 64; ++k)
+                    r.push_back(k == 63 ? static_cast<u8>(sum) : kSpd[k]);
+            }
+        } else {
+            reply({kError, 0, cmd});
+            return;
+        }
+        break;
+    }
     case cWarmStart:
     case cMsReset:
     case cResetSystem:

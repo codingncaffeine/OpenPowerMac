@@ -276,7 +276,7 @@ int main(int argc, char** argv)
     bool vdumped = false, wildCaught = false, mqProbed = false;
     u32 late300Shown = 0, ext500Shown = 0;
     bool ctx500Seen = false, chimeEntryShown = false;
-    u32 prev68kPc = 0, ring68k[128] = {}, ring68kAt = 0;
+    u32 prev68kPc = 0, ring68k[128] = {}, ring68kAt = 0, idScanShown = 0;
     struct InsRec {
         u64 at;
         u32 r8, r9, r10, r12, r13;
@@ -508,6 +508,16 @@ int main(int argc, char** argv)
         if (cpu.st.gpr[24] != prev68kPc) {
             prev68kPc = cpu.st.gpr[24];
             ring68k[ring68kAt++ & 127u] = prev68kPc;
+            // D7 is BoxFlags during the 68K boot era; log every value
+            // change with the 68K pc that produced it.
+            static u32 lastD7 = 0xEE00EE00u;
+            if (idScanShown < 80 && cpu.st.gpr[15] != lastD7) {
+                lastD7 = cpu.st.gpr[15];
+                ++idScanShown;
+                printf("-- D7 %08x at pc68=%08x (prev %08x)\n", lastD7,
+                       prev68kPc,
+                       ring68k[(ring68kAt + 126u) & 127u]);
+            }
             if (!chimeEntryShown && (prev68kPc & 0xFFFFFF00u) == 0xFFCCE100u) {
                 chimeEntryShown = true;
                 printf("-- 68k trail into the chime (last 128 pcs):\n   ");

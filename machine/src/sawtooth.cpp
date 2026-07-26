@@ -18,7 +18,7 @@ static constexpr u8 kSpd[64] = {
 
 u8 SawtoothBus::spdByte() const
 {
-    const u8 idx = i2cSub_ & 63u;
+    const u8 idx = i2c_[0].sub & 63u;
     if (idx == 63) {
         u32 sum = 0;
         for (u32 k = 0; k < 63; ++k)

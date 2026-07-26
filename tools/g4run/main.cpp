@@ -63,6 +63,7 @@ int main(int argc, char** argv)
                     // ROM's wall-clock waits (harness lever, not machine
                     // truth — timings scale, ordering is preserved)
     const char* ramDumpPath = nullptr;
+    bool serialCr = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -85,6 +86,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--fast-tb"))
             fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--dump-ram")) ramDumpPath = next();
+        else if (!strcmp(a, "--serial-cr")) serialCr = true;
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -112,6 +114,9 @@ int main(int argc, char** argv)
         }
         return 0;
     }
+
+    if (serialCr)
+        bus.injectSerial(""); // CR in the escape window -> serial console
 
     Cpu cpu;
     cpu.attach(bus);
@@ -147,6 +152,14 @@ int main(int argc, char** argv)
         }
         if (fastTb)
             cpu.tick(fastTb);
+        static u64 lastFetchSample = 0;
+        if (cpu.st.pc == 0xFF80B640u &&
+            executed - lastFetchSample > 20000000ull) {
+            lastFetchSample = executed;
+            printf("-- C@ sample @%llu addr=%08x lr=%08x\n",
+                   static_cast<unsigned long long>(executed),
+                   cpu.st.gpr[20], cpu.st.lr);
+        }
         static u32 blinkShown = 0;
         if ((cpu.st.pc == 0xFFF82960u || cpu.st.pc == 0xFFF829D0u) &&
             blinkShown < 2) {
@@ -253,14 +266,31 @@ int main(int argc, char** argv)
                    ul[k].val, ul[k].pc);
     }
     {
+        const auto& cl = bus.cfgLog();
+        printf("-- pci config accesses (%zu; bus latch val pc r/w):\n",
+               cl.size());
+        for (size_t k = 0; k < cl.size() && k < 60; ++k)
+            printf("   f%u %08x %08x pc=%08x %c @%llu\n",
+                   ((cl[k].pa >> 28) & 7u) * 2u, cl[k].pa & 0x00FFFFFFu,
+                   cl[k].val, cl[k].pc & ~1u, (cl[k].pc & 1u) ? 'w' : 'r',
+                   static_cast<unsigned long long>(cl[k].at));
+    }
+    {
         const auto& il = bus.i2cLog();
         printf("-- i2c transactions (%zu; addr|sub -> byte):\n", il.size());
-        for (size_t k = 0; k < il.size() && k < 80; ++k)
+        for (size_t k = 0; k < il.size() && k < 140; ++k) {
+            if (il[k].pa & 0x01000000u) {
+                printf("   kw2 wr [%02x] <- %02x pc=%08x @%llu\n",
+                       (il[k].pa >> 8) & 0xFFu, il[k].pa & 0xFFu,
+                       il[k].pc, static_cast<unsigned long long>(il[k].at));
+                continue;
+            }
             printf("   %02x|%02x -> %s%02x pc=%08x @%llu\n",
                    (il[k].pa >> 8) & 0xFF, il[k].pa & 0xFF,
                    il[k].val == 0xFFFFFFFFu ? "nack " : "",
                    il[k].val & 0xFF, il[k].pc,
                    static_cast<unsigned long long>(il[k].at));
+        }
     }
     {
         const auto& sz = bus.sizeLog();
@@ -273,13 +303,18 @@ int main(int argc, char** argv)
     {
         const std::string& con = bus.console();
         printf("-- serial console (%zu bytes):\n", con.size());
-        if (!con.empty()) {
-            printf("%.*s\n", static_cast<int>(con.size() > 8192 ? 8192
-                                                                : con.size()),
-                   con.c_str());
-            if (con.size() > 8192)
-                printf("   ... (%zu more bytes)\n", con.size() - 8192);
+        const size_t lim = con.size() > 8192 ? 8192 : con.size();
+        for (size_t k = 0; k < lim; ++k) {
+            const char c = con[k];
+            if (c == '\n' || c == '\r' || (c >= 0x20 && c < 0x7F))
+                putchar(c == '\r' ? '\n' : c);
+            else
+                putchar('.');
         }
+        if (!con.empty())
+            putchar('\n');
+        if (con.size() > 8192)
+            printf("   ... (%zu more bytes)\n", con.size() - 8192);
     }
     {
         const auto& pl = bus.pmu().log;
@@ -304,7 +339,7 @@ int main(int argc, char** argv)
         printf("-- keylargo first-touch log (%zu offsets):\n", kl.size());
         size_t shown = 0;
         for (u32 pa : bus.macioOrder) {
-            if (++shown > 100) {
+            if (++shown > 600) {
                 printf("   ... %zu more\n", kl.size() - 100);
                 break;
             }

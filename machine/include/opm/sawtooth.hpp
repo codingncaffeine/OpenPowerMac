@@ -47,6 +47,24 @@ public:
         // family; 0x07 = "1.0.10", the post-fix revision (Linux-validated
         // constant table).
         unin_[3] = 0x07;
+        // PCI config seeds — mac-io KeyLargo at one-hot slot 23 on the
+        // f2 bus (the ROM's own identity probe at latch 0x00800000
+        // reg 0, observed @913). Identity per the Apple ID space:
+        // vendor 0x106B, device 0x0022, class ff (other), rev 3.
+        // Remaining registers of the device start as zero (writable
+        // store) rather than master-abort all-ones.
+        cfgSeed(1, 0x00800000u, 0x0022106Bu);
+        cfgSeed(1, 0x00800008u, 0xFF000003u);
+        for (u32 r = 0x04; r <= 0x3C; r += 4)
+            if (r != 0x08)
+                cfgSeed(1, 0x00800000u | r, 0);
+    }
+
+    void cfgSeed(u32 b, u32 latch, u32 nativeLeWord)
+    {
+        const u32 key = (b << 28) | (latch & 0x00FFFF00u) |
+                        ((latch & 0xFFu) & 0xFCu);
+        cfgSpace_[key] = nativeLeWord;
     }
 
     u8 read8(u32 pa) override { return static_cast<u8>(read(pa, 1)); }
@@ -107,8 +125,11 @@ public:
 
     // SCC (+0x13000): MacRISC layout — ctrl B/A at +0x00/+0x20, data B/A
     // at +0x10/+0x30. Enough Z8530 to drain transmit (RR0 TX-empty) and
-    // capture the ROM's serial console log verbatim.
+    // capture the ROM's serial console log verbatim. Bytes queued with
+    // injectSerial() appear as channel-A receive data — a CR during the
+    // firmware's 5-second escape window selects the serial console.
     const std::string& console() const { return console_; }
+    void injectSerial(const std::string& s) { rxQueue_ += s; }
 
     // Uni-North "Keywest" I2C at 0xF8001000 — the DIMM SPD bus. Byte
     // registers at +3 of each 0x10-strided word, protocol as the ROM's
@@ -121,6 +142,15 @@ public:
     //                 transaction chain
     //   +0x50 ADDR (dev|1 = read), +0x60 SUBADDR, +0x70 DATA
     static constexpr u32 kI2cBase = 0xF8001000u;
+
+    // Uni-North PCI config mechanism: three host bridges, each with an
+    // address latch at fX800000 and a data window at fXc00000..+7
+    // (X = 0 AGP, 2 mac-io/66MHz, 4 PCI slots). The latch value picks
+    // {type-0 one-hot slot | type-1 bus/devfn} + register; every data
+    // access is logged with the live latch so the ROM/OF teach us the
+    // exact addressing they use. Config registers come from a sparse
+    // store seeded with the devices the machine carries.
+    const std::vector<RegWr>& cfgLog() const { return cfgLog_; }
 
     // Unclaimed + ROM-write traffic, keyed by physical address.
     const std::map<u32, Acc>& accessLog() const { return log_; }
@@ -168,6 +198,8 @@ private:
             }
             if (off >= 0x13000u && off < 0x14000u)
                 return sccRead(off - 0x13000u);
+            if (off >= 0x18000u && off < 0x18100u)
+                return i2cRead(1, off - 0x18000u);
             const u32 v = get(kl_.data() + off, len);
             klNote(kMacIoBase + off, 0, false);
             return v;
@@ -185,9 +217,11 @@ private:
         if (pa >= kRomBase && pa - kRomBase + len <= rom_.size())
             return get(rom_.data() + (pa - kRomBase), len);
         if (pa >= kI2cBase && pa + len <= kI2cBase + 0x100u)
-            return i2cRead(pa - kI2cBase);
+            return i2cRead(0, pa - kI2cBase);
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize)
             return get(unin_ + (pa - kUniNBase), len);
+        if (const int b = cfgBus(pa); b >= 0)
+            return cfgAccess(static_cast<u32>(b), pa, 0, len, false);
         note(pa, 0, false);
         return len == 1 ? 0xFFu : len == 2 ? 0xFFFFu : 0xFFFFFFFFu;
     }
@@ -207,6 +241,10 @@ private:
                 sccWrite(off - 0x13000u, static_cast<u8>(v));
                 return;
             }
+            if (off >= 0x18000u && off < 0x18100u) {
+                i2cWrite(1, off - 0x18000u, static_cast<u8>(v));
+                return;
+            }
             put(kl_.data() + off, v, len);
             klNote(kMacIoBase + off, v, true);
             return;
@@ -223,7 +261,7 @@ private:
             return;
         }
         if (pa >= kI2cBase && pa + len <= kI2cBase + 0x100u) {
-            i2cWrite(pa - kI2cBase, static_cast<u8>(v));
+            i2cWrite(0, pa - kI2cBase, static_cast<u8>(v));
             return;
         }
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize) {
@@ -233,62 +271,162 @@ private:
                                     pcRef ? *pcRef : 0});
             return;
         }
+        if (const int b = cfgBus(pa); b >= 0) {
+            cfgAccess(static_cast<u32>(b), pa, v, len, true);
+            return;
+        }
         note(pa, v, true); // ROM/flash writes land here too, unapplied
     }
 
-    // Keywest engine. The SPD EEPROM answers for DIMM slot 1; a slave
-    // that isn't populated simply never acks (STATUS bit1 stays clear),
-    // which is the ROM's own not-present path.
-    u32 i2cRead(u32 off)
+    // -1 if pa is not a config latch/window; else the bridge index 0/1/2
+    // for f0/f2/f4.
+    static int cfgBus(u32 pa)
     {
-        if ((off & 0xFu) != 3u)
+        const u32 top = pa >> 24;
+        if (top != 0xF0u && top != 0xF2u && top != 0xF4u)
+            return -1;
+        const u32 sub = pa & 0x00FFFFFFu;
+        if (sub - 0x800000u < 4u || sub - 0xC00000u < 8u)
+            return static_cast<int>((top - 0xF0u) >> 1);
+        return -1;
+    }
+
+    u32 cfgAccess(u32 b, u32 pa, u32 v, u32 len, bool wr)
+    {
+        const bool isData = (pa & 0x00FFFFFFu) >= 0xC00000u;
+        if (!isData) { // address latch (LE device: stwbrx image arrives)
+            if (wr) {
+                u32 nat = 0;
+                for (u32 k = 0; k < len; ++k)
+                    nat |= ((v >> (8 * (len - 1 - k))) & 0xFFu)
+                           << (8 * (((pa + k) & 3u)));
+                cfgAddr_[b] = (cfgAddr_[b] & ~maskAt(pa, len)) |
+                              (nat & maskAt(pa, len));
+                return 0;
+            }
+            return swapLanes(cfgAddr_[b], pa, len);
+        }
+        const u32 reg = (cfgAddr_[b] & 0xFCu) | (pa & 7u);
+        const u32 key = (b << 28) | (cfgAddr_[b] & 0x00FFFF00u) |
+                        ((cfgAddr_[b] & 0xFFu) & 0xFCu) | (pa & 7u);
+        u32 out = 0xFFFFFFFFu;
+        auto it = cfgSpace_.find(key & ~3u);
+        if (it != cfgSpace_.end()) {
+            // stored native-LE word; serve the requested lanes
+            out = it->second;
+        }
+        if (wr) {
+            u32 word = it != cfgSpace_.end() ? it->second : 0u;
+            for (u32 k = 0; k < len; ++k) {
+                const u32 lane = (pa + k) & 3u;
+                word = (word & ~(0xFFu << (8 * lane))) |
+                       (((v >> (8 * (len - 1 - k))) & 0xFFu) << (8 * lane));
+            }
+            cfgSpace_[key & ~3u] = word;
+        }
+        if (cfgLog_.size() < 2048)
+            cfgLog_.push_back({stamp ? *stamp : 0,
+                               (b << 28) | (cfgAddr_[b] & 0x00FFFFFFu),
+                               wr ? v : out, (pcRef ? *pcRef : 0) |
+                                                 (wr ? 1u : 0u)});
+        (void)reg;
+        if (wr)
             return 0;
+        // reads assemble from the stored LE word's lanes, BE-composed
+        u32 r = 0;
+        for (u32 k = 0; k < len; ++k) {
+            const u32 lane = (pa + k) & 3u;
+            r = (r << 8) | ((out >> (8 * lane)) & 0xFFu);
+        }
+        return r;
+    }
+
+    static u32 maskAt(u32 pa, u32 len)
+    {
+        u32 m = 0;
+        for (u32 k = 0; k < len; ++k)
+            m |= 0xFFu << (8 * ((pa + k) & 3u));
+        return m;
+    }
+    static u32 swapLanes(u32 word, u32 pa, u32 len)
+    {
+        u32 r = 0;
+        for (u32 k = 0; k < len; ++k)
+            r = (r << 8) | ((word >> (8 * ((pa + k) & 3u))) & 0xFFu);
+        return r;
+    }
+
+    // Keywest engine (two cells: Uni-North's SPD bus, and KeyLargo's own
+    // at mac-io +0x18000 — the codec/sensor bus, no slaves modeled).
+    // A slave that isn't populated simply never acks (STATUS bit1 stays
+    // clear, ISR auto-advances to stop), which is the not-present path
+    // both the ROM and OF handle.
+    struct Keywest {
+        u8 mode = 0, ctrl = 0, isr = 0, addr = 0, sub = 0;
+        bool acked = false;
+    };
+    u32 i2cRead(u32 n, u32 off)
+    {
+        Keywest& kw = i2c_[n];
+        if ((off & 0xFu) != (n == 0 ? 3u : 0u))
+            return 0; // uni-n cell wires its bytes at lane 3, mac-io at 0
+
         switch (off >> 4) {
-        case 0: return i2cMode_;
-        case 1: return i2cCtrl_;
-        case 2: return i2cAcked_ ? 0x02u : 0x00u;
-        case 3: return i2cIsr_;
-        case 5: return i2cAddr_;
-        case 6: return i2cSub_;
-        case 7: return i2cAcked_ ? spdByte() : 0xFFu;
+        case 0: return kw.mode;
+        case 1: return kw.ctrl;
+        case 2: return kw.acked ? 0x02u : 0x00u;
+        case 3: return kw.isr;
+        case 5: return kw.addr;
+        case 6: return kw.sub;
+        case 7: return kw.acked ? slaveByte(n) : 0xFFu;
         default: return 0;
         }
     }
-    void i2cWrite(u32 off, u8 v)
+    void i2cWrite(u32 n, u32 off, u8 v)
     {
-        if ((off & 0xFu) != 3u)
+        Keywest& kw = i2c_[n];
+        if (n == 1 && i2cLog_.size() < 512)
+            i2cLog_.push_back({stamp ? *stamp : 0,
+                               0x01000000u | (off << 8) | v, 0,
+                               pcRef ? *pcRef : 0});
+        if ((off & 0xFu) != (n == 0 ? 3u : 0u))
             return;
         switch (off >> 4) {
-        case 0: i2cMode_ = v; break;
+        case 0: kw.mode = v; break;
         case 1:
-            i2cCtrl_ = v;
+            kw.ctrl = v;
             if ((v & 0x02u) && !(v & 0x01u)) { // launch address phase
-                i2cAcked_ = spdPresent();      // (|1 = AAK continuation)
-                i2cIsr_ |= 0x02u;
+                kw.acked = slavePresent(n);    // (|1 = AAK continuation)
+                kw.isr |= 0x02u;
                 if (i2cLog_.size() < 512)
                     i2cLog_.push_back({stamp ? *stamp : 0,
-                                       (u32(i2cAddr_) << 8) | i2cSub_,
-                                       i2cAcked_ ? spdByte() : 0xFFFFFFFFu,
+                                       (n << 16) | (u32(kw.addr) << 8) |
+                                           kw.sub,
+                                       kw.acked ? slaveByte(n)
+                                                : 0xFFFFFFFFu,
                                        pcRef ? *pcRef : 0});
             }
             break;
         case 3: // W1C; each clear advances the polled chain
-            if ((v & 0x02u) && (i2cIsr_ & 0x02u))
-                i2cIsr_ |= i2cAcked_ ? 0x01u  // acked: data byte ready
-                                     : 0x04u; // nacked: auto-stop done
+            if ((v & 0x02u) && (kw.isr & 0x02u))
+                kw.isr |= kw.acked ? 0x01u  // acked: data byte ready
+                                   : 0x04u; // nacked: auto-stop done
             if (v & 0x01u)
-                i2cIsr_ |= 0x04u; // data consumed -> stop completes
-            i2cIsr_ &= static_cast<u8>(~v);
+                kw.isr |= 0x04u; // data consumed -> stop completes
+            kw.isr &= static_cast<u8>(~v);
             break;
-        case 5: i2cAddr_ = v; break;
-        case 6: i2cSub_ = v; break;
+        case 5: kw.addr = v; break;
+        case 6: kw.sub = v; break;
         default: break;
         }
     }
-    bool spdPresent() const
+    bool slavePresent(u32 n) const
     {
-        return (i2cAddr_ & 0xFEu) == 0xA0u; // one DIMM, slot 1
+        if (n != 0)
+            return false; // mac-io cell: nothing on the bus yet
+        return (i2c_[0].addr & 0xFEu) == 0xA0u; // one DIMM, slot 1
     }
+    u8 slaveByte(u32 n) const { return n == 0 ? spdByte() : 0xFFu; }
     u8 spdByte() const;
 
     // Z8530, just enough for a polled console: pointer-register protocol
@@ -297,12 +435,18 @@ private:
     u32 sccRead(u32 off)
     {
         const u32 ch = (off >> 5) & 1u; // 0 = B (+0x00), 1 = A (+0x20)
-        if (off & 0x10u)
-            return 0; // data read: nothing buffered
+        if (off & 0x10u) { // data: serve queued RX on channel A
+            if (ch == 1 && !rxQueue_.empty()) {
+                const u8 b = static_cast<u8>(rxQueue_.front());
+                rxQueue_.erase(rxQueue_.begin());
+                return b;
+            }
+            return 0;
+        }
         const u32 r = sccPtr_[ch];
         sccPtr_[ch] = 0;
-        if (r == 0)
-            return 0x04u; // RR0: TX buffer empty
+        if (r == 0) // RR0: TX empty, RX-avail while channel A has data
+            return 0x04u | ((ch == 1 && !rxQueue_.empty()) ? 0x01u : 0x00u);
         return sccRr_[ch][r & 15u];
     }
     void sccWrite(u32 off, u8 v)
@@ -383,9 +527,11 @@ private:
     u32 sccPtr_[2] = {0, 0};
     u8 sccWr_[2][16] = {};
     u8 sccRr_[2][16] = {};
-    std::string console_;
-    u8 i2cMode_ = 0, i2cCtrl_ = 0, i2cIsr_ = 0, i2cAddr_ = 0, i2cSub_ = 0;
-    bool i2cAcked_ = false;
+    std::string console_, rxQueue_;
+    Keywest i2c_[2]; // 0 = Uni-North SPD bus, 1 = mac-io cell
+    u32 cfgAddr_[3] = {0, 0, 0};
+    std::map<u32, u32> cfgSpace_; // (bus<<28|latch&~3) -> native-LE word
+    std::vector<RegWr> cfgLog_;
 };
 
 } // namespace opm

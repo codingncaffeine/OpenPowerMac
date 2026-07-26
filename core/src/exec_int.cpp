@@ -903,6 +903,10 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         return;
     if (spr == 1017) { // L2CR: invalidate completes instantly, L2IP reads 0
         c.st.l2cr = v & ~1u;
+        if (v & 0x00200000u)
+            c.l2WipeAll(); // L2I global invalidate
+        if (v & 0x80000000u)
+            c.l2Resize(); // L2E: size the model per L2SIZ
         return;
     }
     if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception
@@ -915,6 +919,13 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
     if (spr == 284) { c.st.tb = (c.st.tb & 0xFFFFFFFF00000000ull) | v; return; }
     if (spr == 285) { c.st.tb = (c.st.tb & 0xFFFFFFFFull) | (static_cast<u64>(v) << 32); return; }
     if (spr == 287) return; // PVR is mfspr-only
+    if (spr == 1008) { // HID0: honor cache-control transitions
+        const u32 old = c.st.hid0;
+        c.st.hid0 = v;
+        if (~old & v & 0x00000400u)
+            c.l1dFlushAll(false); // DCFI 0->1: flash invalidate, no wb
+        return;
+    }
     *sprPtr(c, spr) = v;
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)
@@ -944,6 +955,10 @@ void h_mfsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.sr[c.st
 // ---- cache / sync / hints --------------------------------------------------
 
 void h_nop(Cpu&, u32, const InsnDesc&) {}
+void h_tlbie(Cpu& c, u32 i, const InsnDesc&)
+{
+    c.tlbInvalidateClass(c.st.gpr[f_rb(i)]);
+}
 void h_dcbz(Cpu& c, u32 i, const InsnDesc&)
 {
     // dcbz raises an alignment exception when the data cache is disabled
@@ -962,8 +977,26 @@ void h_dcbz(Cpu& c, u32 i, const InsnDesc&)
         raiseAlign(c, i, ea);
         return;
     }
-    for (u32 k = 0; k < 32; k += 4)
-        c.bus->write32(pa + k, 0);
+    c.dcbzLine(pa); // zeros exist in the cache only until written back
+}
+
+void h_dcbf(Cpu& c, u32 i, const InsnDesc&)
+{
+    u32 pa;
+    if (c.translate(eaX(c, i) & ~31u, false, false, pa))
+        c.dcbClean(pa, true);
+}
+void h_dcbst(Cpu& c, u32 i, const InsnDesc&)
+{
+    u32 pa;
+    if (c.translate(eaX(c, i) & ~31u, false, false, pa))
+        c.dcbClean(pa, false);
+}
+void h_dcbi(Cpu& c, u32 i, const InsnDesc&)
+{
+    u32 pa;
+    if (c.translate(eaX(c, i) & ~31u, true, false, pa))
+        c.dcbKill(pa);
 }
 
 } // namespace
@@ -1123,18 +1156,18 @@ void bindHandlers()
     setHandler("sync", h_nop);
     setHandler("isync", h_nop);
     setHandler("eieio", h_nop);
-    setHandler("dcbf", h_nop);
-    setHandler("dcbst", h_nop);
+    setHandler("dcbf", h_dcbf);
+    setHandler("dcbst", h_dcbst);
     setHandler("dcbt", h_nop);
     setHandler("dcbtst", h_nop);
     setHandler("dcba", h_nop);
-    setHandler("dcbi", h_nop);
+    setHandler("dcbi", h_dcbi);
     setHandler("icbi", h_nop);
     setHandler("dcbz", h_dcbz);
     setHandler("dst", h_nop);
     setHandler("dstst", h_nop);
     setHandler("dss", h_nop);
-    setHandler("tlbie", h_nop);
+    setHandler("tlbie", h_tlbie);
     setHandler("tlbsync", h_nop);
 
     bindFpuHandlers();

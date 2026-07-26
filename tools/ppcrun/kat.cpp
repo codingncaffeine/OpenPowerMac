@@ -257,6 +257,7 @@ int runFile(const fs::path& file, int& totalTests)
         bus.write32(cpu.st.pc, insn);
 
         cpu.step();
+        cpu.l1dFlushAll(true); // memory expectations observe through the cache
 
         std::string diff;
         bool pass = true;

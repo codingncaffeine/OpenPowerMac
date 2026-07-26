@@ -1,11 +1,16 @@
 // MMU: real mode, block address translation (4 IBAT + 4 DBAT pairs, blocks
-// to 256 MB), and the segment/hashed-page-table path with hardware table
-// search and R/C writeback. Per UM ch.5 / PEM ch.7.
+// to 256 MB), and the segment/hashed-page-table path through modeled TLBs
+// (128-entry, 2-way, 64-set I and D sides, LRU per set) with hardware
+// table search and R/C writeback on reload. Per UM ch.5 / PEM ch.7.
 //
-// No TLB contents are modeled: every access walks BATs/PTEGs, which is
-// strictly more coherent than real TLBs (never stale), so tlbie/tlbsync
-// remain architectural no-ops. A software TLB cache is a P8 performance
-// item, not a correctness one.
+// The TLBs are load-bearing, not an optimization. The original draft
+// walked the table on every access ("strictly more coherent than real
+// TLBs — never stale") — FALSIFIED 2026-07-26 by the Gossamer boot ROM:
+// its regime teardown byte-wipes the whole hash table while the wiping
+// thread keeps executing through translated code, I/O, and pager mappings,
+// relying on warm TLB entries until it issues tlbie. Software may depend
+// on translation staleness; the TLB models it. tlbie invalidates the
+// addressed congruence class in both TLBs; tlbsync stays a no-op (1 CPU).
 //
 // Fault status (verified against UM Tables 5-3/5-4 and PEM Tables 6-12/6-13):
 //   DSI DSISR: miss=bit1 (0x40000000), protection=bit4 (0x08000000),
@@ -136,8 +141,46 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                           : (sr & 0x40000000u) != 0;  // Ks
     const u32 vsid = sr & 0x00FFFFFFu;
 
-    // 3) Hashed page table search (primary, then secondary).
     const u32 pageIndex = (ea >> 12) & 0xFFFFu;
+
+    // 3) TLB lookup (EA[14-19] selects the set). A hit answers from the
+    // cached PTE image — including after the memory PTE was modified or
+    // wiped; that staleness is the architectural contract until tlbie.
+    TlbEntry(&tlbSet)[64][2] = fetch ? itlb : dtlb;
+    u8* tlbLru = fetch ? itlbLru : dtlbLru;
+    const u32 set = pageIndex & 63u;
+    if (!mmuProbe) {
+        for (u32 way = 0; way < 2; ++way) {
+            TlbEntry& e = tlbSet[set][way];
+            if (!e.v || e.vsid != vsid || e.pi != pageIndex)
+                continue;
+            if (fetch && (e.wimg & kWimgG)) {
+                raiseExc(Exc::Isi, cia, 0x10000000u);
+                return false;
+            }
+            if (!ppAllows(e.pp, key, write)) {
+                if (fetch)
+                    raiseExc(Exc::Isi, cia, 0x08000000u);
+                else
+                    dsi(0x08000000u);
+                return false;
+            }
+            if (write && !e.c) {
+                // First store through the entry: hardware runs a table
+                // search to set C. Modeled as invalidate + reload so the
+                // walk below re-reads the PTE (and faults if it is gone).
+                e.v = false;
+                break;
+            }
+            pa = e.rpn | (ea & 0xFFFu);
+            if (wimg)
+                *wimg = e.wimg;
+            tlbLru[set] = static_cast<u8>(way ^ 1u); // other way is LRU
+            return true;
+        }
+    }
+
+    // 4) Hashed page table search (primary, then secondary).
     const u32 api = pageIndex >> 10;
     const u32 htaborg = st.sdr1 & 0xFFFF0000u;
     const u32 htabmask = st.sdr1 & 0x1FFu;
@@ -151,7 +194,13 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                              ((hash & 0x3FFu) << 6);
         for (u32 slot = 0; slot < 8; ++slot) {
             const u32 pteAddr = ptegAddr + slot * 8u;
-            const u32 w0 = bus->read32(pteAddr);
+            // Hardware table searches are cacheable (UM 5.x: implied WIM =
+            // 0b001) and go through the data cache — a table living in
+            // dirty cache lines is fully architectural, and the pre-DRAM
+            // boot depends on it. Probes stay off the cache.
+            const u32 w0 =
+                mmuProbe ? bus->read32(pteAddr)
+                         : static_cast<u32>(memRead(pteAddr, 4, 2u));
             if (!(w0 & 0x80000000u))
                 continue;
             if (((w0 >> 7) & 0xFFFFFFu) != vsid)
@@ -161,7 +210,9 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
             if ((w0 & 0x3Fu) != api)
                 continue;
 
-            const u32 w1 = bus->read32(pteAddr + 4);
+            const u32 w1 =
+                mmuProbe ? bus->read32(pteAddr + 4)
+                         : static_cast<u32>(memRead(pteAddr + 4, 4, 2u));
             if (fetch && (w1 & (kWimgG << 3))) { // guarded-memory fetch: no R
                 raiseExc(Exc::Isi, cia, 0x10000000u);
                 return false;
@@ -169,8 +220,8 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
             u32 nw1 = w1 | 0x00000100u; // R: set on PTE match (TLB reload)
             const u32 pp = w1 & 3u;
             if (!ppAllows(pp, key, write)) {
-                if (nw1 != w1)
-                    bus->write32(pteAddr + 4, nw1);
+                if (nw1 != w1 && !mmuProbe)
+                    memWrite(pteAddr + 4, 4, nw1, 2u);
                 if (fetch)
                     raiseExc(Exc::Isi, cia, 0x08000000u);
                 else
@@ -179,11 +230,18 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
             }
             if (write)
                 nw1 |= 0x00000080u; // C: only for a permitted store
-            if (nw1 != w1)
-                bus->write32(pteAddr + 4, nw1);
+            if (nw1 != w1 && !mmuProbe)
+                memWrite(pteAddr + 4, 4, nw1, 2u);
             pa = (w1 & 0xFFFFF000u) | (ea & 0xFFFu);
             if (wimg)
                 *wimg = (w1 >> 3) & 0xFu;
+            if (!mmuProbe) { // TLB reload into the set's LRU way
+                const u32 way = tlbLru[set];
+                tlbSet[set][way] = {true, (nw1 & 0x80u) != 0, vsid,
+                                    pageIndex, w1 & 0xFFFFF000u,
+                                    (w1 >> 3) & 0xFu, pp};
+                tlbLru[set] = static_cast<u8>(way ^ 1u);
+            }
             return true;
         }
     }
@@ -194,6 +252,28 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
     else
         dsi(0x40000000u);
     return false;
+}
+
+// tlbie: invalidate the congruence class EA[14-19] selects — both ways,
+// both TLBs (UM 5.4.4: one class of each side per tlbie).
+void Cpu::tlbInvalidateClass(u32 ea)
+{
+    const u32 set = (ea >> 12) & 63u;
+    for (u32 way = 0; way < 2; ++way) {
+        itlb[set][way].v = false;
+        dtlb[set][way].v = false;
+    }
+}
+
+void Cpu::tlbFlushAll()
+{
+    for (u32 s = 0; s < 64; ++s) {
+        for (u32 w = 0; w < 2; ++w) {
+            itlb[s][w] = TlbEntry{};
+            dtlb[s][w] = TlbEntry{};
+        }
+        itlbLru[s] = dtlbLru[s] = 0;
+    }
 }
 
 // ---- fault-aware virtual accessors ----------------------------------------
@@ -247,34 +327,31 @@ bool Cpu::readV(u32 ea, u32 len, u64& out)
         raiseExc(Exc::Dsi, st.pc - 4, 0);
         return false;
     }
+    u32 wimg = 0;
     if (st.msr & msr::LE) {
         if (len == 8) { // two munged word accesses; words swap
-            u32 hi, lo;
-            if (!translate(ea ^ 4u, false, false, pa))
+            u64 hi, lo;
+            if (!translate(ea ^ 4u, false, false, pa, &wimg))
                 return false;
-            hi = bus->read32(pa);
-            if (!translate((ea + 4u) ^ 4u, false, false, pa))
+            hi = memRead(pa, 4, wimg);
+            if (!translate((ea + 4u) ^ 4u, false, false, pa, &wimg))
                 return false;
-            lo = bus->read32(pa);
-            out = (static_cast<u64>(hi) << 32) | lo;
+            lo = memRead(pa, 4, wimg);
+            out = (hi << 32) | lo;
             return true;
         }
         ea ^= len == 1 ? 7u : (len == 2 ? 6u : 4u);
     }
     if (((ea ^ (ea + len - 1)) & ~0xFFFu) == 0) {
-        if (!translate(ea, false, false, pa))
+        if (!translate(ea, false, false, pa, &wimg))
             return false;
-        switch (len) {
-        case 1: out = bus->read8(pa); return true;
-        case 2: out = bus->read16(pa); return true;
-        case 4: out = bus->read32(pa); return true;
-        default: out = bus->read64(pa); return true;
-        }
+        out = memRead(pa, len, wimg);
+        return true;
     }
     for (u32 i = 0; i < len; ++i) {
-        if (!translate(ea + i, false, false, pa))
+        if (!translate(ea + i, false, false, pa, &wimg))
             return false;
-        out = (out << 8) | bus->read8(pa);
+        out = (out << 8) | memRead(pa, 1, wimg);
     }
     return true;
 }
@@ -290,32 +367,29 @@ bool Cpu::writeV(u32 ea, u32 len, u64 v)
         raiseExc(Exc::Dsi, st.pc - 4, 0);
         return false;
     }
+    u32 wimg = 0;
     if (st.msr & msr::LE) {
         if (len == 8) {
-            if (!translate(ea ^ 4u, true, false, pa))
+            if (!translate(ea ^ 4u, true, false, pa, &wimg))
                 return false;
-            bus->write32(pa, static_cast<u32>(v >> 32));
-            if (!translate((ea + 4u) ^ 4u, true, false, pa))
+            memWrite(pa, 4, static_cast<u32>(v >> 32), wimg);
+            if (!translate((ea + 4u) ^ 4u, true, false, pa, &wimg))
                 return false;
-            bus->write32(pa, static_cast<u32>(v));
+            memWrite(pa, 4, static_cast<u32>(v), wimg);
             return true;
         }
         ea ^= len == 1 ? 7u : (len == 2 ? 6u : 4u);
     }
     if (((ea ^ (ea + len - 1)) & ~0xFFFu) == 0) {
-        if (!translate(ea, true, false, pa))
+        if (!translate(ea, true, false, pa, &wimg))
             return false;
-        switch (len) {
-        case 1: bus->write8(pa, static_cast<u8>(v)); return true;
-        case 2: bus->write16(pa, static_cast<u16>(v)); return true;
-        case 4: bus->write32(pa, static_cast<u32>(v)); return true;
-        default: bus->write64(pa, v); return true;
-        }
+        memWrite(pa, len, v, wimg);
+        return true;
     }
     for (u32 i = 0; i < len; ++i) {
-        if (!translate(ea + i, true, false, pa))
+        if (!translate(ea + i, true, false, pa, &wimg))
             return false;
-        bus->write8(pa, static_cast<u8>(v >> (8 * (len - 1 - i))));
+        memWrite(pa, 1, (v >> (8 * (len - 1 - i))) & 0xFFu, wimg);
     }
     return true;
 }
@@ -327,6 +401,13 @@ bool Cpu::fetch32(u32 ea, u32& insn)
         ea ^= 4u; // instruction fetches munge like word data (PEM 3.1.4.4)
     if (!translate(ea, false, true, pa))
         return false;
+    // Fetch coherence: serve from a hitting D-cache or L2 line first.
+    // Stronger than real hardware's split caches (which demand dcbst+icbi
+    // sweeps), never weaker — deterministic superset, RECEIPT.
+    if (l1dPeek32(pa, insn))
+        return true;
+    if (l2Peek32(pa, insn))
+        return true;
     insn = bus->read32(pa);
     return true;
 }

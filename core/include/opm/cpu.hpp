@@ -4,6 +4,7 @@
 #include "insn.hpp"
 #include <map>
 #include <string>
+#include <vector>
 
 namespace opm {
 
@@ -143,6 +144,7 @@ struct Cpu {
         extIrqLine = smiPending = decPending = pmPending = false;
         napping = false;
         cycleAccum = 0;
+        tlbFlushAll();
     }
     void halt(std::string reason)
     {
@@ -164,6 +166,71 @@ struct Cpu {
     void raiseSmi() { smiPending = true; }
 
     bool userMode() const { return (st.msr & msr::PR) != 0; }
+
+    // TLBs (UM ch.5: separate 128-entry, 2-way set-associative I and D
+    // TLBs, 64 sets indexed by EA[14-19], LRU replacement per set). This is
+    // REQUIRED micro-architectural state, not an optimization: the Old
+    // World ROM's regime teardown wipes the hash table while relying on
+    // warm TLB entries to keep its own code, I/O, and pager mappings alive
+    // until it issues tlbie — walk-per-access dies exactly where real
+    // silicon survives (pinned empirically, macrun boot trace 2026-07-26).
+    // Lives outside CpuState: visible only through the staleness contract;
+    // SST state deliberately excludes it.
+    struct TlbEntry {
+        bool v = false, c = false;
+        u32 vsid = 0, pi = 0, rpn = 0, wimg = 0, pp = 0;
+    };
+    TlbEntry itlb[64][2], dtlb[64][2];
+    u8 itlbLru[64] = {}, dtlbLru[64] = {};
+    bool mmuProbe = false; // instrumentation: bypass TLB and R/C writeback
+    void tlbInvalidateClass(u32 ea); // tlbie: both ways, both TLBs
+    void tlbFlushAll();
+
+    // L1 data cache (UM ch.3: 32 KB, 8-way, 128 sets, 32-byte blocks,
+    // write-back with write-allocate; LRU stands in for the PLRU tree —
+    // architecturally invisible). Load-bearing the same way the TLBs are:
+    // the Gossamer ROM runs its early world out of dcbz-conjured cache
+    // lines (cache-as-RAM) before the memory controller is enabled, so
+    // those lines must live and hit without any bus fill.
+    struct DLine {
+        bool v = false, d = false;
+        u32 tag = 0; // pa >> 12
+        u32 age = 0;
+        u8 b[32] = {};
+    };
+    DLine l1d[128][8];
+    u32 l1dClock = 0;
+    bool dceOn() const { return (st.hid0 & 0x00004000u) != 0; }
+    u64 memRead(u32 pa, u32 len, u32 wimg);
+    void memWrite(u32 pa, u32 len, u64 v, u32 wimg);
+    bool l1dPeek32(u32 pa, u32& w); // fetch path coherence peek
+    void dcbzLine(u32 pa);          // allocate + zero, no fill
+    void dcbClean(u32 pa, bool invalidate); // dcbst / dcbf
+    void dcbKill(u32 pa);                   // dcbi
+    void l1dFlushAll(bool writeback);
+
+    // Backside L2 (UM ch.3.7: L2CR-governed, 256K-2MB, 2-way here). The
+    // boot ROM runs its pre-DRAM world in it via L2CR[L2TS]: dcbf/dcbst
+    // pushes land in the L2 marked valid instead of dying on the bus (UM
+    // 2-17/L2TS verbatim) — hash tables and sizing scratch live there
+    // until real memory exists. Castouts allocate; fills probe L2 first.
+    struct L2Line {
+        bool v = false, d = false;
+        u32 tag = 0; // pa >> 5 (line number)
+        u32 age = 0;
+        u8 b[32] = {};
+    };
+    std::vector<L2Line> l2;
+    u32 l2Sets = 0, l2Clock = 0;
+    bool l2On() const { return (st.l2cr & 0x80000000u) != 0; }
+    void l2Resize();                 // per L2CR[L2SIZ]
+    L2Line* l2Find(u32 pa);
+    void l2Install(u32 pa, const u8* bytes, bool dirty);
+    bool l2ReadLine(u32 pa, u8* out);
+    void l2Invalidate(u32 pa);
+    void l2WipeAll();                // L2I global invalidate
+    bool l2Peek32(u32 pa, u32& w);
+    void l2FlushAll(bool writeback); // instrumentation/harness coherence
 
     // MMU (mmu.cpp). translate() raises ISI/DSI itself on failure. wimg, if
     // requested, receives the access's WIMG nibble (W=8,I=4,M=2,G=1; real

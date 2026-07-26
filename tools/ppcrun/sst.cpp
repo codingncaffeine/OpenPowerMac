@@ -284,6 +284,7 @@ int runFile(const fs::path& file, int& total, int shown, int& failures)
         cpu.st.msr = 0;
         applyState(cpu, bus, *t.get("initial"));
         cpu.step();
+        cpu.l1dFlushAll(true); // final-state memory reads go through the cache
         std::string diff;
         bool ok = !cpu.halted && checkState(cpu, bus, *t.get("final"), diff);
         if (cpu.halted)

@@ -6,6 +6,7 @@ add_library(opmcore STATIC
   src/exec_int.cpp
   src/exceptions.cpp
   src/mmu.cpp
+  src/cache.cpp
   src/softfp.cpp
   src/fpu.cpp
   src/altivec.cpp

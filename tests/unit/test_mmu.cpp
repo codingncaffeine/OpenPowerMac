@@ -119,6 +119,109 @@ TEST_CASE("mmu page-protection matrix (PEM Table 7-15), 64 combinations")
                     }
 }
 
+TEST_CASE("mmu TLB: staleness contract, tlbie class, C-update, LRU")
+{
+    // Same geometry as the matrix test: vsid 5, SDR1 htaborg 0x0009.
+    auto setup = [](Cpu& c, MapBus& bus) {
+        c.attach(bus);
+        c.reset();
+        c.st.msr = msr::DR;
+        c.st.pc = 0x1004;
+        c.st.sdr1 = 0x00090000u;
+        for (u32 s = 0; s < 16; ++s)
+            c.st.sr[s] = 5u;
+    };
+    // PTE for (vsid 5, pageIndex pi) at its primary PTEG, slot 0.
+    auto pteAddr = [](u32 pi) {
+        return 0x00090000u | (((5u ^ pi) & 0x3FFu) << 6);
+    };
+    auto insert = [&](MapBus& bus, u32 pi, u32 rpn, u32 pp) {
+        bus.write32(pteAddr(pi), 0x80000000u | (5u << 7) | (pi >> 10));
+        bus.write32(pteAddr(pi) + 4, rpn | pp);
+    };
+
+    SUBCASE("stale entry survives a PTE wipe until tlbie")
+    {
+        MapBus bus;
+        Cpu c;
+        setup(c, bus);
+        insert(bus, 3, 0x00005000u, 2);
+        u32 pa = 0;
+        REQUIRE(c.translate(0x3000u, false, false, pa));
+        CHECK(pa == 0x5000u);
+
+        bus.write32(pteAddr(3), 0); // regime teardown wipes the PTE
+        pa = 0;
+        CHECK(c.translate(0x3000u, false, false, pa)); // warm TLB answers
+        CHECK(pa == 0x5000u);
+
+        c.tlbInvalidateClass(0x3000u);
+        CHECK_FALSE(c.translate(0x3000u, false, false, pa)); // now a miss
+        CHECK(c.st.dsisr == 0x40000000u);
+    }
+
+    SUBCASE("tlbie hits only its congruence class")
+    {
+        MapBus bus;
+        Cpu c;
+        setup(c, bus);
+        insert(bus, 3, 0x00005000u, 2);   // set 3
+        insert(bus, 4, 0x00006000u, 2);   // set 4
+        u32 pa = 0;
+        REQUIRE(c.translate(0x3000u, false, false, pa));
+        REQUIRE(c.translate(0x4000u, false, false, pa));
+        bus.write32(pteAddr(3), 0);
+        bus.write32(pteAddr(4), 0);
+        c.tlbInvalidateClass(0x4000u); // only set 4
+        CHECK(c.translate(0x3000u, false, false, pa)); // stale, alive
+        CHECK_FALSE(c.translate(0x4000u, false, false, pa));
+    }
+
+    SUBCASE("first store through a clean entry re-walks to set C")
+    {
+        MapBus bus;
+        Cpu c;
+        setup(c, bus);
+        insert(bus, 3, 0x00005000u, 2);
+        u32 pa = 0;
+        REQUIRE(c.translate(0x3000u, false, false, pa)); // load: C stays 0
+        CHECK((bus.read32(pteAddr(3) + 4) & 0x80u) == 0);
+        REQUIRE(c.translate(0x3000u, true, false, pa)); // store: C-update
+        CHECK((bus.read32(pteAddr(3) + 4) & 0x80u) != 0);
+
+        // Wiped PTE + clean entry: the C-update walk must fault the store
+        // while loads keep working off the stale entry.
+        insert(bus, 4, 0x00006000u, 2);
+        REQUIRE(c.translate(0x4000u, false, false, pa));
+        bus.write32(pteAddr(4), 0);
+        CHECK(c.translate(0x4000u, false, false, pa));
+        CHECK_FALSE(c.translate(0x4000u, true, false, pa));
+        CHECK(c.st.dsisr == (0x40000000u | 0x02000000u));
+    }
+
+    SUBCASE("two ways per set, LRU eviction")
+    {
+        MapBus bus;
+        Cpu c;
+        setup(c, bus);
+        // Three pages in congruence class 3: pageIndex 3, 67, 131.
+        insert(bus, 3, 0x00005000u, 2);
+        insert(bus, 67, 0x00006000u, 2);
+        insert(bus, 131, 0x00007000u, 2);
+        u32 pa = 0;
+        REQUIRE(c.translate(0x00003000u, false, false, pa)); // way A
+        REQUIRE(c.translate(0x00043000u, false, false, pa)); // way B
+        REQUIRE(c.translate(0x00083000u, false, false, pa)); // evicts A
+        bus.write32(pteAddr(3), 0);
+        bus.write32(pteAddr(67), 0);
+        bus.write32(pteAddr(131), 0);
+        CHECK_FALSE(c.translate(0x00003000u, false, false, pa)); // evicted
+        c.st.dsisr = 0;
+        CHECK(c.translate(0x00043000u, false, false, pa)); // still cached
+        CHECK(c.translate(0x00083000u, false, false, pa)); // still cached
+    }
+}
+
 TEST_CASE("mmu BAT protection: PP=00 blocks, x1 read-only, 10 read/write")
 {
     struct Row {

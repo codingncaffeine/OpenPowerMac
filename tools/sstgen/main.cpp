@@ -563,6 +563,7 @@ int generate(const char* mnem, const fs::path& outDir, u32 count)
         const CpuState before = g.cpu.st;
         const std::map<u32, u8> ramBeforeRun = g.bus.initial;
         g.cpu.step();
+        g.cpu.l1dFlushAll(true); // recorded ram state observes the cache
         if (g.cpu.halted)
             continue; // trap taken / not-yet-modeled path: skip in v0
 

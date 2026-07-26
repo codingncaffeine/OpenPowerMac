@@ -212,6 +212,42 @@ int main(int argc, char** argv)
                 slotPrev[1] = v1;
             }
         }
+        static bool sadSeen = false;
+        static u32 sadHits = 0;
+        if (!sadSeen && executed > 1300000000ull &&
+            (executed & 0xFFFFu) == 0) {
+            static u32 sadPrev = 0xEEEE0000u;
+            u32 v = 0, pa0 = 0;
+            {
+                cpu.mmuProbe = true;
+                const CpuState saved = cpu.st;
+                cpu.st.msr |= 0x30u;
+                if (cpu.translate(0x00000AF0u, false, true, pa0)) {
+                    if (!cpu.l1dPeek32(pa0, v))
+                        v = bus.read32(pa0);
+                }
+                cpu.st = saved;
+                cpu.mmuProbe = false;
+            }
+            if (sadPrev == 0xEEEE0000u) {
+                sadPrev = v;
+                printf("-- lowmem $AF0 -> pa %08x initial %08x @%llu\n",
+                       pa0, v, static_cast<unsigned long long>(executed));
+            }
+            if (v != sadPrev && ++sadHits < 8) {
+                sadSeen = (v >> 16) == 0x000Au;
+                printf("-- sad-mac code %04x appeared by @%llu; 68kpc(r24)="
+                       "%08x\n   ring:\n",
+                       v >> 16, static_cast<unsigned long long>(executed),
+                       cpu.st.gpr[24]);
+                const u32 cnt = ring.n < 96 ? ring.n : 96;
+                for (u32 k = 0; k < cnt; ++k) {
+                    const auto& e = ring.e[(ring.n - cnt + k) & 127u];
+                    disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
+                    printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
+                }
+            }
+        }
         static int lockTrace = -1;
         static u64 spin68Last = 0;
         if (cpu.st.pc == 0x68067ECCu && executed - spin68Last > 300000000ull) {

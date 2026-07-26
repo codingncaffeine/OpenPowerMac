@@ -164,6 +164,8 @@ void applyState(Cpu& c, MapBus& bus, const JVal& s)
         c.st.vscr = static_cast<u32>(vs->num);
     if (const JVal* vv = s.get("vrsave"))
         c.st.vrsave = static_cast<u32>(vv->num);
+    if (const JVal* h0 = s.get("hid0"))
+        c.st.hid0 = static_cast<u32>(h0->num);
     c.st.cr = static_cast<u32>(s.get("cr")->num);
     c.st.xer = static_cast<u32>(s.get("xer")->num);
     c.st.lr = static_cast<u32>(s.get("lr")->num);
@@ -236,6 +238,8 @@ bool checkState(Cpu& c, MapBus& bus, const JVal& s, std::string& diff)
         chk("vscr", static_cast<u32>(vs->num), c.st.vscr);
     if (const JVal* vv = s.get("vrsave"))
         chk("vrsave", static_cast<u32>(vv->num), c.st.vrsave);
+    if (const JVal* h0 = s.get("hid0"))
+        chk("hid0", static_cast<u32>(h0->num), c.st.hid0);
     chk("cr", static_cast<u32>(s.get("cr")->num), c.st.cr);
     chk("xer", static_cast<u32>(s.get("xer")->num), c.st.xer);
     chk("lr", static_cast<u32>(s.get("lr")->num), c.st.lr);

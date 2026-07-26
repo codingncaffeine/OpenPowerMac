@@ -1,0 +1,106 @@
+# P6 chip layer: little-endian mode, DABR/IABR breakpoints, L2CR, SPR
+# privilege refinements.
+#
+# LE-mode note: the harness writes the test insn at physical 0x1000, but an
+# LE fetch munges the address with ^0b100 — each LE vector also places the
+# instruction word at 0x1004 via mem@.
+
+test le_lwz_munges_word
+msr=00000001 r4=00003000
+mem@00001004=80640000
+mem@00003004=11223344
+insn 80640000                     # lwz r3,0(r4): LE word EA ^= 4
+expect r3=11223344 pc=00001004
+end
+
+test le_lbz_munges_byte
+msr=00000001 r4=00003000
+mem@00001004=88640000
+mem@00003007=AB
+insn 88640000                     # lbz r3,0(r4): LE byte EA ^= 7
+expect r3=000000AB pc=00001004
+end
+
+test le_lhz_munges_half
+msr=00000001 r4=00003002
+mem@00001004=A0640000
+mem@00003004=BEEF
+insn A0640000                     # lhz r3,0(r4): EA 3002 ^ 6 = 3004
+expect r3=0000BEEF pc=00001004
+end
+
+test le_stw_munges
+msr=00000001 r3=CAFEBABE r4=00003000
+mem@00001004=90640000
+insn 90640000                     # stw r3,0(r4) lands at 3004
+expect mem@00003004=CAFEBABE pc=00001004
+end
+
+test le_misaligned_word_faults
+msr=00000001 r4=00003001
+mem@00001004=80640000
+insn 80640000                     # any misaligned LE access -> alignment
+expect pc=00000600 srr0=00001000 srr1=00000001 msr=00000000 dar=00003001 dsisr=00000064
+end
+
+test le_lmw_always_faults
+msr=00000001 r9=00003000
+mem@00001004=BBA90000
+insn BBA90000                     # lmw r29,0(r9): multiples fault in LE
+expect pc=00000600 srr0=00001000 srr1=00000001 msr=00000000 dar=00003000 dsisr=00001FA9
+end
+
+test dabr_read_hit
+msr=00000000 r4=00003000 dabr=00003001 bamr=FFFFFFF8
+insn 80640000                     # lwz r3,0(r4): DABR[DR] dword match -> DSI
+expect pc=00000300 srr0=00001000 srr1=00000000 dar=00003000 dsisr=00400000
+end
+
+test dabr_write_hit
+msr=00000000 r3=DEADBEEF r4=00003000 dabr=00003002 bamr=FFFFFFF8
+insn 90640000                     # stw: DABR[DW] -> DSI with the write bit
+expect pc=00000300 srr0=00001000 dar=00003000 dsisr=02400000 mem@00003000=00000000
+end
+
+test dabr_read_only_lets_writes_pass
+msr=00000000 r3=DEADBEEF r4=00003000 dabr=00003001 bamr=FFFFFFF8
+insn 90640000                     # DR-only breakpoint ignores stores
+expect pc=00001004 mem@00003000=DEADBEEF
+end
+
+test dabr_bt_mismatch_no_hit
+msr=00000000 r4=00003000 dabr=00003005 bamr=FFFFFFF8
+mem@00003000=0BADF00D
+insn 80640000                     # BT=1 wants MSR[DR]=1: no match in real mode
+expect r3=0BADF00D pc=00001004
+end
+
+test iabr_fires_before_execute
+msr=00000000 r3=11111111 iabr=00001002
+insn 38600042                     # li r3,0x42 — never executes
+expect pc=00001300 srr0=00001000 srr1=00000000 msr=00000000 r3=11111111
+end
+
+test l2cr_invalidate_completes
+msr=00000000 r3=80200001
+insn 7C79FBA6                     # mtspr L2CR,r3: L2IP always reads 0
+expect l2cr=80200000 pc=00001004
+end
+
+test spr_user_undefined_low_is_illegal
+msr=00004000
+insn 7C6302A6                     # mfspr r3,3: undefined, SPR&0x10=0 -> illegal
+expect pc=00000700 srr0=00001000 srr1=00084000 msr=00000000
+end
+
+test spr_user_undefined_high_is_privileged
+msr=00004000
+insn 7C7102A6                     # mfspr r3,17: undefined, SPR&0x10 -> privileged
+expect pc=00000700 srr0=00001000 srr1=00044000 msr=00000000
+end
+
+test spr_user_reads_ubamr
+msr=00004000 bamr=FFFFFFF8
+insn 7C67EAA6                     # mfspr r3,935 (UBAMR): user-readable
+expect r3=FFFFFFF8 pc=00001004
+end

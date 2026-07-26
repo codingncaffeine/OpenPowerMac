@@ -90,6 +90,10 @@ bool applyKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
         return true;
     }
     if (key == "vscr") { c.st.vscr = static_cast<u32>(hexval(val)); return true; }
+    if (key == "hid0") { c.st.hid0 = static_cast<u32>(hexval(val)); return true; }
+    if (key == "iabr") { c.st.iabr = static_cast<u32>(hexval(val)); return true; }
+    if (key == "dabr") { c.st.dabr = static_cast<u32>(hexval(val)); return true; }
+    if (key == "bamr") { c.st.bamr = static_cast<u32>(hexval(val)); return true; }
     if (key == "xer") { c.st.xer = static_cast<u32>(hexval(val)); return true; }
     if (key == "cr")  { c.st.cr = static_cast<u32>(hexval(val)); return true; }
     if (key == "lr")  { c.st.lr = static_cast<u32>(hexval(val)); return true; }
@@ -176,6 +180,8 @@ bool checkKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
         return false;
     }
     if (key == "vscr") return expectU32(c.st.vscr);
+    if (key == "hid0") return expectU32(c.st.hid0);
+    if (key == "l2cr") return expectU32(c.st.l2cr);
     if (key == "xer") return expectU32(c.st.xer);
     if (key == "cr")  return expectU32(c.st.cr);
     if (key == "lr")  return expectU32(c.st.lr);

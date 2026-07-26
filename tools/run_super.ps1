@@ -10,7 +10,8 @@ New-Item -ItemType Directory -Force $out | Out-Null
 
 $kernels = @(
   @{ Name = 'kernel1'; Want = "S1`nI1`nT1`nD3`nA1`nOK`n" },
-  @{ Name = 'kernel2'; Want = "M1`nC1`nP1`nF1`nOK`n" }
+  @{ Name = 'kernel2'; Want = "M1`nC1`nP1`nF1`nOK`n" },
+  @{ Name = 'kernel3'; Want = "N1`nT1`nOK`n" }
 )
 
 $fail = 0

@@ -467,11 +467,11 @@ void emitState(FILE* f, const CpuState& s, const std::map<u32, u8>& ram)
         fprintf(f, "]%s", i == 31 ? "" : ",");
     }
     fprintf(f,
-            "],\"vscr\":%u,\"vrsave\":%u,"
+            "],\"vscr\":%u,\"vrsave\":%u,\"hid0\":%u,"
             "\"fpscr\":%u,\"cr\":%u,\"xer\":%u,\"lr\":%u,\"ctr\":%u,\"msr\":%u,"
             "\"srr0\":%u,\"srr1\":%u,\"dec\":%u,\"tb\":%llu,"
             "\"resv\":[%u,%u],\"ram\":[",
-            s.vscr, s.vrsave,
+            s.vscr, s.vrsave, s.hid0,
             s.fpscr, s.cr, s.xer, s.lr, s.ctr, s.msr, s.srr0, s.srr1, s.dec,
             static_cast<unsigned long long>(s.tb), s.resvValid ? 1u : 0u,
             s.resvAddr);
@@ -541,6 +541,9 @@ int generate(const char* mnem, const fs::path& outDir, u32 count)
         g.cpu.st.vrsave = g.rng.word();
         if (isVecInsn(*d) && g.rng.chance(85))
             g.cpu.st.msr |= 0x02000000u; // most vector chapters run with VEC on
+        // Caches usually on (dcbz executes); a minority records the
+        // HID0[DCE]=0 alignment-exception behavior.
+        g.cpu.st.hid0 = g.rng.chance(80) ? 0x0000C000u : 0u;
         g.cpu.st.cr = g.rng.word();
         g.cpu.st.xer = (g.rng.word() & 0xE0000000u) | g.rng.u(0, 16);
         g.cpu.st.lr = g.rng.word() & ~3u;

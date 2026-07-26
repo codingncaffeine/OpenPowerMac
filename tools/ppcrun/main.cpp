@@ -255,6 +255,7 @@ int main(int argc, char** argv)
     cpu.st.msr |= msr::FP | msr::VEC; // the rig hands programs a usable FPU
                                       // and vector unit, as firmware would
                                       // (KAT/SST paths set MSR themselves)
+    cpu.st.hid0 |= 0x0000C000u;       // ICE|DCE: caches on, so dcbz works
 
     char text[128];
     u64 executed = 0;

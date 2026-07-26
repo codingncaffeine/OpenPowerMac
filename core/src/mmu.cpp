@@ -198,11 +198,69 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
 
 // ---- fault-aware virtual accessors ----------------------------------------
 // Accesses that cross a 4 KB page translate each page separately.
+//
+// Little-endian mode (MSR[LE]): the EA's low bits are modified per access
+// size (PEM Table 3-2: byte ^0b111, half ^0b110, word ^0b100), doublewords
+// split into two munged word accesses (word swap), and any misaligned
+// access raises an alignment exception (RECEIPT: PEM allows but does not
+// require this; the classic implementations fault, and munging is undefined
+// for misaligned EAs). DABR watchpoints compare the pre-munge EA at
+// double-word granularity under the BAMR mask, honoring DABR[29]=BT
+// against MSR[DR]; a hit is a DSI with DSISR[9].
+
+namespace {
+
+// UM: DABR_CMP[0-28] = DABR[0-28] AND BAMR[0-28], compared against the EA
+// masked the same way — BAMR zero bits are don't-cares. DR=bit31, DW=bit30,
+// BT=bit29 (matches MSR[DR]).
+inline bool dabrHit(const CpuState& s, u32 ea, bool write)
+{
+    const u32 en = write ? 2u : 1u; // DW / DR
+    if (!(s.dabr & en))
+        return false;
+    if ((((s.dabr >> 2) & 1u) != 0) != ((s.msr & msr::DR) != 0)) // BT
+        return false;
+    return ((((ea ^ s.dabr) >> 3) & (s.bamr >> 3)) & 0x1FFFFFFFu) == 0;
+}
+
+} // namespace
+
+bool Cpu::leAlignCheck(u32 ea, u32 len)
+{
+    if (!(st.msr & msr::LE) || (ea & (len - 1)) == 0)
+        return true;
+    st.dar = ea;
+    st.dsisr = alignDsisr(curInsn);
+    raiseExc(Exc::Alignment, st.pc - 4, 0);
+    return false;
+}
 
 bool Cpu::readV(u32 ea, u32 len, u64& out)
 {
     out = 0;
     u32 pa;
+    if (!leAlignCheck(ea, len))
+        return false;
+    if (dabrHit(st, ea, false)) {
+        st.dar = ea;
+        st.dsisr = 0x00400000u;
+        raiseExc(Exc::Dsi, st.pc - 4, 0);
+        return false;
+    }
+    if (st.msr & msr::LE) {
+        if (len == 8) { // two munged word accesses; words swap
+            u32 hi, lo;
+            if (!translate(ea ^ 4u, false, false, pa))
+                return false;
+            hi = bus->read32(pa);
+            if (!translate((ea + 4u) ^ 4u, false, false, pa))
+                return false;
+            lo = bus->read32(pa);
+            out = (static_cast<u64>(hi) << 32) | lo;
+            return true;
+        }
+        ea ^= len == 1 ? 7u : (len == 2 ? 6u : 4u);
+    }
     if (((ea ^ (ea + len - 1)) & ~0xFFFu) == 0) {
         if (!translate(ea, false, false, pa))
             return false;
@@ -224,6 +282,26 @@ bool Cpu::readV(u32 ea, u32 len, u64& out)
 bool Cpu::writeV(u32 ea, u32 len, u64 v)
 {
     u32 pa;
+    if (!leAlignCheck(ea, len))
+        return false;
+    if (dabrHit(st, ea, true)) {
+        st.dar = ea;
+        st.dsisr = 0x00400000u | 0x02000000u;
+        raiseExc(Exc::Dsi, st.pc - 4, 0);
+        return false;
+    }
+    if (st.msr & msr::LE) {
+        if (len == 8) {
+            if (!translate(ea ^ 4u, true, false, pa))
+                return false;
+            bus->write32(pa, static_cast<u32>(v >> 32));
+            if (!translate((ea + 4u) ^ 4u, true, false, pa))
+                return false;
+            bus->write32(pa, static_cast<u32>(v));
+            return true;
+        }
+        ea ^= len == 1 ? 7u : (len == 2 ? 6u : 4u);
+    }
     if (((ea ^ (ea + len - 1)) & ~0xFFFu) == 0) {
         if (!translate(ea, true, false, pa))
             return false;
@@ -245,6 +323,8 @@ bool Cpu::writeV(u32 ea, u32 len, u64 v)
 bool Cpu::fetch32(u32 ea, u32& insn)
 {
     u32 pa;
+    if (st.msr & msr::LE)
+        ea ^= 4u; // instruction fetches munge like word data (PEM 3.1.4.4)
     if (!translate(ea, false, true, pa))
         return false;
     insn = bus->read32(pa);

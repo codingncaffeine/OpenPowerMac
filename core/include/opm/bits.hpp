@@ -66,4 +66,18 @@ constexpr u32 f_sr(u32 i)      { return ppcbits(i, 12, 15); }
 constexpr u32 f_simm5(u32 i)   { return ppcbits(i, 11, 15); }
 constexpr u32 f_vsh(u32 i)     { return ppcbits(i, 22, 25); }  // vsldoi SH
 
+// Alignment-exception DSISR opcode image per PEM Table 6-14 (cross-checked
+// against the Table 6-15 inverse mapping). Shared by the executors and the
+// LE-mode alignment path in the virtual accessors.
+constexpr u32 alignDsisr(u32 i)
+{
+    u32 d = (ppcbits(i, 6, 10) << 5) | ppcbits(i, 11, 15);
+    if (f_primary(i) == 31u)
+        d |= (ppcbits(i, 29, 30) << 15) | (ppcbit(i, 25) << 14) |
+             (ppcbits(i, 21, 24) << 10);
+    else
+        d |= (ppcbit(i, 5) << 14) | (ppcbits(i, 1, 4) << 10);
+    return d;
+}
+
 } // namespace opm

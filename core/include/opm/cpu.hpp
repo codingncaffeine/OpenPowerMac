@@ -107,7 +107,11 @@ struct Cpu {
     bool extIrqLine = false;   // level-sensitive external interrupt
     bool smiPending = false;
     bool decPending = false;
+    bool pmPending = false;    // performance monitor (PMC MSB with PMXE)
     bool raisedThisStep = false;
+    bool napping = false;      // MSR[POW] + HID0 nap/doze/sleep: TB ticks,
+                               // no instructions until an enabled interrupt
+    u32 curInsn = 0;           // instruction being executed (LE align image)
     u32 cycleAccum = 0;
     u32 cyclesPerTbTick = 4;   // TB = bus clock / 4; provisional 1 cycle/insn
 
@@ -136,6 +140,9 @@ struct Cpu {
         st = CpuState{};
         halted = false;
         haltReason.clear();
+        extIrqLine = smiPending = decPending = pmPending = false;
+        napping = false;
+        cycleAccum = 0;
     }
     void halt(std::string reason)
     {
@@ -165,6 +172,7 @@ struct Cpu {
     bool readV(u32 ea, u32 len, u64& out);
     bool writeV(u32 ea, u32 len, u64 v);
     bool fetch32(u32 ea, u32& insn);
+    bool leAlignCheck(u32 ea, u32 len); // LE mode: misaligned -> alignment exc
 
     bool readV8(u32 ea, u32& v)  { u64 t; if (!readV(ea, 1, t)) return false; v = static_cast<u32>(t); return true; }
     bool readV16(u32 ea, u32& v) { u64 t; if (!readV(ea, 2, t)) return false; v = static_cast<u32>(t); return true; }

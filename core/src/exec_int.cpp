@@ -447,23 +447,8 @@ LOAD(h_lhax, eaX, readV16, static_cast<u32>(sext16(v)))
 
 void updRa(Cpu& c, u32 insn, u32 ea) { c.st.gpr[f_ra(insn)] = ea; }
 
-// Alignment-exception DSISR opcode image per PEM Table 6-14 (cross-checked
-// against the Table 6-15 inverse mapping for stwcx./dcbz/lswi/lmw rows):
-// [15-16]=insn[29-30] X-form else 0, [17]=insn[25] X / insn[5] D,
-// [18-21]=insn[21-24] X / insn[1-4] D, [22-26]=insn[6-10], [27-31]=insn[11-15].
-// RECEIPT: [22-26] is architecturally undefined for dcbz and [27-31] for
-// non-update non-string forms — we fill both from the image anyway.
-u32 alignDsisr(u32 i)
-{
-    u32 d = (ppcbits(i, 6, 10) << 5) | ppcbits(i, 11, 15);
-    if (f_primary(i) == 31u)
-        d |= (ppcbits(i, 29, 30) << 15) | (ppcbit(i, 25) << 14) |
-             (ppcbits(i, 21, 24) << 10);
-    else
-        d |= (ppcbit(i, 5) << 14) | (ppcbits(i, 1, 4) << 10);
-    return d;
-}
-
+// RECEIPT: DSISR image fields that are architecturally undefined for a form
+// (dcbz's [22-26], non-update [27-31]) are filled from the image anyway.
 void raiseAlign(Cpu& c, u32 insn, u32 ea)
 {
     c.st.dar = ea;
@@ -539,7 +524,7 @@ void h_sthbrx(Cpu& c, u32 i, const InsnDesc&)
 void h_lmw(Cpu& c, u32 i, const InsnDesc&)
 {
     u32 ea = eaD(c, i);
-    if (ea & 3u) {
+    if ((ea & 3u) || (c.st.msr & msr::LE)) { // LE: multiples always fault
         raiseAlign(c, i, ea);
         return;
     }
@@ -553,7 +538,7 @@ void h_lmw(Cpu& c, u32 i, const InsnDesc&)
 void h_stmw(Cpu& c, u32 i, const InsnDesc&)
 {
     u32 ea = eaD(c, i);
-    if (ea & 3u) {
+    if ((ea & 3u) || (c.st.msr & msr::LE)) {
         raiseAlign(c, i, ea);
         return;
     }
@@ -598,23 +583,43 @@ void storeString(Cpu& c, u32 rs, u32 ea, u32 n)
         }
     }
 }
+// String ops in little-endian mode raise alignment (UM 4.6.6, verified).
+bool leStringFault(Cpu& c, u32 i, u32 ea)
+{
+    if (!(c.st.msr & msr::LE))
+        return false;
+    raiseAlign(c, i, ea);
+    return true;
+}
 void h_lswi(Cpu& c, u32 i, const InsnDesc&)
 {
+    const u32 ea = gpr0(c, f_ra(i));
+    if (leStringFault(c, i, ea))
+        return;
     const u32 n = f_nb(i) ? f_nb(i) : 32u;
-    loadString(c, f_rt(i), gpr0(c, f_ra(i)), n);
+    loadString(c, f_rt(i), ea, n);
 }
 void h_stswi(Cpu& c, u32 i, const InsnDesc&)
 {
+    const u32 ea = gpr0(c, f_ra(i));
+    if (leStringFault(c, i, ea))
+        return;
     const u32 n = f_nb(i) ? f_nb(i) : 32u;
-    storeString(c, f_rt(i), gpr0(c, f_ra(i)), n);
+    storeString(c, f_rt(i), ea, n);
 }
 void h_lswx(Cpu& c, u32 i, const InsnDesc&)
 {
-    loadString(c, f_rt(i), eaX(c, i), c.st.xer & 0x7Fu);
+    const u32 ea = eaX(c, i);
+    if (leStringFault(c, i, ea))
+        return;
+    loadString(c, f_rt(i), ea, c.st.xer & 0x7Fu);
 }
 void h_stswx(Cpu& c, u32 i, const InsnDesc&)
 {
-    storeString(c, f_rt(i), eaX(c, i), c.st.xer & 0x7Fu);
+    const u32 ea = eaX(c, i);
+    if (leStringFault(c, i, ea))
+        return;
+    storeString(c, f_rt(i), ea, c.st.xer & 0x7Fu);
 }
 
 // ---- FP loads / stores -----------------------------------------------------
@@ -782,7 +787,8 @@ u32* sprPtr(Cpu& c, u32 spr)
     case 942: case 958: return &s.pmc[3];
     case 939: case 955: return &s.siar;
     case 943: case 959: return &s.sdar;
-    case 951: return &s.bamr; // TODO(P6): pin BAMR/UBAMR numbers from the UM SPR table
+    case 935: return &s.bamr; // UBAMR: user-level read access to BAMR
+    case 951: return &s.bamr;
     case 1008: return &s.hid0;
     case 1009: return &s.hid1;
     case 1010: return &s.iabr;
@@ -802,6 +808,7 @@ bool sprUserReadable(u32 spr)
 {
     switch (spr) {
     case 1: case 8: case 9: case 256: // XER/LR/CTR/VRSAVE
+    case 935: // UBAMR
     case 936: case 937: case 938: case 939: case 940: case 941: case 942:
     case 943: // performance-monitor user copies
         return true;
@@ -814,27 +821,50 @@ bool sprUserWritable(u32 spr)
     return spr == 1 || spr == 8 || spr == 9 || spr == 256;
 }
 
+// User access to an UNDEFINED SPR: privileged exception if the encoded
+// SPR[0] bit (n & 0x10) is set, illegal otherwise (PEM 6.4.7).
+bool sprAccessFault(Cpu& c, u32 spr, bool known, bool userAllowed)
+{
+    if (c.userMode()) {
+        if (!known && !(spr & 0x10u)) {
+            c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgIllegal);
+            return true;
+        }
+        if (!userAllowed) {
+            c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgPrivileged);
+            return true;
+        }
+    }
+    if (!known) {
+        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgIllegal);
+        return true;
+    }
+    return false;
+}
+
 void h_mfspr(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 spr = f_spr(i);
-    if (c.userMode() && !sprUserReadable(spr)) {
-        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgPrivileged);
+    const bool tb = spr == 268 || spr == 269;
+    u32* p = tb ? nullptr : sprPtr(c, spr);
+    if (sprAccessFault(c, spr, tb || p != nullptr,
+                       tb || sprUserReadable(spr)))
         return;
-    }
     if (spr == 268) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb); return; }
     if (spr == 269) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb >> 32); return; }
-    if (u32* p = sprPtr(c, spr)) {
-        c.st.gpr[f_rt(i)] = *p;
-        return;
-    }
-    c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgIllegal);
+    c.st.gpr[f_rt(i)] = *p;
 }
 void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 spr = f_spr(i);
     const u32 v = c.st.gpr[f_rt(i)];
-    if (c.userMode() && !sprUserWritable(spr)) {
-        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgPrivileged);
+    const bool special = spr == 22 || spr == 284 || spr == 285 || spr == 287;
+    if (sprAccessFault(c, spr,
+                       special || sprPtr(c, spr) != nullptr,
+                       sprUserWritable(spr)))
+        return;
+    if (spr == 1017) { // L2CR: invalidate completes instantly, L2IP reads 0
+        c.st.l2cr = v & ~1u;
         return;
     }
     if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception
@@ -847,11 +877,7 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
     if (spr == 284) { c.st.tb = (c.st.tb & 0xFFFFFFFF00000000ull) | v; return; }
     if (spr == 285) { c.st.tb = (c.st.tb & 0xFFFFFFFFull) | (static_cast<u64>(v) << 32); return; }
     if (spr == 287) return; // PVR is mfspr-only
-    if (u32* p = sprPtr(c, spr)) {
-        *p = v;
-        return;
-    }
-    c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgIllegal);
+    *sprPtr(c, spr) = v;
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)
 {
@@ -863,7 +889,15 @@ void h_mftb(Cpu& c, u32 i, const InsnDesc&)
 }
 
 void h_mfmsr(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.msr; }
-void h_mtmsr(Cpu& c, u32 i, const InsnDesc&) { c.st.msr = c.st.gpr[f_rt(i)] & msr::VALID; }
+void h_mtmsr(Cpu& c, u32 i, const InsnDesc&)
+{
+    c.st.msr = c.st.gpr[f_rt(i)] & msr::VALID;
+    // MSR[POW] with a HID0 power mode selected enters nap/doze/sleep: no
+    // further instructions until an enabled interrupt (TB keeps ticking).
+    if ((c.st.msr & msr::POW) &&
+        (c.st.hid0 & 0x00E00000u)) // DOZE | NAP | SLEEP
+        c.napping = true;
+}
 void h_mtsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.sr[f_sr(i)] = c.st.gpr[f_rt(i)]; }
 void h_mfsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.gpr[f_rt(i)] = c.st.sr[f_sr(i)]; }
 void h_mtsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.sr[c.st.gpr[f_rb(i)] >> 28] = c.st.gpr[f_rt(i)]; }
@@ -874,11 +908,15 @@ void h_mfsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.sr[c.st
 void h_nop(Cpu&, u32, const InsnDesc&) {}
 void h_dcbz(Cpu& c, u32 i, const InsnDesc&)
 {
-    // dcbz to a write-through or cache-inhibited page/block raises an
-    // alignment exception (UM 4.6.6 / Table 5-4; xnu relies on this).
-    // The HID0[DCE]=0 "cache disabled" alignment condition is a P6 item —
-    // the cache model does not exist yet (ledger row).
+    // dcbz raises an alignment exception when the data cache is disabled
+    // (HID0[DCE]=0) or the target is write-through/cache-inhibited
+    // (UM 4.6.6 / Table 5-4; xnu relies on the W/I case). RECEIPT: the
+    // DCE check precedes translation.
     const u32 ea = eaX(c, i) & ~31u; // 32-byte block: never crosses a page
+    if (!(c.st.hid0 & 0x00004000u)) { // DCE
+        raiseAlign(c, i, ea);
+        return;
+    }
     u32 pa, wimg;
     if (!c.translate(ea, true, false, pa, &wimg))
         return;

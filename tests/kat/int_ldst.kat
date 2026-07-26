@@ -62,7 +62,7 @@ expect mem@2000=CAFEBABE cr=20000000 resv=0
 end
 
 test dcbz_clears_block
-r2=00002010 mem@2000=FF mem@201F=EE
+r2=00002010 hid0=0000C000 mem@2000=FF mem@201F=EE
 insn 7C0017EC                     # dcbz 0,r2
 expect mem@2000=00 mem@201F=00
 end

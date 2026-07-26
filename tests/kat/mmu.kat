@@ -205,7 +205,7 @@ end
 # ---- dcbz WIMG rule --------------------------------------------------------
 
 test dcbz_cache_inhibited_alignment
-msr=00000010 r4=00003010
+msr=00000010 r4=00003010 hid0=0000C000
 dbatu0=00001FFE dbatl0=00000022   # I=1 in WIMG
 mem@00003010=AABBCCDD
 insn 7C0027EC                     # dcbz 0,r4 -> block 0x3000
@@ -213,9 +213,16 @@ expect pc=00000600 srr0=00001000 srr1=00000010 dar=00003000 dsisr=00017C00 mem@0
 end
 
 test dcbz_zeroes_translated_block
-msr=00000010 r4=00003010
+msr=00000010 r4=00003010 hid0=0000C000
 dbatu0=00001FFE dbatl0=00000002
 mem@00003010=AABBCCDD mem@0000301C=EEFF0011
 insn 7C0027EC                     # dcbz 0,r4
 expect pc=00001004 mem@00003010=00000000 mem@0000301C=00000000
+end
+
+test dcbz_cache_disabled_alignment
+msr=00000000 r4=00003010
+mem@00003010=AABBCCDD
+insn 7C0027EC                     # HID0[DCE]=0: dcbz faults even in real mode
+expect pc=00000600 srr0=00001000 dar=00003000 dsisr=00017C00 mem@00003010=AABBCCDD
 end

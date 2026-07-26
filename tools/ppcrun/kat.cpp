@@ -81,6 +81,11 @@ bool applyKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
     if (key == "lr")  { c.st.lr = static_cast<u32>(hexval(val)); return true; }
     if (key == "ctr") { c.st.ctr = static_cast<u32>(hexval(val)); return true; }
     if (key == "pc")  { c.st.pc = static_cast<u32>(hexval(val)); return true; }
+    if (key == "msr") { c.st.msr = static_cast<u32>(hexval(val)); return true; }
+    if (key == "srr0") { c.st.srr0 = static_cast<u32>(hexval(val)); return true; }
+    if (key == "srr1") { c.st.srr1 = static_cast<u32>(hexval(val)); return true; }
+    if (key == "dec") { c.st.dec = static_cast<u32>(hexval(val)); return true; }
+    if (key == "dar") { c.st.dar = static_cast<u32>(hexval(val)); return true; }
     if (key == "resv") {
         c.st.resvValid = true;
         c.st.resvAddr = static_cast<u32>(hexval(val)) & ~31u;
@@ -114,6 +119,11 @@ bool checkKey(Cpu& c, KatBus& bus, const std::string& key, const std::string& va
     if (key == "lr")  return expectU32(c.st.lr);
     if (key == "ctr") return expectU32(c.st.ctr);
     if (key == "pc")  return expectU32(c.st.pc);
+    if (key == "msr") return expectU32(c.st.msr);
+    if (key == "srr0") return expectU32(c.st.srr0);
+    if (key == "srr1") return expectU32(c.st.srr1);
+    if (key == "dec") return expectU32(c.st.dec);
+    if (key == "dar") return expectU32(c.st.dar);
     if (key == "resv") {
         const bool want = hexval(val) != 0;
         if (c.st.resvValid == want)

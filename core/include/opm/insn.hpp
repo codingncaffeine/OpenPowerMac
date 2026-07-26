@@ -131,4 +131,35 @@ enum class Style : u8 { Gnu, Llvm }; // rN/fN/vN prefixes vs bare numbers
 // Unknown words render as ".long 0x????????".
 int disassemble(u32 insn, u32 pc, char* out, size_t cap, Style style);
 
+// Facility classification (drives FP/AltiVec-unavailable gating).
+inline bool isFpInsn(const InsnDesc& d)
+{
+    switch (d.pat) {
+    case Pat::FRT_D_RA: case Pat::FRS_D_RA: case Pat::FRT_RA_RB:
+    case Pat::FRS_RA_RB: case Pat::FP2: case Pat::FP3: case Pat::FP3C:
+    case Pat::FP4: case Pat::FCMP: case Pat::MTFSF: case Pat::MTFSFI:
+    case Pat::MTFSB: case Pat::MCRFS: case Pat::MFFS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// AltiVec-unavailable applies to everything touching VRs/VSCR except the
+// data-stream hints (verified: dst/dstst/dss run with MSR[VEC]=0, and VRSAVE
+// is never gated).
+inline bool isVecInsn(const InsnDesc& d)
+{
+    if (d.flags & (FL_TBIT | FL_ABIT))
+        return false;
+    switch (d.pat) {
+    case Pat::VX3: case Pat::VX2B: case Pat::VX_SPLAT: case Pat::VX_SPLATIS:
+    case Pat::MFVSCR: case Pat::MTVSCR: case Pat::VA4P: case Pat::VA_MADD:
+    case Pat::VSLDOI: case Pat::VD_RA_RB: case Pat::VS_RA_RB:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace opm

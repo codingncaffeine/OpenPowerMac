@@ -127,12 +127,12 @@ void h_cmpl(Cpu& c, u32 i, const InsnDesc&)  { cmpU(c, f_crfd(i), c.st.gpr[f_ra(
 void h_twi(Cpu& c, u32 i, const InsnDesc&)
 {
     if (trapCond(f_to(i), static_cast<i32>(c.st.gpr[f_ra(i)]), sext16(f_d(i))))
-        c.halt("trap (twi)");
+        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgTrap);
 }
 void h_tw(Cpu& c, u32 i, const InsnDesc&)
 {
     if (trapCond(f_to(i), static_cast<i32>(c.st.gpr[f_ra(i)]), static_cast<i32>(c.st.gpr[f_rb(i)])))
-        c.halt("trap (tw)");
+        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgTrap);
 }
 
 // ---- rotates ---------------------------------------------------------------
@@ -209,8 +209,16 @@ void h_bcctr(Cpu& c, u32 i, const InsnDesc&)
         c.st.pc = c.st.ctr & ~3u;
 }
 
-void h_sc(Cpu& c, u32, const InsnDesc&) { c.halt("sc (system call — P2)"); }
-void h_rfi(Cpu& c, u32, const InsnDesc&) { c.halt("rfi (P2)"); }
+void h_sc(Cpu& c, u32, const InsnDesc&)
+{
+    // SRR0 gets the address of the instruction AFTER sc.
+    c.raiseExc(Exc::SystemCall, c.st.pc, 0);
+}
+void h_rfi(Cpu& c, u32, const InsnDesc&)
+{
+    c.st.msr = c.st.srr1 & msr::VALID;
+    c.st.pc = c.st.srr0 & ~3u;
+}
 
 // ---- XO-form arithmetic ----------------------------------------------------
 
@@ -441,6 +449,12 @@ LOADX(h_lhax, static_cast<u32>(sext16(c.bus->read16(ea))))
 
 void updRa(Cpu& c, u32 insn, u32 ea) { c.st.gpr[f_ra(insn)] = ea; }
 
+void raiseAlign(Cpu& c, u32 ea)
+{
+    c.st.dar = ea; // DSISR opcode-image bits land with the P3 MMU work
+    c.raiseExc(Exc::Alignment, c.st.pc - 4, 0);
+}
+
 void h_lwzu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = c.bus->read32(ea); updRa(c, i, ea); }
 void h_lbzu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = c.bus->read8(ea); updRa(c, i, ea); }
 void h_lhzu(Cpu& c, u32 i, const InsnDesc&)  { const u32 ea = eaD(c, i); c.st.gpr[f_rt(i)] = c.bus->read16(ea); updRa(c, i, ea); }
@@ -489,12 +503,20 @@ void h_sthbrx(Cpu& c, u32 i, const InsnDesc&)
 void h_lmw(Cpu& c, u32 i, const InsnDesc&)
 {
     u32 ea = eaD(c, i);
+    if (ea & 3u) {
+        raiseAlign(c, ea);
+        return;
+    }
     for (u32 r = f_rt(i); r <= 31; ++r, ea += 4)
         c.st.gpr[r] = c.bus->read32(ea);
 }
 void h_stmw(Cpu& c, u32 i, const InsnDesc&)
 {
     u32 ea = eaD(c, i);
+    if (ea & 3u) {
+        raiseAlign(c, ea);
+        return;
+    }
     for (u32 r = f_rt(i); r <= 31; ++r, ea += 4)
         c.bus->write32(ea, c.st.gpr[r]);
 }
@@ -554,7 +576,7 @@ void h_lwarx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 ea = eaX(c, i);
     if (ea & 3u) {
-        c.halt("alignment (lwarx)");
+        raiseAlign(c, ea);
         return;
     }
     c.st.resvValid = true;
@@ -565,7 +587,7 @@ void h_stwcx(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 ea = eaX(c, i);
     if (ea & 3u) {
-        c.halt("alignment (stwcx.)");
+        raiseAlign(c, ea);
         return;
     }
     // UM: the reservation is non-specific with respect to this processor —
@@ -663,21 +685,53 @@ u32* sprPtr(Cpu& c, u32 spr)
     }
 }
 
+// User-mode readable SPRs; everything else is supervisor-only.
+bool sprUserReadable(u32 spr)
+{
+    switch (spr) {
+    case 1: case 8: case 9: case 256: // XER/LR/CTR/VRSAVE
+    case 936: case 937: case 938: case 939: case 940: case 941: case 942:
+    case 943: // performance-monitor user copies
+        return true;
+    default:
+        return false;
+    }
+}
+bool sprUserWritable(u32 spr)
+{
+    return spr == 1 || spr == 8 || spr == 9 || spr == 256;
+}
+
 void h_mfspr(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 spr = f_spr(i);
+    if (c.userMode() && !sprUserReadable(spr)) {
+        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgPrivileged);
+        return;
+    }
     if (spr == 268) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb); return; }
     if (spr == 269) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb >> 32); return; }
     if (u32* p = sprPtr(c, spr)) {
         c.st.gpr[f_rt(i)] = *p;
         return;
     }
-    c.halt("mfspr from unknown SPR " + std::to_string(spr));
+    c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgIllegal);
 }
 void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
 {
     const u32 spr = f_spr(i);
     const u32 v = c.st.gpr[f_rt(i)];
+    if (c.userMode() && !sprUserWritable(spr)) {
+        c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgPrivileged);
+        return;
+    }
+    if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception
+        const u32 old = c.st.dec;
+        c.st.dec = v;
+        if (!(old & 0x80000000u) && (v & 0x80000000u))
+            c.decPending = true;
+        return;
+    }
     if (spr == 284) { c.st.tb = (c.st.tb & 0xFFFFFFFF00000000ull) | v; return; }
     if (spr == 285) { c.st.tb = (c.st.tb & 0xFFFFFFFFull) | (static_cast<u64>(v) << 32); return; }
     if (spr == 287) return; // PVR is mfspr-only
@@ -685,7 +739,7 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         *p = v;
         return;
     }
-    c.halt("mtspr to unknown SPR " + std::to_string(spr));
+    c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgIllegal);
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)
 {
@@ -697,7 +751,7 @@ void h_mftb(Cpu& c, u32 i, const InsnDesc&)
 }
 
 void h_mfmsr(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.msr; }
-void h_mtmsr(Cpu& c, u32 i, const InsnDesc&) { c.st.msr = c.st.gpr[f_rt(i)]; }
+void h_mtmsr(Cpu& c, u32 i, const InsnDesc&) { c.st.msr = c.st.gpr[f_rt(i)] & msr::VALID; }
 void h_mtsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.sr[f_sr(i)] = c.st.gpr[f_rt(i)]; }
 void h_mfsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.gpr[f_rt(i)] = c.st.sr[f_sr(i)]; }
 void h_mtsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.sr[c.st.gpr[f_rb(i)] >> 28] = c.st.gpr[f_rt(i)]; }

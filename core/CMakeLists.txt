@@ -4,6 +4,7 @@ add_library(opmcore STATIC
   src/disasm.cpp
   src/cpu.cpp
   src/exec_int.cpp
+  src/exceptions.cpp
 )
 
 target_include_directories(opmcore PUBLIC include)

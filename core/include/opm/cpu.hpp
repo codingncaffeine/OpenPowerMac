@@ -43,6 +43,58 @@ struct CpuState {
     u32 resvAddr = 0;           // 32-byte-granule base
 };
 
+// MSR bit masks (32-bit, PPC numbering bit 0 = MSB). Verified: VEC = bit 6
+// (UM Table 2-1); layout per MPCPRG; PM position pinned pending P6 sweep.
+namespace msr {
+inline constexpr u32 VEC = 0x02000000u;
+inline constexpr u32 POW = 0x00040000u;
+inline constexpr u32 ILE = 0x00010000u;
+inline constexpr u32 EE  = 0x00008000u;
+inline constexpr u32 PR  = 0x00004000u;
+inline constexpr u32 FP  = 0x00002000u;
+inline constexpr u32 ME  = 0x00001000u;
+inline constexpr u32 FE0 = 0x00000800u;
+inline constexpr u32 SE  = 0x00000400u;
+inline constexpr u32 BE  = 0x00000200u;
+inline constexpr u32 FE1 = 0x00000100u;
+inline constexpr u32 IP  = 0x00000040u;
+inline constexpr u32 IR  = 0x00000020u;
+inline constexpr u32 DR  = 0x00000010u;
+inline constexpr u32 PM  = 0x00000004u;
+inline constexpr u32 RI  = 0x00000002u;
+inline constexpr u32 LE  = 0x00000001u;
+// Bits the 7400 implements (mtmsr/rfi mask).
+inline constexpr u32 VALID = VEC | POW | ILE | EE | PR | FP | ME | FE0 | SE |
+                             BE | FE1 | IP | IR | DR | PM | RI | LE;
+} // namespace msr
+
+// Exception vectors (offsets; base 0xFFF00000 when MSR[IP], else 0).
+enum class Exc : u32 {
+    SystemReset = 0x00100,
+    MachineCheck = 0x00200,
+    Dsi = 0x00300,
+    Isi = 0x00400,
+    External = 0x00500,
+    Alignment = 0x00600,
+    Program = 0x00700,
+    FpUnavailable = 0x00800,
+    Decrementer = 0x00900,
+    SystemCall = 0x00C00,
+    Trace = 0x00D00,
+    PerfMon = 0x00F00,
+    VecUnavailable = 0x00F20,
+    Iabr = 0x01300,
+    Smi = 0x01400,
+    VecAssist = 0x01600,
+    Thermal = 0x01700,
+};
+
+// Program-exception SRR1 cause bits.
+inline constexpr u32 kSrr1ProgFpEnabled = 0x00100000u;
+inline constexpr u32 kSrr1ProgIllegal = 0x00080000u;
+inline constexpr u32 kSrr1ProgPrivileged = 0x00040000u;
+inline constexpr u32 kSrr1ProgTrap = 0x00020000u;
+
 struct Cpu {
     CpuState st;
     Bus* bus = nullptr;
@@ -50,6 +102,27 @@ struct Cpu {
     // Census of decode gaps hit at runtime: mnemonic (or raw word) -> count.
     std::map<std::string, u64> unimplemented;
     std::map<u32, u64> unknownWords;
+
+    // Async lines / pending state.
+    bool extIrqLine = false;   // level-sensitive external interrupt
+    bool smiPending = false;
+    bool decPending = false;
+    bool raisedThisStep = false;
+    u32 cycleAccum = 0;
+    u32 cyclesPerTbTick = 4;   // TB = bus clock / 4; provisional 1 cycle/insn
+
+    void tick(u32 cycles)
+    {
+        cycleAccum += cycles;
+        while (cycleAccum >= cyclesPerTbTick) {
+            cycleAccum -= cyclesPerTbTick;
+            st.tb += 1;
+            const u32 old = st.dec;
+            st.dec -= 1;
+            if (!(old & 0x80000000u) && (st.dec & 0x80000000u))
+                decPending = true;
+        }
+    }
 
     // Set when execution cannot continue (pre-P2 stand-in for the exception
     // model: traps, sc, illegal ops halt with a reason instead of vectoring).
@@ -73,6 +146,17 @@ struct Cpu {
     // Execute up to n instructions; returns the number actually executed.
     u64 run(u64 n);
     void step();
+
+    // Vector to an exception per the UM ch.4 model: SRR0/SRR1 composition,
+    // MSR transition (clears VEC/POW/EE/PR/FP/FE0/SE/BE/FE1/PM/IR/DR/RI,
+    // LE<-ILE, keeps ME/IP/ILE), PC to base|vector.
+    // srr0 = address to save; extra = exception-specific SRR1 bits (1-4,10-15).
+    void raiseExc(Exc v, u32 srr0, u32 extra);
+
+    void setExternalIrq(bool level) { extIrqLine = level; }
+    void raiseSmi() { smiPending = true; }
+
+    bool userMode() const { return (st.msr & msr::PR) != 0; }
 
     // --- state helpers shared by executors ---
     void setCr0(u32 val)

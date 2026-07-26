@@ -176,6 +176,19 @@ int main(int argc, char** argv)
             printf("-- serial input injected @%llu: %s\n",
                    static_cast<unsigned long long>(executed), serialInput);
         }
+        static int nsectTrail = -1;
+        if (nsectTrail < 0 && !bus.ataLog().empty() &&
+            bus.ataLog().back().pa == 0x20020u &&
+            !(bus.ataLog().back().pa & 1u) && bus.ataLog().size() > 40)
+            nsectTrail = 3000; // trace the driver's continuation
+        if (nsectTrail > 0) {
+            --nsectTrail;
+            if (cpu.st.pc == 0xFF80B710u)
+                printf("-- post-nsect C! a=%08x v=%02x\n", cpu.st.gpr[20],
+                       cpu.st.gpr[21] & 0xFFu);
+            else if (cpu.st.pc == 0xFF80B1C0u)
+                printf("-- post-nsect C@ a=%08x\n", cpu.st.gpr[20]);
+        }
         static u64 lastFetchSample = 0;
         if (cpu.st.pc == 0xFF80B640u &&
             executed - lastFetchSample > 20000000ull) {
@@ -288,6 +301,15 @@ int main(int argc, char** argv)
             printf("   @%-11llu %08x <- %08x pc=%08x\n",
                    static_cast<unsigned long long>(ul[k].at), ul[k].pa,
                    ul[k].val, ul[k].pc);
+    }
+    {
+        const auto& cl = bus.cd().log;
+        printf("-- cd command log (%zu; c=ata p=packet e=err):\n   ",
+               cl.size());
+        for (size_t k = 0; k < cl.size() && k < 200; ++k)
+            printf("%c%02x@%llu ", cl[k].kind, cl[k].val,
+                   static_cast<unsigned long long>(cl[k].at));
+        printf("\n");
     }
     {
         const auto& al = bus.ataLog();

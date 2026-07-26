@@ -82,7 +82,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
             lba0_ = 0x01;
             bcLo_ = 0x14;
             bcHi_ = 0xEB;
-            status_ = 0;
+            status_ = 0x40;
             error_ = 0x01;
         }
         break;
@@ -103,7 +103,7 @@ void AtaCell::ataCommand(u8 cmd)
         bcLo_ = 0x14;
         bcHi_ = 0xEB;
         error_ = 0x01;
-        status_ = 0;
+        status_ = 0x40;
         break;
     case 0xA1: { // IDENTIFY PACKET DEVICE
         data_.assign(512, 0);

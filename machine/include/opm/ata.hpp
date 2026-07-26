@@ -48,7 +48,7 @@ private:
     // task file — the ATAPI signature (01 01 14 EB) is presented from
     // power-on, not only after an explicit reset
     u8 features_ = 0, nsect_ = 0x01, lba0_ = 0x01, bcLo_ = 0x14,
-       bcHi_ = 0xEB, dev_ = 0, status_ = 0, error_ = 0x01, devctl_ = 0;
+       bcHi_ = 0xEB, dev_ = 0, status_ = 0x40, error_ = 0x01, devctl_ = 0;
     // PIO engine
     std::vector<u8> data_;
     size_t dataAt_ = 0;

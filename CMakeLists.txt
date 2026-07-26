@@ -15,6 +15,7 @@ endif()
 
 add_subdirectory(core)
 add_subdirectory(tools/ppcrun)
+add_subdirectory(tools/sstgen)
 
 if(OPM_BUILD_TESTS)
   enable_testing()

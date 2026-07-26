@@ -1,0 +1,5 @@
+add_executable(sstgen main.cpp)
+target_link_libraries(sstgen PRIVATE opmcore)
+if(MSVC)
+  target_compile_definitions(sstgen PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

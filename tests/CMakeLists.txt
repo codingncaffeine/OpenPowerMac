@@ -12,3 +12,8 @@ endif()
 
 add_test(NAME unit COMMAND opm_unit)
 add_test(NAME kat COMMAND ppcrun --kat ${CMAKE_CURRENT_SOURCE_DIR}/kat)
+
+add_test(NAME sst_gen COMMAND sstgen --out ${CMAKE_BINARY_DIR}/sst --count 100)
+set_tests_properties(sst_gen PROPERTIES FIXTURES_SETUP sstdata)
+add_test(NAME sst COMMAND ppcrun --sst ${CMAKE_BINARY_DIR}/sst)
+set_tests_properties(sst PROPERTIES FIXTURES_REQUIRED sstdata)

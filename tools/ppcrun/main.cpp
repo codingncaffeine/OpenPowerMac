@@ -11,6 +11,7 @@
 #include "opm/cpu.hpp"
 #include "opm/bits.hpp"
 #include "kat.hpp"
+#include "sst.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -174,7 +175,8 @@ void usage()
             "  --disasm       disassemble executable sections and exit\n"
             "  --style S      disassembly style: gnu | llvm (default gnu)\n"
             "  --ledger       dump the ISA ledger (implemented/decoded) and exit\n"
-            "  --kat PATH     run known-answer tests (.kat file or directory)\n");
+            "  --kat PATH     run known-answer tests (.kat file or directory)\n"
+            "  --sst PATH     run SST-PPC JSON chapters (file or directory)\n");
     exit(2);
 }
 
@@ -206,6 +208,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ledger")) ledger = true;
         else if (!strcmp(a, "--style")) style = strcmp(next(), "llvm") ? Style::Gnu : Style::Llvm;
         else if (!strcmp(a, "--kat")) return runKats(next()) ? 1 : 0;
+        else if (!strcmp(a, "--sst")) return runSst(next()) ? 1 : 0;
         else if (a[0] == '-') usage();
         else path = a;
     }

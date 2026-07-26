@@ -18,6 +18,7 @@ add_subdirectory(machine)
 add_subdirectory(tools/ppcrun)
 add_subdirectory(tools/sstgen)
 add_subdirectory(tools/macrun)
+add_subdirectory(tools/g4run)
 
 if(OPM_BUILD_TESTS)
   enable_testing()

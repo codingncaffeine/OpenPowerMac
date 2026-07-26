@@ -1,0 +1,5 @@
+add_executable(g4run main.cpp)
+target_link_libraries(g4run PRIVATE opmmachine)
+if(MSVC)
+  target_compile_definitions(g4run PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

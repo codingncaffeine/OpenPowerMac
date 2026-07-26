@@ -97,6 +97,7 @@ public:
     // each new register the ROM consults stays visible. Blocks earn real
     // device models as the boot demands behavior a store can't fake.
     static constexpr u32 kMacIoBase = 0xF3000000u;
+    static constexpr u32 kMacIoBar = 0x80000000u; // OF's PCI BAR assignment
     static constexpr u32 kMacIoSize = 0x80000u;
     const std::map<u32, Acc>& macioLog() const { return klLog_; }
     std::vector<u32> macioOrder;
@@ -129,6 +130,7 @@ public:
     const u64* stamp = nullptr;
 
     size_t ramBytes() const { return ram_.size(); }
+    const std::vector<u8>& ram() const { return ram_; }
 
 private:
     // During memory sizing the RAM controller exposes each DIMM slot in a
@@ -142,8 +144,34 @@ private:
     std::vector<RegWr> szLog_; // sizing-window probe traffic (val=data)
     std::vector<RegWr> i2cLog_; // one entry per launched transaction
 
+    // mac-io answers at both its early hard decode and the OF-assigned
+    // PCI BAR; the BAR wins over the overlapping sizing window.
+    u32 macioOff(u32 pa) const
+    {
+        if (pa - kMacIoBase < kMacIoSize)
+            return pa - kMacIoBase;
+        if (pa - kMacIoBar < kMacIoSize)
+            return pa - kMacIoBar;
+        return 0xFFFFFFFFu;
+    }
+
     u32 read(u32 pa, u32 len)
     {
+        const u32 off = macioOff(pa);
+        if (off != 0xFFFFFFFFu) {
+            if (off >= 0x16000u && off < 0x18000u) {
+                u32 v = 0;
+                for (u32 k = 0; k < len; ++k)
+                    v = (v << 8) |
+                        pmu_.read(off - 0x16000u + k, stamp ? *stamp : 0);
+                return v;
+            }
+            if (off >= 0x13000u && off < 0x14000u)
+                return sccRead(off - 0x13000u);
+            const u32 v = get(kl_.data() + off, len);
+            klNote(kMacIoBase + off, 0, false);
+            return v;
+        }
         if (pa - kSizeWin < 0x20000000u) {
             const u32 v =
                 get(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), len);
@@ -160,27 +188,29 @@ private:
             return i2cRead(pa - kI2cBase);
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize)
             return get(unin_ + (pa - kUniNBase), len);
-        if (pa >= kMacIoBase && pa + len <= kMacIoBase + kMacIoSize) {
-            const u32 off = pa - kMacIoBase;
-            if (off >= 0x16000u && off < 0x18000u) {
-                u32 v = 0;
-                for (u32 k = 0; k < len; ++k)
-                    v = (v << 8) |
-                        pmu_.read(off - 0x16000u + k, stamp ? *stamp : 0);
-                return v;
-            }
-            if (off >= 0x13000u && off < 0x14000u)
-                return sccRead(off - 0x13000u);
-            const u32 v = get(kl_.data() + off, len);
-            klNote(pa, 0, false);
-            return v;
-        }
         note(pa, 0, false);
         return len == 1 ? 0xFFu : len == 2 ? 0xFFFFu : 0xFFFFFFFFu;
     }
 
     void write(u32 pa, u32 v, u32 len)
     {
+        if (const u32 moff = macioOff(pa); moff != 0xFFFFFFFFu) {
+            const u32 off = moff;
+            if (off >= 0x16000u && off < 0x18000u) {
+                for (u32 k = 0; k < len; ++k)
+                    pmu_.write(off - 0x16000u + k,
+                               static_cast<u8>(v >> (8 * (len - 1 - k))),
+                               stamp ? *stamp : 0);
+                return;
+            }
+            if (off >= 0x13000u && off < 0x14000u) {
+                sccWrite(off - 0x13000u, static_cast<u8>(v));
+                return;
+            }
+            put(kl_.data() + off, v, len);
+            klNote(kMacIoBase + off, v, true);
+            return;
+        }
         if (pa - kSizeWin < 0x20000000u) {
             put(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), v, len);
             if (szLog_.size() < 4000)
@@ -201,23 +231,6 @@ private:
             if (uninLog_.size() < 4096)
                 uninLog_.push_back({stamp ? *stamp : 0, pa, v,
                                     pcRef ? *pcRef : 0});
-            return;
-        }
-        if (pa >= kMacIoBase && pa + len <= kMacIoBase + kMacIoSize) {
-            const u32 off = pa - kMacIoBase;
-            if (off >= 0x16000u && off < 0x18000u) {
-                for (u32 k = 0; k < len; ++k)
-                    pmu_.write(off - 0x16000u + k,
-                               static_cast<u8>(v >> (8 * (len - 1 - k))),
-                               stamp ? *stamp : 0);
-                return;
-            }
-            if (off >= 0x13000u && off < 0x14000u) {
-                sccWrite(off - 0x13000u, static_cast<u8>(v));
-                return;
-            }
-            put(kl_.data() + off, v, len);
-            klNote(pa, v, true);
             return;
         }
         note(pa, v, true); // ROM/flash writes land here too, unapplied

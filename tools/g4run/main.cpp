@@ -44,9 +44,9 @@ struct Ring {
     struct Ent {
         u32 pc = 0, insn = 0;
     };
-    Ent e[32];
+    Ent e[128];
     u32 n = 0;
-    void push(u32 pc, u32 insn) { e[n++ & 31u] = {pc, insn}; }
+    void push(u32 pc, u32 insn) { e[n++ & 127u] = {pc, insn}; }
 };
 
 } // namespace
@@ -62,6 +62,7 @@ int main(int argc, char** argv)
     u32 fastTb = 0; // extra TB cycles per instruction: compresses the
                     // ROM's wall-clock waits (harness lever, not machine
                     // truth — timings scale, ordering is preserved)
+    const char* ramDumpPath = nullptr;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -83,6 +84,7 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--fast-tb"))
             fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--dump-ram")) ramDumpPath = next();
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -155,13 +157,27 @@ int main(int argc, char** argv)
                    cpu.st.gpr[1] & 15u, cpu.st.gpr[1], cpu.st.lr);
         }
         static bool code3Shown = false;
-        if (cpu.st.pc == 0xFFF80144u && !code3Shown) {
+        if (cpu.raisedThisStep && cpu.st.pc == 0x00000700u && !code3Shown) {
             code3Shown = true;
-            printf("-- code-3 entry @%llu; ring into it:\n",
-                   static_cast<unsigned long long>(executed));
-            const u32 cnt = ring.n < 24 ? ring.n : 24;
+            printf("-- first 0x700 @%llu srr0=%08x srr1=%08x lr=%08x "
+                   "ctr=%08x\n",
+                   static_cast<unsigned long long>(executed), cpu.st.srr0,
+                   cpu.st.srr1, cpu.st.lr, cpu.st.ctr);
+            printf("   r0-r7: ");
+            for (u32 k = 0; k < 8; ++k)
+                printf("%08x ", cpu.st.gpr[k]);
+            printf("\n   r24-r31: ");
+            for (u32 k = 24; k < 32; ++k)
+                printf("%08x ", cpu.st.gpr[k]);
+            cpu.l1dFlushAll(true);
+            const u32 fr = cpu.st.gpr[2];
+            printf("\n   frame[r2=%08x] +80..+9c:", fr);
+            for (u32 k = 0x80; k <= 0x9C; k += 4)
+                printf(" %08x", bus.read32(fr + k));
+            printf("\n   ring:\n");
+            const u32 cnt = ring.n < 96 ? ring.n : 96;
             for (u32 k = 0; k < cnt; ++k) {
-                const auto& e = ring.e[(ring.n - cnt + k) & 31u];
+                const auto& e = ring.e[(ring.n - cnt + k) & 127u];
                 disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
                 printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
             }
@@ -193,6 +209,17 @@ int main(int argc, char** argv)
     }
 
     cpu.l1dFlushAll(true);
+    if (ramDumpPath) {
+        FILE* f = fopen(ramDumpPath, "wb");
+        if (f) {
+            const size_t n = bus.ram().size() < (64u << 20)
+                                 ? bus.ram().size()
+                                 : size_t(64u << 20);
+            fwrite(bus.ram().data(), 1, n, f);
+            fclose(f);
+            printf("-- ram dumped (%zu bytes): %s\n", n, ramDumpPath);
+        }
+    }
     printf("-- executed %llu instructions; stop pc=%08x%s\n",
            static_cast<unsigned long long>(executed), cpu.st.pc,
            cpu.halted ? " (halted)" : "");
@@ -315,7 +342,7 @@ int main(int argc, char** argv)
     printf("-- last instructions:\n");
     const u32 cnt = ring.n < 32 ? ring.n : 32;
     for (u32 k = 0; k < cnt; ++k) {
-        const auto& e = ring.e[(ring.n - cnt + k) & 31u];
+        const auto& e = ring.e[(ring.n - cnt + k) & 127u];
         disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
         printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
     }

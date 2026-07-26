@@ -1,0 +1,37 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+.vs/
+.vscode/
+*.user
+
+# Dev-shell local state
+imgui.ini
+CMakeUserPresets.json
+
+# Local planning docs — never pushed
+_plans/
+
+# Apple ROMs, OS media, and disk images — user-supplied, never committed
+*.rom
+roms/
+*.img
+*.image
+*.dsk
+*.hfs
+*.dmg
+*.cdr
+*.iso
+*.toast
+*.cue
+*.bin
+*.smi
+*.sit
+*.sea
+*.hqx
+
+# Vendor manuals and locally fetched test data — reference shelf lives in scratch, never in-repo
+docs/refs/
+tests/data/

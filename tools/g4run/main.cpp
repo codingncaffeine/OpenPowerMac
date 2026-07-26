@@ -280,6 +280,14 @@ int main(int argc, char** argv)
                    ul[k].val, ul[k].pc);
     }
     {
+        const auto& al = bus.ataLog();
+        printf("-- ata traffic (%zu; off r/w val pc):\n", al.size());
+        for (size_t k = 0; k < al.size() && k < 120; ++k)
+            printf("   +%05x %c %02x pc=%08x @%llu\n", al[k].pa & ~1u,
+                   (al[k].pa & 1u) ? 'r' : 'w', al[k].val & 0xFFu,
+                   al[k].pc, static_cast<unsigned long long>(al[k].at));
+    }
+    {
         const auto& cl = bus.cfgLog();
         printf("-- pci config accesses (%zu; bus latch val pc r/w):\n",
                cl.size());

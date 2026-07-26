@@ -123,6 +123,12 @@ public:
     // The VIA cell (+0x16000..+0x17FFF) routes to the PMU99 model.
     PmuVia& pmu() { return pmu_; }
 
+    // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
+    // with a /disk node). Register traffic is logged bus-tagged while
+    // the cells serve empty-bus semantics; the atapi-disk open sequence
+    // defines the contract the real device model must meet.
+    const std::vector<RegWr>& ataLog() const { return ataLog_; }
+
     // SCC (+0x13000): MacRISC layout — ctrl B/A at +0x00/+0x20, data B/A
     // at +0x10/+0x30. Enough Z8530 to drain transmit (RR0 TX-empty) and
     // capture the ROM's serial console log verbatim. Bytes queued with
@@ -200,6 +206,12 @@ private:
                 return sccRead(off - 0x13000u);
             if (off >= 0x18000u && off < 0x18100u)
                 return i2cRead(1, off - 0x18000u);
+            if (off - 0x1F000u < 0x3000u) {
+                if (ataLog_.size() < 3000)
+                    ataLog_.push_back({stamp ? *stamp : 0, off | 1u, 0,
+                                       pcRef ? *pcRef : 0});
+                return 0; // empty bus: no BSY, no DRDY, zero signature
+            }
             const u32 v = get(kl_.data() + off, len);
             klNote(kMacIoBase + off, 0, false);
             return v;
@@ -243,6 +255,12 @@ private:
             }
             if (off >= 0x18000u && off < 0x18100u) {
                 i2cWrite(1, off - 0x18000u, static_cast<u8>(v));
+                return;
+            }
+            if (off - 0x1F000u < 0x3000u) {
+                if (ataLog_.size() < 3000)
+                    ataLog_.push_back({stamp ? *stamp : 0, off, v,
+                                       pcRef ? *pcRef : 0});
                 return;
             }
             put(kl_.data() + off, v, len);
@@ -532,6 +550,7 @@ private:
     u32 cfgAddr_[3] = {0, 0, 0};
     std::map<u32, u32> cfgSpace_; // (bus<<28|latch&~3) -> native-LE word
     std::vector<RegWr> cfgLog_;
+    std::vector<RegWr> ataLog_;
 };
 
 } // namespace opm

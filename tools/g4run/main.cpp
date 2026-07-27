@@ -51,6 +51,84 @@ struct Ring {
     void push(u32 pc, u32 insn) { e[n++ & 127u] = {pc, insn}; }
 };
 
+// Classic Mac code is self-describing: a MacsBug symbol — a length byte with
+// the high bit set, then the name — sits just past each function's RTS. So
+// the Mac OS ROM, once loaded into RAM, carries its own symbol table.
+// tools/symbolize.sh has been rewriting logs with it after the fact; doing it
+// in-process means every trace line names a routine as it is printed, which
+// is the difference between reading a dig and decoding one.
+//
+// Built lazily: the ROM is not in RAM until Trampoline has run, so an early
+// attempt finds nothing and is retried later rather than cached as empty.
+struct SymTab {
+    std::vector<std::pair<u32, std::string>> syms;
+    bool built = false;
+    u64 lastTry = 0;
+
+    void build(const std::vector<u8>& ram, u32 paBase, u32 vaBase, u32 len)
+    {
+        syms.clear();
+        if (static_cast<size_t>(paBase) + len > ram.size())
+            return;
+        for (u32 k = 1; k < len; ++k) {
+            const u8 tag = ram[paBase + k - 1];
+            if (tag < 0x80u)
+                continue;
+            u32 n = tag & 0x7Fu;
+            if (n < 4 || n > 31 || k + n > len)
+                continue;
+            bool ok = true;
+            for (u32 j = 0; j < n && ok; ++j) {
+                const char c = static_cast<char>(ram[paBase + k + j]);
+                const bool head = (j == 0);
+                ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     c == '_' ||
+                     (!head && ((c >= '0' && c <= '9') || c == '.'));
+            }
+            if (!ok)
+                continue;
+            syms.emplace_back(vaBase + k,
+                              std::string(reinterpret_cast<const char*>(
+                                              ram.data() + paBase + k),
+                                          n));
+            k += n;
+        }
+        std::sort(syms.begin(), syms.end());
+        built = syms.size() > 200; // a handful of hits is noise, not a table
+    }
+
+    // Rotating buffers: a printf commonly symbolizes more than one address.
+    const char* at(u32 a)
+    {
+        static char buf[6][64];
+        static u32 turn = 0;
+        char* out = buf[turn++ % 6u];
+        if (!built || syms.empty() || a < syms.front().first) {
+            out[0] = 0;
+            return out;
+        }
+        size_t lo = 0, hi = syms.size() - 1, best = 0;
+        while (lo <= hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (syms[mid].first <= a) {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                if (mid == 0)
+                    break;
+                hi = mid - 1;
+            }
+        }
+        const u32 off = a - syms[best].first;
+        if (off > 0x4000u) { // too far to be inside that routine
+            out[0] = 0;
+            return out;
+        }
+        snprintf(out, 64, "<%s+0x%x>", syms[best].second.c_str(), off);
+        return out;
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -95,6 +173,8 @@ int main(int argc, char** argv)
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
     bool fastTbSet = false;            // CLI wins over a resumed value
     bool realtime = false;             // --realtime: TB from the host clock
+    u32 callLo = 0, callHi = 0;        // --call-trace LO HI
+    u64 callFrom = 0;                  // --call-trace-at N: gate
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -161,6 +241,12 @@ int main(int argc, char** argv)
             verifySteps = strtoull(next(), nullptr, 0);
         }
         else if (!strcmp(a, "--realtime")) realtime = true;
+        else if (!strcmp(a, "--call-trace")) {
+            callLo = static_cast<u32>(strtoul(next(), nullptr, 0));
+            callHi = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
+        else if (!strcmp(a, "--call-trace-at"))
+            callFrom = strtoull(next(), nullptr, 0);
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -384,6 +470,25 @@ int main(int argc, char** argv)
         cpu.setExternalIrq(bus.pic().cpuLine());
     };
 
+    // Symbolize on demand. The table cannot exist until the Mac OS ROM is in
+    // RAM, so building it is retried rather than cached empty.
+    SymTab symtab;
+    auto sym = [&](u32 a) -> const char* {
+        if (!symtab.built && executed > 100000000ull &&
+            executed - symtab.lastTry > 100000000ull) {
+            symtab.lastTry = executed;
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            symtab.build(bus.ram(), 0x00C00000u, 0xFFC00000u, 0x00200000u);
+            if (symtab.built)
+                printf("-- symbols: %zu MacsBug names from the ROM in RAM "
+                       "@%llu\n",
+                       symtab.syms.size(),
+                       static_cast<unsigned long long>(executed));
+        }
+        return symtab.at(a);
+    };
+
     Ring ring;
     int excLogged = 0;
     struct ExcEnt {
@@ -442,14 +547,79 @@ int main(int argc, char** argv)
             static int ab = 0;
             if (ab < 40) {
                 ++ab;
-                if (pc == 0xFFDD18E8u)
+                if (pc == 0xFFDD18E8u) {
                     printf("ADDBUS enter pb=%08x @%llu\n", cpu.st.gpr[29],
                            static_cast<unsigned long long>(executed));
+                    // Who registers the bus? The parameter block this
+                    // worker is handed carries a NULL at +0x3E, so the
+                    // bus's registered-driver list is created empty and
+                    // every later lookup answers -56. That makes the
+                    // CALLER the whole remaining question, and a param
+                    // block on its own does not name one. Walk the native
+                    // backchain (PowerOpen linkage: saved LR at +8 of the
+                    // caller's frame) and report the 68K pc too, since the
+                    // manager is reachable from both worlds.
+                    printf("   lr=%08x r24=%08x sp=%08x chain:", cpu.st.lr,
+                           cpu.st.gpr[24], cpu.st.gpr[1]);
+                    cpu.l1dFlushAll(true);
+                    cpu.l2FlushAll(true);
+                    cpu.mmuProbe = true;
+                    const CpuState abSaved = cpu.st;
+                    const bool abRaised = cpu.raisedThisStep;
+                    const CpuState abArmed = cpu.st;
+                    auto abRead = [&](u32 ea, u32& v) {
+                        u32 pa = 0;
+                        cpu.st = abArmed;
+                        const bool ok = cpu.translate(ea, false, false, pa);
+                        cpu.st = abArmed;
+                        if (!ok || (pa & ~3u) + 4 > bus.ram().size())
+                            return false;
+                        v = bus.read32(pa & ~3u);
+                        return true;
+                    };
+                    u32 sp = cpu.st.gpr[1];
+                    for (u32 f = 0; f < 8 && sp; ++f) {
+                        u32 bc = 0, slr = 0;
+                        if (!abRead(sp, bc) || !bc || bc <= sp)
+                            break;
+                        if (abRead(bc + 8, slr))
+                            printf(" %08x%s", slr, sym(slr));
+                        sp = bc;
+                    }
+                    printf("\n");
+                    cpu.st = abSaved;
+                    cpu.raisedThisStep = abRaised;
+                    cpu.mmuProbe = false;
+                    fflush(stdout);
+                }
                 else
                     printf("ADDBUS %s -> %d\n",
                            pc == 0xFFDD18F8u ? "check1(dd3b18)"
                                              : "check2(dd1834)",
                            static_cast<int>(cpu.st.gpr[3]));
+                fflush(stdout);
+            }
+        }
+        // Generic "who calls this?" — an entry edge into an address range.
+        // Every time this question came up it was answered by hand-rolling
+        // a backchain walk at one specific site, which costs a build and a
+        // run each time and only ever answers once. Detecting the transfer
+        // itself is both simpler and more general: if the new pc is inside
+        // the window and the old one was not, control just entered it, and
+        // the OLD pc is the call site whatever instruction form got there —
+        // bl, bctrl, a jump table, or a 68K trap thunk. LR and the first
+        // three argument registers come along, since "who called" is nearly
+        // always followed by "with what".
+        if (callLo && cpu.st.pc >= callLo && cpu.st.pc < callHi &&
+            !(pc >= callLo && pc < callHi) && executed >= callFrom) {
+            static int ct = 0;
+            if (ct < 200) {
+                ++ct;
+                printf("CALL %08x%s -> %08x%s lr=%08x r3=%08x r4=%08x "
+                       "r5=%08x @%llu\n",
+                       pc, sym(pc), cpu.st.pc, sym(cpu.st.pc), cpu.st.lr,
+                       cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.gpr[5],
+                       static_cast<unsigned long long>(executed));
                 fflush(stdout);
             }
         }
@@ -555,7 +725,17 @@ int main(int argc, char** argv)
                 const bool pbRaised = cpu.raisedThisStep;
                 const CpuState pbArmed = cpu.st;
                 const u32 pb = cpu.st.gpr[3];
-                printf("ATAPB fn=%02x pb=%08x @%llu\n", fn, pb,
+                // Report the PHYSICAL address too. A parameter block is a
+                // virtual pointer, --watch-mem takes a physical one, and a
+                // watch aimed at a guessed translation fires zero times and
+                // reads as "never written" — which is the same silence as a
+                // watch that was simply pointed at the wrong page.
+                u32 pbPa = 0;
+                cpu.st = pbArmed;
+                const bool pbOk = cpu.translate(pb, false, false, pbPa);
+                cpu.st = pbArmed;
+                printf("ATAPB fn=%02x pb=%08x pa=%s%08x @%llu\n", fn, pb,
+                       pbOk ? "" : "?", pbPa,
                        static_cast<unsigned long long>(executed));
                 for (u32 row = 0; row < 0x50u; row += 16) {
                     printf("   +%02x:", row);
@@ -772,9 +952,10 @@ int main(int argc, char** argv)
                     // trap line's registers bracket the previous call.
                     if (atFull < 200) {
                         ++atFull;
-                        printf("ATRAP $A%03x pc68=%08x D0=%08x D7=%08x "
+                        printf("ATRAP $A%03x pc68=%08x%s D0=%08x D7=%08x "
                                "A0=%08x A3=%08x @%llu\n",
-                               t, cur68, cpu.st.gpr[8], cpu.st.gpr[15],
+                               t, cur68, sym(cur68), cpu.st.gpr[8],
+                               cpu.st.gpr[15],
                                cpu.st.gpr[16], cpu.st.gpr[19],
                                static_cast<unsigned long long>(executed));
                         fflush(stdout);
@@ -956,7 +1137,6 @@ int main(int argc, char** argv)
                         const CpuState cSaved = cpu.st;
                         const bool cRaised = cpu.raisedThisStep;
                         cpu.st.msr |= 0x30u;
-                        const CpuState cArmed = cpu.st;
                         u32 cs = 0xFFFFFFFFu, pa = 0;
                         const u32 pb = cpu.st.gpr[16];
                         if (cpu.translate(pb + 0x1Au, false, false, pa) &&
@@ -1904,9 +2084,19 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(n));
     }
     {
+        // Head AND tail: the head is the card's own FCode bring-up, the
+        // tail is whatever the OS driver did most recently — and when the
+        // display work starts it is the tail that matters. Reporting only
+        // the head is the same trimming trap the ATA log had.
         const auto& al = bus.ati().log;
-        printf("-- ati reg traffic (%zu; w/r first-touch):\n", al.size());
-        for (size_t k = 0; k < al.size() && k < 120; ++k)
+        printf("-- ati reg traffic (%zu; w/r; first 60 then last 60):\n",
+               al.size());
+        for (size_t k = 0; k < al.size() && k < 60; ++k)
+            printf("   %c +%04x %08x pc=%08x @%llu\n",
+                   al[k].wr ? 'w' : 'r', al[k].off, al[k].val, al[k].pc,
+                   static_cast<unsigned long long>(al[k].at));
+        for (size_t k = al.size() > 60 ? al.size() - 60 : 60; k < al.size();
+             ++k)
             printf("   %c +%04x %08x pc=%08x @%llu\n",
                    al[k].wr ? 'w' : 'r', al[k].off, al[k].val, al[k].pc,
                    static_cast<unsigned long long>(al[k].at));

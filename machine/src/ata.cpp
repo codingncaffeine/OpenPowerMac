@@ -68,7 +68,12 @@ void AtaCell::diskStartRead()
 #else
     fseeko(iso_, static_cast<off_t>(readLba_ * 512), SEEK_SET);
 #endif
-    (void)fread(data_.data(), 1, data_.size(), iso_);
+    // A short read means the request ran past the end of the image. The
+    // buffer is already zeroed, which is what a drive hands back for a
+    // sector it cannot supply, so the transfer completes with zeros rather
+    // than with whatever was in the buffer before.
+    const size_t got = fread(data_.data(), 1, data_.size(), iso_);
+    (void)got;
     dataAt_ = 0;
     ++readLba_;
     --readLeft_;
@@ -270,8 +275,21 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 #else
                 fseeko(iso_, static_cast<off_t>(wrLba_ * 512), SEEK_SET);
 #endif
-                (void)fwrite(data_.data(), 1, data_.size(), iso_);
+                // A host write that does not land is a lost disk write, and
+                // silently dropping one is how a guest filesystem corrupts
+                // itself hours later. Report it the way a drive would.
+                const bool wrote =
+                    fwrite(data_.data(), 1, data_.size(), iso_) ==
+                    data_.size();
                 fflush(iso_);
+                if (!wrote) {
+                    error_ = 0x04; // ABRT
+                    status_ = kDrdy | kDsc | kErr;
+                    wrLeft_ = 0;
+                    irq_ = true;
+                    dataAt_ = 0;
+                    return;
+                }
                 ++wrLba_;
                 --wrLeft_;
                 dataAt_ = 0;

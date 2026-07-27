@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 2;
+constexpr u32 kSnapVersion = 3;
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -407,6 +407,7 @@ void AtaCell::snapSave(SnapWriter& w) const
         w.u8v(ev.val);
         w.u32v(ev.a);
         w.u32v(ev.b);
+        w.u32v(ev.pc);
     }
 }
 
@@ -458,6 +459,7 @@ void AtaCell::snapLoad(SnapReader& r)
         ev.val = r.u8v();
         ev.a = r.u32v();
         ev.b = r.u32v();
+        ev.pc = r.u32v();
         log.push_back(ev);
     }
 }

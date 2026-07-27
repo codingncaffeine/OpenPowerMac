@@ -51,12 +51,17 @@ public:
 
     struct Ev {
         u64 at;
-        char kind; // 'c' ata cmd, 'p' packet op, 'e' error path
+        char kind; // c ata cmd, p packet op, e error path
         u8 val;
         u32 a = 0, b = 0; // READ ops: LBA + sector count
+        u32 pc = 0;    // the instruction that issued it
     };
     std::vector<Ev> log;
     const u64* stamp = nullptr;
+    // Which code issued a command. The command log had timestamps but no
+    // issuer, so "who asked for this sector" meant correlating two logs by
+    // eye across a trimmed window.
+    const u32* pcRef = nullptr;
 
     // Snapshot. The backing FILE* is deliberately NOT state: every access
     // seeks explicitly before reading, so re-attaching the same image on

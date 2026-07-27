@@ -187,7 +187,7 @@ void AtaCell::diskCommand(u8 cmd)
     default:
         if (log.size() >= 4096)
             log.erase(log.begin(), log.begin() + 2048);
-        log.push_back({stamp ? *stamp : 0, 'e', cmd});
+        log.push_back({stamp ? *stamp : 0, 'e', cmd, 0, 0, pcRef ? *pcRef : 0});
         error_ = 0x04; // ABRT
         status_ = (kDrdy | kDsc) | kErr;
         break;
@@ -335,7 +335,7 @@ void AtaCell::ataCommand(u8 cmd)
     if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
     if (true)
-        log.push_back({stamp ? *stamp : 0, 'c', cmd});
+        log.push_back({stamp ? *stamp : 0, 'c', cmd, 0, 0, pcRef ? *pcRef : 0});
     error_ = 0;
     if (disk_) { // ATA hard disk: a different command set entirely
         diskCommand(cmd);
@@ -400,7 +400,7 @@ void AtaCell::ataCommand(u8 cmd)
         if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
     if (true)
-            log.push_back({stamp ? *stamp : 0, 'e', cmd});
+            log.push_back({stamp ? *stamp : 0, 'e', cmd, 0, 0, pcRef ? *pcRef : 0});
         error_ = 0x04; // ABRT
         status_ = kDrdy | kErr;
         break;
@@ -413,7 +413,7 @@ void AtaCell::packet(const u8* cdb)
     if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
     if (true)
-        log.push_back({stamp ? *stamp : 0, 'p', cdb[0]});
+        log.push_back({stamp ? *stamp : 0, 'p', cdb[0], 0, 0, pcRef ? *pcRef : 0});
     error_ = 0;
     data_.clear();
     dataAt_ = 0;
@@ -524,7 +524,7 @@ void AtaCell::packet(const u8* cdb)
         if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
     if (true)
-            log.push_back({stamp ? *stamp : 0, 'e', cdb[0]});
+            log.push_back({stamp ? *stamp : 0, 'e', cdb[0], 0, 0, pcRef ? *pcRef : 0});
         sense_ = 0x05; // illegal request
         error_ = 0x04 | (0x05 << 4);
         nsect_ = kIo | kCoD;

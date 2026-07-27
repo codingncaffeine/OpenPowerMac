@@ -242,6 +242,7 @@ int main(int argc, char** argv)
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
     u64 dumpStructsAt = 0;             // --dump-structs-at N
+    u64 dumpRamAt = 0;                 // --dump-ram-at N
     bool dumpStructsEnd = false;       // --dump-structs
     const char* eventsPath = nullptr;  // --events FILE (JSONL)
     u32 watchVa = 0;                   // --watch-va ADDR
@@ -330,6 +331,8 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--arm-on-pc"))
             armOnPc = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--dump-structs")) dumpStructsEnd = true;
+        else if (!strcmp(a, "--dump-ram-at"))
+            dumpRamAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-structs-at"))
             dumpStructsAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--events")) eventsPath = next();
@@ -433,6 +436,8 @@ int main(int argc, char** argv)
     bus.pcRef = &cpu.st.pc;
     bus.stamp = &executed;
     bus.cd().stamp = &executed;
+    bus.cd().pcRef = &cpu.st.pc;
+    bus.hd().pcRef = &cpu.st.pc;
     bus.hd().stamp = &executed;
     bus.pic().stamp = &executed;
     bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
@@ -966,6 +971,22 @@ int main(int argc, char** argv)
                 printf("-- trace window done (%llu lines)\n",
                        static_cast<unsigned long long>(traceLines));
         }
+        // A dump taken at END of run does not describe memory at an
+        // earlier moment: this driver module is reloaded every kick, so an
+        // end-of-run image disassembles to code at different boundaries
+        // than the ones that actually executed. Dump AT the instant.
+        if (dumpRamAt && executed == dumpRamAt && ramDumpPath) {
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            if (FILE* rf = fopen(ramDumpPath, "wb")) {
+                fwrite(bus.ram().data(), 1, bus.ram().size(), rf);
+                fclose(rf);
+                printf("-- ram dumped at %llu: %s\n",
+                       static_cast<unsigned long long>(executed),
+                       ramDumpPath);
+            }
+            ramDumpPath = nullptr; // once
+        }
         if (dumpStructsAt && executed == dumpStructsAt)
             dumpStructs("--dump-structs-at");
         // Drive-queue change detector. We keep inferring "nothing ever
@@ -1018,19 +1039,18 @@ int main(int argc, char** argv)
                     printf("-- ARMED on value r%u == %08x\n", watchReg,
                            watchVal);
                 }
-                // r8-r15 are D0-D7 ONLY while the 68K emulator's dispatch
-                // loop is running. Inside its helper routines they are
-                // ordinary scratch, so a hit reported from a helper is not
-                // a 68K register assignment at all — measured: an
-                // `addic. r8,r0,-56` at 680b8640 looked exactly like
-                // "D0 := -56" and is not. Say which world the hit is in.
+                // r8-r15 hold D0-D7 throughout the 68K emulator,
+                // including inside its opcode handlers: a handler tail
+                // such as `addic. r8,r0,-56; b <dispatch>` IS setting D0.
+                // Outside 0x68xxxxxx the registers belong to native code
+                // and say nothing about the 68K world. (An earlier label
+                // here called handler registers scratch; that was wrong.)
                 printf("REGSET r%u := %08x  [%s] pc=%08x r24=%08x lr=%08x "
                        "@%llu\n",
                        watchReg, watchVal,
-                       (pc & 0xFF000000u) != 0x68000000u ? "native"
-                       : (pc >= 0x68066000u && pc < 0x68068000u)
-                           ? "68K dispatch"
-                           : "68K emulator helper - regs are SCRATCH",
+                       (pc & 0xFF000000u) == 0x68000000u
+                           ? "68K world - r8-r15 are D0-D7"
+                           : "native - not 68K registers",
                        pc, cpu.st.gpr[24], cpu.st.lr,
                        static_cast<unsigned long long>(executed));
                 snprintf(evb, sizeof evb,
@@ -1320,17 +1340,27 @@ int main(int argc, char** argv)
             // return, and D0 at that moment is the answer. Bracketing a
             // return value by hand across a twelve-thousand-line trace was
             // costing a run each time; this prints it.
-            if (t68Lo && cur68 != prev68 && cur68 >= t68Lo && cur68 < t68Hi &&
+            // Sampling on "r24 changed" has now produced three wrong
+            // readings, because r24 is a FETCH pointer running ahead of the
+            // instruction being executed and r27 lags it by a prefetch. The
+            // one moment the pair is consistent is the emulator's own
+            // opcode fetch: `lhau r27, 2(r24)` (0xaf780002) pre-increments
+            // r24 and then loads the opcode AT it, so immediately after
+            // that instruction r24 IS the address of the opcode in r27.
+            // Trigger there and the trace is authoritative by construction.
+            const bool atFetch = cpu.curInsn == 0xAF780002u;
+            if (t68Lo && atFetch && cur68 >= t68Lo && cur68 < t68Hi &&
                 executed >= watchFrom) {
                 static u32 t68n = 0;
                 if (t68n < t68Cap) {
                     ++t68n;
                     const bool isRts = (cpu.st.gpr[27] & 0xFFFFu) == 0x4E75u;
-                    printf("%s %08x%s D0=%08x D1=%08x A0=%08x A1=%08x "
-                           "A6=%08x\n",
+                    printf("%s %08x%s op=%04x D0=%08x D1=%08x A0=%08x "
+                           "A1=%08x A6=%08x\n",
                            isRts ? "RET" : "T68", cur68, sym(cur68),
-                           cpu.st.gpr[8], cpu.st.gpr[9], cpu.st.gpr[16],
-                           cpu.st.gpr[17], cpu.st.gpr[22]);
+                           cpu.st.gpr[27] & 0xFFFFu, cpu.st.gpr[8],
+                           cpu.st.gpr[9], cpu.st.gpr[16], cpu.st.gpr[17],
+                           cpu.st.gpr[22]);
                     if (t68n == t68Cap)
                         printf("-- trace-68k cap %u reached @%llu\n", t68Cap,
                                static_cast<unsigned long long>(executed));
@@ -2465,12 +2495,12 @@ int main(int argc, char** argv)
         const size_t cs = cl.size() > 200 ? cl.size() - 200 : 0;
         for (size_t k = cs; k < cl.size(); ++k) {
             if (cl[k].a || cl[k].b)
-                printf("%c%02x:%x+%x@%llu ", cl[k].kind, cl[k].val,
+                printf("%c%02x:%x+%x@%llu/%08x ", cl[k].kind, cl[k].val,
                        cl[k].a, cl[k].b,
-                       static_cast<unsigned long long>(cl[k].at));
+                       static_cast<unsigned long long>(cl[k].at), cl[k].pc);
             else
-                printf("%c%02x@%llu ", cl[k].kind, cl[k].val,
-                       static_cast<unsigned long long>(cl[k].at));
+                printf("%c%02x@%llu/%08x ", cl[k].kind, cl[k].val,
+                       static_cast<unsigned long long>(cl[k].at), cl[k].pc);
         }
         printf("\n");
     }
@@ -2485,11 +2515,11 @@ int main(int argc, char** argv)
         const size_t hs = hl.size() > 200 ? hl.size() - 200 : 0;
         for (size_t k = hs; k < hl.size(); ++k) {
             if (hl[k].a || hl[k].b)
-                printf("%c%02x:%x+%x@%llu ", hl[k].kind, hl[k].val, hl[k].a,
-                       hl[k].b, static_cast<unsigned long long>(hl[k].at));
+                printf("%c%02x:%x+%x@%llu/%08x ", hl[k].kind, hl[k].val, hl[k].a,
+                       hl[k].b, static_cast<unsigned long long>(hl[k].at), hl[k].pc);
             else
-                printf("%c%02x@%llu ", hl[k].kind, hl[k].val,
-                       static_cast<unsigned long long>(hl[k].at));
+                printf("%c%02x@%llu/%08x ", hl[k].kind, hl[k].val,
+                       static_cast<unsigned long long>(hl[k].at), hl[k].pc);
         }
         printf("\n");
     }

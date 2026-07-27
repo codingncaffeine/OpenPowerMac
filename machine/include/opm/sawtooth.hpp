@@ -327,16 +327,17 @@ private:
             if (off - 0x1F000u < 0x3000u) {
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
-                // Unpopulated channel: the ATA data lines float high
-                // (pull-ups), so every register reads all-ones. Status
-                // 0xFF is how drivers conclude "no device" — zeros here
-                // read as a present-but-never-ready device and the Mac
-                // OS channel drivers back off and retry forever, parking
-                // the whole boot behind the ndrv scan.
+                // Unpopulated channel: the ATA data lines float high on the
+                // pull-ups, EXCEPT DD7 which the host pulls DOWN. DD7 is
+                // the status register.s BSY bit, so an empty channel reads
+                // 0x7F: BSY already clear, which is how a driver concludes
+                // "no device" at once. Answering 0xFF leaves BSY stuck set
+                // and every probe of an empty slot burns its full timeout
+                // before the bus scan can move on.
                 const bool isHd = off < 0x20000u && hd_.present();
                 u32 v = isCd   ? cd_.read(off - 0x20000u, len)
                         : isHd ? hd_.read(off - 0x1F000u, len)
-                               : (~0u >> (32 - 8 * len));
+                               : ((~0u >> (32 - 8 * len)) & ~0x80u);
                 if ((off & 0xFF0u) != 0) {
                     if (ataLog_.size() >= 6000)
                         ataLog_.erase(ataLog_.begin(),

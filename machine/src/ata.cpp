@@ -6,6 +6,9 @@ namespace opm {
 
 // status bits
 static constexpr u8 kBsy = 0x80, kDrdy = 0x40, kDrq = 0x08, kErr = 0x01;
+// Seek-complete: ATA (non-packet) devices must assert it alongside DRDY;
+// drivers wait on it during device detection. ATAPI devices do not.
+static constexpr u8 kDsc = 0x10;
 // interrupt-reason (nsect) bits during ATAPI phases
 static constexpr u8 kCoD = 0x01, kIo = 0x02;
 
@@ -44,7 +47,7 @@ bool AtaCell::attachDisk(const char* path)
     lba0_ = 0x01;
     bcLo_ = 0x00;
     bcHi_ = 0x00;
-    status_ = kDrdy;
+    status_ = kDrdy | kDsc;
     error_ = 0x01;
     return true;
 }
@@ -53,7 +56,7 @@ void AtaCell::diskStartRead()
 {
     if (readLeft_ == 0) {
         nsect_ = 0;
-        status_ = kDrdy;
+        status_ = (kDrdy | kDsc);
         irq_ = true;
         return;
     }
@@ -69,7 +72,7 @@ void AtaCell::diskStartRead()
     dataAt_ = 0;
     ++readLba_;
     --readLeft_;
-    status_ = kDrq | kDrdy;
+    status_ = kDrq | (kDrdy | kDsc);
     irq_ = true;
 }
 
@@ -111,6 +114,7 @@ void AtaCell::diskCommand(u8 cmd)
         w16(60, static_cast<u16>(secs));
         w16(61, static_cast<u16>(secs >> 16));
         w16(63, 0x0007);            // multiword DMA 0-2
+        w16(51, 0x0200);            // PIO cycle timing mode
         w16(64, 0x0003);            // PIO modes 3 and 4
         w16(65, 120);               // min multiword DMA cycle
         w16(67, 120);               // min PIO cycle without flow control
@@ -120,7 +124,7 @@ void AtaCell::diskCommand(u8 cmd)
         w16(88, 0x001F);            // ultra DMA 0-4 supported
         dataAt_ = 0;
         nsect_ = 0;
-        status_ = kDrq | kDrdy;
+        status_ = kDrq | (kDrdy | kDsc);
         irq_ = true;
         break;
     }
@@ -138,7 +142,7 @@ void AtaCell::diskCommand(u8 cmd)
         wrLeft_ = nsect_ ? nsect_ : 256u;
         data_.assign(512, 0);
         dataAt_ = 0;
-        status_ = kDrq | kDrdy; // host may deliver the first sector
+        status_ = kDrq | (kDrdy | kDsc); // host may deliver the first sector
         break;
     case 0x40:
     case 0x41: // READ VERIFY SECTOR(S)
@@ -148,7 +152,7 @@ void AtaCell::diskCommand(u8 cmd)
     case 0xEA: // FLUSH CACHE EXT
     case 0xEF: // SET FEATURES
     case 0x10: // RECALIBRATE
-        status_ = kDrdy;
+        status_ = (kDrdy | kDsc);
         irq_ = true;
         break;
     case 0x08:
@@ -158,14 +162,14 @@ void AtaCell::diskCommand(u8 cmd)
         bcLo_ = 0x00;
         bcHi_ = 0x00;
         error_ = 0x01;
-        status_ = kDrdy;
+        status_ = (kDrdy | kDsc);
         break;
     default:
         if (log.size() >= 4096)
             log.erase(log.begin(), log.begin() + 2048);
         log.push_back({stamp ? *stamp : 0, 'e', cmd});
         error_ = 0x04; // ABRT
-        status_ = kDrdy | kErr;
+        status_ = (kDrdy | kDsc) | kErr;
         break;
     }
 }
@@ -186,12 +190,12 @@ u32 AtaCell::read(u32 off, u32 len)
         return 0;
     // No slave on this channel. Nothing drives the bus when device 1 is
     // selected, so the pull-ups win and every register reads all-ones —
-    // the same physics as an unpopulated channel (see the mac-io ATA
-    // window read path). Returning zeros instead presents status 0x00,
-    // i.e. a device that is present but never asserts DRDY, and the bus
-    // scan waits on it forever instead of concluding "absent".
+    // EXCEPT on DD7, which the host pulls DOWN. DD7 carries the status
+    // register.s BSY bit, so an absent device reads 0x7F rather than 0xFF:
+    // BSY already clear, which is how a driver concludes "absent" at once
+    // instead of waiting out a timeout on a bit that never falls.
     if (dev_ & 0x10u)
-        return ~0u >> (32 - 8 * len);
+        return (~0u >> (32 - 8 * len)) & ~0x80u;
     switch (off & 0xFF0u) {
     case 0x000: { // data: PIO out of data_
         u32 v = 0;
@@ -245,7 +249,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
                 ++wrLba_;
                 --wrLeft_;
                 dataAt_ = 0;
-                status_ = wrLeft_ ? (kDrq | kDrdy) : kDrdy;
+                status_ = wrLeft_ ? (kDrq | kDrdy | kDsc) : (kDrdy | kDsc);
                 irq_ = true;
             }
         }

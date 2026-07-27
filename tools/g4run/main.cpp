@@ -387,6 +387,38 @@ int main(int argc, char** argv)
                 // Log the selector going in and the OSErr coming back at
                 // ffd9bc64 — that says WHICH device it is asking about and
                 // whether any of them is our CD on bus 0.
+                // .ATALoad's Control entry. Its DRVR header at ffd9aff0
+                // gives drvrControl = 0x3C, so every _Control the driver
+                // receives arrives here with the csCode in the param block
+                // at A0+0x1A. The 250 ms kick is csCode $41 and only reads
+                // the request queue; the selector-1 "device arrived"
+                // enqueue must come in as some other csCode — or never.
+                if (cur68 == 0xFFD9B02Cu) {
+                    static int cc = 0;
+                    if (cc < 60) {
+                        ++cc;
+                        cpu.l1dFlushAll(true);
+                        cpu.l2FlushAll(true);
+                        cpu.mmuProbe = true;
+                        const CpuState cSaved = cpu.st;
+                        const bool cRaised = cpu.raisedThisStep;
+                        cpu.st.msr |= 0x30u;
+                        const CpuState cArmed = cpu.st;
+                        u32 cs = 0xFFFFFFFFu, pa = 0;
+                        const u32 pb = cpu.st.gpr[16];
+                        if (cpu.translate(pb + 0x1Au, false, false, pa) &&
+                            pa + 2 < bus.ram().size())
+                            cs = (bus.read32(pa & ~3u) >>
+                                  (16 - 8 * (pa & 2u))) &
+                                 0xFFFFu;
+                        cpu.st = cSaved;
+                        cpu.raisedThisStep = cRaised;
+                        cpu.mmuProbe = false;
+                        printf("CTL csCode=%04x pb=%08x @%llu\n", cs, pb,
+                               static_cast<unsigned long long>(executed));
+                        fflush(stdout);
+                    }
+                }
                 // The 68K ATA Manager itself: GetTrapAddress($AAF1) returns
                 // 000a3c10 at run time (RAM — the manager is installed and
                 // patched in), and the loaded driver calls it a dozen times

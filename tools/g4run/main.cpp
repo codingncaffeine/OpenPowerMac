@@ -183,6 +183,15 @@ int main(int argc, char** argv)
     std::vector<std::pair<u64, u32>> firsts;
     std::map<u32, u64> delayCallers; // DelayFor entry: lr census — what
                                      // is the parked boot waiting on?
+    struct DfTrace {
+        u64 at;
+        u32 durHi, durLo;
+        u32 caller[6];
+    };
+    DfTrace dfRing[12] = {};
+    u32 dfRingAt = 0; // ring: the LAST traces always cover the park
+    std::map<u32, u64> pc68Hist; // 68K-pc (r24) census inside the
+                                 // emulator: names the 68K busy loop
 
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
@@ -190,52 +199,52 @@ int main(int argc, char** argv)
         const u32 region = pc >> 10;
         if (seen.emplace(region, executed).second)
             firsts.push_back({executed, pc});
-        if ((executed & 63u) == 0)
+        if ((executed & 63u) == 0) {
             ++pcHist[pc];
+            if ((pc & 0xFF000000u) == 0x68000000u)
+                ++pc68Hist[cpu.st.gpr[24] & ~1u];
+        }
         ring.push(pc, cpu.curInsn);
         if (pc == 0xFFD8736Cu) {
             delayCallers[cpu.st.lr]++;
-            // Parked steady state only: walk the native backchain to name
-            // the waiter (saved LR lives at 8(frame) per CFM convention).
-            static int dfTraces = 0;
-            if (executed > 3300000000ull && dfTraces < 12) {
-                ++dfTraces;
-                cpu.l1dFlushAll(true);
-                cpu.l2FlushAll(true);
-                cpu.mmuProbe = true;
-                const CpuState dfSaved = cpu.st;
-                const bool dfRaised = cpu.raisedThisStep;
-                cpu.st.msr |= 0x30u;
-                const CpuState dfArmed = cpu.st;
-                auto dfRead = [&](u32 ea, u32& v) {
-                    u32 pa = 0;
-                    cpu.st = dfArmed;
-                    const bool ok = cpu.translate(ea, false, false, pa);
-                    cpu.st = dfArmed;
-                    if (!ok || (pa & ~3u) + 4 > bus.ram().size())
-                        return false;
-                    v = bus.read32(pa & ~3u);
-                    return true;
-                };
-                printf("-- DelayFor bt#%d @%llu dur=%08x:%08x lr=%08x "
-                       "sp=%08x\n",
-                       dfTraces, static_cast<unsigned long long>(executed),
-                       cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.lr,
-                       cpu.st.gpr[1]);
-                u32 sp = cpu.st.gpr[1];
-                for (int f = 0; f < 6 && sp; ++f) {
-                    u32 bc = 0, slr = 0;
-                    if (!dfRead(sp, bc) || !bc)
-                        break;
-                    if (dfRead(bc + 8, slr))
-                        printf("   frame%d sp=%08x caller=%08x\n", f, bc,
-                               slr);
-                    sp = bc;
-                }
-                cpu.st = dfSaved;
-                cpu.raisedThisStep = dfRaised;
-                cpu.mmuProbe = false;
+            // Ring-capture every entry's backchain (saved LR at 8(frame)
+            // per CFM); the LAST traces always cover the parked steady
+            // state no matter how the boot timeline shifts.
+            DfTrace& t = dfRing[dfRingAt++ % 12u];
+            t.at = executed;
+            t.durHi = cpu.st.gpr[3];
+            t.durLo = cpu.st.gpr[4];
+            for (u32 f = 0; f < 6; ++f)
+                t.caller[f] = 0;
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            cpu.mmuProbe = true;
+            const CpuState dfSaved = cpu.st;
+            const bool dfRaised = cpu.raisedThisStep;
+            cpu.st.msr |= 0x30u;
+            const CpuState dfArmed = cpu.st;
+            auto dfRead = [&](u32 ea, u32& v) {
+                u32 pa = 0;
+                cpu.st = dfArmed;
+                const bool ok = cpu.translate(ea, false, false, pa);
+                cpu.st = dfArmed;
+                if (!ok || (pa & ~3u) + 4 > bus.ram().size())
+                    return false;
+                v = bus.read32(pa & ~3u);
+                return true;
+            };
+            u32 sp = cpu.st.gpr[1];
+            for (u32 f = 0; f < 6 && sp; ++f) {
+                u32 bc = 0, slr = 0;
+                if (!dfRead(sp, bc) || !bc)
+                    break;
+                if (dfRead(bc + 8, slr))
+                    t.caller[f] = slr;
+                sp = bc;
             }
+            cpu.st = dfSaved;
+            cpu.raisedThisStep = dfRaised;
+            cpu.mmuProbe = false;
         }
         if (trace) {
             disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
@@ -708,6 +717,27 @@ int main(int argc, char** argv)
         for (const auto& [pc, n] : pcHist)
             top.push_back({n, pc});
         std::sort(top.rbegin(), top.rend());
+        printf("-- DelayFor last traces (of %u):\n", dfRingAt);
+        for (u32 k = 0; k < 12u && k < dfRingAt; ++k) {
+            const DfTrace& t =
+                dfRing[(dfRingAt - (dfRingAt < 12u ? dfRingAt : 12u) + k) %
+                       12u];
+            printf("   @%llu dur=%08x:%08x  %08x %08x %08x %08x %08x "
+                   "%08x\n",
+                   static_cast<unsigned long long>(t.at), t.durHi, t.durLo,
+                   t.caller[0], t.caller[1], t.caller[2], t.caller[3],
+                   t.caller[4], t.caller[5]);
+        }
+        printf("-- 68k pc histogram (top 16):\n");
+        {
+            std::vector<std::pair<u64, u32>> h;
+            for (const auto& [a, n] : pc68Hist)
+                h.push_back({n, a});
+            std::sort(h.rbegin(), h.rend());
+            for (size_t k = 0; k < h.size() && k < 16; ++k)
+                printf("   %08x  samples=%llu\n", h[k].second,
+                       static_cast<unsigned long long>(h[k].first));
+        }
         printf("-- DelayFor callers (%zu):\n", delayCallers.size());
         {
             std::vector<std::pair<u64, u32>> dc;

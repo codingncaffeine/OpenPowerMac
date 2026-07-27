@@ -22,6 +22,12 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
 
 OPM_API void opm_destroy(OpmMachine* m);
 
+// Defer PCI visibility of the ATI card until `insn` executed instructions
+// (0 = visible from reset). The practiced boot hides the card past OF's
+// console choice (~228M) so the serial console stays owned; the card node
+// is then created via the Forth bridge. 236M is the practiced value.
+OPM_API void opm_ati_at(OpmMachine* m, uint64_t insn);
+
 // Execute up to `insns` more instructions; returns the machine's total.
 OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns);
 

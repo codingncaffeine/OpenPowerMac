@@ -38,3 +38,8 @@ tests/data/
 
 # derived screen dumps
 *.ppm
+
+# WPF shell build artifacts (native/ receives opmcapi.dll from CMake)
+shell/bin/
+shell/obj/
+shell/native/

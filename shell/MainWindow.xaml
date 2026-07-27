@@ -1,0 +1,86 @@
+<Window x:Class="OpenPowerMac.Shell.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="OpenPowerMac"
+        Width="1024" Height="900" MinWidth="720" MinHeight="560"
+        Background="{StaticResource WindowBg}"
+        Foreground="{StaticResource TextPrimary}"
+        FontFamily="Segoe UI" FontSize="13">
+    <DockPanel>
+        <Menu DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem x:Name="miRom" Header="Choose Boot ROM…" Click="OnChooseRom" />
+                <MenuItem x:Name="miCd" Header="Choose CD Image…" Click="OnChooseCd" />
+                <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
+                <Separator />
+                <MenuItem Header="E_xit" Click="OnExit" />
+            </MenuItem>
+            <MenuItem Header="_Machine">
+                <MenuItem x:Name="miStart" Header="_Start" Click="OnStart" />
+                <MenuItem x:Name="miStop" Header="S_top" Click="OnStop" IsEnabled="False" />
+                <Separator />
+                <MenuItem x:Name="miAutoBoot" Header="Auto-boot script (display + USB + mac-boot)"
+                          IsCheckable="True" Click="OnAutoBootToggled" />
+            </MenuItem>
+        </Menu>
+
+        <StatusBar DockPanel.Dock="Bottom">
+            <StatusBarItem>
+                <TextBlock x:Name="txtState" Text="stopped" Foreground="{StaticResource TextSecondary}" />
+            </StatusBarItem>
+            <Separator Width="1" Background="{StaticResource BorderBrush}" />
+            <StatusBarItem>
+                <TextBlock x:Name="txtInsns" Text="0 insns" Foreground="{StaticResource TextSecondary}" />
+            </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock x:Name="txtMips" Text="" Foreground="{StaticResource TextSecondary}" />
+            </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock x:Name="txtPc" Text="" FontFamily="Consolas" Foreground="{StaticResource TextSecondary}" />
+            </StatusBarItem>
+            <StatusBarItem HorizontalAlignment="Right">
+                <TextBlock x:Name="txtVideo" Text="no video" Foreground="{StaticResource TextSecondary}" />
+            </StatusBarItem>
+        </StatusBar>
+
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" MinHeight="200" />
+                <RowDefinition Height="4" />
+                <RowDefinition Height="240" MinHeight="110" />
+            </Grid.RowDefinitions>
+
+            <Border Grid.Row="0" Background="{StaticResource Letterbox}">
+                <Grid>
+                    <Image x:Name="imgScreen" Stretch="Uniform"
+                           RenderOptions.BitmapScalingMode="NearestNeighbor" />
+                    <StackPanel x:Name="pnlNoVideo" VerticalAlignment="Center" HorizontalAlignment="Center">
+                        <TextBlock Text="OpenPowerMac" FontSize="26" FontWeight="SemiBold"
+                                   HorizontalAlignment="Center" Foreground="{StaticResource TextSecondary}" />
+                        <TextBlock x:Name="txtHint" Margin="0,10,0,0" FontSize="13" TextAlignment="Center"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   Text="Machine ▸ Start boots the Sawtooth ROM.&#10;The firmware talks on the serial console below until the display comes up." />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch"
+                          Background="{StaticResource BorderBrush}" Focusable="False" />
+
+            <DockPanel Grid.Row="2" Background="{StaticResource Surface}">
+                <DockPanel DockPanel.Dock="Bottom" Margin="6,4,6,6">
+                    <Button x:Name="btnSend" DockPanel.Dock="Right" Content="Send" MinWidth="70"
+                            Margin="6,0,0,0" Click="OnSend" IsEnabled="False" />
+                    <TextBox x:Name="txtInput" FontFamily="Consolas" FontSize="13"
+                             VerticalContentAlignment="Center" KeyDown="OnInputKeyDown"
+                             ToolTip="One Forth line — Enter sends with CR; ';' splits into separate lines" />
+                </DockPanel>
+                <TextBox x:Name="txtConsole" IsReadOnly="True" IsReadOnlyCaretVisible="True"
+                         FontFamily="Consolas" FontSize="13" TextWrapping="NoWrap"
+                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                         BorderThickness="0" Margin="6,6,6,0"
+                         Background="{StaticResource Letterbox}" />
+            </DockPanel>
+        </Grid>
+    </DockPanel>
+</Window>

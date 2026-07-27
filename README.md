@@ -26,6 +26,14 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
+The Windows front end (`shell/`, WPF on .NET) builds separately once the native library
+has been built — it picks `opmcapi.dll` up from `shell/native/`:
+
+```
+cd shell
+dotnet build -c Release
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

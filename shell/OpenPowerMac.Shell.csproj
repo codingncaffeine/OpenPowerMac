@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net11.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>OpenPowerMac</AssemblyName>
+    <RootNamespace>OpenPowerMac.Shell</RootNamespace>
+    <Product>OpenPowerMac</Product>
+    <AssemblyTitle>OpenPowerMac</AssemblyTitle>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <!-- Ship the native core DLL (built by CMake into shell/native) beside the app. -->
+  <ItemGroup>
+    <None Include="native\opmcapi.dll" Condition="Exists('native\opmcapi.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>opmcapi.dll</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

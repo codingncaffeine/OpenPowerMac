@@ -59,10 +59,22 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     m->bus->pic().stamp = &m->executed;
     m->bus->pmu().tbRef = &m->cpu.st.tb;
     m->bus->ataDma().stamp = &m->executed;
+    m->bus->ataDma().pcRef = &m->cpu.st.pc;
+    for (u32 f = 0; f < 2; ++f) {
+        m->bus->ohci(f).stamp = &m->executed;
+        m->bus->ohci(f).pcRef = &m->cpu.st.pc;
+    }
+    m->bus->ati().stamp = &m->executed;
+    m->bus->ati().pcRef = &m->cpu.st.pc;
     return m;
 }
 
 OPM_API void opm_destroy(OpmMachine* m) { delete m; }
+
+OPM_API void opm_ati_at(OpmMachine* m, uint64_t insn)
+{
+    m->bus->atiVisibleAt = insn;
+}
 
 OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
 {

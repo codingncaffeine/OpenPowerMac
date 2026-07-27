@@ -204,6 +204,36 @@ int main(int argc, char** argv)
             if ((pc & 0xFF000000u) == 0x68000000u)
                 ++pc68Hist[cpu.st.gpr[24] & ~1u];
         }
+        // One full boot-candidate cycle, 68K-level: arm once the park's
+        // per-second scan re-reads the partition map, then record every
+        // 68K pc transition until the budget runs out. Maps the whole
+        // load→checksum→reject path including the rejection branch.
+        if ((pc & 0xFF000000u) == 0x68000000u) {
+            static u32 prev68 = 0;
+            static int armed = 0; // 0 idle, 1 recording, 2 done
+            static u32 rec = 0;
+            const u32 cur68 = cpu.st.gpr[24];
+            if (armed == 1 && cur68 != prev68) {
+                if (rec < 30000u) {
+                    printf("T %08x D0=%08x\n", cur68, cpu.st.gpr[8]);
+                    ++rec;
+                } else {
+                    armed = 2;
+                    printf("-- 68k cycle trace done (30000)\n");
+                }
+            }
+            prev68 = cur68;
+            if (!armed && executed > 3900000000ull &&
+                !bus.cd().log.empty()) {
+                const auto& e = bus.cd().log.back();
+                if (e.kind == 'p' && e.val == 0xA8 && e.a == 1 &&
+                    e.b == 1) {
+                    armed = 1;
+                    printf("-- 68k cycle trace ARMED @%llu\n",
+                           static_cast<unsigned long long>(executed));
+                }
+            }
+        }
         ring.push(pc, cpu.curInsn);
         if (pc == 0xFFD8736Cu) {
             delayCallers[cpu.st.lr]++;

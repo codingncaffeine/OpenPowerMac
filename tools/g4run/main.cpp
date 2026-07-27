@@ -204,35 +204,71 @@ int main(int argc, char** argv)
             if ((pc & 0xFF000000u) == 0x68000000u)
                 ++pc68Hist[cpu.st.gpr[24] & ~1u];
         }
-        // One full boot-candidate cycle, 68K-level: arm once the park's
-        // per-second scan re-reads the partition map, then record every
-        // 68K pc transition until the budget runs out. Maps the whole
-        // load→checksum→reject path including the rejection branch.
+        // Matcher forensics: every memcmp the parked registry walk runs,
+        // with both operands read back through the live MMU. Shows what
+        // the driver matcher wants vs what our nodes offer.
         if ((pc & 0xFF000000u) == 0x68000000u) {
             static u32 prev68 = 0;
-            static int armed = 0; // 0 idle, 1 recording, 2 done
-            static u32 rec = 0;
             const u32 cur68 = cpu.st.gpr[24];
-            if (armed == 1 && cur68 != prev68) {
-                if (rec < 30000u) {
-                    printf("T %08x D0=%08x\n", cur68, cpu.st.gpr[8]);
-                    ++rec;
-                } else {
-                    armed = 2;
-                    printf("-- 68k cycle trace done (30000)\n");
+            if (cur68 != prev68 &&
+                (cur68 == 0xFFCA99C2u || cur68 == 0xFFD9BC90u) &&
+                executed > 4000000000ull) {
+                static int pairs = 0;
+                if (pairs < 3000) {
+                    ++pairs;
+                    cpu.l1dFlushAll(true);
+                    cpu.l2FlushAll(true);
+                    cpu.mmuProbe = true;
+                    const CpuState mcSaved = cpu.st;
+                    const bool mcRaised = cpu.raisedThisStep;
+                    cpu.st.msr |= 0x30u;
+                    const CpuState mcArmed = cpu.st;
+                    auto rd8 = [&](u32 ea, u8& v) {
+                        u32 pa = 0;
+                        cpu.st = mcArmed;
+                        bool ok = cpu.translate(ea, false, false, pa);
+                        cpu.st = mcArmed;
+                        if (!ok) {
+                            ok = ea < 0x00400000u &&
+                                 cpu.translate(0x68000000u + ea, false,
+                                               false, pa);
+                            cpu.st = mcArmed;
+                        }
+                        if (!ok || pa >= bus.ram().size())
+                            return false;
+                        v = static_cast<u8>(bus.read32(pa & ~3u) >>
+                                            (8 * (3 - (pa & 3u))));
+                        return true;
+                    };
+                    auto str = [&](u32 ea, char* out) {
+                        int k = 0;
+                        for (; k < 20; ++k) {
+                            u8 c = 0;
+                            if (!rd8(ea + static_cast<u32>(k), c))
+                                break;
+                            out[k] = (c >= 32 && c < 127)
+                                         ? static_cast<char>(c)
+                                         : (c ? '.' : 0);
+                            if (!c)
+                                break;
+                        }
+                        out[k] = 0;
+                    };
+                    char a[24], b[24];
+                    const bool sc = cur68 == 0xFFD9BC90u;
+                    str(cpu.st.gpr[sc ? 17 : 16], a);
+                    str(cpu.st.gpr[sc ? 19 : 17], b);
+                    printf("%c %08x|%s| %08x|%s| n=%u @%llu\n",
+                           sc ? 'S' : 'M', cpu.st.gpr[sc ? 17 : 16], a,
+                           cpu.st.gpr[sc ? 19 : 17], b,
+                           cpu.st.gpr[9] & 0xFFFFu,
+                           static_cast<unsigned long long>(executed));
+                    cpu.st = mcSaved;
+                    cpu.raisedThisStep = mcRaised;
+                    cpu.mmuProbe = false;
                 }
             }
             prev68 = cur68;
-            if (!armed && executed > 3900000000ull &&
-                !bus.cd().log.empty()) {
-                const auto& e = bus.cd().log.back();
-                if (e.kind == 'p' && e.val == 0xA8 && e.a == 1 &&
-                    e.b == 1) {
-                    armed = 1;
-                    printf("-- 68k cycle trace ARMED @%llu\n",
-                           static_cast<unsigned long long>(executed));
-                }
-            }
         }
         ring.push(pc, cpu.curInsn);
         if (pc == 0xFFD8736Cu) {

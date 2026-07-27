@@ -340,7 +340,7 @@ int main(int argc, char** argv)
                            static_cast<unsigned long long>(executed));
                 }
             }
-            if (cur68 != prev68 && executed > 4200000000ull) {
+            if (cur68 != prev68 && executed > 2800000000ull) {
                 const bool body = (cur68 >= 0xFFD9A000u &&
                                    cur68 < 0xFFD9D000u) ||
                                   (cur68 >= 0xFFC5DA00u &&
@@ -387,6 +387,87 @@ int main(int argc, char** argv)
                 // Log the selector going in and the OSErr coming back at
                 // ffd9bc64 — that says WHICH device it is asking about and
                 // whether any of them is our CD on bus 0.
+                // The generic strcmp at ffd9bc7c, read after both operand
+                // loads (A1 = 8(A6), A3 = 12(A6)). The install path walks
+                // the DDR, finds ddType 0x0701, and then this compare
+                // returns -1 and the failure propagates out. Print both
+                // strings so the failing comparison names itself.
+                if (cur68 == 0xFFD9BC90u) {
+                    static int sc = 0;
+                    if (sc < 300) {
+                        ++sc;
+                        cpu.l1dFlushAll(true);
+                        cpu.l2FlushAll(true);
+                        cpu.mmuProbe = true;
+                        const CpuState sSaved = cpu.st;
+                        const bool sRaised = cpu.raisedThisStep;
+                        cpu.st.msr |= 0x30u;
+                        const CpuState sArmed = cpu.st;
+                        auto str = [&](u32 ea, char* out) {
+                            for (int k = 0; k < 24; ++k) {
+                                u32 pa = 0;
+                                cpu.st = sArmed;
+                                const bool ok =
+                                    cpu.translate(ea + k, false, false, pa);
+                                cpu.st = sArmed;
+                                if (!ok || pa >= bus.ram().size()) {
+                                    out[k] = 0;
+                                    return;
+                                }
+                                const u8 c = static_cast<u8>(
+                                    bus.read32(pa & ~3u) >>
+                                    (8 * (3 - (pa & 3u))));
+                                out[k] = (c >= 32 && c < 127)
+                                             ? static_cast<char>(c)
+                                             : 0;
+                                if (!c)
+                                    return;
+                            }
+                            out[24] = 0;
+                        };
+                        char a[26] = {}, b[26] = {};
+                        str(cpu.st.gpr[17], a);
+                        str(cpu.st.gpr[19], b);
+                        cpu.st = sSaved;
+                        cpu.raisedThisStep = sRaised;
+                        cpu.mmuProbe = false;
+                        printf("SCMP |%s| vs |%s| @%llu\n", a, b,
+                               static_cast<unsigned long long>(executed));
+                        fflush(stdout);
+                    }
+                }
+                // The queue's own entry point, ffd9b504: the ATA Manager
+                // holds this proc plus refNum ffcd (-51) and a context
+                // pointer in a registration record, and calls it to
+                // announce events. It switches on the word at (A3);
+                // selector 1 is the "device arrived" enqueue. We only ever
+                // observe selector 8. Log every selector that actually
+                // arrives, so "8 and nothing else" is a measured fact.
+                if (cur68 == 0xFFD9B504u) {
+                    static int qs = 0;
+                    if (qs < 40) {
+                        ++qs;
+                        cpu.l1dFlushAll(true);
+                        cpu.l2FlushAll(true);
+                        cpu.mmuProbe = true;
+                        const CpuState qSaved = cpu.st;
+                        const bool qRaised = cpu.raisedThisStep;
+                        cpu.st.msr |= 0x30u;
+                        u32 sel = 0xFFFFFFFFu, pa = 0;
+                        const u32 a3 = cpu.st.gpr[19];
+                        if (cpu.translate(a3, false, false, pa) &&
+                            pa + 2 < bus.ram().size())
+                            sel = (bus.read32(pa & ~3u) >>
+                                   (16 - 8 * (pa & 2u))) &
+                                  0xFFFFu;
+                        cpu.st = qSaved;
+                        cpu.raisedThisStep = qRaised;
+                        cpu.mmuProbe = false;
+                        printf("QSEL sel=%04x a3=%08x @%llu\n", sel, a3,
+                               static_cast<unsigned long long>(executed));
+                        fflush(stdout);
+                    }
+                }
                 // .ATALoad's Control entry. Its DRVR header at ffd9aff0
                 // gives drvrControl = 0x3C, so every _Control the driver
                 // receives arrives here with the csCode in the param block

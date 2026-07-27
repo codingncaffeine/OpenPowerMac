@@ -210,11 +210,10 @@ int main(int argc, char** argv)
         if ((pc & 0xFF000000u) == 0x68000000u) {
             static u32 prev68 = 0;
             const u32 cur68 = cpu.st.gpr[24];
-            if (cur68 != prev68 &&
-                (cur68 == 0xFFCA99C2u || cur68 == 0xFFD9BC90u) &&
-                executed > 4000000000ull) {
+            if (cur68 != prev68 && cur68 == 0xFFD9B050u &&
+                executed > 4100000000ull) {
                 static int pairs = 0;
-                if (pairs < 3000) {
+                if (pairs < 3) {
                     ++pairs;
                     cpu.l1dFlushAll(true);
                     cpu.l2FlushAll(true);
@@ -240,29 +239,17 @@ int main(int argc, char** argv)
                                             (8 * (3 - (pa & 3u))));
                         return true;
                     };
-                    auto str = [&](u32 ea, char* out) {
-                        int k = 0;
-                        for (; k < 20; ++k) {
-                            u8 c = 0;
-                            if (!rd8(ea + static_cast<u32>(k), c))
-                                break;
-                            out[k] = (c >= 32 && c < 127)
-                                         ? static_cast<char>(c)
-                                         : (c ? '.' : 0);
-                            if (!c)
-                                break;
-                        }
-                        out[k] = 0;
-                    };
-                    char a[24], b[24];
-                    const bool sc = cur68 == 0xFFD9BC90u;
-                    str(cpu.st.gpr[sc ? 17 : 16], a);
-                    str(cpu.st.gpr[sc ? 19 : 17], b);
-                    printf("%c %08x|%s| %08x|%s| n=%u @%llu\n",
-                           sc ? 'S' : 'M', cpu.st.gpr[sc ? 17 : 16], a,
-                           cpu.st.gpr[sc ? 19 : 17], b,
-                           cpu.st.gpr[9] & 0xFFFFu,
+                    // '!act' scanner entry: A1 (r17) = the manager's
+                    // device table — dump the header + first entries.
+                    const u32 tbl = cpu.st.gpr[17];
+                    printf("A %08x @%llu:", tbl,
                            static_cast<unsigned long long>(executed));
+                    for (u32 k = 0; k < 0x60; ++k) {
+                        u8 c = 0;
+                        rd8(tbl + k, c);
+                        printf("%s%02x", (k & 15u) ? "" : " ", c);
+                    }
+                    printf("\n");
                     cpu.st = mcSaved;
                     cpu.raisedThisStep = mcRaised;
                     cpu.mmuProbe = false;

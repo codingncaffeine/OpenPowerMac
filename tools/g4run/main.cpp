@@ -960,10 +960,11 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(executed), pc, sym(pc),
                    cpu.curInsn, tt);
             if ((pc & 0xFF000000u) == 0x68000000u)
-                printf(" | 68K %08x%s op=%04x D0=%08x A0=%08x\n",
+                printf(" | 68K %08x%s op=%04x D0=%08x A0=%08x r3=%08x "
+                       "r4=%08x\n",
                        cpu.st.gpr[24], sym(cpu.st.gpr[24]),
                        cpu.st.gpr[27] & 0xFFFFu, cpu.st.gpr[8],
-                       cpu.st.gpr[16]);
+                       cpu.st.gpr[16], cpu.st.gpr[3], cpu.st.gpr[4]);
             else
                 printf(" | r3=%08x r4=%08x lr=%08x\n", cpu.st.gpr[3],
                        cpu.st.gpr[4], cpu.st.lr);

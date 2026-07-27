@@ -214,6 +214,22 @@ int main(int argc, char** argv)
         if ((pc & 0xFF000000u) == 0x68000000u) {
             static u32 prev68 = 0;
             const u32 cur68 = cpu.st.gpr[24];
+            // Ungated: the ROM only reaches this call site when it has
+            // already matched Apple_HFS, so it is rare by construction and
+            // worth catching from the first boot-time attempt onward.
+            if (cur68 != prev68 &&
+                (cur68 == 0xFFD9BC60u || cur68 == 0xFFD9BC64u)) {
+                static int calls = 0;
+                if (calls < 80) {
+                    ++calls;
+                    printf("DRV%s D0=%08x D5=%08x D6=%08x A0=%08x A6=%08x "
+                           "@%llu\n",
+                           cur68 == 0xFFD9BC60u ? ">" : "<", cpu.st.gpr[8],
+                           cpu.st.gpr[13], cpu.st.gpr[14], cpu.st.gpr[16],
+                           cpu.st.gpr[22],
+                           static_cast<unsigned long long>(executed));
+                }
+            }
             if (cur68 != prev68 && executed > 4200000000ull) {
                 const bool body = (cur68 >= 0xFFD9A000u &&
                                    cur68 < 0xFFD9D000u) ||
@@ -255,6 +271,12 @@ int main(int argc, char** argv)
                                drvOff, cpu.st.gpr[8], cpu.st.gpr[9],
                                cpu.st.gpr[16], cpu.st.gpr[17]);
                 }
+                // The ROM hands the loaded driver one device at a time via
+                // JSR 8(A0) at ffd9bc60 ('BOOT' in D0, the device selector
+                // in D5, which the driver folds into 0x01000000|(dev<<16)).
+                // Log the selector going in and the OSErr coming back at
+                // ffd9bc64 — that says WHICH device it is asking about and
+                // whether any of them is our CD on bus 0.
                 // The 68K ATA Manager itself: GetTrapAddress($AAF1) returns
                 // 000a3c10 at run time (RAM — the manager is installed and
                 // patched in), and the loaded driver calls it a dozen times

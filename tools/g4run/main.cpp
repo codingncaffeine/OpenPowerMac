@@ -440,9 +440,9 @@ int main(int argc, char** argv)
                 // any install. Watch a small RANGE, not an exact pc — r24
                 // is a fetch pointer and not every instruction address is
                 // ever equal to it.
-                if (cur68 >= 0xFFD9B692u && cur68 <= 0xFFD9B6F2u) {
+                if (cur68 >= 0xFFD9B6DCu && cur68 <= 0xFFD9B6F0u) {
                     static int mi = 0;
-                    if (mi < 40) {
+                    if (mi < 60) {
                         ++mi;
                         printf("MGRINQ pc68=%08x D0=%08x D7=%08x @%llu\n",
                                cur68, cpu.st.gpr[8], cpu.st.gpr[15],

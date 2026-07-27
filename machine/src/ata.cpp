@@ -36,8 +36,16 @@ u32 AtaCell::dmaTake(u8* dst, u32 n)
 
 u32 AtaCell::read(u32 off, u32 len)
 {
-    if (!present() || (dev_ & 0x10u))
-        return 0; // empty bus / absent slave: zeros, no BSY
+    if (!present())
+        return 0;
+    // No slave on this channel. Nothing drives the bus when device 1 is
+    // selected, so the pull-ups win and every register reads all-ones —
+    // the same physics as an unpopulated channel (see the mac-io ATA
+    // window read path). Returning zeros instead presents status 0x00,
+    // i.e. a device that is present but never asserts DRDY, and the bus
+    // scan waits on it forever instead of concluding "absent".
+    if (dev_ & 0x10u)
+        return ~0u >> (32 - 8 * len);
     switch (off & 0xFF0u) {
     case 0x000: { // data: PIO out of data_
         u32 v = 0;

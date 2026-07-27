@@ -51,6 +51,67 @@ struct Ring {
     void push(u32 pc, u32 insn) { e[n++ & 127u] = {pc, insn}; }
 };
 
+// Toolbox trap names, for the ones this dig actually meets. A trace line
+// reading "$A03D" costs a lookup every time it is read; one reading
+// "_DrvrInstall" does not — and _DrvrInstall and _AddDrive are precisely the
+// two calls whose absence is the whole mount story.
+const char* trapName(u32 t)
+{
+    switch (t & 0x0FFFu) {
+    case 0x00E: return "_LoadSeg";
+    case 0x01F: return "_DisposePtr";
+    case 0x022: return "_NewHandle";
+    case 0x023: return "_DisposeHandle";
+    case 0x029: return "_HLock";
+    case 0x02E: return "_BlockMove";
+    case 0x03D: return "_DrvrInstall";     // never seen: see the mount dig
+    case 0x04E: return "_AddDrive";        // never seen: see the mount dig
+    case 0x055: return "_StripAddress";
+    case 0x098: return "_HWPriv";
+    case 0x11E: return "_NewPtr";
+    case 0x122: return "_NewHandleClear";
+    case 0x128: return "_RecoverHandle";
+    case 0x146: return "_GetTrapAddress";
+    case 0x147: return "_SetTrapAddress";
+    case 0x14D: return "_SetToolTrapAddress";
+    case 0x1AD: return "_Gestalt";
+    case 0x71E: return "_NewPtrSysClear";
+    case 0x746: return "_GetToolTrapAddress";
+    case 0x976: return "_MixedModeDispatch";
+    case 0xAF1: return "_ATAMgr";
+    default: return "";
+    }
+}
+
+// A machine-readable event stream beside the human one. Most analysis this
+// session was ad-hoc awk over a hundred thousand lines of prose, which is
+// slow to write and easy to mis-scope — "every manager completion between
+// the driver call and its answer" took three attempts. One JSON object per
+// event makes that a filter rather than a parser.
+struct Events {
+    FILE* f = nullptr;
+    void open(const char* path)
+    {
+        if (path)
+            f = fopen(path, "wb");
+    }
+    void close()
+    {
+        if (f)
+            fclose(f);
+        f = nullptr;
+    }
+    // kind plus a pre-formatted body of "key":value pairs.
+    void emit(u64 at, const char* kind, const char* body)
+    {
+        if (!f)
+            return;
+        fprintf(f, "{\"at\":%llu,\"kind\":\"%s\"%s%s}\n",
+                static_cast<unsigned long long>(at), kind,
+                body && *body ? "," : "", body ? body : "");
+    }
+};
+
 // Classic Mac code is self-describing: a MacsBug symbol — a length byte with
 // the high bit set, then the name — sits just past each function's RTS. So
 // the Mac OS ROM, once loaded into RAM, carries its own symbol table.
@@ -180,6 +241,12 @@ int main(int argc, char** argv)
     u32 t68Cap = 4000;                 // --trace-68k-lines N
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
+    u64 dumpStructsAt = 0;             // --dump-structs-at N
+    bool dumpStructsEnd = false;       // --dump-structs
+    const char* eventsPath = nullptr;  // --events FILE (JSONL)
+    u32 watchVa = 0;                   // --watch-va ADDR
+    u64 traceFrom = 0;                 // --trace-from N: full trace window
+    u64 traceLines = 2000;             // --trace-lines M
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -262,6 +329,16 @@ int main(int argc, char** argv)
             watchFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--arm-on-pc"))
             armOnPc = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--dump-structs")) dumpStructsEnd = true;
+        else if (!strcmp(a, "--dump-structs-at"))
+            dumpStructsAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--events")) eventsPath = next();
+        else if (!strcmp(a, "--trace-from"))
+            traceFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--trace-lines"))
+            traceLines = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--watch-va"))
+            watchVa = static_cast<u32>(strtoul(next(), nullptr, 0));
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -279,6 +356,15 @@ int main(int argc, char** argv)
         fprintf(stderr, "g4run: --rom is required\n");
         return 2;
     }
+
+    // Run manifest. A log found on disk a day later has to be able to say
+    // what produced it: which flags, which images, which limits. More than
+    // one conclusion this session had to be re-derived because a log could
+    // not be matched to its command line.
+    printf("-- g4run manifest:");
+    for (int i = 1; i < argc; ++i)
+        printf(" %s", argv[i]);
+    printf("\n");
 
     std::vector<u8> rom = readFile(romPath);
     if (rom.size() != SawtoothBus::kRomSize)
@@ -504,6 +590,192 @@ int main(int argc, char** argv)
         return symtab.at(a);
     };
 
+    // ONE guest reader. Six ad-hoc copies of this dance had accumulated —
+    // flush the caches so dirty lines are visible, set mmuProbe so the walk
+    // has no side effects, save and restore the CPU state around a
+    // translation that raises on failure. Six copies means six chances to
+    // forget one of the four steps, and forgetting the flush reads stale
+    // memory that looks like real evidence.
+    auto guest = [&](u32 ea, u32 len) -> long long {
+        cpu.l1dFlushAll(true);
+        cpu.l2FlushAll(true);
+        cpu.mmuProbe = true;
+        const CpuState saved = cpu.st;
+        const bool raised = cpu.raisedThisStep;
+        cpu.st.msr |= 0x30u;
+        const CpuState armed = cpu.st;
+        long long out = -1;
+        u32 v = 0;
+        bool ok = true;
+        for (u32 k = 0; k < len && ok; ++k) {
+            u32 pa = 0;
+            cpu.st = armed;
+            ok = cpu.translate(ea + k, false, false, pa);
+            cpu.st = armed;
+            if (!ok || pa >= bus.ram().size()) {
+                ok = false;
+                break;
+            }
+            v = (v << 8) | static_cast<u8>(bus.read32(pa & ~3u) >>
+                                           (8 * (3 - (pa & 3u))));
+        }
+        if (ok)
+            out = static_cast<long long>(v);
+        cpu.st = saved;
+        cpu.raisedThisStep = raised;
+        cpu.mmuProbe = false;
+        return out; // -1 when the address does not translate to RAM
+    };
+
+    // Structure dumpers. "Is the drive queue empty?" and "which drivers are
+    // installed?" have been answered all session by reading raw hex out of
+    // a RAM dump and counting offsets by hand. A queue is a shape; print
+    // the shape.
+    auto dumpStructs = [&](const char* why) {
+        printf("== guest structures (%s) @%llu\n", why,
+               static_cast<unsigned long long>(executed));
+        // The Blue task's 68K lowmem lives at PHYSICAL 0x4000: lowmem 0 is
+        // PA 0x4000, so $308 is PA 0x4308 — which is exactly what the drive
+        // queue detector has been reading all along. Going through the MMU
+        // instead reads whichever address space happens to be current, and
+        // that is how this dumper first printed a queue head of 43a67c28 in
+        // a 64 MB machine.
+        cpu.l1dFlushAll(true);
+        cpu.l2FlushAll(true);
+        auto pa32 = [&](u32 pa) -> long long {
+            return pa + 4 <= bus.ram().size()
+                       ? static_cast<long long>(bus.read32(pa))
+                       : -1;
+        };
+        auto pa16 = [&](u32 pa) -> long long {
+            return pa + 2 <= bus.ram().size()
+                       ? static_cast<long long>(bus.read32(pa & ~3u) >>
+                                                (16 - 8 * (pa & 2u)) &
+                                                0xFFFFu)
+                       : -1;
+        };
+        // Every 68K address needs the same rebase, not just the lowmem
+        // globals: a queue element or a unit-table entry is a 68K pointer
+        // too, and reading one as a raw physical address lands in the RAM
+        // junk fill and prints 64 confident garbage handles.
+        auto b32 = [&](u32 a68) { return pa32(0x4000u + a68); };
+        auto b16 = [&](u32 a68) { return pa16(0x4000u + a68); };
+        auto lm32 = b32;
+        auto lm16 = b16;
+
+        // 68K lowmem is PER ADDRESS SPACE under the nanokernel, so these
+        // cells only mean anything while the Blue task's context is live.
+        // Read at an arbitrary moment they translate to somebody else's
+        // memory and print confident nonsense — a queue head of 43a67c28
+        // in a 64 MB machine, a unit table at 409e2ee4. Check the shape
+        // before believing the contents, and say so rather than printing
+        // numbers that will be quoted later as measurements.
+        const long long utProbe = lm32(0x011C), unProbe = lm16(0x01D2);
+        const bool sane = utProbe > 0x400 && utProbe < 0x04000000 &&
+                          unProbe >= 16 && unProbe <= 256;
+        if (!sane) {
+            printf("   NOT IN THE 68K WORLD: UTableBase=%08llx count=%lld "
+                   "are not plausible, so lowmem is another address space "
+                   "right now.\n"
+                   "   Re-run with --dump-structs-at N for an N inside the "
+                   "Blue task (the park qualifies).\n",
+                   utProbe & 0xFFFFFFFF, unProbe & 0xFFFF);
+            fflush(stdout);
+            return;
+        }
+
+        // Drive queue, lowmem $308: a QHdr {flags, qHead, qTail}. Each
+        // element is the thing the Start Manager is waiting for.
+        const long long qf = lm16(0x0308), qh = lm32(0x030A),
+                        qt = lm32(0x030E);
+        printf("   DrvQHdr $308: flags=%04llx head=%08llx tail=%08llx\n",
+               qf & 0xFFFF, qh & 0xFFFFFFFF, qt & 0xFFFFFFFF);
+        u32 el = static_cast<u32>(qh);
+        for (int n = 0; n < 8 && el && qh > 0; ++n) {
+            // A drive queue element is addressed at its qLink; the four
+            // bytes before it are dQDrvSz/flags.
+            const long long link = b32(el);
+            const long long drv = b16(el + 6);
+            const long long ref = b16(el + 8);
+            const long long fsid = b16(el + 10);
+            printf("     drive[%d] @%08x dQDrive=%lld dQRefNum=%lld "
+                   "dQFSID=%04llx next=%08llx\n",
+                   n, el, drv, static_cast<long long>(static_cast<i16>(ref)),
+                   fsid & 0xFFFF, link & 0xFFFFFFFF);
+            if (link <= 0)
+                break;
+            el = static_cast<u32>(link);
+        }
+
+        // Unit table: UTableBase $11C, UnitNtryCnt $1D2. Which DRVRs exist,
+        // and at which refNum — .ATALoad is unit 50 / refNum -51.
+        const long long ut = lm32(0x011C), un = lm16(0x01D2);
+        printf("   UTableBase=%08llx entries=%lld (non-null:", ut & 0xFFFFFFFF,
+               un & 0xFFFF);
+        if (ut > 0)
+            for (u32 k = 0; k < (un > 0 && un < 128 ? u32(un) : 64u); ++k) {
+                const long long dce = b32(static_cast<u32>(ut) + k * 4);
+                if (dce > 0)
+                    printf(" %u=%08llx", k, dce & 0xFFFFFFFF);
+            }
+        printf(")\n");
+
+        // The ATA Manager's own lists. r4/r5 at every manager call is the
+        // globals pointer; +0x38 is the device list, +0x44 the registered
+        // drivers that fn 0x98 enumerates.
+        // The manager's globals pointer is a NATIVE address (r4/r5 at every
+        // manager call), so it takes neither the 68K rebase nor a raw
+        // physical read — it needs the native context that owns it. Print
+        // the two list heads only when they look like list heads; a
+        // "driver[0] refNum=-1 proc=ffffffff" assembled out of junk is
+        // worse than no line at all, because it looks like a finding.
+        const u32 g = 0x00067BF0u;
+        const long long dev = pa32(g + 0x38), drv = pa32(g + 0x44);
+        const bool ataSane = dev >= 0 && drv >= 0 &&
+                             dev < static_cast<long long>(bus.ram().size()) &&
+                             drv < static_cast<long long>(bus.ram().size());
+        if (!ataSane) {
+            printf("   ATA globals %08x: not readable from here "
+                   "(+38=%08llx +44=%08llx are not plausible list heads; "
+                   "this pointer lives in the native context)\n",
+                   g, dev & 0xFFFFFFFF, drv & 0xFFFFFFFF);
+            fflush(stdout);
+            return;
+        }
+        printf("   ATA globals %08x: devices@+38=%08llx drivers@+44=%08llx\n",
+               g, dev & 0xFFFFFFFF, drv & 0xFFFFFFFF);
+        u32 node = static_cast<u32>(dev > 0 ? dev : 0);
+        for (int n = 0; n < 8 && node; ++n) {
+            const long long nx = pa32(node);
+            const long long id = pa16(node + 0x0C);
+            printf("     device[%d] @%08x id=%04llx next=%08llx\n", n, node,
+                   id & 0xFFFF, nx & 0xFFFFFFFF);
+            if (nx <= 0)
+                break;
+            node = static_cast<u32>(nx);
+        }
+        node = static_cast<u32>(drv > 0 ? drv : 0);
+        for (int n = 0; n < 8 && node; ++n) {
+            const long long nx = pa32(node);
+            const long long ref = pa16(node + 4);
+            const long long proc = pa32(node + 6);
+            printf("     driver[%d] @%08x refNum=%lld proc=%08llx "
+                   "next=%08llx\n",
+                   n, node, static_cast<long long>(static_cast<i16>(ref)),
+                   proc & 0xFFFFFFFF, nx & 0xFFFFFFFF);
+            if (nx <= 0)
+                break;
+            node = static_cast<u32>(nx);
+        }
+        fflush(stdout);
+    };
+
+    Events evlog;
+    evlog.open(eventsPath);
+    if (eventsPath)
+        printf("-- events: %s (one JSON object per line)\n", eventsPath);
+    char evb[512];
+
     Ring ring;
     int excLogged = 0;
     struct ExcEnt {
@@ -635,9 +907,67 @@ int main(int argc, char** argv)
                        pc, sym(pc), cpu.st.pc, sym(cpu.st.pc), cpu.st.lr,
                        cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.gpr[5],
                        static_cast<unsigned long long>(executed));
+                snprintf(evb, sizeof evb,
+                         "\"from\":%u,\"to\":%u,\"lr\":%u,\"r3\":%u,"
+                         "\"r4\":%u,\"r5\":%u",
+                         pc, cpu.st.pc, cpu.st.lr, cpu.st.gpr[3],
+                         cpu.st.gpr[4], cpu.st.gpr[5]);
+                evlog.emit(executed, "call", evb);
                 fflush(stdout);
             }
         }
+        // --watch-va: aim the memory watch at a GUEST VIRTUAL address by
+        // translating it through the live MMU once the mapping exists. A
+        // watch pointed at a hand-computed physical address fired zero
+        // times this session and read exactly like "nothing ever writes
+        // this", which is the most expensive kind of wrong answer.
+        if (watchVa && !bus.watchPa && (executed & 0xFFFFFu) == 0) {
+            const long long probe = guest(watchVa, 1);
+            if (probe >= 0) {
+                cpu.mmuProbe = true;
+                const CpuState vSaved = cpu.st;
+                cpu.st.msr |= 0x30u;
+                u32 pa = 0;
+                if (cpu.translate(watchVa, false, false, pa)) {
+                    cpu.st = vSaved;
+                    bus.watchPa = pa;
+                    bus.watchPaEnd = pa + 3;
+                    printf("-- watch-va %08x resolved to PA %08x @%llu\n",
+                           watchVa, pa,
+                           static_cast<unsigned long long>(executed));
+                    fflush(stdout);
+                }
+                cpu.st = vSaved;
+                cpu.mmuProbe = false;
+            }
+        }
+        // A single-step view, windowed in TIME. --trace starts at
+        // instruction zero, which is useless three billion in; the range
+        // tracers only see code whose address you already know. What was
+        // missing is "show me every instruction around HERE" — which,
+        // resumed from a snapshot, costs seconds and is what a debugger's
+        // step button actually provides.
+        if (traceFrom && executed >= traceFrom &&
+            executed < traceFrom + traceLines) {
+            char tt[128];
+            disassemble(cpu.curInsn, pc, tt, sizeof tt, Style::Gnu);
+            printf("STEP @%llu %08x%s %08x  %-28s",
+                   static_cast<unsigned long long>(executed), pc, sym(pc),
+                   cpu.curInsn, tt);
+            if ((pc & 0xFF000000u) == 0x68000000u)
+                printf(" | 68K %08x%s op=%04x D0=%08x A0=%08x\n",
+                       cpu.st.gpr[24], sym(cpu.st.gpr[24]),
+                       cpu.st.gpr[27] & 0xFFFFu, cpu.st.gpr[8],
+                       cpu.st.gpr[16]);
+            else
+                printf(" | r3=%08x r4=%08x lr=%08x\n", cpu.st.gpr[3],
+                       cpu.st.gpr[4], cpu.st.lr);
+            if (executed + 1 == traceFrom + traceLines)
+                printf("-- trace window done (%llu lines)\n",
+                       static_cast<unsigned long long>(traceLines));
+        }
+        if (dumpStructsAt && executed == dumpStructsAt)
+            dumpStructs("--dump-structs-at");
         // Drive-queue change detector. We keep inferring "nothing ever
         // adds a drive"; this turns that into a positive statement.
         // DrvQHdr is 68K lowmem $308 and blue lowmem maps VA+0x4000, so
@@ -688,10 +1018,26 @@ int main(int argc, char** argv)
                     printf("-- ARMED on value r%u == %08x\n", watchReg,
                            watchVal);
                 }
-                printf("REGSET r%u := %08x  pc=%08x r24=%08x lr=%08x "
+                // r8-r15 are D0-D7 ONLY while the 68K emulator's dispatch
+                // loop is running. Inside its helper routines they are
+                // ordinary scratch, so a hit reported from a helper is not
+                // a 68K register assignment at all — measured: an
+                // `addic. r8,r0,-56` at 680b8640 looked exactly like
+                // "D0 := -56" and is not. Say which world the hit is in.
+                printf("REGSET r%u := %08x  [%s] pc=%08x r24=%08x lr=%08x "
                        "@%llu\n",
-                       watchReg, watchVal, pc, cpu.st.gpr[24], cpu.st.lr,
+                       watchReg, watchVal,
+                       (pc & 0xFF000000u) != 0x68000000u ? "native"
+                       : (pc >= 0x68066000u && pc < 0x68068000u)
+                           ? "68K dispatch"
+                           : "68K emulator helper - regs are SCRATCH",
+                       pc, cpu.st.gpr[24], cpu.st.lr,
                        static_cast<unsigned long long>(executed));
+                snprintf(evb, sizeof evb,
+                         "\"reg\":%u,\"val\":%u,\"pc\":%u,\"pc68\":%u,"
+                         "\"lr\":%u",
+                         watchReg, watchVal, pc, cpu.st.gpr[24], cpu.st.lr);
+                evlog.emit(executed, "regset", evb);
                 fflush(stdout);
             }
             prevWatch = now;
@@ -746,6 +1092,12 @@ int main(int argc, char** argv)
                        cpu.st.gpr[3]);
                 fflush(stdout); // rare: keep readable if a run is cut short
             }
+            // The human log keeps its first-use census; the event stream
+            // records EVERY call, because "which call, in what order, with
+            // which block" is a question a census cannot answer.
+            snprintf(evb, sizeof evb, "\"fn\":%u,\"pb\":%u", fn,
+                     cpu.st.gpr[3]);
+            evlog.emit(executed, "ata_call", evb);
             // The registration and lookup calls, byte for byte. The manager
             // reads a pointer at PB+0x3E and copies 256 bytes through it,
             // and its whole registered-driver list stays empty when that
@@ -869,6 +1221,10 @@ int main(int argc, char** argv)
                 printf("ATARES pb=%08x result=%d fn=%02x @%llu\n", rpb, res,
                        rb(0x12) & 0xFF,
                        static_cast<unsigned long long>(executed));
+                snprintf(evb, sizeof evb,
+                         "\"pb\":%u,\"result\":%d,\"fn\":%d", rpb, res,
+                         rb(0x12) & 0xFF);
+                evlog.emit(executed, "ata_result", evb);
                 for (u32 row = 0x10; row < 0x50u; row += 16) {
                     printf("   +%02x:", row);
                     for (u32 k = 0; k < 16; ++k) {
@@ -1084,14 +1440,20 @@ int main(int argc, char** argv)
                     // trap line's registers bracket the previous call.
                     if (atFull < 200) {
                         ++atFull;
-                        printf("ATRAP $A%03x pc68=%08x%s D0=%08x D7=%08x "
-                               "A0=%08x A3=%08x @%llu\n",
-                               t, cur68, sym(cur68), cpu.st.gpr[8],
-                               cpu.st.gpr[15],
+                        printf("ATRAP $A%03x %-18s pc68=%08x%s D0=%08x "
+                               "D7=%08x A0=%08x A3=%08x @%llu\n",
+                               t, trapName(t), cur68, sym(cur68),
+                               cpu.st.gpr[8], cpu.st.gpr[15],
                                cpu.st.gpr[16], cpu.st.gpr[19],
                                static_cast<unsigned long long>(executed));
                         fflush(stdout);
                     }
+                    snprintf(evb, sizeof evb,
+                             "\"trap\":%u,\"name\":\"%s\",\"pc68\":%u,"
+                             "\"d0\":%u,\"d7\":%u,\"a0\":%u",
+                             t, trapName(t), cur68, cpu.st.gpr[8],
+                             cpu.st.gpr[15], cpu.st.gpr[16]);
+                    evlog.emit(executed, "atrap", evb);
                     ++traps[t];
                 }
                 // Branch-outcome truth. r24 is a FETCH pointer, so the
@@ -1985,12 +2347,27 @@ int main(int argc, char** argv)
     printf("-- executed %llu instructions; stop pc=%08x%s\n",
            static_cast<unsigned long long>(executed), cpu.st.pc,
            cpu.halted ? " (halted)" : "");
+    // Gate state first, because "hits=0" has two completely different
+    // meanings and only this line distinguishes them: the watch looked and
+    // saw nothing, or the watch never started looking. Three instruments
+    // this session reported silence of the second kind and it was read as
+    // silence of the first.
+    printf("-- gates: arm-at-park=%u (park seen %u times, %s) "
+           "arm-on-pc=%08x watch-from=%llu (%s) events=%s\n",
+           armAtPark, parkSeen, parkArmed ? "ARMED" : "never armed", armOnPc,
+           static_cast<unsigned long long>(watchFrom),
+           executed >= watchFrom ? "reached" : "NEVER REACHED",
+           eventsPath ? eventsPath : "off");
     printf("-- instrument census (hits=0 means the watch never fired —\n"
            "   check the address is a crossed fetch position and that any\n"
            "   gate actually opened before the run ended):\n");
     for (const auto& c : cen)
         printf("   %-10s hits=%llu\n", c.name,
                static_cast<unsigned long long>(c.hits));
+    if (dumpStructsEnd)
+        dumpStructs("end of run");
+    evlog.emit(executed, "end", nullptr);
+    evlog.close();
     printf("-- msr=%08x dec=%08x hid0=%08x\n", cpu.st.msr, cpu.st.dec,
            cpu.st.hid0);
     {

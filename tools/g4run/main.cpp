@@ -74,6 +74,12 @@ int main(int argc, char** argv)
     u32 viaA = 0x00;                   // VIA port A strap levels
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
+    u32 stackAt = 0;                   // --stack-at ADDR: 68K backchain dump
+    u32 watchReg = 99;                 // --watch-reg N: value-origin watch
+    u32 watchVal = 0;                  // --watch-val V
+    u32 armAtPark = 0;                 // --arm-at-park N: condition gate
+    u32 parkSeen = 0;
+    bool parkArmed = false;
     u32 tracePass = 0;                 // --trace-pass N: only this kick pass
     u64 ataPokeAt = 0;                 // hand-enqueue an .ATALoad request
     u32 ataPokeDev = 0;                // its deviceID field (entry+4)
@@ -112,6 +118,14 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
             atiAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--stack-at"))
+            stackAt = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--watch-reg"))
+            watchReg = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--watch-val"))
+            watchVal = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--arm-at-park"))
+            armAtPark = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--trace-pass"))
             tracePass = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--ata-poke"))
@@ -275,6 +289,38 @@ int main(int argc, char** argv)
                 lastDq = dq;
             }
         }
+        // Value-origin watch: "who put this value here?" was the dominant
+        // question this session, and answering it by bracketing across
+        // separate runs cost hours. --watch-reg N --watch-val V reports
+        // every instruction that makes gpr[N] become V, with the pc that
+        // did it and the 68K pc in effect, which answers it in one run.
+        if (watchReg < 32) {
+            static u32 prevWatch = 0;
+            static int wn = 0;
+            const u32 now = cpu.st.gpr[watchReg];
+            if (now == watchVal && prevWatch != watchVal && wn < 60) {
+                ++wn;
+                printf("REGSET r%u := %08x  pc=%08x r24=%08x lr=%08x "
+                       "@%llu\n",
+                       watchReg, watchVal, pc, cpu.st.gpr[24], cpu.st.lr,
+                       static_cast<unsigned long long>(executed));
+                fflush(stdout);
+            }
+            prevWatch = now;
+        }
+        // Event-based arming. Hard-coded instruction gates go stale the
+        // moment any fix shifts the timeline — one did this session, by
+        // 830M instructions, and silently disarmed every instrument.
+        // Arming on a CONDITION instead is durable: the park is the 68K
+        // Start Manager's tick spin at ffc03666, so the Nth time we see it
+        // the machine is definitively parked, whatever the clock says.
+        if (!parkArmed && (pc & 0xFF000000u) == 0x68000000u &&
+            cpu.st.gpr[24] == 0xFFC03666u && ++parkSeen >= armAtPark) {
+            parkArmed = true;
+            printf("-- ARMED on park (ffc03666 x%u) @%llu\n", armAtPark,
+                   static_cast<unsigned long long>(executed));
+            fflush(stdout);
+        }
         const u32 region = pc >> 10;
         if (seen.emplace(region, executed).second)
             firsts.push_back({executed, pc});
@@ -404,7 +450,8 @@ int main(int argc, char** argv)
                            static_cast<unsigned long long>(executed));
                 }
             }
-            if (cur68 != prev68 && executed > 2800000000ull) {
+            if (cur68 != prev68 &&
+                (armAtPark ? parkArmed : executed > 2800000000ull)) {
                 ++cen[kCen68kGate].hits;
                 const bool body = (cur68 >= 0xFFD9A000u &&
                                    cur68 < 0xFFD9D000u) ||
@@ -530,6 +577,52 @@ int main(int argc, char** argv)
                         }
                     }
                     prevSeq = cur68;
+                }
+                // General 68K call-stack capture at any address. "Who
+                // called this?" came up repeatedly and was answered each
+                // time by hand-walking a backchain at one specific site.
+                // A LINK A6 frame stores the caller's A6 at (A6) and the
+                // return address at 4(A6), so the chain walks itself.
+                if (stackAt && cur68 == stackAt) {
+                    static int sk = 0;
+                    if (sk < 8) {
+                        ++sk;
+                        cpu.l1dFlushAll(true);
+                        cpu.l2FlushAll(true);
+                        cpu.mmuProbe = true;
+                        const CpuState kSaved = cpu.st;
+                        const bool kRaised = cpu.raisedThisStep;
+                        cpu.st.msr |= 0x30u;
+                        const CpuState kArmed = cpu.st;
+                        auto rd32 = [&](u32 ea, u32& v) {
+                            u32 pa = 0;
+                            cpu.st = kArmed;
+                            const bool ok =
+                                cpu.translate(ea, false, false, pa);
+                            cpu.st = kArmed;
+                            if (!ok || pa + 4 > bus.ram().size())
+                                return false;
+                            v = bus.read32(pa);
+                            return true;
+                        };
+                        printf("STACK at %08x @%llu:", cur68,
+                               static_cast<unsigned long long>(executed));
+                        u32 frame = cpu.st.gpr[22];
+                        for (int k = 0; k < 8 && frame; ++k) {
+                            u32 nxt = 0, ret = 0;
+                            if (!rd32(frame, nxt) || !rd32(frame + 4, ret))
+                                break;
+                            printf(" %08x", ret);
+                            if (nxt <= frame)
+                                break;
+                            frame = nxt;
+                        }
+                        printf("\n");
+                        cpu.st = kSaved;
+                        cpu.raisedThisStep = kRaised;
+                        cpu.mmuProbe = false;
+                        fflush(stdout);
+                    }
                 }
                 // The generic strcmp at ffd9bc7c, read after both operand
                 // loads (A1 = 8(A6), A3 = 12(A6)). The install path walks

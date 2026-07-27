@@ -559,7 +559,14 @@ VA=$((${2:?usage: dis68k.sh <ram-dump> <va> [bytes] [--strict]}))
 N=${3:-96}
 STRICT=0
 [ "${4:-}" = "--strict" ] && STRICT=1
-PA=$((VA - 0xFF000000))
+# ROM addresses (ffcxxxxx/ffdxxxxx) are staged at PA 0x00c00000; anything
+# lower is already a RAM address and is its own offset in the dump. Driver
+# images loaded at run time live there, so both need to work.
+if [ "$VA" -ge $((0xFF000000)) ]; then
+  PA=$((VA - 0xFF000000))
+else
+  PA=$VA
+fi
 
 xxd -s "$PA" -l "$N" -p "$DUMP" | tr -d '\n' |
   awk -v VA="$VA" -v STRICT="$STRICT" -f "$AWKSRC"

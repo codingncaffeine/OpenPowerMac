@@ -70,22 +70,23 @@ struct SymTab {
         syms.clear();
         if (static_cast<size_t>(paBase) + len > ram.size())
             return;
+        auto idChar = [](u8 c, bool head) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   c == '_' ||
+                   (!head && ((c >= '0' && c <= '9') || c == '.'));
+        };
         for (u32 k = 1; k < len; ++k) {
-            const u8 tag = ram[paBase + k - 1];
-            if (tag < 0x80u)
+            // A MacsBug name is preceded by a byte with the high bit set.
+            // The low bits carry the length in the common form, but Apple
+            // also emits 0x80/0x81 with the length in the FOLLOWING byte, so
+            // matching on the length field alone silently finds nothing.
+            // Take the marker as the signal and measure the name itself.
+            if (ram[paBase + k - 1] < 0x80u || !idChar(ram[paBase + k], true))
                 continue;
-            u32 n = tag & 0x7Fu;
-            if (n < 4 || n > 31 || k + n > len)
-                continue;
-            bool ok = true;
-            for (u32 j = 0; j < n && ok; ++j) {
-                const char c = static_cast<char>(ram[paBase + k + j]);
-                const bool head = (j == 0);
-                ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                     c == '_' ||
-                     (!head && ((c >= '0' && c <= '9') || c == '.'));
-            }
-            if (!ok)
+            u32 n = 1;
+            while (n < 32 && k + n < len && idChar(ram[paBase + k + n], false))
+                ++n;
+            if (n < 4)
                 continue;
             syms.emplace_back(vaBase + k,
                               std::string(reinterpret_cast<const char*>(
@@ -175,6 +176,10 @@ int main(int argc, char** argv)
     bool realtime = false;             // --realtime: TB from the host clock
     u32 callLo = 0, callHi = 0;        // --call-trace LO HI
     u64 callFrom = 0;                  // --call-trace-at N: gate
+    u32 t68Lo = 0, t68Hi = 0;          // --trace-68k LO HI
+    u32 t68Cap = 4000;                 // --trace-68k-lines N
+    u64 watchFrom = 0;                 // --watch-from N: value-watch gate
+    u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -247,6 +252,16 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--call-trace-at"))
             callFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--trace-68k")) {
+            t68Lo = static_cast<u32>(strtoul(next(), nullptr, 0));
+            t68Hi = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
+        else if (!strcmp(a, "--trace-68k-lines"))
+            t68Cap = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--watch-from"))
+            watchFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--arm-on-pc"))
+            armOnPc = static_cast<u32>(strtoul(next(), nullptr, 0));
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -654,7 +669,17 @@ int main(int argc, char** argv)
             // which lies the same way a stale instruction-count gate does —
             // by reporting the wrong window rather than none. --arm-on-value
             // is exempt, since it is the watch itself that opens that gate.
-            const bool report = armOnValue || !armAtPark || parkArmed;
+            // Two gates, because neither alone is enough: --arm-at-park is
+            // durable against timeline shifts but can only open once the
+            // machine has parked, which is too LATE for anything that
+            // happens on the way there; --watch-from opens at an explicit
+            // instruction count, which is exact but goes stale the moment a
+            // fix moves the boot. Ungated, a 60-entry cap fills with
+            // unrelated hits in the first few million instructions and the
+            // watch reports the wrong window rather than none — the same
+            // failure in a new costume.
+            const bool report = (armOnValue || !armAtPark || parkArmed) &&
+                                executed >= watchFrom;
             if (now == watchVal && prevWatch != watchVal && report &&
                 wn < 60) {
                 ++wn;
@@ -677,7 +702,21 @@ int main(int argc, char** argv)
         // Arming on a CONDITION instead is durable: the park is the 68K
         // Start Manager's tick spin at ffc03666, so the Nth time we see it
         // the machine is definitively parked, whatever the clock says.
-        if (!parkArmed && (pc & 0xFF000000u) == 0x68000000u &&
+        // Arm on ARRIVAL at an address, native or 68K. The park gate is
+        // durable but can only open once the machine has parked, so it is
+        // useless for anything on the way there; an instruction count is
+        // exact but goes stale on the next timing change. Arming on the
+        // very code under study is both durable and early enough — three
+        // separate watches this session reported the wrong window because
+        // neither existing gate could express "when this routine runs".
+        if (!parkArmed && armOnPc &&
+            (pc == armOnPc || cpu.st.gpr[24] == armOnPc)) {
+            parkArmed = true;
+            printf("-- ARMED on pc %08x @%llu\n", armOnPc,
+                   static_cast<unsigned long long>(executed));
+            fflush(stdout);
+        }
+        if (!parkArmed && armAtPark && (pc & 0xFF000000u) == 0x68000000u &&
             cpu.st.gpr[24] == 0xFFC03666u && ++parkSeen >= armAtPark) {
             parkArmed = true;
             printf("-- ARMED on park (ffc03666 x%u) @%llu\n", armAtPark,
@@ -754,6 +793,36 @@ int main(int argc, char** argv)
                     }
                     printf("\n");
                 }
+                // AddATABus is handed a pointer at PB+0x30 to a 16-byte bus
+                // descriptor, which the handler copies into the new bus
+                // record. Three calls arrive with byte-identical parameter
+                // blocks, so whatever distinguishes one channel from the
+                // next is inside that structure — and which channel each
+                // registration is for is exactly the question when two of
+                // the three come back -56.
+                if (fn == 0x93u) {
+                    u32 desc = 0, pa = 0;
+                    cpu.st = pbArmed;
+                    if (cpu.translate(pb + 0x30u, false, false, pa) &&
+                        pa + 4 <= bus.ram().size())
+                        desc = bus.read32(pa & ~3u);
+                    cpu.st = pbArmed;
+                    printf("   bus descriptor at %08x:", desc);
+                    for (u32 k = 0; k < 16; ++k) {
+                        u32 dpa = 0;
+                        cpu.st = pbArmed;
+                        const bool ok =
+                            cpu.translate(desc + k, false, false, dpa);
+                        cpu.st = pbArmed;
+                        if (ok && dpa < bus.ram().size())
+                            printf(" %02x", static_cast<u8>(
+                                                bus.read32(dpa & ~3u) >>
+                                                (8 * (3 - (dpa & 3u)))));
+                        else
+                            printf(" ??");
+                    }
+                    printf("\n");
+                }
                 cpu.st = pbSaved;
                 cpu.raisedThisStep = pbRaised;
                 cpu.mmuProbe = false;
@@ -772,8 +841,48 @@ int main(int argc, char** argv)
             const int res = static_cast<int>(cpu.st.gpr[4]);
             if (cp < 200 && res != 0) {
                 ++cp;
-                printf("ATARES pb=%08x result=%d @%llu\n", cpu.st.gpr[3],
-                       res, static_cast<unsigned long long>(executed));
+                // The parameter block of the call that FAILED, not of the
+                // first call with each function code. Over a whole boot
+                // there are only a handful of non-zero completions, and
+                // which call each one belongs to — and with what arguments
+                // — is the entire question. A first-use census cannot say,
+                // because the failing call is rarely the first of its kind.
+                cpu.l1dFlushAll(true);
+                cpu.l2FlushAll(true);
+                cpu.mmuProbe = true;
+                const CpuState rSaved = cpu.st;
+                const bool rRaised = cpu.raisedThisStep;
+                const CpuState rArmed = cpu.st;
+                const u32 rpb = cpu.st.gpr[3];
+                auto rb = [&](u32 off) -> int {
+                    u32 pa = 0;
+                    cpu.st = rArmed;
+                    const bool ok =
+                        cpu.translate(rpb + off, false, false, pa);
+                    cpu.st = rArmed;
+                    if (!ok || pa >= bus.ram().size())
+                        return -1;
+                    return static_cast<int>(
+                        static_cast<u8>(bus.read32(pa & ~3u) >>
+                                        (8 * (3 - (pa & 3u)))));
+                };
+                printf("ATARES pb=%08x result=%d fn=%02x @%llu\n", rpb, res,
+                       rb(0x12) & 0xFF,
+                       static_cast<unsigned long long>(executed));
+                for (u32 row = 0x10; row < 0x50u; row += 16) {
+                    printf("   +%02x:", row);
+                    for (u32 k = 0; k < 16; ++k) {
+                        const int v = rb(row + k);
+                        if (v < 0)
+                            printf(" ??");
+                        else
+                            printf(" %02x", v);
+                    }
+                    printf("\n");
+                }
+                cpu.st = rSaved;
+                cpu.raisedThisStep = rRaised;
+                cpu.mmuProbe = false;
                 fflush(stdout);
             }
         }
@@ -848,6 +957,29 @@ int main(int argc, char** argv)
         if ((pc & 0xFF000000u) == 0x68000000u) {
             static u32 prev68 = 0;
             const u32 cur68 = cpu.st.gpr[24];
+            // A 68K tracer aimed by flag rather than by recompile, plus the
+            // question that came up more than any other in this dig: WHAT
+            // DID THAT ROUTINE ANSWER. The emulator holds the current 68K
+            // opcode in r27, so an RTS (0x4E75) inside the window is a
+            // return, and D0 at that moment is the answer. Bracketing a
+            // return value by hand across a twelve-thousand-line trace was
+            // costing a run each time; this prints it.
+            if (t68Lo && cur68 != prev68 && cur68 >= t68Lo && cur68 < t68Hi &&
+                executed >= watchFrom) {
+                static u32 t68n = 0;
+                if (t68n < t68Cap) {
+                    ++t68n;
+                    const bool isRts = (cpu.st.gpr[27] & 0xFFFFu) == 0x4E75u;
+                    printf("%s %08x%s D0=%08x D1=%08x A0=%08x A1=%08x "
+                           "A6=%08x\n",
+                           isRts ? "RET" : "T68", cur68, sym(cur68),
+                           cpu.st.gpr[8], cpu.st.gpr[9], cpu.st.gpr[16],
+                           cpu.st.gpr[17], cpu.st.gpr[22]);
+                    if (t68n == t68Cap)
+                        printf("-- trace-68k cap %u reached @%llu\n", t68Cap,
+                               static_cast<unsigned long long>(executed));
+                }
+            }
             // Ungated: the ROM only reaches this call site when it has
             // already matched Apple_HFS, so it is rare by construction and
             // worth catching from the first boot-time attempt onward.

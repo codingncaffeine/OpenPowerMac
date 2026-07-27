@@ -70,6 +70,7 @@ int main(int argc, char** argv)
     const char* cdPath = nullptr;
     const char* serialInput = nullptr; // ';' separates lines
     u64 serialAt = 240000000ull;       // inject once the prompt is up
+    u32 viaA = 0x00;                   // VIA port A strap levels
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -99,6 +100,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--serial-at"))
             serialAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--cd")) cdPath = next();
+        else if (!strcmp(a, "--via-a")) viaA = strtoul(next(), nullptr, 0);
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -145,6 +147,12 @@ int main(int argc, char** argv)
     bus.stamp = &executed;
     bus.cd().stamp = &executed;
     bus.pic().stamp = &executed;
+    bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
+    bus.pmu().portAIn = static_cast<u8>(viaA);
+    for (u32 f = 0; f < 2; ++f) {
+        bus.ohci(f).stamp = &executed;
+        bus.ohci(f).pcRef = &cpu.st.pc;
+    }
 
     Ring ring;
     int excLogged = 0;
@@ -173,6 +181,7 @@ int main(int argc, char** argv)
         }
         if (fastTb && executed < fastTbUntil)
             cpu.tick(fastTb);
+        bus.ohciTick(cpu.st.tb);
         bus.syncIrqs();
         cpu.setExternalIrq(bus.pic().cpuLine());
         if (serialInput && executed == serialAt) {
@@ -216,6 +225,78 @@ int main(int argc, char** argv)
         // primitive jumps through this cell and it is 0 at the fatal
         // call — the sad-mac's null procPtr. This names every writer:
         // the builder's clear, and (if it ever runs) the real install.
+        // Who issues the PMU polls: print pc/lr at each new command byte
+        // (the wire log has no pc; the issuers' code is the decode target).
+        static size_t pmuLogSeen = 0;
+        static u32 pmuCmdShown = 0;
+        {
+            const auto& pl2 = bus.pmu().log;
+            while (pmuLogSeen < pl2.size()) {
+                const auto& ev = pl2[pmuLogSeen++];
+                if (ev.kind == 'c' && executed > 1200000000ull &&
+                    pmuCmdShown < 40 &&
+                    (ev.val == 0xDCu || ev.val == 0x78u || ev.val == 0x8Fu ||
+                     ev.val == 0x39u)) {
+                    ++pmuCmdShown;
+                    printf("-- pmu cmd %02x @%llu pc=%08x lr=%08x r24=%08x\n",
+                           ev.val,
+                           static_cast<unsigned long long>(executed),
+                           cpu.st.pc, cpu.st.lr, cpu.st.gpr[24]);
+                }
+            }
+        }
+        // Who computes product-code: the OF dictionary compiles it as
+        // lis/ori/blr with the value baked into the ori at PA 03C3AF74-
+        // region; the writer pc is the machine-identity computation.
+        static u32 pcodePrev = 0xEEEEEEEEu;
+        static u32 pcodeShown = 0;
+        if (executed > 30000000ull && executed < 262000000ull) {
+            u32 cv = 0;
+            if (!cpu.l1dPeek32(0x03D08BD0u, cv))
+                cv = bus.read32(0x03D08BD0u);
+            if (cv != pcodePrev && pcodeShown < 8) {
+                ++pcodeShown;
+                printf("-- pcode cell %08x -> %08x @%llu pc=%08x "
+                       "lr=%08x\n",
+                       pcodePrev, cv,
+                       static_cast<unsigned long long>(executed),
+                       cpu.st.pc, cpu.st.lr);
+                printf("   rstack r30=%08x:", cpu.st.gpr[30]);
+                {
+                    cpu.l1dFlushAll(true);
+                    cpu.mmuProbe = true;
+                    const CpuState saved2 = cpu.st;
+                    const bool savedR2 = cpu.raisedThisStep;
+                    for (u32 k = 0; k < 16; ++k) {
+                        const u32 ea = (cpu.st.gpr[30] + k * 4) & ~3u;
+                        u32 pa2 = ea;
+                        cpu.st = saved2;
+                        if ((cpu.st.msr & 0x10u) &&
+                            !cpu.translate(ea, false, false, pa2))
+                            pa2 = 0xFFFFFFFFu;
+                        printf(" %08x", pa2 == 0xFFFFFFFFu
+                                            ? 0xEEEEEEEEu
+                                            : bus.read32(pa2));
+                    }
+                    cpu.st = saved2;
+                    cpu.raisedThisStep = savedR2;
+                    cpu.mmuProbe = false;
+                }
+                printf("\n");
+                if ((cv & 0xFFFFu) != 0 && cv != 0xEEEEEEEEu) {
+                    printf("   ppc ring (last 20):\n");
+                    const u32 zc = ring.n < 20 ? ring.n : 20;
+                    for (u32 k = 0; k < zc; ++k) {
+                        const auto& e = ring.e[(ring.n - zc + k) & 127u];
+                        disassemble(e.insn, e.pc, text, sizeof text,
+                                    Style::Gnu);
+                        printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
+                    }
+                }
+            }
+            if (cv != pcodePrev)
+                pcodePrev = cv;
+        }
         static u32 instShown = 0;
         if ((pc == 0xFFE2325Cu || pc == 0xFFE23380u) && instShown < 12) {
             ++instShown;
@@ -235,8 +316,15 @@ int main(int argc, char** argv)
             if (pc == 0xFFE2325Cu && !poked) {
                 poked = true;
                 cpu.l1dFlushAll(true);
-                bus.write32(0x000116C4u, 0xFFC339A2u);
-                printf("-- DIAGNOSTIC poke: [EM+294] := ffc339a2 (RTS)\n");
+                const u32 cur = bus.read32(0x000116C4u);
+                if (cur == 0) {
+                    bus.write32(0x000116C4u, 0xFFC339A2u);
+                    printf("-- DIAGNOSTIC poke: [EM+294] := ffc339a2 "
+                           "(RTS)\n");
+                } else {
+                    printf("-- [EM+294] already seeded: %08x (no poke)\n",
+                           cur);
+                }
             }
         }
         static u32 emPrev = 0xEEEEEEEEu;
@@ -289,6 +377,26 @@ int main(int argc, char** argv)
         if (cpu.st.gpr[24] != prev68k) {
             prev68k = cpu.st.gpr[24];
             ring68[ring68At++ & 127u] = {prev68k, cpu.st.gpr[27], pc};
+            // 60Hz tick delivery tracer: the 68K tick handler increments
+            // lowmem Ticks at ffc0bc00 (ADDQ.L #1,($016A).W); entries
+            // into the handler region name the delivery mechanism.
+            static u32 tickShown = 0;
+            if (prev68k >= 0xFFC0BBE8u && prev68k <= 0xFFC0BBF0u &&
+                tickShown < 3 && executed > 1200000000ull &&
+                (pc & 0xFFC00000u) == 0x68000000u) {
+                ++tickShown;
+                printf("-- tick delivery #%u @%llu pc68=%08x ppcpc=%08x "
+                       "lr=%08x\n   ring:",
+                       tickShown, static_cast<unsigned long long>(executed),
+                       prev68k, cpu.st.pc, cpu.st.lr);
+                for (u32 k = 0; k < 24; ++k) {
+                    const Ent68& e =
+                        ring68[(ring68At + 128u - 24u + k) & 127u];
+                    printf(" %08x%s", e.pc68,
+                           (e.ppc & 0xFFC00000u) == 0x68000000u ? "" : "*");
+                }
+                printf("\n");
+            }
             // Two triggers, first one wins: the fatal transfer itself
             // (r24 lands on 68K VA 0 — the null jump that becomes the
             // Line-F sad-mac) or, as backup, death-handler entry. The
@@ -644,7 +752,28 @@ int main(int argc, char** argv)
         const size_t start = pl.size() > 120 ? pl.size() - 120 : 0;
         for (size_t k = start; k < pl.size(); ++k)
             printf("%c%02x ", pl[k].kind, pl[k].val);
-        printf("\n");
+        printf("\n-- pmu tail with stamps (last 40):\n");
+        const size_t s2 = pl.size() > 40 ? pl.size() - 40 : 0;
+        for (size_t k = s2; k < pl.size(); ++k)
+            printf("   %c %02x @%llu\n", pl[k].kind, pl[k].val,
+                   static_cast<unsigned long long>(pl[k].at));
+    }
+    for (u32 f = 0; f < 2; ++f) {
+        const auto& ol = bus.ohci(f).log;
+        printf("-- ohci%u writes (%zu):\n", f, ol.size());
+        for (size_t k = 0; k < ol.size() && k < 60; ++k)
+            printf("   +%03x <- %08x pc=%08x @%llu\n", ol[k].off,
+                   ol[k].val, ol[k].pc,
+                   static_cast<unsigned long long>(ol[k].at));
+    }
+    {
+        const auto& il = bus.pic().log;
+        printf("-- openpic events (%zu; v=src<<24|vp a=iack e=eoi "
+               "r=raise):\n",
+               il.size());
+        for (size_t k = 0; k < il.size(); ++k)
+            printf("   %c %08x @%llu\n", il[k].kind, il[k].val,
+                   static_cast<unsigned long long>(il[k].at));
     }
     {
         const auto& kl = bus.macioLog();

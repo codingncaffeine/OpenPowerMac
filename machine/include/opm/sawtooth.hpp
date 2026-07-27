@@ -1,6 +1,7 @@
 #pragma once
 #include "opm/ata.hpp"
 #include "opm/bus.hpp"
+#include "opm/ohci.hpp"
 #include "opm/openpic.hpp"
 #include "opm/pmu.hpp"
 #include "opm/types.hpp"
@@ -69,6 +70,26 @@ public:
         for (u32 r = 0x04; r <= 0x3C; r += 4)
             if (r != 0x08)
                 cfgSeed(1, 0x00800000u | r, 0);
+        // KeyLargo's two OHCI USB functions: usb@18 / usb@19 on the f2
+        // bus (one-hot bits 24/25). Apple id 0x0019, class 0x0C0310
+        // (serial bus / USB / OHCI), INT pin A; BAR0 is a 4 KB memory
+        // window with real sizing-mask behavior (cfgAccess below). The
+        // Boot ROM carries ohci+usb-hid FCode; the USB Expert seeds the
+        // boot-keyboard shim chain per controller it registers — no
+        // controllers is the path Apple never booted.
+        for (u32 f = 0; f < 2; ++f) {
+            const u32 hot = 0x01000000u << f;
+            cfgSeed(1, hot | 0x00u, 0x0019106Bu);
+            cfgSeed(1, hot | 0x08u, 0x0C031001u);
+            cfgSeed(1, hot | 0x3Cu, 0x00000100u);
+            for (u32 r = 0x04; r <= 0x38; r += 4)
+                if (r != 0x08)
+                    cfgSeed(1, hot | r, 0);
+        }
+        for (u32 f = 0; f < 2; ++f) {
+            ohci_[f].ram = ram_.data();
+            ohci_[f].ramSize = static_cast<u32>(ram_.size());
+        }
     }
 
     void cfgSeed(u32 b, u32 latch, u32 nativeLeWord)
@@ -135,9 +156,22 @@ public:
     PmuVia& pmu() { return pmu_; }
 
     // OpenPIC at +0x40000 (the tree's interrupt-controller@40000).
-    // Device level lines: ata-3@20000 = source 20, its DBDMA = 12.
+    // Device level lines: ata-3@20000 = source 20, its DBDMA = 12;
+    // the OHCI functions ride KeyLargo sources 27/28 (usb@18/usb@19).
     OpenPic& pic() { return pic_; }
-    void syncIrqs() { pic_.setLine(20, cd_.irqLine()); }
+    void syncIrqs()
+    {
+        pic_.setLine(20, cd_.irqLine());
+        pic_.setLine(27, ohci_[0].irqLine());
+        pic_.setLine(28, ohci_[1].irqLine());
+    }
+
+    OhciCell& ohci(u32 i) { return ohci_[i & 1u]; }
+    void ohciTick(u64 tb)
+    {
+        ohci_[0].tick(tb);
+        ohci_[1].tick(tb);
+    }
 
     // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
     // with a /disk node). The CD lives on ata-3@20000 device 0 when an
@@ -241,6 +275,9 @@ private:
             klNote(kMacIoBase + off, 0, false);
             return v;
         }
+        for (u32 f = 0; f < 2; ++f)
+            if (ohciBar_[f] && pa - ohciBar_[f] < 0x1000u)
+                return ohci_[f].read(pa - ohciBar_[f], len);
         if (pa - kSizeWin < 0x20000000u) {
             const u32 v =
                 get(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), len);
@@ -298,6 +335,11 @@ private:
             klNote(kMacIoBase + off, v, true);
             return;
         }
+        for (u32 f = 0; f < 2; ++f)
+            if (ohciBar_[f] && pa - ohciBar_[f] < 0x1000u) {
+                ohci_[f].write(pa - ohciBar_[f], v, len);
+                return;
+            }
         if (pa - kSizeWin < 0x20000000u) {
             put(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), v, len);
             if (szLog_.size() < 4000)
@@ -370,6 +412,24 @@ private:
                 const u32 lane = (pa + k) & 3u;
                 word = (word & ~(0xFFu << (8 * lane))) |
                        (((v >> (8 * (len - 1 - k))) & 0xFFu) << (8 * lane));
+            }
+            // OHCI BAR0 (usb@18/19 reg 0x10): a real 4 KB memory BAR —
+            // all-ones sizing writes read back the size mask, address
+            // writes relocate the register cell. BARs 1-5 and the
+            // expansion-ROM BAR are hardwired zero (a single-BAR
+            // function; a writable store here grows phantom BARs).
+            for (u32 f = 0; f < 2; ++f) {
+                if (b == 1u && (cfgAddr_[b] & 0x0FFFFF00u) ==
+                                   (0x01000000u << f)) {
+                    if (reg == 0x10u) {
+                        word &= 0xFFFFF000u;
+                        ohciBar_[f] =
+                            (word != 0xFFFFF000u) ? word : ohciBar_[f];
+                    } else if ((reg >= 0x14u && reg <= 0x2Cu) ||
+                               reg == 0x30u) {
+                        word = 0;
+                    }
+                }
             }
             cfgSpace_[key & ~3u] = word;
         }
@@ -592,6 +652,8 @@ private:
     std::vector<RegWr> ataLog_;
     AtaCell cd_;
     OpenPic pic_;
+    OhciCell ohci_[2];
+    u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
 };
 
 } // namespace opm

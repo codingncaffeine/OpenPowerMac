@@ -8,6 +8,7 @@ add_library(opmmachine STATIC
   src/sawtooth.cpp
   src/ata.cpp
   src/openpic.cpp
+  src/ohci.cpp
 )
 
 target_include_directories(opmmachine PUBLIC include)

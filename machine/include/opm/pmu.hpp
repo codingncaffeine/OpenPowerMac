@@ -33,6 +33,20 @@ public:
 
     bool ackLevel() const { return ack_; }
 
+    // VIA port A input levels: board-identity straps on real machines
+    // (open lines float high through pull-ups; grounded straps encode
+    // the board). The boot ROM folds these into product-code/product-id
+    // and gates per-board behavior (the f2 slot-names incl. USB!) on it.
+    u8 portAIn = 0x00;
+
+    // Timebase pointer: when wired, the VIA timers count TB/32 (the real
+    // 7400-side ratio — TB at bus/4 ≈ 25 MHz against the VIA's ~783 kHz
+    // phi2), so --fast-tb compresses VIA time and TB time uniformly. The
+    // OS calibrates its tick chain against these timers; pacing them per
+    // instruction while the TB runs compressed splits the machine into
+    // two clocks and stretches every tick-timed wait by the same factor.
+    const u64* tbRef = nullptr;
+
 private:
     void reqEdge(bool asserted, u64 now);
     u8 nextReply();
@@ -41,8 +55,9 @@ private:
     u8 orb_ = 0, ora_ = 0, ddrb_ = 0, ddra_ = 0;
     u8 t1ll_ = 0, t1lh_ = 0, t2cl_ = 0;
     u16 t1Load_ = 0xFFFF, t2Load_ = 0xFFFF;
-    u64 t1At_ = 0, t2At_ = 0;
-    u16 timerNow(u16 loaded, u64 loadedAt, u64 now) const;
+    u64 t1At_ = 0, t2At_ = 0; // in VIA-tick units (vclk)
+    u64 vclk(u64 now) const;
+    u16 timerNow(u16 loaded, u64 loadedAtV, u64 now) const;
     u8 sr_ = 0, acr_ = 0, pcr_ = 0, ifr_ = 0, ier_ = 0;
 
     // PMU engine

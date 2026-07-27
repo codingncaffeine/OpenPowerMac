@@ -25,6 +25,14 @@ public:
     u32 read(u32 off, u32 len);
     void write(u32 off, u32 v, u32 len);
 
+    // DBDMA drain of the current data phase: same completion semantics
+    // as PIO reads (chunked READs refill through finishPio).
+    u32 dmaAvail() const
+    {
+        return static_cast<u32>(data_.size() - dataAt_);
+    }
+    u32 dmaTake(u8* dst, u32 n);
+
     struct Ev {
         u64 at;
         char kind; // 'c' ata cmd, 'p' packet op, 'e' error path

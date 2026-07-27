@@ -9,6 +9,8 @@ add_library(opmmachine STATIC
   src/ata.cpp
   src/openpic.cpp
   src/ohci.cpp
+  src/r128.cpp
+  src/dbdma.cpp
 )
 
 target_include_directories(opmmachine PUBLIC include)

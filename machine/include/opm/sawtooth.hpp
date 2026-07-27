@@ -1,7 +1,9 @@
 #pragma once
 #include "opm/ata.hpp"
+#include "opm/dbdma.hpp"
 #include "opm/bus.hpp"
 #include "opm/ohci.hpp"
+#include "opm/r128.hpp"
 #include "opm/openpic.hpp"
 #include "opm/pmu.hpp"
 #include "opm/types.hpp"
@@ -90,7 +92,59 @@ public:
             ohci_[f].ram = ram_.data();
             ohci_[f].ramSize = static_cast<u32>(ram_.size());
         }
+        // Uni-North's own host-bridge PCI functions at device 11 of
+        // each bus ("11,UNI-N" in the ROM's slot names; the AGP-slot
+        // probe consults its bridge): AGP = 106b:0020, internal 66MHz =
+        // 106b:001E, 33MHz PCI = 106b:001F, all class 0x060000.
+        {
+            const u32 dev[3] = {0x0020106Bu, 0x001E106Bu, 0x001F106Bu};
+            for (u32 b = 0; b < 3; ++b) {
+                cfgSeed(b, 0x00000800u, dev[b]);
+                cfgSeed(b, 0x00000808u, 0x06000000u);
+                for (u32 r = 0x04; r <= 0x3C; r += 4)
+                    if (r != 0x08)
+                        cfgSeed(b, 0x00000800u | r, 0);
+            }
+        }
+        // ATI Rage 128 Pro AGP at f0 device 16 (the AGP slot, "SLOT-A"
+        // per the real card's dump): 1002:5046 'PF', class display.
+        // BAR0 = 32 MB framebuffer aperture, BAR1 = 256 B I/O, BAR2 =
+        // 16 KB register block, expansion ROM = 128 KB (the card's own
+        // FCode image, attached from a file — never committed).
+        cfgSeed(0, 0x00010000u, 0x50461002u);
+        cfgSeed(0, 0x00010008u, 0x03000000u);
+        cfgSeed(0, 0x0001003Cu, 0x00000100u);
+        for (u32 r = 0x04; r <= 0x38; r += 4)
+            if (r != 0x08)
+                cfgSeed(0, 0x00010000u | r, 0);
+        ataDma_.dmaBus = this;
+        ataDma_.ata = &cd_;
     }
+
+    bool attachAtiRom(const char* path)
+    {
+        FILE* f = fopen(path, "rb");
+        if (!f)
+            return false;
+        fseek(f, 0, SEEK_END);
+        const long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        atiRom_.assign(static_cast<size_t>(n > 0 ? n : 0), 0);
+        const bool ok =
+            !atiRom_.empty() &&
+            fread(atiRom_.data(), 1, atiRom_.size(), f) == atiRom_.size();
+        fclose(f);
+        if (!ok)
+            atiRom_.clear();
+        return ok;
+    }
+    R128Cell& ati() { return ati_; }
+    bool atiPresent() const { return !atiRom_.empty(); }
+    // Harness sequencing: hide the AGP function from config space until
+    // this instruction count. OF picks its console (~228M) before the
+    // injected probe (~245M) — with the card invisible at choice time
+    // the console stays serial, and the FCode still runs at probe time.
+    u64 atiVisibleAt = 0;
 
     void cfgSeed(u32 b, u32 latch, u32 nativeLeWord)
     {
@@ -172,6 +226,11 @@ public:
         ohci_[0].tick(tb);
         ohci_[1].tick(tb);
     }
+
+    // DBDMA channel for ata-3@20000 at mac-io +0x8B00 — the OS ATA
+    // driver's data path (task file stays PIO; INPUT descriptors pull
+    // the CD's data phases straight into RAM).
+    DbdmaChannel& ataDma() { return ataDma_; }
 
     // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
     // with a /disk node). The CD lives on ata-3@20000 device 0 when an
@@ -260,15 +319,21 @@ private:
                 return i2cRead(1, off - 0x18000u);
             if (off - 0x40000u < 0x40000u)
                 return pic_.read(off - 0x40000u, len);
+            if (off - 0x8B00u < 0x100u)
+                return ataDma_.read(off - 0x8B00u, len);
             if (off - 0x1F000u < 0x3000u) {
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
                 u32 v = 0;
                 if (isCd)
                     v = cd_.read(off - 0x20000u, len);
-                if ((off & 0xFF0u) != 0 && ataLog_.size() < 3000)
+                if ((off & 0xFF0u) != 0) {
+                    if (ataLog_.size() >= 6000)
+                        ataLog_.erase(ataLog_.begin(),
+                                      ataLog_.begin() + 3000);
                     ataLog_.push_back({stamp ? *stamp : 0, off | 1u, v,
                                        pcRef ? *pcRef : 0});
+                }
                 return v; // empty buses: no BSY, no DRDY, zero signature
             }
             const u32 v = get(kl_.data() + off, len);
@@ -278,6 +343,19 @@ private:
         for (u32 f = 0; f < 2; ++f)
             if (ohciBar_[f] && pa - ohciBar_[f] < 0x1000u)
                 return ohci_[f].read(pa - ohciBar_[f], len);
+        if (atiRomBar_ > 1u && pa - (atiRomBar_ & ~1u) < 0x20000u &&
+            !atiRom_.empty()) {
+            const u32 ro = pa - (atiRomBar_ & ~1u);
+            u32 v = 0;
+            for (u32 k = 0; k < len; ++k)
+                v = (v << 8) |
+                    (ro + k < atiRom_.size() ? atiRom_[ro + k] : 0xFFu);
+            return v;
+        }
+        if (atiRegBar_ && pa - atiRegBar_ < 0x4000u)
+            return ati_.read(pa - atiRegBar_, len);
+        if (atiFbBar_ && pa - atiFbBar_ < (32u << 20))
+            return get(ati_.vram.data() + (pa - atiFbBar_), len);
         if (pa - kSizeWin < 0x20000000u) {
             const u32 v =
                 get(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), len);
@@ -323,12 +401,24 @@ private:
                 pic_.write(off - 0x40000u, v, len);
                 return;
             }
+            if (off - 0x8B00u < 0x100u) {
+                ataDma_.write(off - 0x8B00u, v, len);
+                return;
+            }
             if (off - 0x1F000u < 0x3000u) {
-                if ((off & 0xFF0u) != 0 && ataLog_.size() < 3000)
+                if ((off & 0xFF0u) != 0) {
+                    if (ataLog_.size() >= 6000)
+                        ataLog_.erase(ataLog_.begin(),
+                                      ataLog_.begin() + 3000);
                     ataLog_.push_back({stamp ? *stamp : 0, off, v,
                                        pcRef ? *pcRef : 0});
-                if (off - 0x20000u < 0x1000u && cd_.present())
+                }
+                if (off - 0x20000u < 0x1000u && cd_.present()) {
                     cd_.write(off - 0x20000u, v, len);
+                    // a task-file write can open a fresh data phase:
+                    // resume any standing DBDMA list
+                    ataDma_.wake();
+                }
                 return;
             }
             put(kl_.data() + off, v, len);
@@ -340,6 +430,14 @@ private:
                 ohci_[f].write(pa - ohciBar_[f], v, len);
                 return;
             }
+        if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
+            ati_.write(pa - atiRegBar_, v, len);
+            return;
+        }
+        if (atiFbBar_ && pa - atiFbBar_ < (32u << 20)) {
+            put(ati_.vram.data() + (pa - atiFbBar_), v, len);
+            return;
+        }
         if (pa - kSizeWin < 0x20000000u) {
             put(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), v, len);
             if (szLog_.size() < 4000)
@@ -398,6 +496,12 @@ private:
             return swapLanes(cfgAddr_[b], pa, len);
         }
         const u32 reg = (cfgAddr_[b] & 0xFCu) | (pa & 7u);
+        if (b == 0u && (cfgAddr_[b] & 0x0FFFFF00u) == 0x00010000u &&
+            atiVisibleAt && stamp && *stamp < atiVisibleAt) {
+            if (!wr)
+                return len == 1 ? 0xFFu : len == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+            return 0; // absent card: master-abort both ways
+        }
         const u32 key = (b << 28) | (cfgAddr_[b] & 0x00FFFF00u) |
                         ((cfgAddr_[b] & 0xFFu) & 0xFCu) | (pa & 7u);
         u32 out = 0xFFFFFFFFu;
@@ -429,6 +533,40 @@ private:
                                reg == 0x30u) {
                         word = 0;
                     }
+                }
+            }
+            // ATI Rage 128 (f0 device 16): FB aperture 32 MB, I/O BAR
+            // 256 B, register BAR 16 KB, expansion ROM 128 KB when an
+            // FCode image is attached (absent card ROM reads zero).
+            if (b == 0u && (cfgAddr_[b] & 0x0FFFFF00u) == 0x00010000u) {
+                switch (reg) {
+                case 0x10u:
+                    word &= 0xFE000000u;
+                    atiFbBar_ = (word != 0xFE000000u) ? word : atiFbBar_;
+                    break;
+                case 0x14u:
+                    word = (word & 0xFFFFFF00u) | 1u;
+                    break;
+                case 0x18u:
+                    word &= 0xFFFFC000u;
+                    atiRegBar_ =
+                        (word != 0xFFFFC000u) ? word : atiRegBar_;
+                    break;
+                case 0x30u:
+                    if (atiRom_.empty())
+                        word = 0;
+                    else {
+                        const u32 en = word & 1u;
+                        word = (word & 0xFFFE0000u) | en;
+                        atiRomBar_ = (word & 0xFFFE0000u) != 0xFFFE0000u
+                                         ? word
+                                         : atiRomBar_;
+                    }
+                    break;
+                default:
+                    if (reg >= 0x1Cu && reg <= 0x2Cu)
+                        word = 0;
+                    break;
                 }
             }
             cfgSpace_[key & ~3u] = word;
@@ -654,6 +792,10 @@ private:
     OpenPic pic_;
     OhciCell ohci_[2];
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
+    R128Cell ati_;
+    DbdmaChannel ataDma_;
+    std::vector<u8> atiRom_;
+    u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;
 };
 
 } // namespace opm

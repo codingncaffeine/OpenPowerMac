@@ -71,6 +71,8 @@ int main(int argc, char** argv)
     const char* serialInput = nullptr; // ';' separates lines
     u64 serialAt = 240000000ull;       // inject once the prompt is up
     u32 viaA = 0x00;                   // VIA port A strap levels
+    const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
+    u64 atiAt = 0;                     // hide the card until this insn
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -101,6 +103,9 @@ int main(int argc, char** argv)
             serialAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--cd")) cdPath = next();
         else if (!strcmp(a, "--via-a")) viaA = strtoul(next(), nullptr, 0);
+        else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
+        else if (!strcmp(a, "--ati-at"))
+            atiAt = strtoull(next(), nullptr, 0);
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -129,6 +134,12 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (atiRomPath) {
+        if (bus.attachAtiRom(atiRomPath))
+            printf("-- ati fcode rom attached: %s\n", atiRomPath);
+        else
+            printf("-- ati rom attach FAILED: %s\n", atiRomPath);
+    }
     if (cdPath) {
         if (bus.attachCd(cdPath))
             printf("-- cd attached: %s\n", cdPath);
@@ -153,6 +164,11 @@ int main(int argc, char** argv)
         bus.ohci(f).stamp = &executed;
         bus.ohci(f).pcRef = &cpu.st.pc;
     }
+    bus.ati().stamp = &executed;
+    bus.ati().pcRef = &cpu.st.pc;
+    bus.atiVisibleAt = atiAt;
+    bus.ataDma().stamp = &executed;
+    bus.ataDma().pcRef = &cpu.st.pc;
 
     Ring ring;
     int excLogged = 0;
@@ -672,7 +688,8 @@ int main(int argc, char** argv)
         const auto& cl = bus.cd().log;
         printf("-- cd command log (%zu; c=ata p=packet e=err):\n   ",
                cl.size());
-        for (size_t k = 0; k < cl.size() && k < 200; ++k)
+        const size_t cs = cl.size() > 200 ? cl.size() - 200 : 0;
+        for (size_t k = cs; k < cl.size(); ++k)
             printf("%c%02x@%llu ", cl[k].kind, cl[k].val,
                    static_cast<unsigned long long>(cl[k].at));
         printf("\n");
@@ -689,7 +706,8 @@ int main(int argc, char** argv)
         const auto& cl = bus.cfgLog();
         printf("-- pci config accesses (%zu; bus latch val pc r/w):\n",
                cl.size());
-        for (size_t k = 0; k < cl.size() && k < 60; ++k)
+        const size_t cfs = cl.size() > 100 ? cl.size() - 100 : 0;
+        for (size_t k = cfs; k < cl.size(); ++k)
             printf("   f%u %08x %08x pc=%08x %c @%llu\n",
                    ((cl[k].pa >> 28) & 7u) * 2u, cl[k].pa & 0x00FFFFFFu,
                    cl[k].val, cl[k].pc & ~1u, (cl[k].pc & 1u) ? 'w' : 'r',
@@ -765,6 +783,70 @@ int main(int argc, char** argv)
             printf("   +%03x <- %08x pc=%08x @%llu\n", ol[k].off,
                    ol[k].val, ol[k].pc,
                    static_cast<unsigned long long>(ol[k].at));
+    }
+    {
+        const auto& al = bus.ati().log;
+        printf("-- ati reg traffic (%zu; w/r first-touch):\n", al.size());
+        for (size_t k = 0; k < al.size() && k < 120; ++k)
+            printf("   %c +%04x %08x pc=%08x @%llu\n",
+                   al[k].wr ? 'w' : 'r', al[k].off, al[k].val, al[k].pc,
+                   static_cast<unsigned long long>(al[k].at));
+    }
+    {
+        const auto& dl = bus.ataDma().log;
+        printf("-- ata dbdma events (%zu; 0=ctl 1=desc 2=input 3=stop "
+               "4=dead):\n",
+               dl.size());
+        for (size_t k = 0; k < dl.size() && k < 80; ++k)
+            printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
+                   dl[k].b, static_cast<unsigned long long>(dl[k].at));
+    }
+    if (bus.atiPresent()) {
+        // CRTC-aware screen dump: geometry straight from the live CRTC
+        // registers, palette from the DAC; the PPM is the machine's
+        // first light (user-verified — never self-judged).
+        const u32 gen = bus.ati().peek(0x0050);
+        const u32 ht = bus.ati().peek(0x0200);
+        const u32 vt = bus.ati().peek(0x0208);
+        const u32 pitch8 = bus.ati().peek(0x022C) & 0xFFFFu;
+        const u32 offset = bus.ati().peek(0x0224);
+        const u32 w = (((ht >> 16) & 0x3FFu) + 1u) * 8u;
+        const u32 h = ((vt >> 16) & 0xFFFu) + 1u;
+        const u32 fmt = (gen >> 8) & 0xFu;
+        printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
+               "offset=%08x\n",
+               gen, w, h, fmt, pitch8, offset);
+        if ((gen & 0x02000000u) && w >= 64 && w <= 2048 && h >= 64 &&
+            h <= 1536 && (fmt == 2u || fmt == 6u)) {
+            const u32 bypp = fmt == 2u ? 1u : 4u;
+            const u32 rowBytes = pitch8 * 8u * bypp;
+            FILE* pf = fopen("ati_screen.ppm", "wb");
+            if (pf) {
+                fprintf(pf, "P6\n%u %u\n255\n", w, h);
+                const auto& vr = bus.ati().vram;
+                for (u32 y = 0; y < h; ++y)
+                    for (u32 x = 0; x < w; ++x) {
+                        const size_t o = offset + size_t(y) * rowBytes +
+                                         size_t(x) * bypp;
+                        u8 rgb[3] = {0, 0, 0};
+                        if (o + bypp <= vr.size()) {
+                            if (fmt == 2u) {
+                                const u32 c = bus.ati().pal(vr[o]);
+                                rgb[0] = static_cast<u8>(c >> 16);
+                                rgb[1] = static_cast<u8>(c >> 8);
+                                rgb[2] = static_cast<u8>(c);
+                            } else {
+                                rgb[0] = vr[o + 2];
+                                rgb[1] = vr[o + 1];
+                                rgb[2] = vr[o + 0];
+                            }
+                        }
+                        fwrite(rgb, 1, 3, pf);
+                    }
+                fclose(pf);
+                printf("-- ati screen dumped: ati_screen.ppm\n");
+            }
+        }
     }
     {
         const auto& il = bus.pic().log;

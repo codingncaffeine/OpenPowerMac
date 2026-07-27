@@ -24,6 +24,16 @@ bool AtaCell::attachIso(const char* path)
     return true;
 }
 
+u32 AtaCell::dmaTake(u8* dst, u32 n)
+{
+    u32 moved = 0;
+    while (moved < n && dataAt_ < data_.size())
+        dst[moved++] = data_[dataAt_++];
+    if (!data_.empty() && dataAt_ >= data_.size())
+        finishPio(true); // chunk drained: stream more or complete
+    return moved;
+}
+
 u32 AtaCell::read(u32 off, u32 len)
 {
     if (!present() || (dev_ & 0x10u))
@@ -95,7 +105,9 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 
 void AtaCell::ataCommand(u8 cmd)
 {
-    if (log.size() < 2048)
+    if (log.size() >= 4096)
+        log.erase(log.begin(), log.begin() + 2048);
+    if (true)
         log.push_back({stamp ? *stamp : 0, 'c', cmd});
     error_ = 0;
     switch (cmd) {
@@ -144,7 +156,9 @@ void AtaCell::ataCommand(u8 cmd)
         irq_ = true;
         break;
     default:
-        if (log.size() < 2048)
+        if (log.size() >= 4096)
+        log.erase(log.begin(), log.begin() + 2048);
+    if (true)
             log.push_back({stamp ? *stamp : 0, 'e', cmd});
         error_ = 0x04; // ABRT
         status_ = kDrdy | kErr;
@@ -155,7 +169,9 @@ void AtaCell::ataCommand(u8 cmd)
 void AtaCell::packet(const u8* cdb)
 {
     irq_ = true; // every packet resolution interrupts
-    if (log.size() < 2048)
+    if (log.size() >= 4096)
+        log.erase(log.begin(), log.begin() + 2048);
+    if (true)
         log.push_back({stamp ? *stamp : 0, 'p', cdb[0]});
     error_ = 0;
     data_.clear();
@@ -238,7 +254,9 @@ void AtaCell::packet(const u8* cdb)
         break;
     }
     default:
-        if (log.size() < 2048)
+        if (log.size() >= 4096)
+        log.erase(log.begin(), log.begin() + 2048);
+    if (true)
             log.push_back({stamp ? *stamp : 0, 'e', cdb[0]});
         sense_ = 0x05; // illegal request
         error_ = 0x04 | (0x05 << 4);

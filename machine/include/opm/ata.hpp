@@ -19,8 +19,14 @@ namespace opm {
 class AtaCell {
 public:
     bool attachIso(const char* path);
+    // The same cell serving an ordinary ATA (non-packet) hard disk, which
+    // is what a Sawtooth actually boots from — the CD is the exception,
+    // not the rule. Read/write, LBA28, and the plain ATA power-on
+    // signature (01 01 00 00) instead of the ATAPI 01 01 14 EB.
+    bool attachDisk(const char* path);
     bool present() const { return iso_ != nullptr; }
     bool irqLine() const { return irq_; }
+    u8 devSel() const { return dev_; } // diagnostic: drive-select bits
 
     u32 read(u32 off, u32 len);
     void write(u32 off, u32 v, u32 len);
@@ -52,8 +58,20 @@ private:
                p[5];
     }
 
+    void diskCommand(u8 cmd);  // ATA (non-packet) command set
+    void diskStartRead();      // present the next sector run through DRQ
+    u32 diskLba() const        // LBA28 out of the task file
+    {
+        return (u32(dev_ & 0x0Fu) << 24) | (u32(bcHi_) << 16) |
+               (u32(bcLo_) << 8) | lba0_;
+    }
+
     FILE* iso_ = nullptr;
     u64 isoBytes_ = 0;
+    bool disk_ = false;    // ATA hard disk rather than ATAPI CD
+    u64 diskSectors_ = 0;  // 512-byte sectors
+    u32 wrLeft_ = 0;       // sectors still to be written this command
+    u64 wrLba_ = 0;
 
     // task file — the ATAPI signature (01 01 14 EB) is presented from
     // power-on, not only after an explicit reset

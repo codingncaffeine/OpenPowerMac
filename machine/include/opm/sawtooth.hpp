@@ -215,6 +215,7 @@ public:
     OpenPic& pic() { return pic_; }
     void syncIrqs()
     {
+        pic_.setLine(19, hd_.irqLine()); // ata-4@1f000, interrupts 0x13
         pic_.setLine(20, cd_.irqLine());
         pic_.setLine(27, ohci_[0].irqLine());
         pic_.setLine(28, ohci_[1].irqLine());
@@ -238,6 +239,8 @@ public:
     // traffic is logged bus-tagged.
     const std::vector<RegWr>& ataLog() const { return ataLog_; }
     bool attachCd(const char* path) { return cd_.attachIso(path); }
+    bool attachHd(const char* path) { return hd_.attachDisk(path); }
+    AtaCell& hd() { return hd_; }
     AtaCell& cd() { return cd_; }
 
     // SCC (+0x13000): MacRISC layout — ctrl B/A at +0x00/+0x20, data B/A
@@ -330,8 +333,10 @@ private:
                 // read as a present-but-never-ready device and the Mac
                 // OS channel drivers back off and retry forever, parking
                 // the whole boot behind the ndrv scan.
-                u32 v = isCd ? cd_.read(off - 0x20000u, len)
-                             : (~0u >> (32 - 8 * len));
+                const bool isHd = off < 0x20000u && hd_.present();
+                u32 v = isCd   ? cd_.read(off - 0x20000u, len)
+                        : isHd ? hd_.read(off - 0x1F000u, len)
+                               : (~0u >> (32 - 8 * len));
                 if ((off & 0xFF0u) != 0) {
                     if (ataLog_.size() >= 6000)
                         ataLog_.erase(ataLog_.begin(),
@@ -423,6 +428,8 @@ private:
                     // a task-file write can open a fresh data phase:
                     // resume any standing DBDMA list
                     ataDma_.wake();
+                } else if (off - 0x1F000u < 0x1000u && hd_.present()) {
+                    hd_.write(off - 0x1F000u, v, len);
                 }
                 return;
             }
@@ -794,6 +801,7 @@ private:
     std::vector<RegWr> cfgLog_;
     std::vector<RegWr> ataLog_;
     AtaCell cd_;
+    AtaCell hd_; // ata-4@1f000: the internal drive a Sawtooth boots from
     OpenPic pic_;
     OhciCell ohci_[2];
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function

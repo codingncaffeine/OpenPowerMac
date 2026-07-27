@@ -68,6 +68,7 @@ int main(int argc, char** argv)
     const char* ramDumpPath = nullptr;
     bool serialCr = false;
     const char* cdPath = nullptr;
+    const char* hdPath = nullptr;
     const char* serialInput = nullptr; // ';' separates lines
     u64 serialAt = 240000000ull;       // inject once the prompt is up
     u32 viaA = 0x00;                   // VIA port A strap levels
@@ -105,6 +106,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--serial-at"))
             serialAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--cd")) cdPath = next();
+        else if (!strcmp(a, "--hd")) hdPath = next();
         else if (!strcmp(a, "--via-a")) viaA = strtoul(next(), nullptr, 0);
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
@@ -148,6 +150,13 @@ int main(int argc, char** argv)
             printf("-- ati fcode rom attached: %s\n", atiRomPath);
         else
             printf("-- ati rom attach FAILED: %s\n", atiRomPath);
+    }
+    if (hdPath) {
+        if (bus.attachHd(hdPath))
+            printf("-- hd attached: %s (present=%d)\n", hdPath,
+                   bus.hd().present() ? 1 : 0);
+        else
+            printf("-- hd attach FAILED: %s\n", hdPath);
     }
     if (cdPath) {
         if (bus.attachCd(cdPath))
@@ -226,6 +235,22 @@ int main(int argc, char** argv)
                        static_cast<unsigned long long>(executed),
                        cpu.st.gpr[3]);
                 fflush(stdout); // rare: keep readable if a run is cut short
+            }
+        }
+        // Every ATA Manager call completes through ffdd4204(PB, result):
+        // each arm ends with `mr r4,<result>; bl 0xdd4204`. The family has
+        // 25 separate sites that can produce -56, so rather than watch
+        // them individually, watch the one place they all funnel through
+        // and correlate the PB pointer with the function code the tally
+        // above already reports for that same PB.
+        if (pc == 0xFFDD4204u) {
+            static int cp = 0;
+            const int res = static_cast<int>(cpu.st.gpr[4]);
+            if (cp < 200 && res != 0) {
+                ++cp;
+                printf("ATARES pb=%08x result=%d @%llu\n", cpu.st.gpr[3],
+                       res, static_cast<unsigned long long>(executed));
+                fflush(stdout);
             }
         }
         // The ATA Manager's device lookup, ffdd3a80: walk the singly-linked

@@ -24,6 +24,152 @@ bool AtaCell::attachIso(const char* path)
     return true;
 }
 
+bool AtaCell::attachDisk(const char* path)
+{
+    iso_ = fopen(path, "r+b");
+    if (!iso_)
+        return false;
+#ifdef _MSC_VER
+    _fseeki64(iso_, 0, SEEK_END);
+    isoBytes_ = static_cast<u64>(_ftelli64(iso_));
+#else
+    fseeko(iso_, 0, SEEK_END);
+    isoBytes_ = static_cast<u64>(ftello(iso_));
+#endif
+    disk_ = true;
+    diskSectors_ = isoBytes_ / 512u;
+    // Plain ATA signature: no packet feature set, so the byte-count pair
+    // stays zero where an ATAPI device answers 14 EB.
+    nsect_ = 0x01;
+    lba0_ = 0x01;
+    bcLo_ = 0x00;
+    bcHi_ = 0x00;
+    status_ = kDrdy;
+    error_ = 0x01;
+    return true;
+}
+
+void AtaCell::diskStartRead()
+{
+    if (readLeft_ == 0) {
+        nsect_ = 0;
+        status_ = kDrdy;
+        irq_ = true;
+        return;
+    }
+    // One sector per DRQ burst: the simplest presentation the taskfile
+    // allows, and what the ROM driver's PIO loop expects.
+    data_.assign(512, 0);
+#ifdef _MSC_VER
+    _fseeki64(iso_, static_cast<long long>(readLba_ * 512), SEEK_SET);
+#else
+    fseeko(iso_, static_cast<off_t>(readLba_ * 512), SEEK_SET);
+#endif
+    (void)fread(data_.data(), 1, data_.size(), iso_);
+    dataAt_ = 0;
+    ++readLba_;
+    --readLeft_;
+    status_ = kDrq | kDrdy;
+    irq_ = true;
+}
+
+void AtaCell::diskCommand(u8 cmd)
+{
+    error_ = 0;
+    switch (cmd) {
+    case 0xEC: { // IDENTIFY DEVICE
+        data_.assign(512, 0);
+        auto w16 = [&](u32 word, u16 val) {
+            data_[2 * word] = static_cast<u8>(val >> 8);
+            data_[2 * word + 1] = static_cast<u8>(val);
+        };
+        auto text = [&](u32 word, u32 words, const char* s) {
+            for (u32 k = 0; k < words * 2; ++k) {
+                const char c = *s ? *s++ : ' ';
+                data_[2 * word + (k ^ 1)] = static_cast<u8>(c);
+            }
+        };
+        const u32 secs = static_cast<u32>(diskSectors_ > 0x0FFFFFFFull
+                                              ? 0x0FFFFFFFull
+                                              : diskSectors_);
+        w16(0, 0x0040);  // non-removable ATA device
+        w16(1, 16383);   // legacy CHS geometry, superseded by LBA
+        w16(3, 16);
+        w16(6, 63);
+        text(10, 10, "OPM00000001");            // serial
+        text(23, 4, "1.0 ");                    // firmware
+        text(27, 20, "OpenPowerMac Hard Disk"); // model
+        w16(47, 0x8010);                        // max sectors per interrupt
+        w16(49, 0x0300);                        // LBA + DMA supported
+        w16(53, 0x0007);                        // words 54-58, 64-70, 88 valid
+        w16(54, 16383);
+        w16(55, 16);
+        w16(56, 63);
+        w16(57, static_cast<u16>(secs));
+        w16(58, static_cast<u16>(secs >> 16));
+        w16(59, 0x0100 | 16);       // multiple sectors currently set
+        w16(60, static_cast<u16>(secs));
+        w16(61, static_cast<u16>(secs >> 16));
+        w16(63, 0x0007);            // multiword DMA 0-2
+        w16(64, 0x0003);            // PIO modes 3 and 4
+        w16(65, 120);               // min multiword DMA cycle
+        w16(67, 120);               // min PIO cycle without flow control
+        w16(68, 120);
+        w16(80, 0x001E);            // ATA-1..ATA-4
+        w16(82, 0x0000);
+        w16(88, 0x001F);            // ultra DMA 0-4 supported
+        dataAt_ = 0;
+        nsect_ = 0;
+        status_ = kDrq | kDrdy;
+        irq_ = true;
+        break;
+    }
+    case 0x20:
+    case 0x21: // READ SECTOR(S)
+    case 0xC4: // READ MULTIPLE
+        readLba_ = diskLba();
+        readLeft_ = nsect_ ? nsect_ : 256u;
+        diskStartRead();
+        break;
+    case 0x30:
+    case 0x31: // WRITE SECTOR(S)
+    case 0xC5: // WRITE MULTIPLE
+        wrLba_ = diskLba();
+        wrLeft_ = nsect_ ? nsect_ : 256u;
+        data_.assign(512, 0);
+        dataAt_ = 0;
+        status_ = kDrq | kDrdy; // host may deliver the first sector
+        break;
+    case 0x40:
+    case 0x41: // READ VERIFY SECTOR(S)
+    case 0x91: // INITIALIZE DEVICE PARAMETERS
+    case 0xC6: // SET MULTIPLE MODE
+    case 0xE7: // FLUSH CACHE
+    case 0xEA: // FLUSH CACHE EXT
+    case 0xEF: // SET FEATURES
+    case 0x10: // RECALIBRATE
+        status_ = kDrdy;
+        irq_ = true;
+        break;
+    case 0x08:
+    case 0x90: // DEVICE RESET / EXECUTE DEVICE DIAGNOSTIC
+        nsect_ = 0x01;
+        lba0_ = 0x01;
+        bcLo_ = 0x00;
+        bcHi_ = 0x00;
+        error_ = 0x01;
+        status_ = kDrdy;
+        break;
+    default:
+        if (log.size() >= 4096)
+            log.erase(log.begin(), log.begin() + 2048);
+        log.push_back({stamp ? *stamp : 0, 'e', cmd});
+        error_ = 0x04; // ABRT
+        status_ = kDrdy | kErr;
+        break;
+    }
+}
+
 u32 AtaCell::dmaTake(u8* dst, u32 n)
 {
     u32 moved = 0;
@@ -75,13 +221,32 @@ void AtaCell::write(u32 off, u32 v, u32 len)
         return;
     const u8 b = static_cast<u8>(v);
     switch (off & 0xFF0u) {
-    case 0x000: // data: CDB bytes arrive as 16-bit writes
+    case 0x000: // data: CDB bytes, or hard-disk write data
         if (cdbPhase_) {
             for (u32 k = 0; k < len && cdbAt_ < 12; ++k)
                 cdb_[cdbAt_++] = static_cast<u8>(v >> (8 * (len - 1 - k)));
             if (cdbAt_ >= 12) {
                 cdbPhase_ = false;
                 packet(cdb_);
+            }
+        } else if (disk_ && wrLeft_ && !data_.empty()) {
+            for (u32 k = 0; k < len && dataAt_ < data_.size(); ++k)
+                data_[dataAt_++] =
+                    static_cast<u8>(v >> (8 * (len - 1 - k)));
+            if (dataAt_ >= data_.size()) { // sector complete: commit it
+#ifdef _MSC_VER
+                _fseeki64(iso_, static_cast<long long>(wrLba_ * 512),
+                          SEEK_SET);
+#else
+                fseeko(iso_, static_cast<off_t>(wrLba_ * 512), SEEK_SET);
+#endif
+                (void)fwrite(data_.data(), 1, data_.size(), iso_);
+                fflush(iso_);
+                ++wrLba_;
+                --wrLeft_;
+                dataAt_ = 0;
+                status_ = wrLeft_ ? (kDrq | kDrdy) : kDrdy;
+                irq_ = true;
             }
         }
         break;
@@ -118,6 +283,10 @@ void AtaCell::ataCommand(u8 cmd)
     if (true)
         log.push_back({stamp ? *stamp : 0, 'c', cmd});
     error_ = 0;
+    if (disk_) { // ATA hard disk: a different command set entirely
+        diskCommand(cmd);
+        return;
+    }
     switch (cmd) {
     case 0x08: // DEVICE RESET -> ATAPI signature
     case 0x90: // EXECUTE DEVICE DIAGNOSTIC
@@ -316,6 +485,10 @@ void AtaCell::packet(const u8* cdb)
 // chunk; called again as the host drains each chunk.
 void AtaCell::finishPio(bool chunkDrained)
 {
+    if (disk_) { // hard disk: one sector per DRQ burst, or completion
+        diskStartRead();
+        return;
+    }
     if (chunkDrained && readLeft_ == 0) { // non-read transfers end here
         nsect_ = kIo | kCoD;
         status_ = kDrdy;

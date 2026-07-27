@@ -4,6 +4,8 @@ project(OpenPowerMac CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# opmcapi is SHARED and links the static core/machine libs; ELF needs those built PIC
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(OPM_BUILD_TESTS "Build unit tests" ON)
 

@@ -37,6 +37,7 @@ public:
         u64 at;
         char kind; // 'c' ata cmd, 'p' packet op, 'e' error path
         u8 val;
+        u32 a = 0, b = 0; // READ ops: LBA + sector count
     };
     std::vector<Ev> log;
     const u64* stamp = nullptr;

@@ -133,9 +133,13 @@ void AtaCell::ataCommand(u8 cmd)
                 data_[2 * word + (k ^ 1)] = static_cast<u8>(c);
             }
         };
-        text(10, 10, "OPM00001");            // serial
-        text(23, 4, "1.0");                  // firmware
-        text(27, 20, "OpenPowerMac CD-ROM"); // model
+        // The Mac OS CD driver whitelists mechanisms by model string
+        // (the on-disc Apple_Driver_ATAPI carries "CD-ROM CR-175",
+        // "CD-ROM FFREDDIE", "CD-211E", …) — present the drive the
+        // Sawtooth shipped with or the boot volume never mounts.
+        text(10, 10, "OPM00001");                 // serial
+        text(23, 4, "7T02");                      // firmware
+        text(27, 20, "MATSHITA CD-ROM CR-175 "); // model
         w16(49, 0x0200);                     // LBA supported
         irq_ = true;
         dataAt_ = 0;
@@ -193,15 +197,15 @@ void AtaCell::packet(const u8* cdb)
         sense_ = 0;
         break;
     }
-    case 0x12: { // INQUIRY
+    case 0x12: { // INQUIRY: same mechanism identity as IDENTIFY
         data_.assign(36, 0);
         data_[0] = 0x05; // CD-ROM
         data_[1] = 0x80; // removable
         data_[3] = 0x02;
         data_[4] = 31;
-        memcpy(&data_[8], "OPM     ", 8);
-        memcpy(&data_[16], "CD-ROM OPM       ", 16);
-        memcpy(&data_[32], "1.0 ", 4);
+        memcpy(&data_[8], "MATSHITA", 8);
+        memcpy(&data_[16], "CD-ROM CR-175   ", 16);
+        memcpy(&data_[32], "7T02", 4);
         break;
     }
     case 0x1B: // START STOP UNIT
@@ -226,6 +230,8 @@ void AtaCell::packet(const u8* cdb)
                         ? ((u32(cdb[7]) << 8) | cdb[8])
                         : ((u32(cdb[6]) << 24) | (u32(cdb[7]) << 16) |
                            (u32(cdb[8]) << 8) | cdb[9]);
+        log.back().a = static_cast<u32>(readLba_);
+        log.back().b = readLeft_;
         finishPio(false);
         return;
     }
@@ -248,9 +254,33 @@ void AtaCell::packet(const u8* cdb)
         data_[19] = static_cast<u8>(blocks);
         break;
     }
-    case 0x5A: { // MODE SENSE(10): minimal header
-        data_.assign(8, 0);
-        data_[1] = 6;
+    case 0x5A: { // MODE SENSE(10)
+        const u8 page = cdb[2] & 0x3Fu;
+        if (page == 0x2A || page == 0x3F) {
+            // CD capabilities / mechanical status: a 4x-8x tray-loading
+            // audio-capable reader, no write paths.
+            data_.assign(8 + 20, 0);
+            data_[1] = 26; // mode data length
+            u8* p = &data_[8];
+            p[0] = 0x2A;
+            p[1] = 18;   // page bytes following
+            p[2] = 0x01; // reads CD-R
+            p[4] = 0x71; // multisession, mode2 form1/2, audio play
+            p[5] = 0x03; // CD-DA commands, stream accurate
+            p[6] = 0x29; // tray loader, eject, lock
+            p[7] = 0x03; // separate volume + mute
+            p[8] = 0x2B; // max speed 11024 KB/s (8x)
+            p[9] = 0x10;
+            p[10] = 0x01; // 256 volume levels
+            p[11] = 0x00;
+            p[12] = 0x00; // 128 KB buffer
+            p[13] = 0x80;
+            p[14] = 0x2B; // current speed = max
+            p[15] = 0x10;
+        } else {
+            data_.assign(8, 0);
+            data_[1] = 6;
+        }
         break;
     }
     default:

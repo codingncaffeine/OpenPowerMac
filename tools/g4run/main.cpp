@@ -689,9 +689,15 @@ int main(int argc, char** argv)
         printf("-- cd command log (%zu; c=ata p=packet e=err):\n   ",
                cl.size());
         const size_t cs = cl.size() > 200 ? cl.size() - 200 : 0;
-        for (size_t k = cs; k < cl.size(); ++k)
-            printf("%c%02x@%llu ", cl[k].kind, cl[k].val,
-                   static_cast<unsigned long long>(cl[k].at));
+        for (size_t k = cs; k < cl.size(); ++k) {
+            if (cl[k].a || cl[k].b)
+                printf("%c%02x:%x+%x@%llu ", cl[k].kind, cl[k].val,
+                       cl[k].a, cl[k].b,
+                       static_cast<unsigned long long>(cl[k].at));
+            else
+                printf("%c%02x@%llu ", cl[k].kind, cl[k].val,
+                       static_cast<unsigned long long>(cl[k].at));
+        }
         printf("\n");
     }
     {

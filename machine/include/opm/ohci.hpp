@@ -1,6 +1,7 @@
 #pragma once
 #include "opm/types.hpp"
 
+#include <map>
 #include <vector>
 
 namespace opm {
@@ -45,7 +46,8 @@ public:
         u64 at;
         u32 off, val, pc;
     };
-    std::vector<Ev> log; // write traffic (reads are cheap to re-derive)
+    std::vector<Ev> log;          // write traffic
+    std::map<u32, u64> readCount; // steady-state poll census per offset
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;
 

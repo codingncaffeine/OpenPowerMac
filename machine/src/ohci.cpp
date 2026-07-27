@@ -102,6 +102,7 @@ void OhciCell::regWrite(u32 idx, u32 v)
 
 u32 OhciCell::read(u32 off, u32 len)
 {
+    readCount[off & ~3u]++;
     const u32 native = regRead(off >> 2);
     if (len == 4)
         return swap32(native);

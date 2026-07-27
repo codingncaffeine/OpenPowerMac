@@ -181,6 +181,8 @@ int main(int argc, char** argv)
     std::map<u32, u64> pcHist; // sampled every 64 steps
     std::map<u32, u64> seen;   // first execution per 1 KB region
     std::vector<std::pair<u64, u32>> firsts;
+    std::map<u32, u64> delayCallers; // DelayFor entry: lr census — what
+                                     // is the parked boot waiting on?
 
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
@@ -191,6 +193,50 @@ int main(int argc, char** argv)
         if ((executed & 63u) == 0)
             ++pcHist[pc];
         ring.push(pc, cpu.curInsn);
+        if (pc == 0xFFD8736Cu) {
+            delayCallers[cpu.st.lr]++;
+            // Parked steady state only: walk the native backchain to name
+            // the waiter (saved LR lives at 8(frame) per CFM convention).
+            static int dfTraces = 0;
+            if (executed > 3300000000ull && dfTraces < 12) {
+                ++dfTraces;
+                cpu.l1dFlushAll(true);
+                cpu.l2FlushAll(true);
+                cpu.mmuProbe = true;
+                const CpuState dfSaved = cpu.st;
+                const bool dfRaised = cpu.raisedThisStep;
+                cpu.st.msr |= 0x30u;
+                const CpuState dfArmed = cpu.st;
+                auto dfRead = [&](u32 ea, u32& v) {
+                    u32 pa = 0;
+                    cpu.st = dfArmed;
+                    const bool ok = cpu.translate(ea, false, false, pa);
+                    cpu.st = dfArmed;
+                    if (!ok || (pa & ~3u) + 4 > bus.ram().size())
+                        return false;
+                    v = bus.read32(pa & ~3u);
+                    return true;
+                };
+                printf("-- DelayFor bt#%d @%llu dur=%08x:%08x lr=%08x "
+                       "sp=%08x\n",
+                       dfTraces, static_cast<unsigned long long>(executed),
+                       cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.lr,
+                       cpu.st.gpr[1]);
+                u32 sp = cpu.st.gpr[1];
+                for (int f = 0; f < 6 && sp; ++f) {
+                    u32 bc = 0, slr = 0;
+                    if (!dfRead(sp, bc) || !bc)
+                        break;
+                    if (dfRead(bc + 8, slr))
+                        printf("   frame%d sp=%08x caller=%08x\n", f, bc,
+                               slr);
+                    sp = bc;
+                }
+                cpu.st = dfSaved;
+                cpu.raisedThisStep = dfRaised;
+                cpu.mmuProbe = false;
+            }
+        }
         if (trace) {
             disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
             fprintf(stderr, "%08x: %s\n", pc, text);
@@ -662,6 +708,16 @@ int main(int argc, char** argv)
         for (const auto& [pc, n] : pcHist)
             top.push_back({n, pc});
         std::sort(top.rbegin(), top.rend());
+        printf("-- DelayFor callers (%zu):\n", delayCallers.size());
+        {
+            std::vector<std::pair<u64, u32>> dc;
+            for (const auto& [lr, n] : delayCallers)
+                dc.push_back({n, lr});
+            std::sort(dc.rbegin(), dc.rend());
+            for (size_t k = 0; k < dc.size() && k < 24; ++k)
+                printf("   lr=%08x x%llu\n", dc[k].second,
+                       static_cast<unsigned long long>(dc[k].first));
+        }
         printf("-- hottest sampled pcs:\n");
         for (size_t k = 0; k < top.size() && k < 12; ++k)
             printf("   %08x  samples=%llu\n", top[k].second,
@@ -789,6 +845,10 @@ int main(int argc, char** argv)
             printf("   +%03x <- %08x pc=%08x @%llu\n", ol[k].off,
                    ol[k].val, ol[k].pc,
                    static_cast<unsigned long long>(ol[k].at));
+        printf("-- ohci%u read census:\n", f);
+        for (const auto& [off, n] : bus.ohci(f).readCount)
+            printf("   +%03x x%llu\n", off,
+                   static_cast<unsigned long long>(n));
     }
     {
         const auto& al = bus.ati().log;

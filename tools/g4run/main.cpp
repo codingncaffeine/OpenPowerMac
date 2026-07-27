@@ -946,12 +946,17 @@ int main(int argc, char** argv)
     }
     {
         const auto& il = bus.pic().log;
-        printf("-- openpic events (%zu; v=src<<24|vp a=iack e=eoi "
-               "r=raise):\n",
+        printf("-- openpic events (%zu; v=src<<24|vp a=iack e=eoi):\n",
                il.size());
         for (size_t k = 0; k < il.size(); ++k)
             printf("   %c %08x @%llu\n", il[k].kind, il[k].val,
                    static_cast<unsigned long long>(il[k].at));
+        printf("-- openpic raises per source:\n");
+        for (u32 s = 0; s < 64; ++s)
+            if (bus.pic().raiseCount[s])
+                printf("   src %u x%llu\n", s,
+                       static_cast<unsigned long long>(
+                           bus.pic().raiseCount[s]));
     }
     {
         const auto& kl = bus.macioLog();

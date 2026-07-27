@@ -33,7 +33,8 @@ public:
         char kind; // 'v' vp write, 'a' iack, 'e' eoi, 'r' raise
         u32 val;
     };
-    std::vector<Ev> log;
+    std::vector<Ev> log;    // v/a/e only — raises would flood the cap
+    u64 raiseCount[64] = {}; // per-source raise tally, uncapped
     const u64* stamp = nullptr;
 
 private:

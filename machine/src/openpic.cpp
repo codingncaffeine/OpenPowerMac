@@ -73,8 +73,7 @@ void OpenPic::setLine(u32 src, bool level)
         return;
     if (level && !line_[src]) {
         pending_[src] = true;
-        if (log.size() < 512)
-            log.push_back({stamp ? *stamp : 0, 'r', src});
+        raiseCount[src < 64 ? src : 63]++;
     }
     line_[src] = level;
     if (!level && (vp_[src] & 0x00400000u))

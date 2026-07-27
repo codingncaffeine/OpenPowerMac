@@ -204,55 +204,112 @@ int main(int argc, char** argv)
             if ((pc & 0xFF000000u) == 0x68000000u)
                 ++pc68Hist[cpu.st.gpr[24] & ~1u];
         }
-        // Matcher forensics: every memcmp the parked registry walk runs,
-        // with both operands read back through the live MMU. Shows what
-        // the driver matcher wants vs what our nodes offer.
+        // Decline forensics: every 68K transition inside the .ATALoad DRVR
+        // body and its _Control caller, MINUS the strcmp character loop
+        // (that loop is 80% of the flow's traffic and is already decoded —
+        // it walks the APM types and matches Apple_Driver_ATAPI). Dropping
+        // it, plus the registry walk's own code, keeps the budget on the
+        // part that has never been captured: what the flow does after the
+        // walk returns, where the install is refused.
         if ((pc & 0xFF000000u) == 0x68000000u) {
             static u32 prev68 = 0;
             const u32 cur68 = cpu.st.gpr[24];
-            if (cur68 != prev68 && cur68 == 0xFFD9B050u &&
-                executed > 4100000000ull) {
-                static int pairs = 0;
-                if (pairs < 3) {
-                    ++pairs;
+            if (cur68 != prev68 && executed > 4200000000ull) {
+                const bool body = (cur68 >= 0xFFD9A000u &&
+                                   cur68 < 0xFFD9D000u) ||
+                                  (cur68 >= 0xFFC5DA00u &&
+                                   cur68 < 0xFFC5DE00u);
+                const bool strcmpLoop = cur68 >= 0xFFD9BC80u &&
+                                        cur68 <= 0xFFD9BCA4u;
+                // Apple's driver checksum (decoded: sum+=byte, sum<<=1,
+                // bit16 rotates into bit0, low word returned). Verified
+                // offline to reproduce the disc's stored pmBootCksum, so
+                // the iterations carry no news — only the result does,
+                // which lands in D0 at the first line past the loop.
+                const bool cksumLoop = cur68 >= 0xFFD9BACCu &&
+                                       cur68 <= 0xFFD9BAF2u;
+                // The on-disc driver runs from the 0x2800 buffer, whose
+                // address is only known at run time: the _NewPtrSysClear
+                // return crosses ffd9c618 with D0 = noErr and A0 = the
+                // pointer. Latch it, then trace the driver's own code in
+                // ITS OWN offsets (they line up with the ISO image at
+                // LBA 0x3c), minus its internal ADD.W/ROL.W checksum.
+                static u32 drvBase = 0;
+                if (cur68 == 0xFFD9C618u && cpu.st.gpr[8] == 0 &&
+                    cpu.st.gpr[16] > 0x10000u) {
+                    if (drvBase != cpu.st.gpr[16]) {
+                        drvBase = cpu.st.gpr[16];
+                        printf("-- driver base %08x @%llu\n", drvBase,
+                               static_cast<unsigned long long>(executed));
+                    }
+                }
+                const u32 drvOff = drvBase ? cur68 - drvBase : 0xFFFFFFFFu;
+                static int dlines = 0;
+                if (drvOff < 0x2800u &&
+                    !(drvOff >= 0x6C0u && drvOff <= 0x6CCu) &&
+                    dlines <= 8000) {
+                    if (++dlines > 8000)
+                        printf("-- driver trace done (8000)\n");
+                    else
+                        printf("V +%04x D0=%08x D1=%08x A0=%08x A1=%08x\n",
+                               drvOff, cpu.st.gpr[8], cpu.st.gpr[9],
+                               cpu.st.gpr[16], cpu.st.gpr[17]);
+                }
+                // The 68K ATA Manager itself: GetTrapAddress($AAF1) returns
+                // 000a3c10 at run time (RAM — the manager is installed and
+                // patched in), and the loaded driver calls it a dozen times
+                // per pass. Dump the parameter block going in and the OSErr
+                // coming back: that is what the driver actually believes
+                // about the bus and its devices.
+                static bool inMgr = false;
+                static int mgrLines = 0;
+                if (cur68 == 0x000A3C10u && mgrLines < 400) {
+                    ++mgrLines;
+                    inMgr = true;
                     cpu.l1dFlushAll(true);
                     cpu.l2FlushAll(true);
                     cpu.mmuProbe = true;
-                    const CpuState mcSaved = cpu.st;
-                    const bool mcRaised = cpu.raisedThisStep;
+                    const CpuState mSaved = cpu.st;
+                    const bool mRaised = cpu.raisedThisStep;
                     cpu.st.msr |= 0x30u;
-                    const CpuState mcArmed = cpu.st;
-                    auto rd8 = [&](u32 ea, u8& v) {
+                    const CpuState mArmed = cpu.st;
+                    const u32 pb = cpu.st.gpr[16];
+                    printf("MGR> pb=%08x D0=%08x A1=%08x:", pb,
+                           cpu.st.gpr[8], cpu.st.gpr[17]);
+                    for (u32 k = 0; k < 0x30; ++k) {
                         u32 pa = 0;
-                        cpu.st = mcArmed;
-                        bool ok = cpu.translate(ea, false, false, pa);
-                        cpu.st = mcArmed;
-                        if (!ok) {
-                            ok = ea < 0x00400000u &&
-                                 cpu.translate(0x68000000u + ea, false,
-                                               false, pa);
-                            cpu.st = mcArmed;
-                        }
-                        if (!ok || pa >= bus.ram().size())
-                            return false;
-                        v = static_cast<u8>(bus.read32(pa & ~3u) >>
-                                            (8 * (3 - (pa & 3u))));
-                        return true;
-                    };
-                    // '!act' scanner entry: A1 (r17) = the manager's
-                    // device table — dump the header + first entries.
-                    const u32 tbl = cpu.st.gpr[17];
-                    printf("A %08x @%llu:", tbl,
-                           static_cast<unsigned long long>(executed));
-                    for (u32 k = 0; k < 0x60; ++k) {
-                        u8 c = 0;
-                        rd8(tbl + k, c);
-                        printf("%s%02x", (k & 15u) ? "" : " ", c);
+                        cpu.st = mArmed;
+                        bool ok = cpu.translate(pb + k, false, false, pa);
+                        cpu.st = mArmed;
+                        if (ok && pa < bus.ram().size())
+                            printf("%s%02x", (k & 15u) ? "" : " ",
+                                   static_cast<u8>(bus.read32(pa & ~3u) >>
+                                                   (8 * (3 - (pa & 3u)))));
+                        else
+                            printf("%s??", (k & 15u) ? "" : " ");
                     }
                     printf("\n");
-                    cpu.st = mcSaved;
-                    cpu.raisedThisStep = mcRaised;
+                    cpu.st = mSaved;
+                    cpu.raisedThisStep = mRaised;
                     cpu.mmuProbe = false;
+                } else if (inMgr && drvOff < 0x2800u) {
+                    inMgr = false;
+                    if (mgrLines < 400)
+                        printf("MGR< D0=%08x D1=%08x A0=%08x +%04x\n",
+                               cpu.st.gpr[8], cpu.st.gpr[9], cpu.st.gpr[16],
+                               drvOff);
+                }
+                static int lines = 0;
+                if (body && !strcmpLoop && !cksumLoop && lines <= 12000) {
+                    if (++lines > 12000)
+                        printf("-- ataload trace done (12000) @%llu\n",
+                               static_cast<unsigned long long>(executed));
+                    else
+                        printf("L %08x D0=%08x D1=%08x A0=%08x A1=%08x "
+                               "A3=%08x\n",
+                               cur68, cpu.st.gpr[8], cpu.st.gpr[9],
+                               cpu.st.gpr[16], cpu.st.gpr[17],
+                               cpu.st.gpr[19]);
                 }
             }
             prev68 = cur68;

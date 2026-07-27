@@ -105,6 +105,10 @@ private:
     u32 readLeft_ = 0;
     u8 sense_ = 0; // last sense key
     bool irq_ = false;
+    // Cell (not drive) registers at +0x200 and up: PIO/DMA timing. They sit
+    // in mac-io, so drive select and an absent slave are irrelevant to them
+    // and they always read back what was written.
+    u32 ctl_[16] = {};
 };
 
 } // namespace opm

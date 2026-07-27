@@ -103,8 +103,13 @@ void AtaCell::diskCommand(u8 cmd)
         text(23, 4, "1.0 ");                    // firmware
         text(27, 20, "OpenPowerMac Hard Disk"); // model
         w16(47, 0x8010);                        // max sectors per interrupt
+        // LBA and multiword DMA, which the channel's DBDMA engine at
+        // mac-io +0x8A00 actually serves. Ultra DMA stays unadvertised: the
+        // engine moves the bytes either way, and claiming a transfer mode
+        // whose timing the cell does not model is the kind of capability
+        // claim a driver acts on and we cannot honour.
         w16(49, 0x0300);                        // LBA + DMA supported
-        w16(53, 0x0007);                        // words 54-58, 64-70, 88 valid
+        w16(53, 0x0003);                        // words 54-58 and 64-70 valid
         w16(54, 16383);
         w16(55, 16);
         w16(56, 63);
@@ -113,7 +118,7 @@ void AtaCell::diskCommand(u8 cmd)
         w16(59, 0x0100 | 16);       // multiple sectors currently set
         w16(60, static_cast<u16>(secs));
         w16(61, static_cast<u16>(secs >> 16));
-        w16(63, 0x0007);            // multiword DMA 0-2
+        w16(63, 0x0007);            // multiword DMA 0-2 supported
         w16(51, 0x0200);            // PIO cycle timing mode
         w16(64, 0x0003);            // PIO modes 3 and 4
         w16(65, 120);               // min multiword DMA cycle
@@ -121,7 +126,7 @@ void AtaCell::diskCommand(u8 cmd)
         w16(68, 120);
         w16(80, 0x001E);            // ATA-1..ATA-4
         w16(82, 0x0000);
-        w16(88, 0x001F);            // ultra DMA 0-4 supported
+        w16(88, 0x0000);            // no ultra DMA
         dataAt_ = 0;
         nsect_ = 0;
         status_ = kDrq | (kDrdy | kDsc);
@@ -131,6 +136,8 @@ void AtaCell::diskCommand(u8 cmd)
     case 0x20:
     case 0x21: // READ SECTOR(S)
     case 0xC4: // READ MULTIPLE
+    case 0xC8: // READ DMA
+    case 0xC9: // READ DMA (no retry)
         readLba_ = diskLba();
         readLeft_ = nsect_ ? nsect_ : 256u;
         diskStartRead();
@@ -138,6 +145,8 @@ void AtaCell::diskCommand(u8 cmd)
     case 0x30:
     case 0x31: // WRITE SECTOR(S)
     case 0xC5: // WRITE MULTIPLE
+    case 0xCA: // WRITE DMA
+    case 0xCB: // WRITE DMA (no retry)
         wrLba_ = diskLba();
         wrLeft_ = nsect_ ? nsect_ : 256u;
         data_.assign(512, 0);
@@ -188,6 +197,19 @@ u32 AtaCell::read(u32 off, u32 len)
 {
     if (!present())
         return 0;
+    // The timing/configuration registers at +0x200 and up live in the mac-io
+    // ATA CELL, not on the drive. They are not on the data bus at all, so
+    // neither drive select nor an absent slave has any bearing on them: they
+    // answer whatever was last written, always. Treating them as drive
+    // registers made them read back 0 (or 0x7F with device 1 selected)
+    // instead of the value the firmware had just written, and Open
+    // Firmware's ATA driver reads-modifies-writes them while setting up a
+    // channel — so it wrote its timing word into a hole and read a
+    // different one back. Same family as the DD7 truth, opposite direction:
+    // that one is about what an ABSENT DRIVE drives; this is about a
+    // register no drive drives at all.
+    if (off >= 0x200u)
+        return ctl_[(off - 0x200u) >> 4 & 15u];
     // No slave on this channel. Nothing drives the bus when device 1 is
     // selected, so the pull-ups win and every register reads all-ones —
     // EXCEPT on DD7, which the host pulls DOWN. DD7 carries the status
@@ -223,6 +245,10 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 {
     if (!present())
         return;
+    if (off >= 0x200u) { // cell timing registers — see read()
+        ctl_[(off - 0x200u) >> 4 & 15u] = v;
+        return;
+    }
     const u8 b = static_cast<u8>(v);
     switch (off & 0xFF0u) {
     case 0x000: // data: CDB bytes, or hard-disk write data

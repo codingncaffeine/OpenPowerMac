@@ -11,6 +11,7 @@
 #include "opm/snapshot.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +94,7 @@ int main(int argc, char** argv)
     const char* resumeFrom = nullptr;  // --resume-from FILE
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
     bool fastTbSet = false;            // CLI wins over a resumed value
+    bool realtime = false;             // --realtime: TB from the host clock
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -158,6 +160,7 @@ int main(int argc, char** argv)
             verifyAt = strtoull(next(), nullptr, 0);
             verifySteps = strtoull(next(), nullptr, 0);
         }
+        else if (!strcmp(a, "--realtime")) realtime = true;
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -311,6 +314,11 @@ int main(int argc, char** argv)
                    "position; nothing will run\n",
                    static_cast<unsigned long long>(maxInsns));
     }
+    if (verifyAt && realtime) {
+        fprintf(stderr, "g4run: --verify-snapshot needs a reproducible run; "
+                        "--realtime is nondeterministic by construction\n");
+        return 2;
+    }
     if (verifyAt) {
         // Validation drives the machine itself, so it owns the clock.
         maxInsns = verifyAt;
@@ -325,9 +333,52 @@ int main(int argc, char** argv)
     // the bare loops the validator uses. Sharing it is the point: a
     // validator that advanced the machine even slightly differently would
     // prove nothing about the run it is meant to certify.
+    // --realtime: the timebase follows the HOST CLOCK instead of the
+    // instruction count. Cpu::step ticks once per instruction against
+    // cyclesPerTbTick = 4, so TB advances one tick per four instructions —
+    // roughly 3M/s at our speed against a real Sawtooth's 25 MHz, which is
+    // why guest time runs about eight times slow and why --fast-tb, which
+    // multiplies the same instruction-derived rate, overshoots into a
+    // decrementer storm instead of fixing it.
+    //
+    // Instruction pacing stays the DEFAULT and is untouched: the snapshot
+    // proof, every A/B run comparison and the whole debugging method depend
+    // on runs being reproducible, and a wall clock is nondeterministic by
+    // construction. Real time is for using the machine; instruction time is
+    // for reasoning about it.
+    const auto hostStart = std::chrono::steady_clock::now();
+    auto rtBase = hostStart;
+    u64 rtTbBase = 0, rtSlips = 0;
+    constexpr u64 kRtNsPerTick = 40;   // 25 MHz = bus/4
+    constexpr u64 kRtCatchup = 25000;  // at most 1 ms of debt per sample
     auto tickPeripherals = [&]() {
-        if (fastTb && executed < fastTbUntil)
+        if (realtime) {
+            if ((executed & 0x3FFu) == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const u64 ns =
+                    static_cast<u64>(std::chrono::duration_cast<
+                                         std::chrono::nanoseconds>(
+                                         now - rtBase)
+                                         .count());
+                const u64 want = rtTbBase + ns / kRtNsPerTick;
+                if (want > cpu.st.tb) {
+                    u64 delta = want - cpu.st.tb;
+                    if (delta > kRtCatchup) {
+                        // A host stall, or simply a stretch we could not
+                        // keep up with. Take the cap and forgive the rest:
+                        // injecting the whole debt would fire a burst of
+                        // decrementer interrupts that models nothing.
+                        delta = kRtCatchup;
+                        rtBase = now;
+                        rtTbBase = cpu.st.tb + delta;
+                        ++rtSlips;
+                    }
+                    cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));
+                }
+            }
+        } else if (fastTb && executed < fastTbUntil) {
             cpu.tick(fastTb);
+        }
         bus.ohciTick(cpu.st.tb);
         bus.syncIrqs();
         cpu.setExternalIrq(bus.pic().cpuLine());
@@ -485,6 +536,48 @@ int main(int argc, char** argv)
                        static_cast<unsigned long long>(executed),
                        cpu.st.gpr[3]);
                 fflush(stdout); // rare: keep readable if a run is cut short
+            }
+            // The registration and lookup calls, byte for byte. The manager
+            // reads a pointer at PB+0x3E and copies 256 bytes through it,
+            // and its whole registered-driver list stays empty when that
+            // pointer is null — but which field of .ATALoad's block lands
+            // at +0x3E is a question about the 68K-to-native glue, not one
+            // to answer by counting offsets in a disassembly. Dump the
+            // block the native side actually sees.
+            static int pbDumps = 0;
+            if ((fn == 0x85u || fn == 0x86u || fn == 0x93u || fn == 0x98u) &&
+                pbDumps < 10) {
+                ++pbDumps;
+                cpu.l1dFlushAll(true);
+                cpu.l2FlushAll(true);
+                cpu.mmuProbe = true;
+                const CpuState pbSaved = cpu.st;
+                const bool pbRaised = cpu.raisedThisStep;
+                const CpuState pbArmed = cpu.st;
+                const u32 pb = cpu.st.gpr[3];
+                printf("ATAPB fn=%02x pb=%08x @%llu\n", fn, pb,
+                       static_cast<unsigned long long>(executed));
+                for (u32 row = 0; row < 0x50u; row += 16) {
+                    printf("   +%02x:", row);
+                    for (u32 k = 0; k < 16; ++k) {
+                        u32 pa = 0;
+                        cpu.st = pbArmed;
+                        const bool ok =
+                            cpu.translate(pb + row + k, false, false, pa);
+                        cpu.st = pbArmed;
+                        if (ok && pa < bus.ram().size())
+                            printf(" %02x", static_cast<u8>(
+                                                bus.read32(pa & ~3u) >>
+                                                (8 * (3 - (pa & 3u)))));
+                        else
+                            printf(" ??");
+                    }
+                    printf("\n");
+                }
+                cpu.st = pbSaved;
+                cpu.raisedThisStep = pbRaised;
+                cpu.mmuProbe = false;
+                fflush(stdout);
             }
         }
         // Every ATA Manager call completes through ffdd4204(PB, result):
@@ -1589,6 +1682,26 @@ int main(int argc, char** argv)
     printf("-- msr=%08x dec=%08x hid0=%08x\n", cpu.st.msr, cpu.st.dec,
            cpu.st.hid0);
     {
+        // Does guest time track host time? The 60 Hz chain increments the
+        // 68K lowmem Ticks long at $016A (blue lowmem maps VA+0x4000, so
+        // PA 0x416A). A desktop that draws correctly but runs at a twelfth
+        // of real speed is not a desktop, so this is the number the pacing
+        // work has to move — stated rather than guessed at.
+        const double host =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          hostStart)
+                .count();
+        const u32 ticks = bus.read32(0x0000416Au);
+        printf("-- timing: %.1f s host, %.1f MIPS, tb=%llu (%.2f MHz), "
+               "guest Ticks=%u (%.1f/host-s; real is 60)%s\n",
+               host, host > 0 ? executed / host / 1e6 : 0.0,
+               static_cast<unsigned long long>(cpu.st.tb),
+               host > 0 ? cpu.st.tb / host / 1e6 : 0.0, ticks,
+               host > 0 ? ticks / host : 0.0,
+               realtime ? (rtSlips ? " [realtime, slipped]" : " [realtime]")
+                        : "");
+    }
+    {
         std::vector<std::pair<u64, u32>> top;
         for (const auto& [pc, n] : pcHist)
             top.push_back({n, pc});
@@ -1663,9 +1776,33 @@ int main(int argc, char** argv)
         printf("\n");
     }
     {
+        // The disk's own command log, the same way the CD's is reported.
+        // Register traffic says what the driver poked; the command log says
+        // what it ASKED FOR, which is the question when a boot device is
+        // probed but never read.
+        const auto& hl = bus.hd().log;
+        printf("-- hd command log (%zu; c=ata p=packet e=err):\n   ",
+               hl.size());
+        const size_t hs = hl.size() > 200 ? hl.size() - 200 : 0;
+        for (size_t k = hs; k < hl.size(); ++k) {
+            if (hl[k].a || hl[k].b)
+                printf("%c%02x:%x+%x@%llu ", hl[k].kind, hl[k].val, hl[k].a,
+                       hl[k].b, static_cast<unsigned long long>(hl[k].at));
+            else
+                printf("%c%02x@%llu ", hl[k].kind, hl[k].val,
+                       static_cast<unsigned long long>(hl[k].at));
+        }
+        printf("\n");
+    }
+    {
+        // The TAIL, not the head: the log is trimmed as it grows, so the
+        // first 120 entries are an arbitrary window that has nothing to do
+        // with what the run was asked to investigate.
         const auto& al = bus.ataLog();
-        printf("-- ata traffic (%zu; off r/w val pc):\n", al.size());
-        for (size_t k = 0; k < al.size() && k < 120; ++k)
+        printf("-- ata traffic (%zu; last 160; off r/w val pc):\n",
+               al.size());
+        const size_t as = al.size() > 160 ? al.size() - 160 : 0;
+        for (size_t k = as; k < al.size(); ++k)
             printf("   +%05x %c %02x pc=%08x @%llu\n", al[k].pa & ~1u,
                    (al[k].pa & 1u) ? 'r' : 'w', al[k].val & 0xFFu,
                    al[k].pc, static_cast<unsigned long long>(al[k].at));

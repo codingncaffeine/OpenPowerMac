@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 1;
+constexpr u32 kSnapVersion = 2;
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -399,6 +399,7 @@ void AtaCell::snapSave(SnapWriter& w) const
     w.u32v(readLeft_);
     w.u8v(sense_);
     w.b(irq_);
+    w.arr32(ctl_, 16);
     w.u64v(log.size());
     for (const Ev& ev : log) {
         w.u64v(ev.at);
@@ -447,6 +448,7 @@ void AtaCell::snapLoad(SnapReader& r)
     readLeft_ = r.u32v();
     sense_ = r.u8v();
     irq_ = r.b();
+    r.arr32(ctl_, 16);
     const u64 n = r.u64v();
     log.clear();
     for (u64 k = 0; k < n && r.ok; ++k) {
@@ -853,6 +855,9 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     sec = w.begin("DBDM");
     ataDma_.snapSave(w);
     w.end(sec);
+    sec = w.begin("DBD2");
+    hdDma_.snapSave(w);
+    w.end(sec);
     sec = w.begin("PMU ");
     pmu_.snapSave(w);
     w.end(sec);
@@ -941,6 +946,9 @@ void SawtoothBus::snapLoad(SnapReader& r)
     e = r.beginSection("DBDM");
     ataDma_.snapLoad(r);
     r.endSection("DBDM", e);
+    e = r.beginSection("DBD2");
+    hdDma_.snapLoad(r);
+    r.endSection("DBD2", e);
     e = r.beginSection("PMU ");
     pmu_.snapLoad(r);
     r.endSection("PMU ", e);
@@ -956,6 +964,8 @@ void SawtoothBus::snapLoad(SnapReader& r)
     }
     ataDma_.dmaBus = this;
     ataDma_.ata = &cd_;
+    hdDma_.dmaBus = this;
+    hdDma_.ata = &hd_;
 }
 
 // --- whole machine --------------------------------------------------------

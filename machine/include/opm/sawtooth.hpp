@@ -122,6 +122,8 @@ public:
                 cfgSeed(0, 0x00010000u | r, 0);
         ataDma_.dmaBus = this;
         ataDma_.ata = &cd_;
+        hdDma_.dmaBus = this;
+        hdDma_.ata = &hd_;
     }
 
     bool attachAtiRom(const char* path)
@@ -222,6 +224,7 @@ public:
     OpenPic& pic() { return pic_; }
     void syncIrqs()
     {
+        pic_.setLine(11, hdDma_.irqLine()); // ata-4's DBDMA (reg 8a00)
         pic_.setLine(19, hd_.irqLine()); // ata-4@1f000, interrupts 0x13
         pic_.setLine(20, cd_.irqLine());
         pic_.setLine(27, ohci_[0].irqLine());
@@ -235,10 +238,19 @@ public:
         ohci_[1].tick(tb);
     }
 
-    // DBDMA channel for ata-3@20000 at mac-io +0x8B00 — the OS ATA
-    // driver's data path (task file stays PIO; INPUT descriptors pull
-    // the CD's data phases straight into RAM).
+    // DBDMA channels, one per ATA cell, at the mac-io offsets the ROM's
+    // own device tree names in each node's second `reg` pair:
+    //   ata-3@20000 -> +0x8B00   (the CD)
+    //   ata-4@1f000 -> +0x8A00   (the internal disk)
+    // The second one was missing, and its absence is not quiet: ata-4 is
+    // the Ultra ATA channel, the ROM publishes `cable-type 80-conductor`
+    // on it, and Open Firmware's driver therefore drives it with DMA. With
+    // no engine behind the window the driver configured the drive and then
+    // never issued a read, so `dir hd:,\` returned an empty listing and
+    // `boot hd:` answered "can't OPEN" — a missing device presenting as a
+    // missing volume.
     DbdmaChannel& ataDma() { return ataDma_; }
+    DbdmaChannel& hdDma() { return hdDma_; }
 
     // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
     // with a /disk node). The CD lives on ata-3@20000 device 0 when an
@@ -339,6 +351,8 @@ private:
                 return pic_.read(off - 0x40000u, len);
             if (off - 0x8B00u < 0x100u)
                 return ataDma_.read(off - 0x8B00u, len);
+            if (off - 0x8A00u < 0x100u)
+                return hdDma_.read(off - 0x8A00u, len);
             if (off - 0x1F000u < 0x3000u) {
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
@@ -448,6 +462,10 @@ private:
                 ataDma_.write(off - 0x8B00u, v, len);
                 return;
             }
+            if (off - 0x8A00u < 0x100u) {
+                hdDma_.write(off - 0x8A00u, v, len);
+                return;
+            }
             if (off - 0x1F000u < 0x3000u) {
                 if ((off & 0xFF0u) != 0) {
                     if (ataLog_.size() >= 6000)
@@ -463,6 +481,7 @@ private:
                     ataDma_.wake();
                 } else if (off - 0x1F000u < 0x1000u && hd_.present()) {
                     hd_.write(off - 0x1F000u, v, len);
+                    hdDma_.wake(); // a command can open a fresh data phase
                 }
                 return;
             }
@@ -839,7 +858,7 @@ private:
     OhciCell ohci_[2];
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
     R128Cell ati_;
-    DbdmaChannel ataDma_;
+    DbdmaChannel ataDma_, hdDma_;
     std::vector<u8> atiRom_;
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;
 };

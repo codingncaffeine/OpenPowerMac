@@ -73,6 +73,9 @@ int main(int argc, char** argv)
     u32 viaA = 0x00;                   // VIA port A strap levels
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
+    u64 ataPokeAt = 0;                 // hand-enqueue an .ATALoad request
+    u32 ataPokeDev = 0;                // its deviceID field (entry+4)
+    u32 ataPokeKind = 1;               // its kind field (entry+8: 1 or 3)
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -106,6 +109,12 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
             atiAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--ata-poke"))
+            ataPokeAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--ata-poke-dev"))
+            ataPokeDev = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--ata-poke-kind"))
+            ataPokeKind = static_cast<u32>(strtoul(next(), nullptr, 0));
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
@@ -203,6 +212,82 @@ int main(int argc, char** argv)
             ++pcHist[pc];
             if ((pc & 0xFF000000u) == 0x68000000u)
                 ++pc68Hist[cpu.st.gpr[24] & ~1u];
+        }
+        // Every ATA Manager call, by function code. ffdd2bac starts with
+        // lbz r31,18(r3) — the PB's function byte — and dispatches on it.
+        // Reporting each code the first time it appears says which
+        // operations the boot actually performs, and in particular whether
+        // any device-registration call is ever made at all.
+        if (pc == 0xFFDD2BC0u) {
+            static u32 atafn[256] = {0};
+            const u32 fn = cpu.st.gpr[31] & 0xFFu;
+            if (atafn[fn]++ == 0) {
+                printf("ATAFN %02x first @%llu pb=%08x\n", fn,
+                       static_cast<unsigned long long>(executed),
+                       cpu.st.gpr[3]);
+                fflush(stdout); // rare: keep readable if a run is cut short
+            }
+        }
+        // The ATA Manager's device lookup, ffdd3a80: walk the singly-linked
+        // list whose head is at globals+0x38 (then +2), comparing each
+        // node's 16-bit id at +0x0C against the wanted one. Manager
+        // function 0x86 preloads -56 (nsDrvErr) and returns it whenever
+        // this yields NULL — which is the exact error the boot dies on.
+        // Log the head, the wanted id, and every id the list actually
+        // holds: that says whether any ATA device is registered at all,
+        // and under which id.
+        if (pc == 0xFFDD3A88u || pc == 0xFFDD3A98u || pc == 0xFFDD3AB0u) {
+            static int lk = 0;
+            if (lk < 120) {
+                ++lk;
+                if (pc == 0xFFDD3A88u)
+                    printf("LK head=%08x want=%08x @%llu\n", cpu.st.gpr[12],
+                           cpu.st.gpr[3],
+                           static_cast<unsigned long long>(executed));
+                else
+                    printf("LK   node=%08x id=%08x want=%08x\n",
+                           cpu.st.gpr[12],
+                           cpu.st.gpr[pc == 0xFFDD3A98u ? 5 : 4],
+                           cpu.st.gpr[11]);
+                fflush(stdout);
+            }
+        }
+        // Proof-first seed. .ATALoad's request queue never receives the
+        // selector-1 "an ATA device arrived" notification (ffd9b504's jump
+        // table, arm 1 at ffd9b54c), so all ten of its slots keep the free
+        // tag '!act' and no disk driver is ever installed — which is why
+        // the on-disc driver honestly answers nsDrvErr. Hand-enqueue one
+        // request, the same way the [EM+294] seed proved the USB chain
+        // before real OHCI existed. Entry layout is from the processor at
+        // ffd9b23e: +0x00 tag 'load', +0x04 deviceID (handed to ATA
+        // Manager function 0x86), +0x08 kind (tested against 1 and 3).
+        // The queue is found by its own header rather than a fixed address:
+        // 'LOAD' followed by free slots at +0x10/+0x20.
+        static bool ataPoked = false;
+        if (!ataPoked && ataPokeAt && executed > ataPokeAt) {
+            ataPoked = true;
+            cpu.l1dFlushAll(true);
+            u32 q = 0;
+            for (u32 pa = 0x1000; pa + 0x120 < bus.ram().size(); pa += 4)
+                if (bus.read32(pa) == 0x4C4F4144u &&
+                    bus.read32(pa + 0x10) == 0x21616374u &&
+                    bus.read32(pa + 0x20) == 0x21616374u) {
+                    q = pa;
+                    break;
+                }
+            if (q) {
+                bus.write32(q + 0x14, ataPokeDev);
+                bus.write32(q + 0x18, ataPokeKind);
+                bus.write32(q + 0x10, 0x6C6F6164u); // 'load' published last
+                printf("-- ATA POKE: queue PA %08x hdr=%08x/%08x count=%u; "
+                       "slot0 := 'load' dev=%08x kind=%u @%llu\n",
+                       q, bus.read32(q + 4), bus.read32(q + 8),
+                       bus.read32(q + 0x0C) & 0xFFFFu, ataPokeDev,
+                       ataPokeKind,
+                       static_cast<unsigned long long>(executed));
+            } else {
+                printf("-- ATA POKE: .ATALoad request queue not found\n");
+            }
         }
         // Decline forensics: every 68K transition inside the .ATALoad DRVR
         // body and its _Control caller, MINUS the strcmp character loop

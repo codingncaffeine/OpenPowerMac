@@ -1692,12 +1692,22 @@ int main(int argc, char** argv)
                                           hostStart)
                 .count();
         const u32 ticks = bus.read32(0x0000416Au);
-        printf("-- timing: %.1f s host, %.1f MIPS, tb=%llu (%.2f MHz), "
-               "guest Ticks=%u (%.1f/host-s; real is 60)%s\n",
+        // Before the 68K world starts, that cell holds power-on RAM junk.
+        // Printing a rate derived from junk is how a measurement becomes a
+        // wrong belief, so say so instead: a plausible count is bounded by
+        // 60/s against a run that has never been longer than minutes.
+        char tickText[96];
+        if (ticks < 100000000u)
+            snprintf(tickText, sizeof tickText,
+                     "guest Ticks=%u (%.1f/host-s; real is 60/s)", ticks,
+                     host > 0 ? ticks / host : 0.0);
+        else
+            snprintf(tickText, sizeof tickText,
+                     "guest Ticks n/a (68K lowmem not initialised yet)");
+        printf("-- timing: %.1f s host, %.1f MIPS, tb=%llu (%.2f MHz), %s%s\n",
                host, host > 0 ? executed / host / 1e6 : 0.0,
                static_cast<unsigned long long>(cpu.st.tb),
-               host > 0 ? cpu.st.tb / host / 1e6 : 0.0, ticks,
-               host > 0 ? ticks / host : 0.0,
+               host > 0 ? cpu.st.tb / host / 1e6 : 0.0, tickText,
                realtime ? (rtSlips ? " [realtime, slipped]" : " [realtime]")
                         : "");
     }

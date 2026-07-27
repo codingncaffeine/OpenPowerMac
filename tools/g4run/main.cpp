@@ -212,40 +212,202 @@ int main(int argc, char** argv)
                 slotPrev[1] = v1;
             }
         }
-        static bool sadSeen = false;
-        static u32 sadHits = 0;
-        if (!sadSeen && executed > 1300000000ull &&
-            (executed & 0xFFFFu) == 0) {
-            static u32 sadPrev = 0xEEEE0000u;
-            u32 v = 0, pa0 = 0;
-            {
-                cpu.mmuProbe = true;
-                const CpuState saved = cpu.st;
-                cpu.st.msr |= 0x30u;
-                if (cpu.translate(0x00000AF0u, false, true, pa0)) {
-                    if (!cpu.l1dPeek32(pa0, v))
-                        v = bus.read32(pa0);
+        // ExpandMem+0x294 watch (PA 000116C4): the Mixed Mode call-68K
+        // primitive jumps through this cell and it is 0 at the fatal
+        // call — the sad-mac's null procPtr. This names every writer:
+        // the builder's clear, and (if it ever runs) the real install.
+        static u32 instShown = 0;
+        if ((pc == 0xFFE2325Cu || pc == 0xFFE23380u) && instShown < 12) {
+            ++instShown;
+            printf("-- installer %s @%llu lr=%08x r3=%08x r4=%08x r5=%08x "
+                   "r29=%08x\n",
+                   pc == 0xFFE2325Cu ? "ENTRY ffe2325c" : "uninstall 23380",
+                   static_cast<unsigned long long>(executed), cpu.st.lr,
+                   cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.gpr[5],
+                   cpu.st.gpr[29]);
+            // DIAGNOSTIC (not machine truth): USBShim chain-calls the
+            // prior boot-keyboard proc from [ExpandMem+0x294] with no
+            // null check; the real seed comes from the USB Expert's
+            // per-controller shim reference — absent while the machine
+            // has no USB. Seed a bare ROM RTS so the boot can proceed
+            // and reveal the next frontier. Real fix = OHCI on PCI.
+            static bool poked = false;
+            if (pc == 0xFFE2325Cu && !poked) {
+                poked = true;
+                cpu.l1dFlushAll(true);
+                bus.write32(0x000116C4u, 0xFFC339A2u);
+                printf("-- DIAGNOSTIC poke: [EM+294] := ffc339a2 (RTS)\n");
+            }
+        }
+        static u32 emPrev = 0xEEEEEEEEu;
+        static u32 emShown = 0;
+        if (executed > 1000000000ull) {
+            u32 cv = 0;
+            if (!cpu.l1dPeek32(0x000116C4u, cv))
+                cv = bus.read32(0x000116C4u);
+            if (emPrev == 0xEEEEEEEEu) {
+                emPrev = cv;
+                printf("-- em+294 baseline %08x @%llu\n", cv,
+                       static_cast<unsigned long long>(executed));
+            }
+            if (cv != emPrev && emShown < 24) {
+                ++emShown;
+                printf("-- em+294 %08x -> %08x @%llu pc=%08x lr=%08x "
+                       "r24=%08x\n",
+                       emPrev, cv,
+                       static_cast<unsigned long long>(executed), cpu.st.pc,
+                       cpu.st.lr, cpu.st.gpr[24]);
+                printf("   ppc ring (last 16):\n");
+                const u32 zc = ring.n < 16 ? ring.n : 16;
+                for (u32 k = 0; k < zc; ++k) {
+                    const auto& e = ring.e[(ring.n - zc + k) & 127u];
+                    disassemble(e.insn, e.pc, text, sizeof text,
+                                Style::Gnu);
+                    printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
                 }
-                cpu.st = saved;
-                cpu.mmuProbe = false;
             }
-            if (sadPrev == 0xEEEE0000u) {
-                sadPrev = v;
-                printf("-- lowmem $AF0 -> pa %08x initial %08x @%llu\n",
-                       pa0, v, static_cast<unsigned long long>(executed));
-            }
-            if (v != sadPrev && ++sadHits < 8) {
-                sadSeen = (v >> 16) == 0x000Au;
-                printf("-- sad-mac code %04x appeared by @%llu; 68kpc(r24)="
-                       "%08x\n   ring:\n",
-                       v >> 16, static_cast<unsigned long long>(executed),
-                       cpu.st.gpr[24]);
-                const u32 cnt = ring.n < 96 ? ring.n : 96;
-                for (u32 k = 0; k < cnt; ++k) {
-                    const auto& e = ring.e[(ring.n - cnt + k) & 127u];
+            if (cv != emPrev)
+                emPrev = cv;
+        }
+        // 68K-pc ring + sad-mac death-handler trigger (the dig's main
+        // instrument). r24 = 68K pc while the emulator runs; Gossamer
+        // conventions hold (D0-D7=r8-r15, A0-A7=r16-r23, r27=opcode).
+        // The death handler at 68K ffc04a6e loads D6:=word[$0AF0] and
+        // D7:=long[$02BA], prints them, and halts at ffc0477e. 68K
+        // lowmem is per-address-space under the nanokernel, so those
+        // cells must translate under the context LIVE at handler entry
+        // (the Blue task) — a sampled context sees the idle task's
+        // lowmem. The ring names the code that detected the failure and
+        // jumped here; the 68K stack carries the vector-stub bsr return
+        // address plus the exception frame with the faulting 68K pc.
+        static u32 prev68k = 0, ring68At = 0;
+        struct Ent68 {
+            u32 pc68, op, ppc;
+        };
+        static Ent68 ring68[128] = {};
+        static bool deathShown = false;
+        if (cpu.st.gpr[24] != prev68k) {
+            prev68k = cpu.st.gpr[24];
+            ring68[ring68At++ & 127u] = {prev68k, cpu.st.gpr[27], pc};
+            // Two triggers, first one wins: the fatal transfer itself
+            // (r24 lands on 68K VA 0 — the null jump that becomes the
+            // Line-F sad-mac) or, as backup, death-handler entry. The
+            // former fires BEFORE the death cascade clobbers the
+            // stack-hosted code that made the jump.
+            if (!deathShown && executed > 1000000000ull &&
+                (prev68k == 0 ||
+                 (prev68k >= 0xFFC04A6Eu && prev68k <= 0xFFC04A90u)) &&
+                (pc & 0xFFC00000u) == 0x68000000u) {
+                deathShown = true;
+                printf("-- 68K %s @%llu pc68=%08x ppcpc=%08x "
+                       "lr=%08x\n",
+                       prev68k == 0 ? "NULL-JUMP" : "DEATH HANDLER",
+                       static_cast<unsigned long long>(executed), prev68k,
+                       cpu.st.pc, cpu.st.lr);
+                printf("   D0-D7: ");
+                for (u32 k = 8; k < 16; ++k)
+                    printf("%08x ", cpu.st.gpr[k]);
+                printf("\n   A0-A7: ");
+                for (u32 k = 16; k < 24; ++k)
+                    printf("%08x ", cpu.st.gpr[k]);
+                printf("\n   r24-r31: ");
+                for (u32 k = 24; k < 32; ++k)
+                    printf("%08x ", cpu.st.gpr[k]);
+                printf("\n   r0-r7: ");
+                for (u32 k = 0; k < 8; ++k)
+                    printf("%08x ", cpu.st.gpr[k]);
+                printf("\n   ctx: sdr1=%08x sr0=%08x sr1=%08x sr6=%08x "
+                       "msr=%08x\n",
+                       cpu.st.sdr1, cpu.st.sr[0], cpu.st.sr[1],
+                       cpu.st.sr[6], cpu.st.msr);
+                printf("   ppc ring (last 96):\n");
+                const u32 pcnt = ring.n < 96 ? ring.n : 96;
+                for (u32 k = 0; k < pcnt; ++k) {
+                    const auto& e = ring.e[(ring.n - pcnt + k) & 127u];
                     disassemble(e.insn, e.pc, text, sizeof text, Style::Gnu);
                     printf("   %08x: %08x  %s\n", e.pc, e.insn, text);
                 }
+                cpu.l1dFlushAll(true); // bus peeks must see cached truth
+                cpu.l2FlushAll(true);
+                cpu.mmuProbe = true;
+                const CpuState saved = cpu.st;
+                const bool savedRaised = cpu.raisedThisStep;
+                cpu.st.msr |= 0x30u; // translation on: live SR/BAT/PTEG
+                const CpuState armed = cpu.st;
+                auto xlat = [&](u32 ea, u32& pa) {
+                    cpu.st = armed; // translate raises on fail; re-arm
+                    const bool ok = cpu.translate(ea, false, false, pa);
+                    cpu.st = armed;
+                    return ok;
+                };
+                auto peek68 = [&](u32 a68, u32& v, u32& paOut) -> char {
+                    u32 pa = 0;
+                    char how = '-';
+                    if (xlat(a68, pa))
+                        how = 'v'; // live page tables / BATs at the EA
+                    else if (a68 < 0x00400000u &&
+                             xlat(0x68000000u + a68, pa))
+                        how = 'b'; // the emulator's lowmem BAT window
+                    paOut = pa;
+                    v = 0;
+                    if (how != '-' && (pa & ~3u) + 4 <= bus.ram().size())
+                        v = bus.read32(pa & ~3u);
+                    else if (how != '-')
+                        how = 'm'; // translated to non-RAM: not read
+                    return how;
+                };
+                u32 v = 0, pa2 = 0;
+                char how = peek68(0x00000AF0u, v, pa2);
+                printf("   [$0AF0] %c pa=%08x -> %08x  (major = hi word)\n",
+                       how, pa2, v);
+                how = peek68(0x000002B8u, v, pa2);
+                printf("   [$02B8] %c pa=%08x -> %08x\n", how, pa2, v);
+                how = peek68(0x000002BCu, v, pa2);
+                printf("   [$02BC] %c pa=%08x -> %08x  (minor long @2BA "
+                       "= 2B8.lo:2BC.hi)\n",
+                       how, pa2, v);
+                printf("   static pa [00F00AF0]=%08x [00004AF0]=%08x\n",
+                       bus.read32(0x00F00AF0u), bus.read32(0x00004AF0u));
+                auto rows = [&](const char* tag, u32 base, u32 n) {
+                    printf("   %s @%08x:\n", tag, base);
+                    for (u32 row = 0; row < n; row += 4) {
+                        printf("   ");
+                        for (u32 col = 0; col < 4; ++col) {
+                            const u32 a = base + (row + col) * 4;
+                            u32 vv = 0, ppa = 0;
+                            const char h = peek68(a, vv, ppa);
+                            printf(" [%08x]%c %08x", a, h, vv);
+                        }
+                        printf("\n");
+                    }
+                };
+                rows("68K stack A7", cpu.st.gpr[23] & ~3u, 32);
+                rows("A6 frame", cpu.st.gpr[22] & ~3u, 8);
+                // The boot's stack-hosted code + fault stack, captured
+                // before the death cascade rewrites it; and the lowmem
+                // death cells ($BFF guard, $C6C/C70/C74 saves, $AF0).
+                rows("stack region", 0x01DF7400u, 256);
+                rows("lowmem BC0-CFF", 0x00000BC0u, 80);
+                cpu.st = saved;
+                cpu.raisedThisStep = savedRaised;
+                cpu.mmuProbe = false;
+                printf("   68k pc ring, oldest first (pc68/op; '*' = ppc "
+                       "pc outside the emulator window):\n");
+                for (u32 k = 0; k < 128; k += 4) {
+                    printf("   ");
+                    for (u32 j = 0; j < 4; ++j) {
+                        const Ent68& e = ring68[(ring68At + k + j) & 127u];
+                        printf(" %08x/%04x%c", e.pc68, e.op & 0xFFFFu,
+                               (e.ppc & 0xFFC00000u) == 0x68000000u
+                                   ? ' '
+                                   : '*');
+                    }
+                    printf("\n");
+                }
+                // Capture the handler's print + park, then stop: the
+                // remaining budget would only spin at the 60fe halt.
+                if (maxInsns > executed + 20000000ull)
+                    maxInsns = executed + 20000000ull;
             }
         }
         static int lockTrace = -1;

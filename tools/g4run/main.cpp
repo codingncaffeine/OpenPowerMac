@@ -172,6 +172,25 @@ int main(int argc, char** argv)
     cpu.attach(bus);
     cpu.reset(); // pc = 0xFFF00100, MSR[IP]: vectors in ROM — authentic
     u64 executed = 0;
+    // Instrument census. A watch that emits nothing is ambiguous between
+    // "never fired", "fired with nothing to say", and "its gate never
+    // opened" — this session lost several runs to exactly that, because a
+    // hardware fix moved the boot 830M instructions earlier and every
+    // instrument gated on a hard-coded instruction count silently armed
+    // after the window it meant to watch. Counting hits and reporting them
+    // at the end makes a silent instrument visibly silent.
+    struct Cen {
+        const char* name;
+        u64 hits;
+    };
+    Cen cen[] = {{"ADDBUS", 0},  {"ATAFN", 0}, {"ATARES", 0},
+                 {"LK", 0},      {"SCMP", 0},  {"QSEL", 0},
+                 {"CTL", 0},     {"DRV", 0},   {"ATAPOKE", 0},
+                 {"68K-gate", 0}};
+    enum {
+        kCenAddbus, kCenAtafn, kCenAtares, kCenLk, kCenScmp,
+        kCenQsel, kCenCtl, kCenDrv, kCenPoke, kCen68kGate
+    };
     bus.pcRef = &cpu.st.pc;
     bus.stamp = &executed;
     bus.cd().stamp = &executed;
@@ -214,6 +233,29 @@ int main(int argc, char** argv)
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
         cpu.step();
+        // kATAMgrAddATABus (fn 0x93) fails with -56, and its worker
+        // ffdd18d0 is the ONLY thing that populates globals+0x44 — the
+        // list whose emptiness makes fn 0x98 answer -56 for the rest of
+        // the boot. The failure is one of two checks at its top:
+        //   dd18e8 lwz r3,48(r29)  the bus/AIM parameter out of the PB
+        //   dd18f0 bl  0xdd3b18    check 1 -> non-zero takes the error path
+        //   dd190c bl  0xdd1834    check 2 -> non-zero IS the returned error
+        if (pc == 0xFFDD18E8u || pc == 0xFFDD18F8u || pc == 0xFFDD1910u) {
+            ++cen[kCenAddbus].hits;
+            static int ab = 0;
+            if (ab < 40) {
+                ++ab;
+                if (pc == 0xFFDD18E8u)
+                    printf("ADDBUS enter pb=%08x @%llu\n", cpu.st.gpr[29],
+                           static_cast<unsigned long long>(executed));
+                else
+                    printf("ADDBUS %s -> %d\n",
+                           pc == 0xFFDD18F8u ? "check1(dd3b18)"
+                                             : "check2(dd1834)",
+                           static_cast<int>(cpu.st.gpr[3]));
+                fflush(stdout);
+            }
+        }
         const u32 region = pc >> 10;
         if (seen.emplace(region, executed).second)
             firsts.push_back({executed, pc});
@@ -228,6 +270,7 @@ int main(int argc, char** argv)
         // operations the boot actually performs, and in particular whether
         // any device-registration call is ever made at all.
         if (pc == 0xFFDD2BC0u) {
+            ++cen[kCenAtafn].hits;
             static u32 atafn[256] = {0};
             const u32 fn = cpu.st.gpr[31] & 0xFFu;
             if (atafn[fn]++ == 0) {
@@ -244,6 +287,7 @@ int main(int argc, char** argv)
         // and correlate the PB pointer with the function code the tally
         // above already reports for that same PB.
         if (pc == 0xFFDD4204u) {
+            ++cen[kCenAtares].hits;
             static int cp = 0;
             const int res = static_cast<int>(cpu.st.gpr[4]);
             if (cp < 200 && res != 0) {
@@ -262,6 +306,7 @@ int main(int argc, char** argv)
         // holds: that says whether any ATA device is registered at all,
         // and under which id.
         if (pc == 0xFFDD3A88u || pc == 0xFFDD3A98u || pc == 0xFFDD3AB0u) {
+            ++cen[kCenLk].hits;
             static int lk = 0;
             if (lk < 120) {
                 ++lk;
@@ -341,6 +386,7 @@ int main(int argc, char** argv)
                 }
             }
             if (cur68 != prev68 && executed > 2800000000ull) {
+                ++cen[kCen68kGate].hits;
                 const bool body = (cur68 >= 0xFFD9A000u &&
                                    cur68 < 0xFFD9D000u) ||
                                   (cur68 >= 0xFFC5DA00u &&
@@ -393,6 +439,7 @@ int main(int argc, char** argv)
                 // returns -1 and the failure propagates out. Print both
                 // strings so the failing comparison names itself.
                 if (cur68 == 0xFFD9BC90u) {
+                    ++cen[kCenScmp].hits;
                     static int sc = 0;
                     if (sc < 300) {
                         ++sc;
@@ -1065,6 +1112,12 @@ int main(int argc, char** argv)
     printf("-- executed %llu instructions; stop pc=%08x%s\n",
            static_cast<unsigned long long>(executed), cpu.st.pc,
            cpu.halted ? " (halted)" : "");
+    printf("-- instrument census (hits=0 means the watch never fired —\n"
+           "   check the address is a crossed fetch position and that any\n"
+           "   gate actually opened before the run ended):\n");
+    for (const auto& c : cen)
+        printf("   %-10s hits=%llu\n", c.name,
+               static_cast<unsigned long long>(c.hits));
     printf("-- msr=%08x dec=%08x hid0=%08x\n", cpu.st.msr, cpu.st.dec,
            cpu.st.hid0);
     {

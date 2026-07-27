@@ -5,6 +5,9 @@
 
 namespace opm {
 
+struct SnapWriter;
+struct SnapReader;
+
 // KeyLargo VIA cell + PMU99 behind it (the Sawtooth's system-management
 // path: power, ADB, RTC, NVRAM-adjacent services). The VIA face is the
 // classic 6522 register file at stride 0x200 across mac-io +0x16000..
@@ -46,6 +49,11 @@ public:
     // instruction while the TB runs compressed splits the machine into
     // two clocks and stretches every tick-timed wait by the same factor.
     const u64* tbRef = nullptr;
+
+    // Snapshot: VIA register file, both timer load/latch pairs in their
+    // VIA-tick timeline, and the PMU frame/reply engine mid-conversation.
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     void reqEdge(bool asserted, u64 now);

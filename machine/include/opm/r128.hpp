@@ -6,6 +6,9 @@
 
 namespace opm {
 
+struct SnapWriter;
+struct SnapReader;
+
 // ATI Rage 128 Pro AGP ('PF', 1002:5046) — the Sawtooth's video card.
 // Bring-up model: the card's own FCode ROM (user-supplied dump, served
 // through the expansion-ROM BAR) programs the chip and publishes the
@@ -43,6 +46,11 @@ public:
         return it != regs_.end() ? it->second : 0;
     }
     u32 pal(u32 i) const { return pal_[i & 0xFFu]; }
+
+    // Snapshot: register store, PLL file, DAC palette, and the 32 MB
+    // framebuffer — the display work after the mount reads all of it.
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     static u32 swap32(u32 v)

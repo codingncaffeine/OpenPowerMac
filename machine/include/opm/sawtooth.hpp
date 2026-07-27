@@ -15,6 +15,9 @@
 
 namespace opm {
 
+struct SnapWriter;
+struct SnapReader;
+
 // Power Mac G4 AGP "Sawtooth" — the project's primary machine.
 //
 // M-SAW-0 founding skeleton: RAM at 0, the 1 MB New World boot ROM (flash)
@@ -285,6 +288,14 @@ public:
 
     size_t ramBytes() const { return ram_.size(); }
     const std::vector<u8>& ram() const { return ram_; }
+
+    // Snapshot of the whole machine minus the CPU: RAM, the boot flash and
+    // the card's FCode image (verified rather than trusted on resume), the
+    // Uni-North / KeyLargo register stores, both Keywest cells, the SCC
+    // including the paced serial-injection cursor, PCI config space with
+    // every latch and derived BAR, and each device cell in turn.
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     // During memory sizing the RAM controller exposes each DIMM slot in a

@@ -11,6 +11,7 @@ add_library(opmmachine STATIC
   src/ohci.cpp
   src/r128.cpp
   src/dbdma.cpp
+  src/snapshot.cpp
 )
 
 target_include_directories(opmmachine PUBLIC include)

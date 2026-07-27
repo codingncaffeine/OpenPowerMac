@@ -7,6 +7,9 @@
 
 namespace opm {
 
+struct SnapWriter;
+struct SnapReader;
+
 // One mac-io ATA cell (Heathrow-lineage register file, stride 0x10)
 // carrying a single ATAPI CD/DVD device as device 0, backed by an ISO
 // image streamed from the host file. Built against the OF driver's own
@@ -18,6 +21,13 @@ namespace opm {
 // ATAPI signature after reset/diagnostic: 01 01 14 EB.
 class AtaCell {
 public:
+    // The image is held open for the life of the cell; nothing else owns it.
+    ~AtaCell()
+    {
+        if (iso_)
+            fclose(iso_);
+    }
+
     bool attachIso(const char* path);
     // The same cell serving an ordinary ATA (non-packet) hard disk, which
     // is what a Sawtooth actually boots from — the CD is the exception,
@@ -47,6 +57,13 @@ public:
     };
     std::vector<Ev> log;
     const u64* stamp = nullptr;
+
+    // Snapshot. The backing FILE* is deliberately NOT state: every access
+    // seeks explicitly before reading, so re-attaching the same image on
+    // resume restores the device completely. snapLoad keeps the live handle
+    // and the stamp pointer, and reports a present/absent mismatch.
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     void ataCommand(u8 cmd);

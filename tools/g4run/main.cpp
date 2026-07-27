@@ -8,6 +8,7 @@
 #include "opm/cpu.hpp"
 #include "opm/insn.hpp"
 #include "opm/sawtooth.hpp"
+#include "opm/snapshot.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -87,6 +88,11 @@ int main(int argc, char** argv)
     u64 ataPokeAt = 0;                 // hand-enqueue an .ATALoad request
     u32 ataPokeDev = 0;                // its deviceID field (entry+4)
     u32 ataPokeKind = 1;               // its kind field (entry+8: 1 or 3)
+    u64 snapAt = 0;                    // --snapshot-at N
+    const char* snapOut = nullptr;     // --snapshot-out FILE
+    const char* resumeFrom = nullptr;  // --resume-from FILE
+    u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
+    bool fastTbSet = false;            // CLI wins over a resumed value
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -106,8 +112,10 @@ int main(int argc, char** argv)
             disStart = static_cast<u32>(strtoul(next(), nullptr, 0));
             disEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         }
-        else if (!strcmp(a, "--fast-tb"))
+        else if (!strcmp(a, "--fast-tb")) {
             fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
+            fastTbSet = true;
+        }
         else if (!strcmp(a, "--fast-tb-until"))
             fastTbUntil = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-ram")) ramDumpPath = next();
@@ -142,10 +150,24 @@ int main(int argc, char** argv)
             ataPokeDev = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--ata-poke-kind"))
             ataPokeKind = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--snapshot-at"))
+            snapAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--snapshot-out")) snapOut = next();
+        else if (!strcmp(a, "--resume-from")) resumeFrom = next();
+        else if (!strcmp(a, "--verify-snapshot")) {
+            verifyAt = strtoull(next(), nullptr, 0);
+            verifySteps = strtoull(next(), nullptr, 0);
+        }
         else {
             fprintf(stderr,
                     "usage: g4run --rom FILE [--ram MB] [--max N] [--trace] "
-                    "[--exc N] [--dis A B]\n");
+                    "[--exc N] [--dis A B]\n"
+                    "       snapshots: --snapshot-at N --snapshot-out FILE | "
+                    "--resume-from FILE\n"
+                    "       validation: --verify-snapshot N M  (run to N, "
+                    "snapshot, run M, restore,\n"
+                    "                   run M again, compare "
+                    "instruction-for-instruction)\n");
             return 2;
         }
     }
@@ -221,6 +243,7 @@ int main(int argc, char** argv)
     bus.pcRef = &cpu.st.pc;
     bus.stamp = &executed;
     bus.cd().stamp = &executed;
+    bus.hd().stamp = &executed;
     bus.pic().stamp = &executed;
     bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
     bus.pmu().portAIn = static_cast<u8>(viaA);
@@ -233,6 +256,82 @@ int main(int argc, char** argv)
     bus.atiVisibleAt = atiAt;
     bus.ataDma().stamp = &executed;
     bus.ataDma().pcRef = &cpu.st.pc;
+
+    // One-shot diagnostic pokes. These are the only instruments that write
+    // guest memory, so unlike every other counter here they are snapshot
+    // state: a resume that re-fired them would poke a machine that has
+    // already moved past the poke.
+    bool ataPoked = false, emPoked = false;
+
+    if (resumeFrom) {
+        std::vector<u8> blob;
+        if (!readSnapshotFile(resumeFrom, blob))
+            return 2;
+        HarnessState h;
+        SnapReader r(blob.data(), blob.size());
+        if (!loadSnapshot(cpu, bus, h, r)) {
+            fprintf(stderr, "g4run: %s is not usable: %s\n", resumeFrom,
+                    r.err.c_str());
+            return 2;
+        }
+        executed = h.executed;
+        parkSeen = h.parkSeen;
+        parkArmed = h.parkArmed;
+        ataPoked = h.ataPoked;
+        emPoked = h.emPoked;
+        // Timebase compression is a harness lever, not machine state: an
+        // explicit flag on the resume command line wins, silence adopts
+        // what the snapshot was running with.
+        if (!fastTbSet) {
+            fastTb = h.fastTb;
+            fastTbUntil = h.fastTbUntil;
+        } else if (fastTb != h.fastTb) {
+            printf("-- note: snapshot ran with --fast-tb %u, this run uses "
+                   "%u\n",
+                   h.fastTb, fastTb);
+        }
+        // Instruments are re-armed from the command line, never resumed.
+        bus.watchPa = watchMemPa;
+        bus.watchPaEnd = watchMemEnd ? watchMemEnd : watchMemPa;
+        bus.watchHits = 0;
+        printf("-- resumed from %s @%llu insns: pc=%08x msr=%08x tb=%llu "
+               "park=%s fingerprint=%016llx\n",
+               resumeFrom, static_cast<unsigned long long>(executed),
+               cpu.st.pc, cpu.st.msr,
+               static_cast<unsigned long long>(cpu.st.tb),
+               parkArmed ? "armed" : "not armed",
+               static_cast<unsigned long long>(
+                   snapshotFingerprint(cpu, bus, h)));
+        if (hdPath)
+            printf("-- note: --hd is a WRITABLE image and lives outside the "
+                   "snapshot; a longer earlier run may already have written "
+                   "past this point\n");
+        if (maxInsns <= executed)
+            printf("-- note: --max %llu is already behind the resumed "
+                   "position; nothing will run\n",
+                   static_cast<unsigned long long>(maxInsns));
+    }
+    if (verifyAt) {
+        // Validation drives the machine itself, so it owns the clock.
+        maxInsns = verifyAt;
+        printf("-- verify-snapshot: run to %llu, snapshot, run %llu, "
+               "restore, run %llu again\n",
+               static_cast<unsigned long long>(verifyAt),
+               static_cast<unsigned long long>(verifySteps),
+               static_cast<unsigned long long>(verifySteps));
+    }
+
+    // The per-step machine advance, shared by the instrumented run loop and
+    // the bare loops the validator uses. Sharing it is the point: a
+    // validator that advanced the machine even slightly differently would
+    // prove nothing about the run it is meant to certify.
+    auto tickPeripherals = [&]() {
+        if (fastTb && executed < fastTbUntil)
+            cpu.tick(fastTb);
+        bus.ohciTick(cpu.st.tb);
+        bus.syncIrqs();
+        cpu.setExternalIrq(bus.pic().cpuLine());
+    };
 
     Ring ring;
     int excLogged = 0;
@@ -259,6 +358,26 @@ int main(int argc, char** argv)
 
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
+        // Snapshot at an instruction boundary, BEFORE the step: `executed`
+        // counts completed instructions and pc is the next one, so a resume
+        // re-enters this loop in exactly the state the write saw.
+        if (snapAt && executed == snapAt) {
+            HarnessState h{executed, fastTb,   fastTbUntil, parkSeen,
+                           parkArmed, ataPoked, emPoked};
+            SnapWriter w;
+            saveSnapshot(cpu, bus, h, w);
+            if (snapOut && writeSnapshotFile(snapOut, w.buf))
+                printf("-- snapshot written @%llu: %s (%zu bytes, "
+                       "fingerprint=%016llx)\n",
+                       static_cast<unsigned long long>(executed), snapOut,
+                       w.buf.size(),
+                       static_cast<unsigned long long>(
+                           snapshotFingerprint(cpu, bus, h)));
+            else if (!snapOut)
+                printf("-- --snapshot-at given without --snapshot-out; "
+                       "nothing written\n");
+            fflush(stdout);
+        }
         cpu.step();
         // kATAMgrAddATABus (fn 0x93) fails with -56, and its worker
         // ffdd18d0 is the ONLY thing that populates globals+0x44 — the
@@ -308,7 +427,15 @@ int main(int argc, char** argv)
             static u32 prevWatch = 0;
             static int wn = 0;
             const u32 now = cpu.st.gpr[watchReg];
-            if (now == watchVal && prevWatch != watchVal && wn < 60) {
+            // --arm-at-park gates the REPORT, never the tracking: a register
+            // hitting a common value over three billion instructions
+            // exhausts the report cap long before the window of interest,
+            // which lies the same way a stale instruction-count gate does —
+            // by reporting the wrong window rather than none. --arm-on-value
+            // is exempt, since it is the watch itself that opens that gate.
+            const bool report = armOnValue || !armAtPark || parkArmed;
+            if (now == watchVal && prevWatch != watchVal && report &&
+                wn < 60) {
                 ++wn;
                 if (armOnValue && !parkArmed) {
                     parkArmed = true;
@@ -413,7 +540,6 @@ int main(int argc, char** argv)
         // Manager function 0x86), +0x08 kind (tested against 1 and 3).
         // The queue is found by its own header rather than a fixed address:
         // 'LOAD' followed by free slots at +0x10/+0x20.
-        static bool ataPoked = false;
         if (!ataPoked && ataPokeAt && executed > ataPokeAt) {
             ataPoked = true;
             cpu.l1dFlushAll(true);
@@ -858,11 +984,7 @@ int main(int argc, char** argv)
             disassemble(cpu.curInsn, pc, text, sizeof text, Style::Gnu);
             fprintf(stderr, "%08x: %s\n", pc, text);
         }
-        if (fastTb && executed < fastTbUntil)
-            cpu.tick(fastTb);
-        bus.ohciTick(cpu.st.tb);
-        bus.syncIrqs();
-        cpu.setExternalIrq(bus.pic().cpuLine());
+        tickPeripherals();
         if (serialInput && executed == serialAt) {
             std::string s(serialInput);
             for (char& c : s)
@@ -991,9 +1113,8 @@ int main(int argc, char** argv)
             // per-controller shim reference — absent while the machine
             // has no USB. Seed a bare ROM RTS so the boot can proceed
             // and reveal the next frontier. Real fix = OHCI on PCI.
-            static bool poked = false;
-            if (pc == 0xFFE2325Cu && !poked) {
-                poked = true;
+            if (pc == 0xFFE2325Cu && !emPoked) {
+                emPoked = true;
                 cpu.l1dFlushAll(true);
                 const u32 cur = bus.read32(0x000116C4u);
                 if (cur == 0) {
@@ -1289,6 +1410,147 @@ int main(int argc, char** argv)
                                        cpu.st.srr1, cpu.st.dsisr, cpu.st.dar};
             ++excRingAt;
         }
+    }
+
+    // Snapshot validation. A snapshot that is believed rather than proven is
+    // worse than no snapshot: it diverges silently and manufactures evidence
+    // that looks exactly like the real thing. So the feature ships with the
+    // proof attached, and the proof is deliberately harsh — the restore
+    // happens ON TOP OF a machine that has already run past the snapshot
+    // point, so any field that is not actually captured is still holding its
+    // later value when leg B starts, and leg B diverges.
+    if (verifyAt) {
+        if (executed != verifyAt) {
+            printf("-- VERIFY ABORTED: run stopped at %llu (halted=%d), "
+                   "never reached %llu\n",
+                   static_cast<unsigned long long>(executed), cpu.halted ? 1 : 0,
+                   static_cast<unsigned long long>(verifyAt));
+            return 3;
+        }
+        struct Step {
+            u32 pc, insn;
+        };
+        constexpr size_t kTraceCap = 4000000; // 32 MB of first-divergence detail
+        std::vector<Step> traceA;
+        auto harness = [&]() {
+            return HarnessState{executed, fastTb,   fastTbUntil, parkSeen,
+                                parkArmed, ataPoked, emPoked};
+        };
+        // Advance exactly as the instrumented loop does: step, tick the
+        // peripherals off the pre-increment clock, then count.
+        auto leg = [&](u64 n, std::vector<Step>* rec,
+                       const std::vector<Step>* expect, u64& digest,
+                       u64& ran) {
+            digest = 1469598103934665603ull;
+            ran = 0;
+            long long firstBad = -1;
+            for (u64 k = 0; k < n && !cpu.halted; ++k) {
+                const u32 pcNow = cpu.st.pc;
+                cpu.step();
+                const u32 insn = cpu.curInsn;
+                const u32 pair[2] = {pcNow, insn};
+                const u8* pb = reinterpret_cast<const u8*>(pair);
+                for (size_t q = 0; q < sizeof pair; ++q) {
+                    digest ^= pb[q];
+                    digest *= 1099511628211ull;
+                }
+                if (rec && rec->size() < kTraceCap)
+                    rec->push_back({pcNow, insn});
+                if (expect && firstBad < 0 && k < expect->size() &&
+                    ((*expect)[static_cast<size_t>(k)].pc != pcNow ||
+                     (*expect)[static_cast<size_t>(k)].insn != insn)) {
+                    firstBad = static_cast<long long>(k);
+                    printf("-- DIVERGENCE at step %lld of the window "
+                           "(insn %llu): straight run had pc=%08x insn=%08x, "
+                           "the resumed run has pc=%08x insn=%08x\n",
+                           firstBad,
+                           static_cast<unsigned long long>(executed),
+                           (*expect)[static_cast<size_t>(k)].pc,
+                           (*expect)[static_cast<size_t>(k)].insn, pcNow,
+                           insn);
+                }
+                tickPeripherals();
+                ++executed;
+                ++ran;
+            }
+        };
+
+        const HarnessState h0 = harness();
+        SnapWriter w0;
+        saveSnapshot(cpu, bus, h0, w0);
+        const u64 fp0 = snapshotFingerprint(cpu, bus, h0);
+        printf("-- verify: snapshot at %llu is %zu bytes, "
+               "fingerprint=%016llx\n",
+               static_cast<unsigned long long>(executed), w0.buf.size(),
+               static_cast<unsigned long long>(fp0));
+        fflush(stdout);
+
+        u64 digA = 0, ranA = 0;
+        leg(verifySteps, &traceA, nullptr, digA, ranA);
+        const u64 fpA = snapshotFingerprint(cpu, bus, harness());
+        printf("-- verify: straight leg ran %llu insns, trace digest "
+               "%016llx, end fingerprint %016llx\n",
+               static_cast<unsigned long long>(ranA),
+               static_cast<unsigned long long>(digA),
+               static_cast<unsigned long long>(fpA));
+        fflush(stdout);
+
+        HarnessState hR;
+        {
+            SnapReader r(w0.buf.data(), w0.buf.size());
+            if (!loadSnapshot(cpu, bus, hR, r)) {
+                printf("-- VERIFY FAILED: the snapshot could not be read "
+                       "back: %s\n",
+                       r.err.c_str());
+                return 3;
+            }
+        }
+        executed = hR.executed;
+        fastTb = hR.fastTb;
+        fastTbUntil = hR.fastTbUntil;
+        parkSeen = hR.parkSeen;
+        parkArmed = hR.parkArmed;
+        ataPoked = hR.ataPoked;
+        emPoked = hR.emPoked;
+
+        // Round-trip identity: serializing the restored machine must
+        // reproduce the same bytes. This catches a field that is saved but
+        // restored wrongly, independently of whether the guest ever reads
+        // it.
+        bool roundTrip = snapshotFingerprint(cpu, bus, hR) == fp0;
+        if (!roundTrip) {
+            SnapWriter w1;
+            saveSnapshot(cpu, bus, hR, w1);
+            size_t at = 0;
+            while (at < w1.buf.size() && at < w0.buf.size() &&
+                   w1.buf[at] == w0.buf[at])
+                ++at;
+            printf("-- VERIFY FAILED: save/load is not lossless — first "
+                   "difference at byte %zu of %zu (restored size %zu)\n",
+                   at, w0.buf.size(), w1.buf.size());
+        }
+
+        u64 digB = 0, ranB = 0;
+        leg(verifySteps, nullptr, &traceA, digB, ranB);
+        const u64 fpB = snapshotFingerprint(cpu, bus, harness());
+        printf("-- verify: resumed leg ran %llu insns, trace digest "
+               "%016llx, end fingerprint %016llx\n",
+               static_cast<unsigned long long>(ranB),
+               static_cast<unsigned long long>(digB),
+               static_cast<unsigned long long>(fpB));
+
+        const bool same = roundTrip && ranA == ranB && digA == digB &&
+                          fpA == fpB;
+        printf("-- VERIFY %s: round-trip %s, %llu instructions "
+               "%s, end state %s\n",
+               same ? "PASSED" : "FAILED", roundTrip ? "lossless" : "LOSSY",
+               static_cast<unsigned long long>(ranA),
+               (ranA == ranB && digA == digB) ? "identical" : "DIVERGED",
+               fpA == fpB ? "identical" : "DIFFERENT");
+        if (!same)
+            printf("   A snapshot that fails this must not be used for "
+                   "evidence: it will diverge silently.\n");
+        return same ? 0 : 3;
     }
 
     if (excRingAt > static_cast<u32>(excShow)) {

@@ -7,6 +7,8 @@ namespace opm {
 
 class Bus;
 class AtaCell;
+struct SnapWriter;
+struct SnapReader;
 
 // Apple DBDMA channel (KeyLargo lineage), one 0x100 register window:
 //   +0x00 channelControl (write: mask in 31:16, values in 15:0)
@@ -41,6 +43,11 @@ public:
         u32 kind, a, b; // 0=ctl 1=desc 2=input 3=stop 4=dead
     };
     std::vector<Ev> log;
+
+    // Snapshot; the bus and ATA-cell pointers are wired by the machine's
+    // constructor and stay valid across a load.
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     static u32 swap32(u32 v)

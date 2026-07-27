@@ -5,6 +5,9 @@
 
 namespace opm {
 
+struct SnapWriter;
+struct SnapReader;
+
 // KeyLargo's embedded OpenPIC (the tree's interrupt-controller@40000,
 // 256 KB window at mac-io +0x40000). Little-endian register file:
 //   +0x01000.. global config (stored, minimally interpreted)
@@ -36,6 +39,9 @@ public:
     std::vector<Ev> log;    // v/a/e only — raises would flood the cap
     u64 raiseCount[64] = {}; // per-source raise tally, uncapped
     const u64* stamp = nullptr;
+
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     u32 iack();

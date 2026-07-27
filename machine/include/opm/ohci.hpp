@@ -6,6 +6,9 @@
 
 namespace opm {
 
+struct SnapWriter;
+struct SnapReader;
+
 // OHCI host controller (KeyLargo carries two as PCI functions — the
 // Sawtooth's usb@18/usb@19). Operational registers per the OpenHCI 1.0
 // spec, little-endian on the PCI side: the bus layer hands us the
@@ -50,6 +53,11 @@ public:
     std::map<u32, u64> readCount; // steady-state poll census per offset
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;
+
+    // Snapshot; the DMA writeback pointer into guest RAM is re-wired by
+    // the bus after a load rather than stored.
+    void snapSave(SnapWriter& w) const;
+    void snapLoad(SnapReader& r);
 
 private:
     static u32 swap32(u32 v)

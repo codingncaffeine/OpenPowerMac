@@ -94,7 +94,13 @@ void AtaCell::diskCommand(u8 cmd)
         auto text = [&](u32 word, u32 words, const char* s) {
             for (u32 k = 0; k < words * 2; ++k) {
                 const char c = *s ? *s++ : ' ';
-                data_[2 * word + (k ^ 1)] = static_cast<u8>(c);
+                // No swap: this buffer holds each word BIG-endian (see
+                // w16 above, which writes the high byte first), and ATA
+                // puts the first character in bits 15:8. Swapping here put
+                // every character pair backwards, so the guest read the
+                // model as "AMSTIHATC -DOR MRC1-57" — and the on-disc Apple
+                // CD driver whitelists mechanisms BY MODEL STRING.
+                data_[2 * word + k] = static_cast<u8>(c);
             }
         };
         const u32 secs = static_cast<u32>(diskSectors_ > 0x0FFFFFFFull
@@ -355,7 +361,13 @@ void AtaCell::ataCommand(u8 cmd)
         auto text = [&](u32 word, u32 words, const char* s) {
             for (u32 k = 0; k < words * 2; ++k) {
                 const char c = *s ? *s++ : ' ';
-                data_[2 * word + (k ^ 1)] = static_cast<u8>(c);
+                // No swap: this buffer holds each word BIG-endian (see
+                // w16 above, which writes the high byte first), and ATA
+                // puts the first character in bits 15:8. Swapping here put
+                // every character pair backwards, so the guest read the
+                // model as "AMSTIHATC -DOR MRC1-57" — and the on-disc Apple
+                // CD driver whitelists mechanisms BY MODEL STRING.
+                data_[2 * word + k] = static_cast<u8>(c);
             }
         };
         // The Mac OS CD driver whitelists mechanisms by model string

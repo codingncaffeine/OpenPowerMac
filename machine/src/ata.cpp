@@ -190,6 +190,23 @@ void AtaCell::diskCommand(u8 cmd)
         log.push_back({stamp ? *stamp : 0, 'e', cmd, 0, 0, pcRef ? *pcRef : 0});
         error_ = 0x04; // ABRT
         status_ = (kDrdy | kDsc) | kErr;
+        // An ABORTED command still completes, and completion is an
+        // interrupt-generating event: the host waits on INTRQ to learn the
+        // outcome, error or not. Every other arm raises it and this one did
+        // not, so an unsupported command left the driver blocked forever.
+        // Measured: the OS probes a non-packet drive with IDENTIFY PACKET
+        // DEVICE (0xA1), which a hard disk must abort, and then never
+        // touched the drive again - no status read, nothing.
+        // ATA-4: a device that aborts an IDENTIFY meant for the other
+        // device class must PLACE ITS SIGNATURE in the task file, which is
+        // how the host classifies it. Without that the OS read a stale
+        // signature, concluded this hard disk was a packet device, and sat
+        // in a PACKET retry loop - 785 aborted commands in one boot.
+        nsect_ = 0x01;
+        lba0_ = 0x01;
+        bcLo_ = 0x00;
+        bcHi_ = 0x00;
+        irq_ = true;
         break;
     }
 }
@@ -317,12 +334,19 @@ void AtaCell::write(u32 off, u32 v, u32 len)
         break;
     case 0x160:
         devctl_ = b;
-        if (b & 0x04u) { // SRST: ATAPI signature
+        if (b & 0x04u) {
+            // Software reset: the device places ITS OWN signature, and that
+            // signature is how the host decides which command set to use.
+            // This arm handed out the ATAPI 01 01 14 EB unconditionally, so
+            // a hard disk announced itself as a packet device - after which
+            // the OS correctly stopped trying IDENTIFY DEVICE and sat in a
+            // PACKET retry loop instead. A non-packet device answers
+            // 01 01 00 00.
             nsect_ = 0x01;
             lba0_ = 0x01;
-            bcLo_ = 0x14;
-            bcHi_ = 0xEB;
-            status_ = 0x40;
+            bcLo_ = disk_ ? 0x00 : 0x14;
+            bcHi_ = disk_ ? 0x00 : 0xEB;
+            status_ = disk_ ? static_cast<u8>(kDrdy | kDsc) : 0x40;
             error_ = 0x01;
         }
         break;
@@ -529,6 +553,7 @@ void AtaCell::packet(const u8* cdb)
         error_ = 0x04 | (0x05 << 4);
         nsect_ = kIo | kCoD;
         status_ = kDrdy | kErr;
+        irq_ = true; // an aborted command still completes - see diskCommand
         return;
     }
     if (!data_.empty()) {

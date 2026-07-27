@@ -1379,12 +1379,12 @@ int main(int argc, char** argv)
                 if (t68n < t68Cap) {
                     ++t68n;
                     const bool isRts = (cpu.st.gpr[27] & 0xFFFFu) == 0x4E75u;
-                    printf("%s %08x%s op=%04x D0=%08x D1=%08x A0=%08x "
-                           "A1=%08x A6=%08x\n",
+                    printf("%s %08x%s op=%04x D0=%08x D6=%08x D7=%08x "
+                           "A0=%08x A3=%08x A4=%08x\n",
                            isRts ? "RET" : "T68", cur68, sym(cur68),
                            cpu.st.gpr[27] & 0xFFFFu, cpu.st.gpr[8],
-                           cpu.st.gpr[9], cpu.st.gpr[16], cpu.st.gpr[17],
-                           cpu.st.gpr[22]);
+                           cpu.st.gpr[14], cpu.st.gpr[15], cpu.st.gpr[16],
+                           cpu.st.gpr[19], cpu.st.gpr[20]);
                     if (t68n == t68Cap)
                         printf("-- trace-68k cap %u reached @%llu\n", t68Cap,
                                static_cast<unsigned long long>(executed));
@@ -2540,6 +2540,18 @@ int main(int argc, char** argv)
         const auto& hl = bus.hd().log;
         printf("-- hd command log (%zu; c=ata p=packet e=err):\n   ",
                hl.size());
+        // Head AND tail: the head is how a probe STARTED, which is what
+        // decides everything after it, and a tail-only view hid it.
+        for (size_t k = 0; k < hl.size() && k < 40; ++k) {
+            if (hl[k].a || hl[k].b)
+                printf("%c%02x:%x+%x@%llu/%08x ", hl[k].kind, hl[k].val,
+                       hl[k].a, hl[k].b,
+                       static_cast<unsigned long long>(hl[k].at), hl[k].pc);
+            else
+                printf("%c%02x@%llu/%08x ", hl[k].kind, hl[k].val,
+                       static_cast<unsigned long long>(hl[k].at), hl[k].pc);
+        }
+        printf("\n   ... tail ...\n   ");
         const size_t hs = hl.size() > 200 ? hl.size() - 200 : 0;
         for (size_t k = hs; k < hl.size(); ++k) {
             if (hl[k].a || hl[k].b)

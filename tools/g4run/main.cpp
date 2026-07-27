@@ -433,6 +433,23 @@ int main(int argc, char** argv)
                 // Log the selector going in and the OSErr coming back at
                 // ffd9bc64 — that says WHICH device it is asking about and
                 // whether any of them is our CD on bus 0.
+                // THE GATE: .ATALoad issues ATA_MgrInquiry (fn 0x90), then
+                // requires the byte the manager returns at PB+0x30 to be
+                // >= 4 (CMPI.B #4 / BCC at ffd9b698); below that it just
+                // DisposePtrs and returns -23 openErr without attempting
+                // any install. Watch a small RANGE, not an exact pc — r24
+                // is a fetch pointer and not every instruction address is
+                // ever equal to it.
+                if (cur68 >= 0xFFD9B692u && cur68 <= 0xFFD9B6F2u) {
+                    static int mi = 0;
+                    if (mi < 40) {
+                        ++mi;
+                        printf("MGRINQ pc68=%08x D0=%08x D7=%08x @%llu\n",
+                               cur68, cpu.st.gpr[8], cpu.st.gpr[15],
+                               static_cast<unsigned long long>(executed));
+                        fflush(stdout);
+                    }
+                }
                 // Every Toolbox A-trap .ATALoad executes. The emulator keeps
                 // the current 68K opcode in r27, so an opcode whose high
                 // nibble is 0xA inside the DRVR body is a trap call. This

@@ -35,3 +35,6 @@ roms/
 # Vendor manuals and locally fetched test data — reference shelf lives in scratch, never in-repo
 docs/refs/
 tests/data/
+
+# derived screen dumps
+*.ppm

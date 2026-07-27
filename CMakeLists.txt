@@ -15,6 +15,7 @@ endif()
 
 add_subdirectory(core)
 add_subdirectory(machine)
+add_subdirectory(capi)
 add_subdirectory(tools/ppcrun)
 add_subdirectory(tools/sstgen)
 add_subdirectory(tools/macrun)

@@ -433,6 +433,24 @@ int main(int argc, char** argv)
                 // Log the selector going in and the OSErr coming back at
                 // ffd9bc64 — that says WHICH device it is asking about and
                 // whether any of them is our CD on bus 0.
+                // Every Toolbox A-trap .ATALoad executes. The emulator keeps
+                // the current 68K opcode in r27, so an opcode whose high
+                // nibble is 0xA inside the DRVR body is a trap call. This
+                // says what the driver DOES rather than what its control
+                // flow looks like — in particular whether it ever reaches
+                // _DrvrInstall ($A03D) or _AddDrive ($A04E), the calls
+                // that would actually put a drive in the queue.
+                if (cur68 >= 0xFFD9A000u && cur68 < 0xFFD9D000u &&
+                    (cpu.st.gpr[27] & 0xF000u) == 0xA000u) {
+                    static u32 traps[0x1000] = {0};
+                    const u32 t = cpu.st.gpr[27] & 0x0FFFu;
+                    if (traps[t]++ == 0) {
+                        printf("ATRAP $A%03x first @%llu pc68=%08x\n", t,
+                               static_cast<unsigned long long>(executed),
+                               cur68);
+                        fflush(stdout);
+                    }
+                }
                 // The generic strcmp at ffd9bc7c, read after both operand
                 // loads (A1 = 8(A6), A3 = 12(A6)). The install path walks
                 // the DDR, finds ddType 0x0701, and then this compare

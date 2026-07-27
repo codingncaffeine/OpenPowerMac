@@ -324,9 +324,14 @@ private:
             if (off - 0x1F000u < 0x3000u) {
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
-                u32 v = 0;
-                if (isCd)
-                    v = cd_.read(off - 0x20000u, len);
+                // Unpopulated channel: the ATA data lines float high
+                // (pull-ups), so every register reads all-ones. Status
+                // 0xFF is how drivers conclude "no device" — zeros here
+                // read as a present-but-never-ready device and the Mac
+                // OS channel drivers back off and retry forever, parking
+                // the whole boot behind the ndrv scan.
+                u32 v = isCd ? cd_.read(off - 0x20000u, len)
+                             : (~0u >> (32 - 8 * len));
                 if ((off & 0xFF0u) != 0) {
                     if (ataLog_.size() >= 6000)
                         ataLog_.erase(ataLog_.begin(),
@@ -334,7 +339,7 @@ private:
                     ataLog_.push_back({stamp ? *stamp : 0, off | 1u, v,
                                        pcRef ? *pcRef : 0});
                 }
-                return v; // empty buses: no BSY, no DRDY, zero signature
+                return v;
             }
             const u32 v = get(kl_.data() + off, len);
             klNote(kMacIoBase + off, 0, false);

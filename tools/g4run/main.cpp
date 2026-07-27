@@ -775,6 +775,7 @@ int main(int argc, char** argv)
         fflush(stdout);
     };
 
+    std::map<u32, u64> trapAll; // global A-trap census (see below)
     Events evlog;
     evlog.open(eventsPath);
     if (eventsPath)
@@ -1350,6 +1351,28 @@ int main(int argc, char** argv)
             // that instruction r24 IS the address of the opcode in r27.
             // Trigger there and the trace is authoritative by construction.
             const bool atFetch = cpu.curInsn == 0xAF780002u;
+            // A GLOBAL A-trap census, keyed to the same authoritative fetch.
+            // The existing trap watch only covers .ATALoad's own body, so
+            // "_DrvrInstall is never called" was only ever a statement about
+            // that one driver. Whether ANY code in the entire boot installs
+            // a unit-table entry is a different question, and the one that
+            // matters now that an empty unit 61 is the known cause.
+            if (atFetch && (cpu.st.gpr[27] & 0xF000u) == 0xA000u) {
+                const u32 t = cpu.st.gpr[27] & 0x0FFFu;
+                ++trapAll[t];
+                if (t == 0x03Du || t == 0x04Eu) { // _DrvrInstall / _AddDrive
+                    static int di = 0;
+                    if (di < 40) {
+                        ++di;
+                        printf("INSTALL $A%03x %s pc68=%08x%s D0=%08x "
+                               "A0=%08x @%llu\n",
+                               t, trapName(t), cur68, sym(cur68),
+                               cpu.st.gpr[8], cpu.st.gpr[16],
+                               static_cast<unsigned long long>(executed));
+                        fflush(stdout);
+                    }
+                }
+            }
             if (t68Lo && atFetch && cur68 >= t68Lo && cur68 < t68Hi &&
                 executed >= watchFrom) {
                 static u32 t68n = 0;
@@ -2395,6 +2418,10 @@ int main(int argc, char** argv)
     for (const auto& c : cen)
         printf("   %-10s hits=%llu\n", c.name,
                static_cast<unsigned long long>(c.hits));
+    printf("-- A-trap census, WHOLE BOOT (not just the DRVR body):\n");
+    for (const auto& [t, n] : trapAll)
+        printf("   $A%03x %-18s x%llu\n", t, trapName(t),
+               static_cast<unsigned long long>(n));
     if (dumpStructsEnd)
         dumpStructs("end of run");
     evlog.emit(executed, "end", nullptr);

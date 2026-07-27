@@ -74,9 +74,12 @@ int main(int argc, char** argv)
     u32 viaA = 0x00;                   // VIA port A strap levels
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
+    u32 watchMemPa = 0, watchMemEnd = 0;  // --watch-mem [--watch-mem-end]
     u32 stackAt = 0;                   // --stack-at ADDR: 68K backchain dump
     u32 watchReg = 99;                 // --watch-reg N: value-origin watch
     u32 watchVal = 0;                  // --watch-val V
+    bool armOnValue = false;           // --arm-on-value: arm when the
+                                       // watched register hits its value
     u32 armAtPark = 0;                 // --arm-at-park N: condition gate
     u32 parkSeen = 0;
     bool parkArmed = false;
@@ -118,12 +121,17 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
             atiAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--watch-mem"))
+            watchMemPa = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--watch-mem-end"))
+            watchMemEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--stack-at"))
             stackAt = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-reg"))
             watchReg = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-val"))
             watchVal = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--arm-on-value")) armOnValue = true;
         else if (!strcmp(a, "--arm-at-park"))
             armAtPark = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--trace-pass"))
@@ -168,6 +176,8 @@ int main(int argc, char** argv)
         else
             printf("-- ati rom attach FAILED: %s\n", atiRomPath);
     }
+    bus.watchPa = watchMemPa;
+    bus.watchPaEnd = watchMemEnd ? watchMemEnd : watchMemPa;
     if (hdPath) {
         if (bus.attachHd(hdPath))
             printf("-- hd attached: %s (present=%d)\n", hdPath,
@@ -300,6 +310,11 @@ int main(int argc, char** argv)
             const u32 now = cpu.st.gpr[watchReg];
             if (now == watchVal && prevWatch != watchVal && wn < 60) {
                 ++wn;
+                if (armOnValue && !parkArmed) {
+                    parkArmed = true;
+                    printf("-- ARMED on value r%u == %08x\n", watchReg,
+                           watchVal);
+                }
                 printf("REGSET r%u := %08x  pc=%08x r24=%08x lr=%08x "
                        "@%llu\n",
                        watchReg, watchVal, pc, cpu.st.gpr[24], cpu.st.lr,

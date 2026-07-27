@@ -145,6 +145,10 @@ public:
     // injected probe (~245M) — with the card invisible at choice time
     // the console stays serial, and the FCode still runs at probe time.
     u64 atiVisibleAt = 0;
+    // Memory write-watch bounds (inclusive); see write().
+    u32 watchPa = 0;
+    u32 watchPaEnd = 0;
+    u32 watchHits = 0;
 
     void cfgSeed(u32 b, u32 latch, u32 nativeLeWord)
     {
@@ -389,8 +393,25 @@ private:
         return len == 1 ? 0xFFu : len == 2 ? 0xFFFFu : 0xFFFFFFFFu;
     }
 
+    // General memory write-watch: report the pc that writes a physical
+    // address, rather than sampling for a change and losing the writer.
+    // "Who wrote this?" is a whole class of question — which code clears
+    // a field, which agent fills a table, whether anything ever touches
+    // the drive queue — and answering it by hand-rolling a one-off watch
+    // per address has been done three times on this machine already.
     void write(u32 pa, u32 v, u32 len)
     {
+        if (watchPa) {
+            const u32 hi = watchPaEnd ? watchPaEnd : watchPa;
+            // A write of len bytes at pa covers [pa, pa+len)
+            if (pa <= hi && pa + len > watchPa && watchHits < 200) {
+                ++watchHits;
+                printf("MEMW pa=%08x len=%u val=%08x pc=%08x @%llu\n", pa,
+                       len, v, pcRef ? *pcRef : 0,
+                       static_cast<unsigned long long>(stamp ? *stamp : 0));
+                fflush(stdout);
+            }
+        }
         if (const u32 moff = macioOff(pa); moff != 0xFFFFFFFFu) {
             const u32 off = moff;
             if (off >= 0x16000u && off < 0x18000u) {

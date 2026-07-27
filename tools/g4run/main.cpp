@@ -74,6 +74,7 @@ int main(int argc, char** argv)
     u32 viaA = 0x00;                   // VIA port A strap levels
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
+    u32 tracePass = 0;                 // --trace-pass N: only this kick pass
     u64 ataPokeAt = 0;                 // hand-enqueue an .ATALoad request
     u32 ataPokeDev = 0;                // its deviceID field (entry+4)
     u32 ataPokeKind = 1;               // its kind field (entry+8: 1 or 3)
@@ -111,6 +112,8 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
             atiAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--trace-pass"))
+            tracePass = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--ata-poke"))
             ataPokeAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--ata-poke-dev"))
@@ -254,6 +257,22 @@ int main(int argc, char** argv)
                                              : "check2(dd1834)",
                            static_cast<int>(cpu.st.gpr[3]));
                 fflush(stdout);
+            }
+        }
+        // Drive-queue change detector. We keep inferring "nothing ever
+        // adds a drive"; this turns that into a positive statement.
+        // DrvQHdr is 68K lowmem $308 and blue lowmem maps VA+0x4000, so
+        // PA 0x4308. Sampled rather than hooked: a dirty cache line can
+        // delay the observation, but the queue going non-empty is a
+        // one-way event, so a late report is still a true one.
+        if ((executed & 0x3FFFFFu) == 0) {
+            static u32 lastDq = 0xFFFFFFFFu;
+            const u32 dq = bus.read32(0x4308u);
+            if (dq != lastDq) {
+                printf("DRVQ $308 = %08x @%llu\n", dq,
+                       static_cast<unsigned long long>(executed));
+                fflush(stdout);
+                lastDq = dq;
             }
         }
         const u32 region = pc >> 10;
@@ -460,13 +479,57 @@ int main(int argc, char** argv)
                 if (cur68 >= 0xFFD9A000u && cur68 < 0xFFD9D000u &&
                     (cpu.st.gpr[27] & 0xF000u) == 0xA000u) {
                     static u32 traps[0x1000] = {0};
+                    static int atFull = 0;
                     const u32 t = cpu.st.gpr[27] & 0x0FFFu;
-                    if (traps[t]++ == 0) {
-                        printf("ATRAP $A%03x first @%llu pc68=%08x\n", t,
-                               static_cast<unsigned long long>(executed),
-                               cur68);
+                    // Arguments as well as identity: a trap census says
+                    // WHICH calls happen, but the interesting value is
+                    // almost always what was passed and what came back.
+                    // A0 is the param-block pointer for the Device
+                    // Manager and ATA Manager calls; D0 carries selectors
+                    // and sizes. The result lands in D0 (and D7 for the
+                    // manager) a few instructions later, so the NEXT
+                    // trap line's registers bracket the previous call.
+                    if (atFull < 200) {
+                        ++atFull;
+                        printf("ATRAP $A%03x pc68=%08x D0=%08x D7=%08x "
+                               "A0=%08x A3=%08x @%llu\n",
+                               t, cur68, cpu.st.gpr[8], cpu.st.gpr[15],
+                               cpu.st.gpr[16], cpu.st.gpr[19],
+                               static_cast<unsigned long long>(executed));
                         fflush(stdout);
                     }
+                    ++traps[t];
+                }
+                // Branch-outcome truth. r24 is a FETCH pointer, so the
+                // word after a short branch is always crossed before the
+                // branch is applied — three watches this session fired on
+                // addresses that are never instruction boundaries, and a
+                // taken BEQ was misread as a fall-through. Flag every
+                // discontinuity instead: a backward step, or a forward
+                // step of more than 6 bytes, means control actually
+                // transferred rather than fell through.
+                // Pass counter: the give-up loop re-enters the request
+                // processor once per kick, and only the FIRST pass gets
+                // furthest, so a capped trace otherwise fills with pass
+                // one.s prefix. --trace-pass N records just pass N.
+                static u32 passNo = 0;
+                if (cur68 == 0xFFD9B240u)
+                    ++passNo;
+                const bool passWanted = !tracePass || passNo == tracePass;
+                if (cur68 >= 0xFFD9B6F0u && cur68 <= 0xFFD9C660u) {
+                    static u32 prevSeq = 0;
+                    static int bt = 0;
+                    if (prevSeq && bt < 400 && passWanted) {
+                        const int d = static_cast<int>(cur68 - prevSeq);
+                        if (d < 0 || d > 6) {
+                            ++bt;
+                            printf("BR %08x -> %08x (%+d) D0=%08x D7=%08x\n",
+                                   prevSeq, cur68, d, cpu.st.gpr[8],
+                                   cpu.st.gpr[15]);
+                            fflush(stdout);
+                        }
+                    }
+                    prevSeq = cur68;
                 }
                 // The generic strcmp at ffd9bc7c, read after both operand
                 // loads (A1 = 8(A6), A3 = 12(A6)). The install path walks

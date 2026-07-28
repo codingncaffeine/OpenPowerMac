@@ -198,6 +198,7 @@ public:
 
     const std::vector<RegWr>& uninLog() const { return uninLog_; }
     const std::vector<RegWr>& flashLog() const { return flashLog_; }
+    const std::vector<u8>& flash() const { return rom_; }
 
     // A system reset, as the PMU's 0xD0 command performs it. The ASICs
     // come back at power-on values; RAM, the attached media and the flash

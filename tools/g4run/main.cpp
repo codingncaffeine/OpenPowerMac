@@ -241,6 +241,7 @@ struct SymTab {
 int main(int argc, char** argv)
 {
     const char* romPath = nullptr;
+    const char* romDumpPath = nullptr; // --dump-rom FILE
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
     size_t ramMb = 256;
@@ -320,6 +321,7 @@ int main(int argc, char** argv)
             return argv[++i];
         };
         if (!strcmp(a, "--rom")) romPath = next();
+        else if (!strcmp(a, "--dump-rom")) romDumpPath = next();
         else if (!strcmp(a, "--nvram-set")) nvramSet.push_back(next());
         else if (!strcmp(a, "--ram")) ramMb = strtoul(next(), nullptr, 0);
         else if (!strcmp(a, "--max")) maxInsns = strtoull(next(), nullptr, 0);
@@ -2976,6 +2978,21 @@ int main(int argc, char** argv)
         for (u32 i = 0; i < 16; ++i)
             printf(" %08x", cpu.st.sr[i]);
         printf("\n");
+    }
+    if (romDumpPath) {
+        // The flash as the guest left it. Open Firmware computes its own
+        // NVRAM checksums, so a run that does `setenv` and `reset-all` and
+        // then dumps here produces a correctly-configured image no amount
+        // of guessing at the partition format would have produced.
+        FILE* f = fopen(romDumpPath, "wb");
+        if (f) {
+            fwrite(bus.flash().data(), 1, bus.flash().size(), f);
+            fclose(f);
+            printf("-- boot flash dumped (%zu bytes): %s\n",
+                   bus.flash().size(), romDumpPath);
+        } else {
+            printf("-- boot flash dump FAILED: %s\n", romDumpPath);
+        }
     }
     {
         const auto& fl = bus.flashLog();

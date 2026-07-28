@@ -1310,28 +1310,27 @@ int main(int argc, char** argv)
             printf("== dis %08x..%08x @%llu\n", disStart, disEnd,
                    static_cast<unsigned long long>(executed));
             for (u32 va = disStart & ~3u; va < disEnd; va += 4) {
+                // Ask the guest's own MMU FIRST, always. Shortcutting
+                // FFxxxxxx to the low ROM copy disassembled a live Open
+                // Firmware address as a data table and made a running
+                // machine look like one that had jumped into a table —
+                // the guest maps that range through the page tables once
+                // MSR[IR] is on, and only the MMU knows where it points.
                 u32 pa = 0;
-                if (va >= 0xFF000000u) {
-                    // ROM-in-RAM. The identity BAT translates FFxxxxxx to
-                    // itself, which is unmapped bus space reading as all
-                    // ones; the Mac OS ROM image actually lives in the low
-                    // copy. Same convention dis68k.sh and --find-code use.
-                    pa = va & 0x00FFFFFFu;
-                } else {
-                    cpu.st = armedDis;
-                    const bool ok = cpu.translate(va, false, false, pa);
-                    cpu.st = armedDis;
-                    if (!ok) {
-                        // Real mode, or a range this context does not map:
-                        // a low EA is its own physical address. Open
-                        // Firmware runs its early world with MSR[IR/DR]
-                        // clear, so refusing here refuses to look at
-                        // firmware at all.
-                        if (va >= bus.ramBytes()) {
-                            printf("   %08x: <untranslatable>\n", va);
-                            continue;
-                        }
+                cpu.st = armedDis;
+                const bool ok = cpu.translate(va, false, false, pa);
+                cpu.st = armedDis;
+                if (!ok) {
+                    // Not mapped in this context. ROM-in-RAM lives in the
+                    // low copy (the convention dis68k.sh and --find-code
+                    // use); firmware in real mode is its own address.
+                    if (va >= 0xFF000000u) {
+                        pa = va & 0x00FFFFFFu;
+                    } else if (va < bus.ramBytes()) {
                         pa = va;
+                    } else {
+                        printf("   %08x: <untranslatable>\n", va);
+                        continue;
                     }
                 }
                 const u32 w = bus.read32(pa);

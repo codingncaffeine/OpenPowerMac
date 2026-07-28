@@ -14,11 +14,20 @@
 
 typedef struct OpmMachine OpmMachine;
 
-// Create a Sawtooth. Any of cdPath/atiRomPath may be null. fastTb = 0
-// disables timebase compression (60 is the practiced boot value).
+// Create a Sawtooth. Any of cdPath/hdPath/atiRomPath may be null.
+//
+// fastTb scales the timebase. 60 was the practiced value for reaching the
+// firmware, but it runs guest time about seven times fast and drives the OS
+// era into a decrementer storm — measured at one 60 Hz tick per host second
+// against a real sixty. 7 lands near real time at present host speed.
+//
+// hdPath is not optional in practice: every boot that reaches Mac OS does so
+// from the hard disk, and a machine created without one only reaches the
+// firmware. atiRomPath is likewise required for any picture — without the
+// card's FCode there is no display node for the OS to bind a driver to.
 OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
-                               const char* atiRomPath, uint32_t ramMb,
-                               uint32_t fastTb);
+                               const char* hdPath, const char* atiRomPath,
+                               uint32_t ramMb, uint32_t fastTb);
 
 OPM_API void opm_destroy(OpmMachine* m);
 

@@ -37,8 +37,8 @@ static std::vector<u8> slurp(const char* path)
 }
 
 OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
-                               const char* atiRomPath, uint32_t ramMb,
-                               uint32_t fastTb)
+                               const char* hdPath, const char* atiRomPath,
+                               uint32_t ramMb, uint32_t fastTb)
 {
     std::vector<u8> rom = slurp(romPath);
     if (rom.size() != SawtoothBus::kRomSize)
@@ -48,6 +48,8 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
                              std::move(rom));
     if (cdPath && *cdPath)
         m->bus->attachCd(cdPath);
+    if (hdPath && *hdPath)
+        m->bus->attachHd(hdPath);
     if (atiRomPath && *atiRomPath)
         m->bus->attachAtiRom(atiRomPath);
     m->fastTb = fastTb;

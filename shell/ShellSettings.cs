@@ -11,21 +11,37 @@ public sealed class ShellSettings
 {
     public string RomPath { get; set; } = "";
     public string CdPath { get; set; } = "";
+
+    // Not optional in practice: every boot that reaches Mac OS does so from
+    // the hard disk. Without one the machine only reaches the firmware.
+    public string HdPath { get; set; } = "";
+
+    // Required for any picture. Without the card's FCode there is no display
+    // node, so the OS has nothing to bind a driver to.
     public string AtiRomPath { get; set; } = "";
+
     public uint RamMb { get; set; } = 256;
-    public uint FastTb { get; set; } = 60;
-    public ulong AtiAt { get; set; } = 236_000_000;
+
+    // 60 was the practiced value for reaching the firmware, but it runs guest
+    // time about seven times fast and drives the OS era into a decrementer
+    // storm — measured at one 60 Hz tick per host second against a real
+    // sixty. 7 lands near real time at present host speed.
+    public uint FastTb { get; set; } = 7;
+
+    // The card must be visible from the start. Held invisible until 236M it
+    // misses Open Firmware's PCI probe entirely, its FCode never runs, and no
+    // display node is built — the screen then stays blank no matter how well
+    // everything downstream works.
+    public ulong AtiAt { get; set; } = 1;
+
     public ulong ScriptAt { get; set; } = 240_000_000;
     public bool AutoBoot { get; set; } = true;
 
-    // ';' becomes CR on injection (one Forth line per segment).
-    public string BootScript { get; set; } =
-        @""" /pci@f0000000"" select-dev;10 8000 probe-pci-device;8000 10 probe-pci-device;unselect-dev;" +
-        @"dev /pci@f0000000/pci1002,5046@10;"" ATY,Rage128Pd"" device-name;"" display"" device-type;" +
-        @""" ATY,Rage128Pd"" encode-string "" compatible"" property;" +
-        @""" /pci@f2000000"" select-dev;3000000 to pci-probe-request;unselect-dev;probe-pci;" +
-        @"dev /pci@f2000000/pci106b,19@18;"" usb"" device-name;"" usb"" device-type;" +
-        @"dev /pci@f2000000/pci106b,19@19;"" usb"" device-name;"" usb"" device-type;mac-boot";
+    // Empty by default. The machine auto-boots on its own now that mac-io
+    // +0x61 is modelled as an input, so Open Firmware honours NVRAM and never
+    // stops at the prompt — there is nothing to type at, and injecting the old
+    // recipe into a booting machine only disturbs it.
+    public string BootScript { get; set; } = "";
 
     private static string FilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

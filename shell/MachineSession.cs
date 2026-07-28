@@ -58,6 +58,7 @@ public sealed class MachineSession
         {
             m = Native.opm_create(s.RomPath,
                                   string.IsNullOrWhiteSpace(s.CdPath) ? null : s.CdPath,
+                                  string.IsNullOrWhiteSpace(s.HdPath) ? null : s.HdPath,
                                   string.IsNullOrWhiteSpace(s.AtiRomPath) ? null : s.AtiRomPath,
                                   s.RamMb, s.FastTb);
             if (m == IntPtr.Zero)

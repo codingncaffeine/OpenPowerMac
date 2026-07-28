@@ -9,7 +9,8 @@ internal static class Native
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern IntPtr opm_create(string romPath, string? cdPath,
-                                           string? atiRomPath, uint ramMb, uint fastTb);
+                                           string? hdPath, string? atiRomPath,
+                                           uint ramMb, uint fastTb);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void opm_destroy(IntPtr m);

@@ -294,6 +294,9 @@ int main(int argc, char** argv)
     u32 t68Cap = 4000;                 // --trace-68k-lines N
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
+    u64 traceOfAt = 0;      // --trace-of AT N: OF word trace
+    u32 traceOfLeft = 0;
+    std::map<u32, std::string> ofNames;
     u32 bpPc[8] = {}, bpHit[8] = {}, bpN = 0; // --bp VA: register breakpoints
     u32 bp68Pc[8] = {}, bp68Hit[8] = {}, bp68N = 0; // --bp68 VA
     u32 bpMax = 4, bpDeref = 96;       // --bp-max N, --bp-deref BYTES
@@ -325,6 +328,10 @@ int main(int argc, char** argv)
         };
         if (!strcmp(a, "--rom")) romPath = next();
         else if (!strcmp(a, "--dump-rom")) romDumpPath = next();
+        else if (!strcmp(a, "--trace-of")) {
+            traceOfAt = strtoull(next(), nullptr, 0);
+            traceOfLeft = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
         else if (!strcmp(a, "--coverage-all")) coverageAll = true;
         else if (!strcmp(a, "--of-word")) {
             if (ofSymN < 8)
@@ -1541,6 +1548,66 @@ int main(int argc, char** argv)
                 cpu.st = saved68;
                 cpu.raisedThisStep = false;
                 fflush(stdout);
+            }
+        }
+        // Open Firmware word trace. The coverage timeline only ever shows a
+        // word the FIRST time it is entered, so a loop — which is exactly
+        // what the display console does — collapses to four lines and hides
+        // its own shape. Build the name table once at the gate, then log
+        // every entry into a known code field in order.
+        if (traceOfAt && executed == traceOfAt) {
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            const CpuState tSaved = cpu.st;
+            cpu.st.msr |= 0x30u;
+            const CpuState tArmed = cpu.st;
+            auto rd = [&](u32 va, u8& out) -> bool {
+                u32 pa = 0;
+                cpu.st = tArmed;
+                const bool ok = cpu.translate(va, false, false, pa);
+                cpu.st = tArmed;
+                if (!ok || pa >= bus.ramBytes())
+                    return false;
+                out = static_cast<u8>(bus.read32(pa & ~3u) >>
+                                      (8 * (3 - (pa & 3u))));
+                return true;
+            };
+            for (u32 va = 0xFF800000u; va < 0xFF930000u; va += 4) {
+                for (u32 len = 1; len <= 31; ++len) {
+                    const u32 hdr = va - ((1u + len + 3u) & ~3u);
+                    u8 b = 0;
+                    if (!rd(hdr, b) || b != len)
+                        continue;
+                    std::string s;
+                    bool ok = true;
+                    for (u32 k = 0; k < len && ok; ++k) {
+                        if (!rd(hdr + 1u + k, b) || b < 0x21 || b > 0x7E)
+                            ok = false;
+                        else
+                            s.push_back(static_cast<char>(b));
+                    }
+                    for (u32 k = 1u + len;
+                         ok && k < ((1u + len + 3u) & ~3u); ++k)
+                        if (!rd(hdr + k, b) || b != 0)
+                            ok = false;
+                    if (ok) {
+                        ofNames[va] = s;
+                        break;
+                    }
+                }
+            }
+            cpu.st = tSaved;
+            cpu.raisedThisStep = false;
+            printf("-- of trace armed @%llu: %zu named words\n",
+                   static_cast<unsigned long long>(executed), ofNames.size());
+            fflush(stdout);
+        }
+        if (!ofNames.empty() && executed >= traceOfAt &&
+            traceOfLeft && (pc & 0xFFF00000u) == 0xFF800000u) {
+            const auto it = ofNames.find(pc);
+            if (it != ofNames.end()) {
+                --traceOfLeft;
+                printf("OF %s\n", it->second.c_str());
             }
         }
         if (bpN && executed >= bpFrom) {

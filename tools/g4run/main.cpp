@@ -332,6 +332,7 @@ int main(int argc, char** argv)
     const char* serialLogPath = nullptr; // --serial-log FILE
     u64 serialRate = 0;                // --serial-rate N
     u64 atiLogFrom = 0;                // --ati-log-from N
+    u64 wmapFrom = 0, wmapTo = 0;      // --wmap FROM TO
     u32 watchVa = 0;                   // --watch-va ADDR
     u64 traceFrom = 0;                 // --trace-from N: full trace window
     u64 traceLines = 2000;             // --trace-lines M
@@ -499,6 +500,10 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--serial-log")) serialLogPath = next();
         else if (!strcmp(a, "--serial-rate"))
             serialRate = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--wmap")) {
+            wmapFrom = strtoull(next(), nullptr, 0);
+            wmapTo = strtoull(next(), nullptr, 0);
+        }
         else if (!strcmp(a, "--ati-log-from"))
             atiLogFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
@@ -701,6 +706,10 @@ int main(int argc, char** argv)
         bus.rxPaceInsns = serialRate;
     if (atiLogFrom)
         bus.ati().logFrom = atiLogFrom;
+    if (wmapTo) {
+        bus.wmapFrom = wmapFrom;
+        bus.wmapTo = wmapTo;
+    }
     if (serialCr)
         bus.injectSerial("\r"); // CR in the escape window -> serial console
 
@@ -3629,6 +3638,22 @@ int main(int argc, char** argv)
             printf("   %c %08x %08x pc=%08x @%llu\n",
                    (sz[k].pa & 1u) ? 'r' : 'w', sz[k].pa & ~1u, sz[k].val,
                    sz[k].pc, static_cast<unsigned long long>(sz[k].at));
+    }
+    if (!bus.wmap.empty()) {
+        std::vector<std::pair<u64, u32>> hot;
+        for (const auto& b : bus.wmap)
+            hot.push_back({b.second, b.first});
+        std::sort(hot.begin(), hot.end(),
+                  [](const std::pair<u64, u32>& a,
+                     const std::pair<u64, u32>& b) {
+                      return a.first > b.first;
+                  });
+        printf("-- write heatmap over [%llu,%llu): %zu MiB buckets\n",
+               (unsigned long long)wmapFrom, (unsigned long long)wmapTo,
+               hot.size());
+        for (size_t k = 0; k < hot.size() && k < 24; ++k)
+            printf("   %04x00000  %12llu writes\n", hot[k].second,
+                   (unsigned long long)hot[k].first);
     }
     {
         const std::string& con = bus.console();

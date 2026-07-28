@@ -162,6 +162,10 @@ public:
     u32 watchPa = 0;
     u32 watchPaEnd = 0;
     u32 watchHits = 0;
+    // --wmap FROM TO: guest writes bucketed by megabyte of physical
+    // address, so "where is the OS painting" has an answer.
+    u64 wmapFrom = 0, wmapTo = 0;
+    std::map<u32, u64> wmap;
 
     void cfgSeed(u32 b, u32 latch, u32 nativeLeWord)
     {
@@ -517,6 +521,14 @@ private:
     // per address has been done three times on this machine already.
     void write(u32 pa, u32 v, u32 len)
     {
+        // Write heatmap. "The OS set a video mode and then painted
+        // nothing" is only ever half an observation — it painted
+        // somewhere, and no instrument could say where. Bucket every
+        // guest write by megabyte over a window and the destination names
+        // itself, whether that is the framebuffer aperture, an alias of
+        // it, or ordinary RAM because a base register was misread.
+        if (wmapTo && stamp && *stamp >= wmapFrom && *stamp < wmapTo)
+            ++wmap[pa >> 20];
         if (watchPa) {
             const u32 hi = watchPaEnd ? watchPaEnd : watchPa;
             // A write of len bytes at pa covers [pa, pa+len)

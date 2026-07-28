@@ -169,8 +169,14 @@ void R128Cell::write(u32 off, u32 v, u32 len)
         // fills 160 states long before the OS driver says anything.
         if (at >= logFrom && ddcWave.size() < 160)
             ddcWave.push_back({gpioSda_, gpioScl_});
+        // Pass the MASTER-driven SDA. Feeding the combined bus level in
+        // made our own slave generate edges: asserting the acknowledge
+        // pulls SDA low, and with SCL high the detector read that as a
+        // START and reset the shift register mid-byte. Start and stop are
+        // defined by what the master does; the slave.s pull-down only
+        // matters when a data bit is sampled.
         ddcStep(!(en2 & kDdcSclBit) || (lvl2 & kDdcSclBit),
-                (!(en2 & kDdcSdaBit) || (lvl2 & kDdcSdaBit)) && ddcSda());
+                !(en2 & kDdcSdaBit) || (lvl2 & kDdcSdaBit));
     } else if (aligned == kClockCntlData) {
         pll_[pllAddr_ & 0x3Fu] = native;
     } else if (aligned == 0x00B0u) { // PALETTE_INDEX
@@ -245,7 +251,7 @@ void R128Cell::ddcStep(bool scl, bool sda)
     if (scl && !ddc_.lastScl) { // rising edge: sample
         switch (ddc_.state) {
         case 1: // address byte
-            ddc_.shift = static_cast<u8>((ddc_.shift << 1) | (sda ? 1 : 0));
+            ddc_.shift = static_cast<u8>((ddc_.shift << 1) | ((sda && ddcSda()) ? 1 : 0));
             if (++ddc_.bits == 8) {
                 ddc_.addr = ddc_.shift;
                 ddcLastAddr = ddc_.addr;
@@ -257,7 +263,7 @@ void R128Cell::ddcStep(bool scl, bool sda)
             }
             break;
         case 3: // data byte from the host (the EDID offset)
-            ddc_.shift = static_cast<u8>((ddc_.shift << 1) | (sda ? 1 : 0));
+            ddc_.shift = static_cast<u8>((ddc_.shift << 1) | ((sda && ddcSda()) ? 1 : 0));
             if (++ddc_.bits == 8) {
                 ddc_.ptr = ddc_.shift;
                 ddc_.bits = 0;

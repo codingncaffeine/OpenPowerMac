@@ -39,6 +39,7 @@ public:
         bool wr;
     };
     std::vector<Ev> log; // first-touch + write traffic
+    u64 logFrom = 0;     // --ati-log-from N: ignore traffic before N
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;
 
@@ -99,6 +100,7 @@ private:
 
     std::map<u32, u32> regs_; // sparse store, offsets word-aligned
     std::map<u32, u32> seen_; // first-touch dedup for the log
+    bool gateOpened_ = false; // logFrom window has been entered
     u32 pllAddr_ = 0;         // CLOCK_CNTL_INDEX low byte
     std::map<u32, u32> pll_;  // PLL register file
     u32 palIdx_ = 0;

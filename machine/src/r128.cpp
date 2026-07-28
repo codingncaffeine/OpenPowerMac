@@ -84,14 +84,27 @@ u32 R128Cell::regRead(u32 idx)
 
 void R128Cell::note(u32 off, u32 val, bool wr)
 {
+    // The card's own FCode bring-up issues thousands of accesses around
+    // 330M and fills the log, so by the time the OS driver touches a
+    // register at 3.9G there is no room left and the accesses that matter
+    // are invisible. logFrom opens the window late; the first-touch set is
+    // cleared as it opens so the OS era gets its own first touches rather
+    // than inheriting the firmware's.
+    const u64 at = stamp ? *stamp : 0;
+    if (at < logFrom)
+        return;
+    if (logFrom && !gateOpened_) {
+        gateOpened_ = true;
+        seen_.clear();
+        log.clear();
+    }
     if (!wr) {
         if (seen_.count(off))
             return;
         seen_[off] = 1;
     }
     if (log.size() < 4096)
-        log.push_back({stamp ? *stamp : 0, off, val,
-                       pcRef ? *pcRef : 0, wr});
+        log.push_back({at, off, val, pcRef ? *pcRef : 0, wr});
 }
 
 u32 R128Cell::read(u32 off, u32 len)

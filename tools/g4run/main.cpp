@@ -331,6 +331,7 @@ int main(int argc, char** argv)
     const char* eventsPath = nullptr;  // --events FILE (JSONL)
     const char* serialLogPath = nullptr; // --serial-log FILE
     u64 serialRate = 0;                // --serial-rate N
+    u64 atiLogFrom = 0;                // --ati-log-from N
     u32 watchVa = 0;                   // --watch-va ADDR
     u64 traceFrom = 0;                 // --trace-from N: full trace window
     u64 traceLines = 2000;             // --trace-lines M
@@ -498,6 +499,8 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--serial-log")) serialLogPath = next();
         else if (!strcmp(a, "--serial-rate"))
             serialRate = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--ati-log-from"))
+            atiLogFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
             traceFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-lines"))
@@ -696,6 +699,8 @@ int main(int argc, char** argv)
 
     if (serialRate)
         bus.rxPaceInsns = serialRate;
+    if (atiLogFrom)
+        bus.ati().logFrom = atiLogFrom;
     if (serialCr)
         bus.injectSerial("\r"); // CR in the escape window -> serial console
 

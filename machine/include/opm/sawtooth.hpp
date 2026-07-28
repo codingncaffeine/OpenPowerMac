@@ -7,6 +7,7 @@
 #include "opm/openpic.hpp"
 #include "opm/pmu.hpp"
 #include "opm/types.hpp"
+#include <cstring>
 
 #include <cstdio>
 #include <map>
@@ -196,6 +197,18 @@ public:
     static constexpr u32 kUniNSize = 0x3000u;
 
     const std::vector<RegWr>& uninLog() const { return uninLog_; }
+
+    // A system reset, as the PMU's 0xD0 command performs it. The ASICs
+    // come back at power-on values; RAM, the attached media and the flash
+    // do not, which is what makes a warm restart a restart rather than a
+    // new machine. The boot ROM writes 2 to Uni-North +0x70 on its way up
+    // and, on the next pass, reads it back and parks forever at fff03600
+    // if bit 1 is still set — so a reset that leaves this register alone
+    // produces a machine that resets once and then never boots again.
+    void systemReset()
+    {
+        memset(unin_, 0, kUniNSize);
+    }
 
     struct Acc {
         u64 firstAt = 0;

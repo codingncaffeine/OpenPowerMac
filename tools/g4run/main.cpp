@@ -1061,6 +1061,7 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(executed));
             fflush(stdout);
             cpu.reset();
+            bus.systemReset();
             cpu.wpPa = wpPa;
             cpu.wpEnd = wpEnd;
             continue;

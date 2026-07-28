@@ -29,6 +29,7 @@ public:
     std::vector<u8> vram;
     // Framebuffer write census — see Sawtooth::write.
     u64 fbWrites = 0;
+    u32 fbBase = 0; // CONFIG_APER_0_BASE: where the OS should paint
     u32 fbLo = 0xFFFFFFFFu, fbHi = 0;
 
     R128Cell() : vram(32u << 20, 0) {}

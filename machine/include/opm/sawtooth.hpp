@@ -824,6 +824,7 @@ private:
                 case 0x10u:
                     word &= 0xFE000000u;
                     atiFbBar_ = (word != 0xFE000000u) ? word : atiFbBar_;
+                    ati_.fbBase = atiFbBar_;
                     break;
                 case 0x14u:
                     // The I/O BAR is not decoration: Open Firmware drives

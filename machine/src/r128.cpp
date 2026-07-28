@@ -11,7 +11,8 @@ static constexpr u32 kClockCntlData = 0x000C;
 static constexpr u32 kBiosScratch = 0x0010;  // BIOS_0_SCRATCH..
 static constexpr u32 kGenReset = 0x00F0;     // GEN_RESET_CNTL
 static constexpr u32 kConfigMemsize = 0x00F8;
-static constexpr u32 kConfigAperSize = 0x0100;
+static constexpr u32 kConfigAper0Base = 0x0100; // CONFIG_APER_0_BASE
+static constexpr u32 kConfigAperSize = 0x0108;  // CONFIG_APER_SIZE
 static constexpr u32 kMemCntl = 0x0140;
 static constexpr u32 kCrtcGenCntl = 0x0050;
 static constexpr u32 kGpioMonid = 0x0068;    // DDC bit-bang
@@ -53,6 +54,13 @@ u32 R128Cell::regRead(u32 idx)
 {
     const u32 off = idx << 2;
     switch (off) {
+    case kConfigAper0Base: {
+        // The framebuffer aperture BASE, not its size. Returning 32 MB here
+        // handed the driver 0x02000000 as the VRAM address, so it painted
+        // into system RAM and the framebuffer counter stayed at zero in
+        // every run. CONFIG_APER_SIZE is 0x0108.
+        return fbBase;
+    }
     case kConfigMemsize:
     case kConfigAperSize: {
         // Power-on default 32 MB; if the init code programs the field,

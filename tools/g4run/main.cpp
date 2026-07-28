@@ -243,6 +243,8 @@ int main(int argc, char** argv)
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
     u64 dumpStructsAt = 0;             // --dump-structs-at N
     u64 dumpRamAt = 0;                 // --dump-ram-at N
+    u32 peekAddr = 0, peekLen = 64;    // --peek VA [LEN] (guest virtual)
+    u64 peekAt = 0;                    // --peek-at N
     bool dumpStructsEnd = false;       // --dump-structs
     const char* eventsPath = nullptr;  // --events FILE (JSONL)
     u32 watchVa = 0;                   // --watch-va ADDR
@@ -331,6 +333,12 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--arm-on-pc"))
             armOnPc = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--dump-structs")) dumpStructsEnd = true;
+        else if (!strcmp(a, "--peek")) {
+            peekAddr = static_cast<u32>(strtoul(next(), nullptr, 0));
+            peekLen = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
+        else if (!strcmp(a, "--peek-at"))
+            peekAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-ram-at"))
             dumpRamAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-structs-at"))
@@ -988,6 +996,27 @@ int main(int argc, char** argv)
                        ramDumpPath);
             }
             ramDumpPath = nullptr; // once
+        }
+        // Read guest memory at a VIRTUAL address, through the live MMU, at a
+        // chosen instant. Structures the guest builds live in whatever
+        // address space is current, so a physical dump at the same number
+        // reads the RAM junk fill instead — which is how a driver's identify
+        // buffer looked empty when the host had in fact pulled all 512 bytes.
+        if (peekAddr && executed == peekAt) {
+            printf("== peek %08x len %u @%llu\n", peekAddr, peekLen,
+                   static_cast<unsigned long long>(executed));
+            for (u32 row = 0; row < peekLen; row += 16) {
+                printf("   +%03x:", row);
+                for (u32 k = 0; k < 16 && row + k < peekLen; ++k) {
+                    const long long v = guest(peekAddr + row + k, 1);
+                    if (v < 0)
+                        printf(" ??");
+                    else
+                        printf(" %02llx", v & 0xFF);
+                }
+                printf("\n");
+            }
+            fflush(stdout);
         }
         if (dumpStructsAt && executed == dumpStructsAt)
             dumpStructs("--dump-structs-at");
@@ -2548,8 +2577,10 @@ int main(int argc, char** argv)
                        hl[k].a, hl[k].b,
                        static_cast<unsigned long long>(hl[k].at), hl[k].pc);
             else
-                printf("%c%02x@%llu/%08x ", hl[k].kind, hl[k].val,
+                printf("%c%02x@%llu/%08x", hl[k].kind, hl[k].val,
                        static_cast<unsigned long long>(hl[k].at), hl[k].pc);
+            if (hl[k].xfer) printf("[%uB]", hl[k].xfer);
+            printf(" ");
         }
         printf("\n   ... tail ...\n   ");
         const size_t hs = hl.size() > 200 ? hl.size() - 200 : 0;
@@ -2558,8 +2589,10 @@ int main(int argc, char** argv)
                 printf("%c%02x:%x+%x@%llu/%08x ", hl[k].kind, hl[k].val, hl[k].a,
                        hl[k].b, static_cast<unsigned long long>(hl[k].at), hl[k].pc);
             else
-                printf("%c%02x@%llu/%08x ", hl[k].kind, hl[k].val,
+                printf("%c%02x@%llu/%08x", hl[k].kind, hl[k].val,
                        static_cast<unsigned long long>(hl[k].at), hl[k].pc);
+            if (hl[k].xfer) printf("[%uB]", hl[k].xfer);
+            printf(" ");
         }
         printf("\n");
     }

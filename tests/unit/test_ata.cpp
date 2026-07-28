@@ -40,13 +40,25 @@ bool makeIso()
     return ok;
 }
 
-// Drain 256 words of an IDENTIFY response the way a driver does: one 16-bit
-// read of the data register at a time.
+// Drain 256 words of an IDENTIFY the way a driver does — one 16-bit read of
+// the data register at a time — and apply the transport's byte swap.
+//
+// The mac-io ATA data register is byte-reversed on the 60x side, so the Mac
+// driver reads it with a byte-swapping load and the buffer it builds in
+// memory is the little-endian image. Measured directly with g4run's --peek
+// on the ATA Manager's identify buffer: the guest's copy of a big-endian
+// buffer came out reversed throughout — geometry 16383/16/63 arrived as
+// ff3f/1000/3f00 and the serial "OPM00000001" as "PO0M000000 1", and
+// .ATALoad then divided by a zero field and sad-macked. This models the
+// same path, so the test asserts what the GUEST sees rather than what the
+// cell happens to return.
+u16 hostSwap(u16 v) { return static_cast<u16>((v >> 8) | (v << 8)); }
+
 std::vector<u16> readIdentify(AtaCell& c)
 {
     std::vector<u16> w;
     for (u32 k = 0; k < 256; ++k)
-        w.push_back(static_cast<u16>(c.read(0x000, 2)));
+        w.push_back(hostSwap(static_cast<u16>(c.read(0x000, 2))));
     return w;
 }
 

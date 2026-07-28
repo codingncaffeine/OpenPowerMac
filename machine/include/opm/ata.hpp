@@ -55,6 +55,7 @@ public:
         u8 val;
         u32 a = 0, b = 0; // READ ops: LBA + sector count
         u32 pc = 0;    // the instruction that issued it
+        u32 xfer = 0;  // bytes the host actually pulled for this command
     };
     std::vector<Ev> log;
     const u64* stamp = nullptr;
@@ -109,6 +110,7 @@ private:
     u64 readLba_ = 0;
     u32 readLeft_ = 0;
     u8 sense_ = 0; // last sense key
+    u32 pulled_ = 0; // data-register bytes served since the last command
     bool irq_ = false;
     // Cell (not drive) registers at +0x200 and up: PIO/DMA timing. They sit
     // in mac-io, so drive select and an absent slave are irrelevant to them

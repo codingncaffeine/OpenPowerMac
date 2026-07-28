@@ -88,8 +88,14 @@ void AtaCell::diskCommand(u8 cmd)
     case 0xEC: { // IDENTIFY DEVICE
         data_.assign(512, 0);
         auto w16 = [&](u32 word, u16 val) {
-            data_[2 * word] = static_cast<u8>(val >> 8);
-            data_[2 * word + 1] = static_cast<u8>(val);
+            // IDENTIFY words are stored LITTLE-ENDIAN in the buffer: the
+            // mac-io data register is byte-reversed on the 60x side, so the
+            // driver reads it with a byte-swapping load. Storing big-endian
+            // put every value in the guest.s memory backwards - measured:
+            // geometry 16383/16/63 arrived as ff3f/1000/3f00 and the serial
+            // "OPM00000001" as "PO0M000000 1".
+            data_[2 * word] = static_cast<u8>(val);
+            data_[2 * word + 1] = static_cast<u8>(val >> 8);
         };
         auto text = [&](u32 word, u32 words, const char* s) {
             for (u32 k = 0; k < words * 2; ++k) {
@@ -100,7 +106,10 @@ void AtaCell::diskCommand(u8 cmd)
                 // every character pair backwards, so the guest read the
                 // model as "AMSTIHATC -DOR MRC1-57" — and the on-disc Apple
                 // CD driver whitelists mechanisms BY MODEL STRING.
-                data_[2 * word + k] = static_cast<u8>(c);
+                // LE buffer: char0 goes in the HIGH byte of the word,
+                // which is data_[2n+1] once the word is stored little-
+                // endian. The transport swaps it back on the way out.
+                data_[2 * word + (k ^ 1)] = static_cast<u8>(c);
             }
         };
         const u32 secs = static_cast<u32>(diskSectors_ > 0x0FFFFFFFull
@@ -249,6 +258,7 @@ u32 AtaCell::read(u32 off, u32 len)
     switch (off & 0xFF0u) {
     case 0x000: { // data: PIO out of data_
         u32 v = 0;
+        pulled_ += len;
         for (u32 k = 0; k < len && dataAt_ < data_.size(); ++k)
             v = (v << 8) | data_[dataAt_++];
         if (dataAt_ >= data_.size())
@@ -356,6 +366,14 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 
 void AtaCell::ataCommand(u8 cmd)
 {
+    // Attribute the bytes the host pulled to the command that produced
+    // them. The data register is deliberately absent from the register
+    // trace, so "did the guest actually READ our IDENTIFY" had no answer
+    // at all — and a driver that issues a command and never drains it
+    // looks identical to one that read the data and disliked it.
+    if (!log.empty())
+        log.back().xfer = pulled_;
+    pulled_ = 0;
     if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
     if (true)
@@ -378,8 +396,8 @@ void AtaCell::ataCommand(u8 cmd)
     case 0xA1: { // IDENTIFY PACKET DEVICE
         data_.assign(512, 0);
         auto w16 = [&](u32 word, u16 val) {
-            data_[2 * word] = static_cast<u8>(val >> 8); // served BE per
-            data_[2 * word + 1] = static_cast<u8>(val);  // PIO byte order
+            data_[2 * word] = static_cast<u8>(val);      // stored LE: the
+            data_[2 * word + 1] = static_cast<u8>(val >> 8); // bus swaps
         };
         w16(0, 0x8580); // ATAPI, CD-ROM, removable, 12-byte CDB
         auto text = [&](u32 word, u32 words, const char* s) {
@@ -391,7 +409,7 @@ void AtaCell::ataCommand(u8 cmd)
                 // every character pair backwards, so the guest read the
                 // model as "AMSTIHATC -DOR MRC1-57" — and the on-disc Apple
                 // CD driver whitelists mechanisms BY MODEL STRING.
-                data_[2 * word + k] = static_cast<u8>(c);
+                data_[2 * word + (k ^ 1)] = static_cast<u8>(c);
             }
         };
         // The Mac OS CD driver whitelists mechanisms by model string

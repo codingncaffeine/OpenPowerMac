@@ -572,6 +572,17 @@ private:
                 return;
             }
             put(kl_.data() + off, v, len);
+            // +0x61 bit 1 is a level INPUT, not a storage bit, and Open
+            // Firmware reads it as a "reset the configuration" strap: with
+            // it low (and security mode off) the startup runs gen-defaults
+            // + gen-default-vars, which overwrite every /options property
+            // that (gen-configs) just built out of NVRAM with the built-in
+            // default. That is why auto-boot?, use-nvramrc?, input-device
+            // and output-device were never once under our control. A wide
+            // store over the GPIO block cleared it; an input line cannot be
+            // cleared by a store.
+            if (off <= 0x61u && off + len > 0x61u)
+                kl_[0x61] = static_cast<u8>(kl_[0x61] | 0x02u);
             klNote(kMacIoBase + off, v, true);
             return;
         }

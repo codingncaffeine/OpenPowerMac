@@ -242,6 +242,12 @@ public:
     // each new register the ROM consults stays visible. Blocks earn real
     // device models as the boot demands behavior a store can't fake.
     static constexpr u32 kMacIoBase = 0xF3000000u;
+    // KeyLargo GPIO block: 0x30 bytes at mac-io +0x50 (QEMU hw/misc/macio).
+    static constexpr u32 kGpioBase = 0x50u;
+    static constexpr u32 kGpioSize = 0x30u;
+    static constexpr u8 kGpioOutData = 1u;
+    static constexpr u8 kGpioInData = 2u;
+    static constexpr u8 kGpioOutEnable = 4u;
     static constexpr u32 kMacIoBar = 0x80000000u; // OF's PCI BAR assignment
     static constexpr u32 kMacIoSize = 0x80000u;
     const std::map<u32, Acc>& macioLog() const { return klLog_; }
@@ -571,18 +577,43 @@ private:
                 }
                 return;
             }
+            u8 gpioOld[8] = {};
+            for (u32 k = 0; k < len && k < 8; ++k)
+                gpioOld[k] = kl_[off + k]; // before the store
             put(kl_.data() + off, v, len);
-            // +0x61 bit 1 is a level INPUT, not a storage bit, and Open
-            // Firmware reads it as a "reset the configuration" strap: with
-            // it low (and security mode off) the startup runs gen-defaults
-            // + gen-default-vars, which overwrite every /options property
-            // that (gen-configs) just built out of NVRAM with the built-in
-            // default. That is why auto-boot?, use-nvramrc?, input-device
-            // and output-device were never once under our control. A wide
-            // store over the GPIO block cleared it; an input line cannot be
-            // cleared by a store.
-            if (off <= 0x61u && off + len > 0x61u)
-                kl_[0x61] = static_cast<u8>(kl_[0x61] | 0x02u);
+            // KeyLargo's GPIO block is 0x30 bytes at mac-io +0x50, and it
+            // is NOT storage. The first eight are level registers and are
+            // read-only; in the rest, bit 1 is IN_DATA — an input — and a
+            // store cannot drive it. It reflects OUT_DATA only while
+            // OUT_ENABLE is set, and otherwise holds its own value.
+            //
+            // This was found one register at a time: +0x61 is index 17 in
+            // the block (GPIO9), and Open Firmware reads its bit 1 as a
+            // "reset the configuration" strap — with it low, startup runs
+            // gen-defaults + gen-default-vars and overwrites every
+            // /options property that (gen-configs) just built out of
+            // NVRAM, which is why auto-boot?, use-nvramrc?, input-device
+            // and output-device were never under our control. A wide store
+            // across the block had been clearing it. The whole block obeys
+            // the same rule, so model the rule rather than the symptom.
+            for (u32 k = 0; k < len && k < 8; ++k) {
+                const u32 g = off + k;
+                if (g < kGpioBase || g >= kGpioBase + kGpioSize)
+                    continue;
+                if (g < kGpioBase + 8u) { // level registers: read-only
+                    kl_[g] = gpioOld[k];
+                    continue;
+                }
+                // The stored byte is now the incoming value; IN_DATA is an
+                // input, so take it from the pre-store byte unless
+                // OUT_ENABLE says the pin is driving.
+                u8 nv = static_cast<u8>(kl_[g] & ~kGpioInData);
+                nv = static_cast<u8>(
+                    nv | ((nv & kGpioOutEnable)
+                              ? static_cast<u8>((nv & kGpioOutData) << 1)
+                              : (gpioOld[k] & kGpioInData)));
+                kl_[g] = nv;
+            }
             klNote(kMacIoBase + off, v, true);
             return;
         }
@@ -1042,6 +1073,7 @@ private:
     std::vector<u8> ram_, rom_;
     u8 unin_[kUniNSize] = {};
     std::vector<u8> kl_ = std::vector<u8>(kMacIoSize, 0);
+    u8 klGpioPrev_[0x30] = {};
     std::vector<RegWr> uninLog_;
     std::vector<RegWr> flashLog_;
     std::vector<RegWr> atiIoLog_; // the card's I/O aperture, in order

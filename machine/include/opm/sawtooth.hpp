@@ -259,6 +259,14 @@ public:
     // ISO is attached; the other buses stay empty. Non-data register
     // traffic is logged bus-tagged.
     const std::vector<RegWr>& ataLog() const { return ataLog_; }
+    // Where Open Firmware actually put the display. An NDRV computes its
+    // register base from the device tree, so an unrouted BAR shows up as a
+    // DSI on a plausible-looking address rather than as anything about
+    // video — the boot died on lwzx from 0x92000104 with these at 0.
+    u32 atiRegBar() const { return atiRegBar_; }
+    u32 atiFbBar() const { return atiFbBar_; }
+    u32 atiRomBar() const { return atiRomBar_; }
+    u32 ohciBar(u32 i) const { return ohciBar_[i & 1u]; }
     bool attachCd(const char* path) { return cd_.attachIso(path); }
     bool attachHd(const char* path) { return hd_.attachDisk(path); }
     AtaCell& hd() { return hd_; }

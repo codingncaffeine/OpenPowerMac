@@ -241,6 +241,7 @@ struct SymTab {
 int main(int argc, char** argv)
 {
     const char* romPath = nullptr;
+    std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
     size_t ramMb = 256;
     bool trace = false;
@@ -318,6 +319,7 @@ int main(int argc, char** argv)
             return argv[++i];
         };
         if (!strcmp(a, "--rom")) romPath = next();
+        else if (!strcmp(a, "--nvram-set")) nvramSet.push_back(next());
         else if (!strcmp(a, "--ram")) ramMb = strtoul(next(), nullptr, 0);
         else if (!strcmp(a, "--max")) maxInsns = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace")) trace = true;
@@ -470,6 +472,82 @@ int main(int argc, char** argv)
     std::vector<u8> rom = readFile(romPath);
     if (rom.size() != SawtoothBus::kRomSize)
         printf("-- note: rom is %zu bytes (expected 1 MiB)\n", rom.size());
+    // Open Firmware configuration variables, set before the machine sees
+    // the flash.
+    //
+    // The ROM carries the default "common" NVRAM partition, and its
+    // `boot-device` is a FireWire path — `fwx/node@30e009e0138e08/sbp-2@…`
+    // — left behind by whoever dumped this ROM. With `auto-boot?=true` and
+    // a boot device that cannot exist, Open Firmware tries, fails, and
+    // drops to a prompt. That is survivable only while OF is talking to the
+    // serial port: once the display card's FCode runs, `output-device=screen`
+    // wins, nothing reaches the serial console, and the injected script is
+    // never read — so the machine that has a display is exactly the machine
+    // that cannot be told to boot.
+    //
+    // The variables are a packed list of NAME=VALUE\0 inside the partition,
+    // and the CHRP header checksum covers only the header, so an entry can
+    // be rewritten and the remainder shifted up without touching it.
+    for (const std::string& kv : nvramSet) {
+        const size_t eq = kv.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            printf("-- nvram-set: ignoring %s (want NAME=VALUE)\n",
+                   kv.c_str());
+            continue;
+        }
+        // Locate the partition: signature 0x70 then the name "common".
+        size_t part = 0;
+        for (size_t p = 0; p + 16 <= rom.size(); p += 16) {
+            if (rom[p] == 0x70 && memcmp(&rom[p + 4], "common", 6) == 0) {
+                part = p;
+                break;
+            }
+        }
+        if (!part) {
+            printf("-- nvram-set: no \"common\" partition in this rom\n");
+            break;
+        }
+        const size_t dataAt = part + 16;
+        const size_t dataEnd =
+            part + size_t((rom[part + 2] << 8) | rom[part + 3]) * 16u;
+        if (dataEnd <= dataAt || dataEnd > rom.size()) {
+            printf("-- nvram-set: partition length is implausible\n");
+            break;
+        }
+        const std::string key = kv.substr(0, eq + 1); // "name="
+        size_t at = std::string::npos;
+        for (size_t p = dataAt; p + key.size() < dataEnd; ++p) {
+            if ((p == dataAt || rom[p - 1] == 0) &&
+                memcmp(&rom[p], key.data(), key.size()) == 0) {
+                at = p;
+                break;
+            }
+        }
+        if (at == std::string::npos) {
+            printf("-- nvram-set: %s not present in the defaults\n",
+                   key.c_str());
+            continue;
+        }
+        size_t oldEnd = at;
+        while (oldEnd < dataEnd && rom[oldEnd] != 0)
+            ++oldEnd;
+        ++oldEnd; // include the terminator
+        const size_t oldLen = oldEnd - at;
+        const size_t newLen = kv.size() + 1;
+        std::vector<u8> tail(rom.begin() + static_cast<long>(oldEnd),
+                             rom.begin() + static_cast<long>(dataEnd));
+        if (at + newLen + tail.size() > dataEnd) {
+            printf("-- nvram-set: %s does not fit\n", kv.c_str());
+            continue;
+        }
+        memcpy(&rom[at], kv.data(), kv.size());
+        rom[at + kv.size()] = 0;
+        memcpy(&rom[at + newLen], tail.data(), tail.size());
+        std::fill(rom.begin() + static_cast<long>(at + newLen + tail.size()),
+                  rom.begin() + static_cast<long>(dataEnd), u8(0));
+        printf("-- nvram-set: %s (was %zu bytes, now %zu)\n", kv.c_str(),
+               oldLen - 1, newLen - 1);
+    }
     printf("-- rom: %zu bytes, ram: %zu MiB\n", rom.size(), ramMb);
     SawtoothBus bus(ramMb * 1024 * 1024, std::move(rom));
 
@@ -2777,6 +2855,39 @@ int main(int argc, char** argv)
                    static_cast<int>(h.len * 2), h.val, h.pc,
                    static_cast<unsigned long long>(h.tb));
     }
+    // The MMU as the guest left it. A DSI names an address but not WHY it
+    // failed, and "the BAR is routed on the bus" and "the guest can reach
+    // that address" are different claims: the boot died on a load from
+    // 0x92000104, which IS the ATI register BAR and IS routed, because
+    // nothing in the guest's own translation covered it.
+    {
+        printf("-- mmu: sdr1=%08x msr=%08x\n", cpu.st.sdr1, cpu.st.msr);
+        for (u32 i = 0; i < 4; ++i) {
+            const u32 u = cpu.st.dbatu[i], l = cpu.st.dbatl[i];
+            if (!u && !l)
+                continue;
+            printf("   dbat%u %08x/%08x  ea %08x len %uKB -> pa %08x "
+                   "%s%s wimg=%x pp=%u\n",
+                   i, u, l, u & 0xFFFE0000u,
+                   (((u >> 2) & 0x7FFu) + 1u) * 128u, l & 0xFFFE0000u,
+                   (u & 2u) ? "Vs" : "--", (u & 1u) ? "Vp" : "--",
+                   (l >> 3) & 0xFu, l & 3u);
+        }
+        for (u32 i = 0; i < 4; ++i) {
+            const u32 u = cpu.st.ibatu[i], l = cpu.st.ibatl[i];
+            if (!u && !l)
+                continue;
+            printf("   ibat%u %08x/%08x  ea %08x len %uKB -> pa %08x "
+                   "%s%s\n",
+                   i, u, l, u & 0xFFFE0000u,
+                   (((u >> 2) & 0x7FFu) + 1u) * 128u, l & 0xFFFE0000u,
+                   (u & 2u) ? "Vs" : "--", (u & 1u) ? "Vp" : "--");
+        }
+        printf("   sr:");
+        for (u32 i = 0; i < 16; ++i)
+            printf(" %08x", cpu.st.sr[i]);
+        printf("\n");
+    }
     // Guest time, measured rather than assumed. The 68K park at ffc03664 is
     // `moveq #15,d0; add.l Ticks,d0; cmp.l Ticks,d0; bcc *-4` — a quarter-
     // second delay off the 60 Hz tick — so how fast Ticks runs IS whether
@@ -3107,6 +3218,10 @@ int main(int argc, char** argv)
         printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
                "offset=%08x\n",
                gen, w, h, fmt, pitch8, offset);
+        printf("-- ati bars: reg=%08x fb=%08x rom=%08x  ohci0=%08x "
+               "ohci1=%08x\n",
+               bus.atiRegBar(), bus.atiFbBar(), bus.atiRomBar(),
+               bus.ohciBar(0), bus.ohciBar(1));
         printf("-- ati framebuffer: %llu writes, span %08x..%08x\n",
                static_cast<unsigned long long>(bus.ati().fbWrites),
                bus.ati().fbWrites ? bus.ati().fbLo : 0u, bus.ati().fbHi);

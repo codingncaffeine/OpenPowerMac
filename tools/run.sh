@@ -12,6 +12,6 @@ exec ./build/tools/g4run/Release/g4run.exe \
  --cd "/c/Users/gamer/Downloads/PowerMacG4.iso" \
  --hd "../scratch/openpowermac/hd.img" \
  --ati-rom "../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom" \
- --ati-at 236000000 \
+ --ati-at "${OPM_ATI_AT:-236000000}" \
  --serial-input '" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 probe-pci-device;unselect-dev;dev /pci@f0000000/pci1002,5046@10;" ATY,Rage128Pd" device-name;" display" device-type;" ATY,Rage128Pd" encode-string " compatible" property;" /pci@f2000000" select-dev;3000000 to pci-probe-request;unselect-dev;probe-pci;dev /pci@f2000000/pci106b,19@18;" usb" device-name;" usb" device-type;dev /pci@f2000000/pci106b,19@19;" usb" device-name;" usb" device-type;mac-boot' \
  "$@"

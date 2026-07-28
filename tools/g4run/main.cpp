@@ -289,6 +289,7 @@ int main(int argc, char** argv)
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
     u32 bpPc[8] = {}, bpHit[8] = {}, bpN = 0; // --bp VA: register breakpoints
+    u32 bp68Pc[8] = {}, bp68Hit[8] = {}, bp68N = 0; // --bp68 VA
     u32 bpMax = 4, bpDeref = 96;       // --bp-max N, --bp-deref BYTES
     u64 bpFrom = 0;                    // --bp-from N: ignore hits before N
     u64 dumpStructsAt = 0;             // --dump-structs-at N
@@ -395,6 +396,11 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--bp")) {
             if (bpN < 8)
                 bpPc[bpN++] = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
+        else if (!strcmp(a, "--bp68")) {
+            if (bp68N < 8)
+                bp68Pc[bp68N++] =
+                    static_cast<u32>(strtoul(next(), nullptr, 0)) & ~1u;
         }
         else if (!strcmp(a, "--bp-max"))
             bpMax = static_cast<u32>(strtoul(next(), nullptr, 0));
@@ -1297,6 +1303,63 @@ int main(int argc, char** argv)
         // (goes stale the moment timing shifts). Naming a PC is durable, and
         // the state that matters at an error site is almost always behind a
         // pointer, so dereference the argument registers too.
+        // The same breakpoint, on the 68K side. The emulator's fetch pointer
+        // is r24, so a PowerPC breakpoint cannot express "stop when the 68K
+        // reaches this address" — and the interesting faults are 68K
+        // exceptions, whose vector number and fault address live in a frame
+        // on the 68K stack (A7 = r23), not in any PowerPC register.
+        if (bp68N && executed >= bpFrom &&
+            (pc & 0xFF000000u) == 0x68000000u) {
+            const u32 p68 = cpu.st.gpr[24] & ~1u;
+            for (u32 bi = 0; bi < bp68N; ++bi) {
+                if (p68 != bp68Pc[bi] || bp68Hit[bi] >= bpMax)
+                    continue;
+                ++bp68Hit[bi];
+                printf("== BP68%u pc68=%08x hit#%u @%llu\n", bi, p68,
+                       bp68Hit[bi],
+                       static_cast<unsigned long long>(executed));
+                printf("   D0-D7:");
+                for (u32 k = 8; k < 16; ++k)
+                    printf(" %08x", cpu.st.gpr[k]);
+                printf("\n   A0-A7:");
+                for (u32 k = 16; k < 24; ++k)
+                    printf(" %08x", cpu.st.gpr[k]);
+                printf("\n");
+                cpu.l1dFlushAll(true);
+                cpu.l2FlushAll(true);
+                const CpuState saved68 = cpu.st;
+                cpu.st.msr |= 0x30u;
+                const CpuState armed68 = cpu.st;
+                auto peek = [&](u32 a68, u32& out) {
+                    u32 pa = 0;
+                    cpu.st = armed68;
+                    const bool ok = cpu.translate(a68, false, false, pa);
+                    cpu.st = armed68;
+                    if (!ok) {
+                        if (a68 >= 0x00400000u)
+                            return false;
+                        pa = a68 + 0x4000u; // 68K low memory
+                    }
+                    if (pa + 4 > bus.ram().size())
+                        return false;
+                    out = bus.read32(pa);
+                    return true;
+                };
+                const u32 a7 = cpu.st.gpr[23];
+                printf("   (A7)@%08x:", a7);
+                for (u32 o = 0; o < 32; o += 4) {
+                    u32 v = 0;
+                    if (peek(a7 + o, v))
+                        printf(" %08x", v);
+                    else
+                        printf(" --------");
+                }
+                printf("\n");
+                cpu.st = saved68;
+                cpu.raisedThisStep = false;
+                fflush(stdout);
+            }
+        }
         if (bpN && executed >= bpFrom) {
             for (u32 bi = 0; bi < bpN; ++bi) {
                 if (pc != bpPc[bi] || bpHit[bi] >= bpMax)
@@ -1312,10 +1375,20 @@ int main(int argc, char** argv)
                         printf(" %08x", cpu.st.gpr[g + k]);
                     printf("\n");
                 }
+                // Flush first. Dereferencing straight off the bus reads
+                // AROUND the caches, so a pointer the guest has just
+                // written still shows its old value — and a stale TVector
+                // reads exactly like a corrupt one.
+                cpu.l1dFlushAll(true);
+                cpu.l2FlushAll(true);
                 const CpuState savedBp = cpu.st;
                 cpu.st.msr |= 0x30u;
                 const CpuState armedBp = cpu.st;
-                for (u32 g = 3; g <= 6; ++g) {
+                // r3-r12: the PowerOpen argument registers plus r11/r12, which
+                // carry the TVector on every cross-fragment call — the
+                // callee address lives at *r12, so a breakpoint that cannot
+                // see r12 cannot name what is about to be called.
+                for (u32 g = 3; g <= 12; ++g) {
                     const u32 ea = cpu.st.gpr[g];
                     if (ea < 0x1000u || ea >= 0xF0000000u)
                         continue;
@@ -2898,9 +2971,9 @@ int main(int argc, char** argv)
         // first 120 entries are an arbitrary window that has nothing to do
         // with what the run was asked to investigate.
         const auto& al = bus.ataLog();
-        printf("-- ata traffic (%zu; last 160; off r/w val pc):\n",
+        printf("-- ata traffic (%zu; last 1200; off r/w val pc):\n",
                al.size());
-        const size_t as = al.size() > 160 ? al.size() - 160 : 0;
+        const size_t as = al.size() > 1200 ? al.size() - 1200 : 0;
         for (size_t k = as; k < al.size(); ++k)
             printf("   +%05x %c %02x pc=%08x @%llu\n", al[k].pa & ~1u,
                    (al[k].pa & 1u) ? 'r' : 'w', al[k].val & 0xFFu,

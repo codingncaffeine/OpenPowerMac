@@ -3749,6 +3749,33 @@ int main(int argc, char** argv)
                bus.ati().ddcBytes);
         printf("--   last DDC address byte: 0x%03x\n",
                bus.ati().ddcLastAddr);
+        // The waveform was captured all along and never printed, which is
+        // why the line assignment kept being guessed instead of read. Each
+        // state is the pair of raw register values at the moment either
+        // line register was written; decode it the way the slave does, so
+        // "617 starts and no address byte" can be seen rather than
+        // inferred. A start is SDA falling while SCL is high, so a run of
+        // them means the decode is calling ordinary data bits starts.
+        {
+            const auto& wave = bus.ati().ddcWave;
+            printf("-- ddc waveform (%zu states; levels enables -> scl sda"
+                   " | edge):\n", wave.size());
+            bool pScl = true, pSda = true;
+            for (size_t k = 0; k < wave.size(); ++k) {
+                const u32 lvl = wave[k].first, en = wave[k].second;
+                const bool scl = !(en & 0x00400000u) || (lvl & 0x00400000u);
+                const bool sda = !(en & 0x00800000u) || (lvl & 0x00800000u);
+                const char* edge = "";
+                if (pScl && scl && sda != pSda)
+                    edge = sda ? "STOP" : "START";
+                else if (scl && !pScl)
+                    edge = "sample";
+                printf("   %3zu %08x %08x -> scl=%d sda=%d %s\n", k, lvl, en,
+                       scl ? 1 : 0, sda ? 1 : 0, edge);
+                pScl = scl;
+                pSda = sda;
+            }
+        }
         printf("-- ati bars: reg=%08x fb=%08x rom=%08x io=%08x  "
                "ohci0=%08x ohci1=%08x\n",
                bus.atiRegBar(), bus.atiFbBar(), bus.atiRomBar(),

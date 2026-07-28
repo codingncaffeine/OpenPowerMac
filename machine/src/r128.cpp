@@ -132,6 +132,7 @@ void R128Cell::write(u32 off, u32 v, u32 len)
                      (((v >> (8 * (len - 1 - k))) & 0xFFu) << (8 * lane));
         }
     }
+    const u64 at = stamp ? *stamp : 0;
     note(off & ~3u, native, true);
     const u32 aligned = off & ~3u;
     if (aligned == kClockCntlIndex) {
@@ -147,7 +148,9 @@ void R128Cell::write(u32 off, u32 v, u32 len)
         regs_[aligned] = native;
         const u32 lvl2 = kLevelIsA0 ? gpioSda_ : gpioScl_;
         const u32 en2 = kLevelIsA0 ? gpioScl_ : gpioSda_;
-        if (ddcWave.size() < 160)
+        // Gated with the register log, and for the same reason: the FCode
+        // fills 160 states long before the OS driver says anything.
+        if (at >= logFrom && ddcWave.size() < 160)
             ddcWave.push_back({gpioSda_, gpioScl_});
         ddcStep(!(en2 & kSclBit) || (lvl2 & kSclBit),
                 (!(en2 & kSdaBit) || (lvl2 & kSdaBit)) && ddcSda());

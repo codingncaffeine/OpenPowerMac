@@ -198,6 +198,7 @@ public:
 
     const std::vector<RegWr>& uninLog() const { return uninLog_; }
     const std::vector<RegWr>& flashLog() const { return flashLog_; }
+    const std::vector<RegWr>& atiIoLog() const { return atiIoLog_; }
     const std::vector<u8>& flash() const { return rom_; }
 
     // A system reset, as the PMU's 0xD0 command performs it. The ASICs
@@ -418,17 +419,26 @@ private:
                     (ro + k < atiRom_.size() ? atiRom_[ro + k] : 0xFFu);
             return v;
         }
-        // The card's PCI I/O aperture, on the AGP bus's I/O window. Two
-        // registers: MM_INDEX at +0x00 selects a memory-mapped register by
-        // byte offset, MM_DATA at +0x04 reads or writes it. Bit 31 of the
-        // index selects the "aperture" form and is not part of the offset.
+        // The card's PCI I/O aperture: MM_INDEX at +0x00 latches a register
+        // offset, MM_DATA at +0x04 reads or writes it.
+        //
+        // PCI I/O space is LITTLE-ENDIAN and the processor is not, so every
+        // value through this window arrives byte-reversed. Without the swap
+        // the latched indices read as 0xa0000000, 0xa4000000, 0xa8000000 —
+        // absurd offsets into a 16 KB register file — and the writes landed
+        // on register 0 while the screen stayed black. Reversed they are
+        // 0xa0, 0xa4, 0xa8, and a byte written at +0x06 addresses lane
+        // 3-(o-4) of the target dword, not lane o-4.
         if (atiIoBar_ && atiIoBar_ < 0x00100000u &&
             pa - (0xF0000000u + atiIoBar_) < 0x100u) {
             const u32 o = pa - (0xF0000000u + atiIoBar_);
             if (o < 4u)
-                return atiMmIndex_;
-            if (o < 8u)
-                return ati_.read((atiMmIndex_ & 0x7FFFFFFCu) + (o - 4u), len);
+                return ioSwap(atiMmIndex_, len);
+            if (o < 8u) {
+                const u32 idx = atiMmIndex_ & 0x3FFCu;
+                const u32 lane = len == 4u ? 0u : (3u - (o - 4u));
+                return ioSwap(ati_.read(idx + lane, len), len);
+            }
             return 0;
         }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u)
@@ -543,12 +553,19 @@ private:
         if (atiIoBar_ && atiIoBar_ < 0x00100000u &&
             pa - (0xF0000000u + atiIoBar_) < 0x100u) {
             const u32 o = pa - (0xF0000000u + atiIoBar_);
+            const u32 sv = ioSwap(v, len);
+            if (atiIoLog_.size() < 400)
+                atiIoLog_.push_back(
+                    {stamp ? *stamp : 0, o | (len << 8), sv,
+                     pcRef ? *pcRef : 0});
             if (o < 4u) {
-                atiMmIndex_ = v;
+                atiMmIndex_ = sv;
                 return;
             }
             if (o < 8u) {
-                ati_.write((atiMmIndex_ & 0x7FFFFFFCu) + (o - 4u), v, len);
+                const u32 idx = atiMmIndex_ & 0x3FFCu;
+                const u32 lane = len == 4u ? 0u : (3u - (o - 4u));
+                ati_.write(idx + lane, sv, len);
                 return;
             }
             return;
@@ -975,6 +992,7 @@ private:
     std::vector<u8> kl_ = std::vector<u8>(kMacIoSize, 0);
     std::vector<RegWr> uninLog_;
     std::vector<RegWr> flashLog_;
+    std::vector<RegWr> atiIoLog_; // the card's I/O aperture, in order
     // Intel/CFI command state for the boot flash. Reads answer the status
     // register while a command is in flight; 0x80 is WSM-ready, and Open
     // Firmware polls it for 8.2 million instructions before giving up.
@@ -1002,6 +1020,16 @@ private:
     DbdmaChannel ataDma_, hdDma_;
     std::vector<u8> atiRom_;
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;
+    // PCI I/O space is little-endian and this processor is not.
+    static u32 ioSwap(u32 v, u32 len)
+    {
+        if (len == 2u)
+            return ((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu);
+        if (len == 4u)
+            return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+                   ((v >> 8) & 0xFF00u) | ((v >> 24) & 0xFFu);
+        return v;
+    }
     u32 atiIoBar_ = 0; // PCI I/O aperture, 256 B: MM_INDEX / MM_DATA
     u32 atiMmIndex_ = 0;
 };

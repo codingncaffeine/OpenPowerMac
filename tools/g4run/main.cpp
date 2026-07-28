@@ -2994,6 +2994,16 @@ int main(int argc, char** argv)
         }
     }
     {
+        const auto& il = bus.atiIoLog();
+        printf("-- ati i/o aperture (%zu; off/len <- val pc @insn):\n",
+               il.size());
+        const size_t is = il.size() > 60 ? il.size() - 60 : 0;
+        for (size_t k = is; k < il.size(); ++k)
+            printf("   +%02x/%u <- %08x pc=%08x @%llu\n", il[k].pa & 0xFFu,
+                   (il[k].pa >> 8) & 7u, il[k].val, il[k].pc,
+                   static_cast<unsigned long long>(il[k].at));
+    }
+    {
         const auto& fl = bus.flashLog();
         printf("-- boot flash writes (%zu; addr <- val pc @insn):\n",
                fl.size());
@@ -3331,10 +3341,10 @@ int main(int argc, char** argv)
         printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
                "offset=%08x\n",
                gen, w, h, fmt, pitch8, offset);
-        printf("-- ati bars: reg=%08x fb=%08x rom=%08x  ohci0=%08x "
-               "ohci1=%08x\n",
+        printf("-- ati bars: reg=%08x fb=%08x rom=%08x io=%08x  "
+               "ohci0=%08x ohci1=%08x\n",
                bus.atiRegBar(), bus.atiFbBar(), bus.atiRomBar(),
-               bus.ohciBar(0), bus.ohciBar(1));
+               bus.atiIoBar(), bus.ohciBar(0), bus.ohciBar(1));
         printf("-- ati framebuffer: %llu writes, span %08x..%08x\n",
                static_cast<unsigned long long>(bus.ati().fbWrites),
                bus.ati().fbWrites ? bus.ati().fbLo : 0u, bus.ati().fbHi);

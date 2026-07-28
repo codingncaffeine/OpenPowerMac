@@ -333,6 +333,8 @@ int main(int argc, char** argv)
     u64 serialRate = 0;                // --serial-rate N
     u64 atiLogFrom = 0;                // --ati-log-from N
     u64 wmapFrom = 0, wmapTo = 0;      // --wmap FROM TO
+    u32 wmapPcBucket = 0;              // --wmap-pc BUCKET
+    bool wmapPcSet = false;
     u32 watchVa = 0;                   // --watch-va ADDR
     u64 traceFrom = 0;                 // --trace-from N: full trace window
     u64 traceLines = 2000;             // --trace-lines M
@@ -500,6 +502,10 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--serial-log")) serialLogPath = next();
         else if (!strcmp(a, "--serial-rate"))
             serialRate = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--wmap-pc")) {
+            wmapPcBucket = static_cast<u32>(strtoul(next(), nullptr, 0));
+            wmapPcSet = true;
+        }
         else if (!strcmp(a, "--wmap")) {
             wmapFrom = strtoull(next(), nullptr, 0);
             wmapTo = strtoull(next(), nullptr, 0);
@@ -709,6 +715,8 @@ int main(int argc, char** argv)
     if (wmapTo) {
         bus.wmapFrom = wmapFrom;
         bus.wmapTo = wmapTo;
+        bus.wmapPcBucket = wmapPcBucket;
+        bus.wmapPcSet = wmapPcSet;
     }
     if (serialCr)
         bus.injectSerial("\r"); // CR in the escape window -> serial console
@@ -3654,6 +3662,21 @@ int main(int argc, char** argv)
         for (size_t k = 0; k < hot.size() && k < 24; ++k)
             printf("   %04x00000  %12llu writes\n", hot[k].second,
                    (unsigned long long)hot[k].first);
+        if (!bus.wmapPcs.empty()) {
+            std::vector<std::pair<u64, u32>> pcs;
+            for (const auto& p : bus.wmapPcs)
+                pcs.push_back({p.second, p.first});
+            std::sort(pcs.begin(), pcs.end(),
+                      [](const std::pair<u64, u32>& a,
+                         const std::pair<u64, u32>& b) {
+                          return a.first > b.first;
+                      });
+            printf("--   writers into %04x00000 (%zu distinct pcs):\n",
+                   bus.wmapPcBucket, pcs.size());
+            for (size_t k = 0; k < pcs.size() && k < 20; ++k)
+                printf("     pc=%08x  %12llu writes\n", pcs[k].second,
+                       (unsigned long long)pcs[k].first);
+        }
     }
     {
         const std::string& con = bus.console();

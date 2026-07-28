@@ -166,6 +166,11 @@ public:
     // address, so "where is the OS painting" has an answer.
     u64 wmapFrom = 0, wmapTo = 0;
     std::map<u32, u64> wmap;
+    // --wmap-pc BUCKET: which instruction writes into that megabyte. Turns
+    // "the desktop is at 0x02100000" into "this pc put it there".
+    u32 wmapPcBucket = 0;
+    bool wmapPcSet = false;
+    std::map<u32, u64> wmapPcs;
 
     void cfgSeed(u32 b, u32 latch, u32 nativeLeWord)
     {
@@ -482,8 +487,11 @@ private:
         }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u)
             return ati_.read(pa - atiRegBar_, len);
-        if (atiFbBar_ && pa - atiFbBar_ < (32u << 20))
-            return get(ati_.vram.data() + (pa - atiFbBar_), len);
+        if (atiFbBar_ && pa - atiFbBar_ < (64u << 20))
+            // Both halves address the same VRAM; the upper is the
+            // big-endian alias.
+            return get(ati_.vram.data() + ((pa - atiFbBar_) & 0x01FFFFFFu),
+                       len);
         if (pa - kSizeWin < 0x20000000u) {
             const u32 v =
                 get(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), len);
@@ -527,8 +535,11 @@ private:
         // guest write by megabyte over a window and the destination names
         // itself, whether that is the framebuffer aperture, an alias of
         // it, or ordinary RAM because a base register was misread.
-        if (wmapTo && stamp && *stamp >= wmapFrom && *stamp < wmapTo)
+        if (wmapTo && stamp && *stamp >= wmapFrom && *stamp < wmapTo) {
             ++wmap[pa >> 20];
+            if (wmapPcSet && (pa >> 20) == wmapPcBucket && pcRef)
+                ++wmapPcs[*pcRef];
+        }
         if (watchPa) {
             const u32 hi = watchPaEnd ? watchPaEnd : watchPa;
             // A write of len bytes at pa covers [pa, pa+len)
@@ -662,7 +673,7 @@ private:
             ati_.write(pa - atiRegBar_, v, len);
             return;
         }
-        if (atiFbBar_ && pa - atiFbBar_ < (32u << 20)) {
+        if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {
             // Framebuffer traffic, counted. "Is the OS drawing anything?"
             // is otherwise answerable only through the CRTC gate, which
             // stays shut until the display driver programs it — so a guest
@@ -672,7 +683,7 @@ private:
             const u32 fo = pa - atiFbBar_;
             if (fo < ati_.fbLo) ati_.fbLo = fo;
             if (fo > ati_.fbHi) ati_.fbHi = fo;
-            put(ati_.vram.data() + (pa - atiFbBar_), v, len);
+            put(ati_.vram.data() + ((pa - atiFbBar_) & 0x01FFFFFFu), v, len);
             return;
         }
         if (pa - kSizeWin < 0x20000000u) {
@@ -834,8 +845,16 @@ private:
             if (b == 0u && (cfgAddr_[b] & 0x0FFFFF00u) == 0x00010000u) {
                 switch (reg) {
                 case 0x10u:
-                    word &= 0xFE000000u;
-                    atiFbBar_ = (word != 0xFE000000u) ? word : atiFbBar_;
+                    // BAR0 is 64 MiB, not 32. The card's own FCode `reg`
+                    // property declares 0x04000000, and it paints into the
+                    // UPPER half — its `address` property is
+                    // mapped-BAR0 + 0x8000 + 0x02000000 — because that half
+                    // is the big-endian alias of the same 32 MiB of VRAM.
+                    // Sized at 32 MiB, the aperture did not even cover the
+                    // address the firmware publishes, so "0 framebuffer
+                    // writes" was a window too small to see them.
+                    word &= 0xFC000000u;
+                    atiFbBar_ = (word != 0xFC000000u) ? word : atiFbBar_;
                     ati_.fbBase = atiFbBar_;
                     break;
                 case 0x14u:

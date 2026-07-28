@@ -29,6 +29,23 @@ static constexpr u32 kGpioA8 = 0x00A8;
 static constexpr bool kLevelIsA0 = true; // else 0xA8 holds the levels
 static constexpr u32 kSclBit = 0x00400000u;
 static constexpr u32 kSdaBit = 0x00800000u;
+// These pins carry two protocols, and the waveform capture shows the two
+// phases using them differently. Open Firmware writes the LEVELS register
+// and reads back static combinations — Apple monitor sense, not a
+// transaction: 33 line states and two starts in a whole boot. Mac OS's
+// driver never writes a level at all; it works purely open drain through
+// the enables, 160 states and 617 starts, which is DDC/I2C.
+//
+// Sense only cares what regRead reports back; I2C only cares which bit the
+// state machine clocks on. So the two can be decoupled, and must be: the
+// earlier attempt to swap kSclBit/kSdaBit fixed the clock but changed the
+// sense readback with it, which moved what the FCode publishes and made
+// the CRTC fall back to Open Firmware's mode. Keep the readback layout
+// exactly as it was and give the DDC state machine its own bit roles,
+// which the trace names unambiguously: from state 43 the driver toggles
+// bit 23 and holds bit 22, so bit 23 is the clock.
+static constexpr u32 kDdcSclBit = 0x00800000u;
+static constexpr u32 kDdcSdaBit = 0x00400000u;
 static constexpr u32 kSenseIn = 0x00C00000u;
 static constexpr u32 kPllTest = 0x0000;
 
@@ -152,8 +169,8 @@ void R128Cell::write(u32 off, u32 v, u32 len)
         // fills 160 states long before the OS driver says anything.
         if (at >= logFrom && ddcWave.size() < 160)
             ddcWave.push_back({gpioSda_, gpioScl_});
-        ddcStep(!(en2 & kSclBit) || (lvl2 & kSclBit),
-                (!(en2 & kSdaBit) || (lvl2 & kSdaBit)) && ddcSda());
+        ddcStep(!(en2 & kDdcSclBit) || (lvl2 & kDdcSclBit),
+                (!(en2 & kDdcSdaBit) || (lvl2 & kDdcSdaBit)) && ddcSda());
     } else if (aligned == kClockCntlData) {
         pll_[pllAddr_ & 0x3Fu] = native;
     } else if (aligned == 0x00B0u) { // PALETTE_INDEX

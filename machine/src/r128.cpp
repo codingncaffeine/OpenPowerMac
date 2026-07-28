@@ -48,6 +48,8 @@ static constexpr u32 kSdaBit = 0x00800000u;
 static constexpr u32 kDdcSclBit = 0x00800000u;
 static constexpr u32 kDdcSdaBit = 0x00400000u;
 static constexpr u32 kSenseIn = 0x00C00000u;
+static constexpr u32 kGenIntCntl = 0x0040;   // bit 0 = CRTC_VBLANK_INT
+static constexpr u32 kGenIntStatus = 0x0044;
 static constexpr u32 kPllTest = 0x0000;
 
 u32 R128Cell::regRead(u32 idx)
@@ -67,6 +69,19 @@ u32 R128Cell::regRead(u32 idx)
         // read back what it wrote (verify loops depend on it).
         auto it = regs_.find(off);
         return it != regs_.end() ? it->second : (32u << 20);
+    }
+    case kGenIntStatus: {
+        // Vertical blank. A display driver arms CRTC_VBLANK_INT in
+        // GEN_INT_CNTL and then waits on this status bit before it will
+        // paint; unimplemented, the wait never ends and the framebuffer
+        // stays untouched however correct the modeset was. Report the
+        // blank as pending whenever it is armed - the panel is retracing
+        // far faster than any polling loop - and let a write acknowledge.
+        auto ic = regs_.find(kGenIntCntl);
+        const bool armed = ic != regs_.end() && (ic->second & 1u);
+        auto it = regs_.find(kGenIntStatus);
+        const u32 v = it != regs_.end() ? it->second : 0;
+        return armed ? (v | 1u) : v;
     }
     case kClockCntlIndex:
         return pllAddr_;

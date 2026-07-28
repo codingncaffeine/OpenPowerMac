@@ -26,9 +26,9 @@ static constexpr u32 kGpioA8 = 0x00A8;
 // Which line is which, and which bit is the direction, are pinned by
 // experiment: the address byte the slave latches is 0xFF until they are
 // right, because a released SDA reads high for all eight bits.
-static constexpr bool kLevelIsA0 = false; // else 0xA8 holds the levels
-static constexpr u32 kSclBit = 0x00800000u;
-static constexpr u32 kSdaBit = 0x00400000u;
+static constexpr bool kLevelIsA0 = true; // else 0xA8 holds the levels
+static constexpr u32 kSclBit = 0x00400000u;
+static constexpr u32 kSdaBit = 0x00800000u;
 static constexpr u32 kSenseIn = 0x00C00000u;
 static constexpr u32 kPllTest = 0x0000;
 

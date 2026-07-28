@@ -211,6 +211,10 @@ public:
     // zero captured output is equally consistent with a console bound to
     // the screen and with a machine that never got that far.
     u64 sccReads = 0, sccWrites = 0;
+    // Which SCC register the firmware polls, by offset. "It is reading the
+    // SCC" is not the same claim as "it is reading channel A's receive
+    // register", and only the second one means an injected byte can land.
+    std::map<u32, u64> sccOffHist;
     const std::vector<u8>& flash() const { return rom_; }
 
     // A system reset, as the PMU's 0xD0 command performs it. The ASICs
@@ -385,6 +389,7 @@ private:
 
             if (off >= 0x13000u && off < 0x14000u) {
                 ++sccReads;
+                ++sccOffHist[off - 0x13000u];
                 return sccRead(off - 0x13000u);
             }
             if (off >= 0x18000u && off < 0x18100u)

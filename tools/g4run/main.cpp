@@ -3357,18 +3357,14 @@ int main(int argc, char** argv)
         printf("-- scc: %llu reads, %llu writes\n",
                static_cast<unsigned long long>(bus.sccReads),
                static_cast<unsigned long long>(bus.sccWrites));
+        for (const auto& e : bus.sccOffHist)
+            printf("--   scc +%03x read %llu times\n", e.first,
+                   static_cast<unsigned long long>(e.second));
         printf("-- ddc: %u starts, %u address matches, %u EDID bytes\n",
                bus.ati().ddcStarts, bus.ati().ddcMatches,
                bus.ati().ddcBytes);
         printf("--   last DDC address byte: 0x%03x\n",
                bus.ati().ddcLastAddr);
-        printf("--   ddc waveform (A0,A8), %zu samples:\n",
-               bus.ati().ddcWave.size());
-        for (size_t k = 0; k < bus.ati().ddcWave.size(); ++k)
-            printf("      %08x %08x%s", bus.ati().ddcWave[k].first,
-                   bus.ati().ddcWave[k].second,
-                   (k % 4) == 3 ? "\n" : "");
-        printf("\n");
         printf("-- ati bars: reg=%08x fb=%08x rom=%08x io=%08x  "
                "ohci0=%08x ohci1=%08x\n",
                bus.atiRegBar(), bus.atiFbBar(), bus.atiRomBar(),

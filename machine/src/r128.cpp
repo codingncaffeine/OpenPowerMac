@@ -264,6 +264,23 @@ void R128Cell::ddcStep(bool scl, bool sda)
                 ddc_.state = 4;
             }
             break;
+        // The acknowledge bit occupies a full clock of its own. Driving it
+        // on the falling edge and moving straight on made the very next
+        // rising edge — the edge that samples the ACK — get counted as the
+        // first bit of the following byte, so every byte after the address
+        // was shifted by one. Apple's own master (ddc2-send-byte in the
+        // boot ROM, ff92c990) shifts eight bits and then polls the ACK in
+        // a retry loop, so the slave has to hold SDA low across that whole
+        // clock and consume its rising edge.
+        case 7: // address ACK sampled: now the data phase begins
+            ddc_.state = (ddc_.addr & 1u) ? 5 : 3;
+            ddc_.shift = (ddc_.addr & 1u) ? edidByte(ddc_.ptr) : 0;
+            ddc_.bits = 0;
+            break;
+        case 8: // offset-byte ACK sampled
+            ddc_.state = 3;
+            ddc_.bits = 0;
+            break;
         case 5: // data byte to the host
             if (++ddc_.bits == 8) {
                 ddc_.bits = 0;
@@ -276,15 +293,13 @@ void R128Cell::ddcStep(bool scl, bool sda)
         }
     } else if (!scl && ddc_.lastScl) { // falling edge: drive
         switch (ddc_.state) {
-        case 2: // acknowledge the address
+        case 2: // acknowledge the address — the ACK owns a whole clock
             ddc_.sdaOut = false;
-            ddc_.state = (ddc_.addr & 1u) ? 5 : 3;
-            ddc_.shift = (ddc_.addr & 1u) ? edidByte(ddc_.ptr) : 0;
-            ddc_.bits = 0;
+            ddc_.state = 7; // eat the rising edge that samples it
             break;
-        case 4: // acknowledge the offset byte
+        case 4: // acknowledge the offset byte, likewise
             ddc_.sdaOut = false;
-            ddc_.state = 3;
+            ddc_.state = 8;
             break;
         case 5: // present the next bit, MSB first
             ddc_.sdaOut = (ddc_.shift & (0x80u >> ddc_.bits)) != 0;

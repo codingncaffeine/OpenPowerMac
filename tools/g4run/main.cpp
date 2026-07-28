@@ -245,6 +245,7 @@ int main(int argc, char** argv)
     u64 dumpRamAt = 0;                 // --dump-ram-at N
     u32 peekAddr = 0, peekLen = 64;    // --peek VA [LEN] (guest virtual)
     u64 peekAt = 0;                    // --peek-at N
+    u64 heartbeat = 0;                 // --heartbeat N: periodic digest
     bool dumpStructsEnd = false;       // --dump-structs
     const char* eventsPath = nullptr;  // --events FILE (JSONL)
     u32 watchVa = 0;                   // --watch-va ADDR
@@ -337,6 +338,8 @@ int main(int argc, char** argv)
             peekAddr = static_cast<u32>(strtoul(next(), nullptr, 0));
             peekLen = static_cast<u32>(strtoul(next(), nullptr, 0));
         }
+        else if (!strcmp(a, "--heartbeat"))
+            heartbeat = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--peek-at"))
             peekAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-ram-at"))
@@ -1017,6 +1020,24 @@ int main(int argc, char** argv)
                 printf("\n");
             }
             fflush(stdout);
+        }
+        // A heartbeat, because a long run is otherwise silent until it ends
+        // and "still working" is indistinguishable from "wedged". Report
+        // whether the machine found any NEW code and whether it did device
+        // I/O since the last beat: real progress shows one or both, a spin
+        // shows neither.
+        if (heartbeat && executed && (executed % heartbeat) == 0) {
+            static size_t lastRegions = 0, lastCd = 0, lastHd = 0;
+            printf("-- beat @%llu: regions %zu (+%zu) cd %zu (+%zu) "
+                   "hd %zu (+%zu) pc=%08x%s\n",
+                   static_cast<unsigned long long>(executed), seen.size(),
+                   seen.size() - lastRegions, bus.cd().log.size(),
+                   bus.cd().log.size() - lastCd, bus.hd().log.size(),
+                   bus.hd().log.size() - lastHd, cpu.st.pc, sym(cpu.st.pc));
+            fflush(stdout);
+            lastRegions = seen.size();
+            lastCd = bus.cd().log.size();
+            lastHd = bus.hd().log.size();
         }
         if (dumpStructsAt && executed == dumpStructsAt)
             dumpStructs("--dump-structs-at");

@@ -76,12 +76,21 @@ u32 R128Cell::regRead(u32 idx)
         // reads the bus back.
         const u32 lvl = kLevelIsA0 ? gpioSda_ : gpioScl_;
         const u32 en = kLevelIsA0 ? gpioScl_ : gpioSda_;
-        const bool scl = !(en & kSclBit) || (lvl & kSclBit);
-        const bool sda = (!(en & kSdaBit) || (lvl & kSdaBit)) && ddcSda();
+        // Report per PIN, and apply the slave's pull-down to the lane the
+        // DDC state machine actually uses. It was applied to kSdaBit
+        // (bit 23) while the state machine drives and reads SDA on
+        // kDdcSdaBit (bit 22), so the acknowledge landed on the wrong lane
+        // and the master never saw it — which is why three corrections to
+        // the slave in a row produced byte-identical counters.
+        auto pin = [&](u32 bit) {
+            const bool masterHigh = !(en & bit) || (lvl & bit);
+            return masterHigh && (bit == kDdcSdaBit ? ddcSda() : true);
+        };
         auto it = regs_.find(off);
         const u32 v = it != regs_.end() ? it->second : 0;
-        return (v & 0xFF3FFFFFu) | (scl ? 0x00400000u : 0u) |
-               (sda ? 0x00800000u : 0u);
+        return (v & 0xFF3FFFFFu) |
+               (pin(0x00400000u) ? 0x00400000u : 0u) |
+               (pin(0x00800000u) ? 0x00800000u : 0u);
     }
     case kGpioMonid:
     case kGpioDvi: {

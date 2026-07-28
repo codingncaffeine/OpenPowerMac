@@ -49,6 +49,7 @@ public:
     // compresses guest time.
     bool tick(); // true when a deferred command ran: wake the DMA list
     u64 cmdDelay_ = 4000;
+    bool dmaXfer_ = false; // current read is a DMA transfer, so no DRQ
 
     // DBDMA drain of the current data phase: same completion semantics
     // as PIO reads (chunked READs refill through finishPio).

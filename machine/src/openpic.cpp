@@ -67,6 +67,13 @@ void OpenPic::write(u32 off, u32 v, u32 len)
         inService_ = -1;
         return;
     }
+    // Anything that reaches here was written into the controller's window
+    // and decoded by nothing. With every source stuck MASKED, the write
+    // that should clear bit 31 is either landing in one of these holes or
+    // is not being issued at all, and a raise count cannot tell the two
+    // apart.
+    if (unclaimed.size() < 256)
+        unclaimed.push_back({stamp ? *stamp : 0, off, native});
 }
 
 void OpenPic::setLine(u32 src, bool level)
@@ -134,6 +141,12 @@ void OpenPic::dumpState() const
                (vp_[s] & 0x80000000u) ? "MASKED" : "enabled",
                line_[s] ? 1 : 0, pending_[s] ? 1 : 0, dest_[s]);
     }
+    printf("--   unclaimed writes into the controller window (%zu):\n",
+           unclaimed.size());
+    for (size_t k = 0; k < unclaimed.size() && k < 24; ++k)
+        printf("     +%05x <- %08x @%llu\n", unclaimed[k].off,
+               unclaimed[k].val,
+               static_cast<unsigned long long>(unclaimed[k].at));
 }
 
 } // namespace opm

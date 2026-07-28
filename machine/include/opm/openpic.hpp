@@ -36,6 +36,8 @@ public:
     // priority does not beat the task priority, or an earlier interrupt is
     // still in service and was never EOId.
     void dumpState() const;
+    struct Unc { u64 at; u32 off; u32 val; };
+    std::vector<Unc> unclaimed;
 
     struct Ev {
         u64 at;

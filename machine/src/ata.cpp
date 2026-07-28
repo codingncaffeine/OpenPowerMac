@@ -57,6 +57,7 @@ void AtaCell::diskStartRead()
     if (readLeft_ == 0) {
         nsect_ = 0;
         status_ = (kDrdy | kDsc);
+        dmaXfer_ = false; // transfer over: back to PIO handshaking
         irq_ = true;
         return;
     }
@@ -77,7 +78,12 @@ void AtaCell::diskStartRead()
     dataAt_ = 0;
     ++readLba_;
     --readLeft_;
-    status_ = kDrq | (kDrdy | kDsc);
+    // DRQ means "host, read the data register" — it is a PIO handshake. A
+    // DMA read hands its sectors to the DBDMA engine over DMARQ instead,
+    // and the host is waiting for the transfer to END: BSY clear, DRQ
+    // clear, DRDY set. Asserting DRQ for every sector of a DMA read means
+    // that condition never arrives, however many sectors actually move.
+    status_ = static_cast<u8>((dmaXfer_ ? 0u : kDrq) | (kDrdy | kDsc));
     irq_ = true;
 }
 
@@ -158,6 +164,7 @@ void AtaCell::diskCommand(u8 cmd)
     case 0xC4: // READ MULTIPLE
     case 0xC8: // READ DMA
     case 0xC9: // READ DMA (no retry)
+        dmaXfer_ = (cmd == 0xC8 || cmd == 0xC9);
         readLba_ = diskLba();
         readLeft_ = nsect_ ? nsect_ : 256u;
         diskStartRead();

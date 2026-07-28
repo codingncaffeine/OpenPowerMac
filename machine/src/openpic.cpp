@@ -1,5 +1,7 @@
 #include "opm/openpic.hpp"
 
+#include <cstdio>
+
 namespace opm {
 
 // The window is little-endian; the bus layer hands us big-endian-composed
@@ -112,6 +114,26 @@ u32 OpenPic::iack()
     if (log.size() < 512)
         log.push_back({stamp ? *stamp : 0, 'a', static_cast<u32>(s)});
     return vp_[s] & 0xFFu;
+}
+
+
+// Diagnostic: the delivery decision, spelled out. highestPending() skips a
+// source when it is masked (vp bit 31) or when its priority does not exceed
+// taskPri_, and cpuLine() additionally requires that nothing is still in
+// service. Any of those three silently turns a raised line into no
+// interrupt at all, and none of them are visible from a raise count.
+void OpenPic::dumpState() const
+{
+    printf("-- openpic state: taskPri=%u inService=%d cpuLine=%d\n",
+           taskPri_, inService_, cpuLine() ? 1 : 0);
+    for (u32 s = 0; s < kSources; ++s) {
+        if (!line_[s] && !pending_[s] && !vp_[s])
+            continue;
+        printf("   src %2u vp=%08x pri=%u %s line=%d pending=%d dest=%08x\n",
+               s, vp_[s], (vp_[s] >> 16) & 0xFu,
+               (vp_[s] & 0x80000000u) ? "MASKED" : "enabled",
+               line_[s] ? 1 : 0, pending_[s] ? 1 : 0, dest_[s]);
+    }
 }
 
 } // namespace opm

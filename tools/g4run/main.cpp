@@ -3887,6 +3887,7 @@ int main(int argc, char** argv)
         for (size_t k = 0; k < il.size(); ++k)
             printf("   %c %08x @%llu\n", il[k].kind, il[k].val,
                    static_cast<unsigned long long>(il[k].at));
+        bus.pic().dumpState();
         printf("-- openpic raises per source:\n");
         for (u32 s = 0; s < 64; ++s)
             if (bus.pic().raiseCount[s])

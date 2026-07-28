@@ -30,6 +30,12 @@ public:
 
     void setLine(u32 src, bool level);
     bool cpuLine() const;
+    // Why is a raised source not being delivered? The line count alone
+    // cannot say: a source can raise a thousand times and never reach the
+    // CPU because its vector-priority still has the mask bit set, or its
+    // priority does not beat the task priority, or an earlier interrupt is
+    // still in service and was never EOId.
+    void dumpState() const;
 
     struct Ev {
         u64 at;

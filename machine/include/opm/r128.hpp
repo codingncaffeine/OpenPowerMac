@@ -2,6 +2,7 @@
 #include "opm/types.hpp"
 
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace opm {
@@ -40,6 +41,38 @@ public:
     std::vector<Ev> log; // first-touch + write traffic
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;
+
+    // Monitor identification over DDC, bit-banged on the GPIO trio the
+    // Rage 128's FCode uses: 0x00A8 carries SCL, 0x00A0 carries SDA, and
+    // 0x00A4 reads the resulting bus. Each line register holds a direction
+    // bit at 22 and a level bit at 23; the lines are open drain, so an
+    // undriven line is high and either side can pull it down.
+    //
+    // Without a slave the bus is dead and Open Firmware's display bring-up
+    // has nothing to identify, which is the state a black screen with a
+    // completed modeset comes from.
+    struct Ddc {
+        u8 state = 0;    // 0 idle, 1 addr, 2 ack-addr, 3 data, 4 ack-data
+        u8 shift = 0;    // byte being clocked
+        u8 bits = 0;     // bits seen in this byte
+        u8 addr = 0;     // device address latched by the last START
+        u8 ptr = 0;      // byte offset within the EDID
+        bool sdaOut = true; // what the slave drives (true = released)
+        bool lastScl = true, lastSda = true;
+    } ddc_;
+    u32 gpioScl_ = 0, gpioSda_ = 0;
+    // DDC census: starts seen, address matches, EDID bytes served. A
+    // bus that is being clocked and a slave that is answering are
+    // different claims.
+    u32 ddcStarts = 0, ddcMatches = 0, ddcBytes = 0;
+    u32 ddcLastAddr = 0x100;
+    // The raw waveform: (0xA0, 0xA8) after every write to either. Four
+    // guesses at which register is level and which bit is the clock all
+    // failed; the pairs themselves say what the lines are doing.
+    std::vector<std::pair<u32, u32>> ddcWave;
+    bool ddcSda() const { return ddc_.sdaOut; }
+    void ddcStep(bool scl, bool sda);
+    u8 edidByte(u8 at) const;
 
     // Harness peeks for the screen dump: raw register cell and the DAC
     // palette (PALETTE_INDEX/DATA auto-increment writes captured).

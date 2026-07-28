@@ -206,6 +206,11 @@ public:
     const std::vector<RegWr>& uninLog() const { return uninLog_; }
     const std::vector<RegWr>& flashLog() const { return flashLog_; }
     const std::vector<RegWr>& atiIoLog() const { return atiIoLog_; }
+    // SCC access census. sccRead/sccWrite bypass the first-touch log, so
+    // "did Open Firmware open the serial console at all" had no answer:
+    // zero captured output is equally consistent with a console bound to
+    // the screen and with a machine that never got that far.
+    u64 sccReads = 0, sccWrites = 0;
     const std::vector<u8>& flash() const { return rom_; }
 
     // A system reset, as the PMU's 0xD0 command performs it. The ASICs
@@ -377,8 +382,11 @@ private:
                         pmu_.read(off - 0x16000u + k, stamp ? *stamp : 0);
                 return v;
             }
-            if (off >= 0x13000u && off < 0x14000u)
+
+            if (off >= 0x13000u && off < 0x14000u) {
+                ++sccReads;
                 return sccRead(off - 0x13000u);
+            }
             if (off >= 0x18000u && off < 0x18100u)
                 return i2cRead(1, off - 0x18000u);
             if (off - 0x40000u < 0x40000u)
@@ -443,7 +451,11 @@ private:
                 return ioSwap(atiMmIndex_, len);
             if (o < 8u) {
                 const u32 idx = atiMmIndex_ & 0x3FFCu;
-                const u32 lane = len == 4u ? 0u : (3u - (o - 4u));
+                // R128Cell stores registers NATIVE (little-endian) and swaps on
+                // the way in, so a byte at I/O offset o-4 belongs in native
+                // lane o-4 - not 3-(o-4), which put every byte in the wrong
+                // half of the register.
+                const u32 lane = len == 4u ? 0u : (o - 4u);
                 return ioSwap(ati_.read(idx + lane, len), len);
             }
             return 0;
@@ -510,6 +522,7 @@ private:
                 return;
             }
             if (off >= 0x13000u && off < 0x14000u) {
+                ++sccWrites;
                 sccWrite(off - 0x13000u, static_cast<u8>(v));
                 return;
             }
@@ -571,7 +584,11 @@ private:
             }
             if (o < 8u) {
                 const u32 idx = atiMmIndex_ & 0x3FFCu;
-                const u32 lane = len == 4u ? 0u : (3u - (o - 4u));
+                // R128Cell stores registers NATIVE (little-endian) and swaps on
+                // the way in, so a byte at I/O offset o-4 belongs in native
+                // lane o-4 - not 3-(o-4), which put every byte in the wrong
+                // half of the register.
+                const u32 lane = len == 4u ? 0u : (o - 4u);
                 ati_.write(idx + lane, sv, len);
                 return;
             }
@@ -904,6 +921,10 @@ private:
     // Z8530, just enough for a polled console: pointer-register protocol
     // per channel, RR0 reports TX-empty always, data writes append to the
     // captured console text.
+    // SCC access census. sccRead/sccWrite bypass the first-touch log, so
+    // "did Open Firmware open the serial console at all" had no answer:
+    // zero captured output is equally consistent with a console bound to
+    // the screen and with a machine that never got that far.
     u32 sccRead(u32 off)
     {
         const u32 ch = (off >> 5) & 1u; // 0 = B (+0x00), 1 = A (+0x20)

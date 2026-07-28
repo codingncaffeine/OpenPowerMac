@@ -1047,6 +1047,24 @@ int main(int argc, char** argv)
 
     while (executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
+        // A machine that cannot restart. Open Firmware's `reset-all` sends
+        // PMU_RESET and then spins until the world comes back; without this
+        // it spun forever, which blocked every route that needs firmware
+        // configuration to survive into a second pass. Devices keep their
+        // state — this is the CPU restart the firmware is waiting for, not a
+        // power cycle, and pretending otherwise would throw away the
+        // attached media and the BAR assignments the next pass re-reads.
+        if (bus.pmu().resetRequest) {
+            bus.pmu().resetRequest = false;
+            printf("-- PMU reset @%llu: restarting the processor "
+                   "(devices keep their state)\n",
+                   static_cast<unsigned long long>(executed));
+            fflush(stdout);
+            cpu.reset();
+            cpu.wpPa = wpPa;
+            cpu.wpEnd = wpEnd;
+            continue;
+        }
         // Snapshot at an instruction boundary, BEFORE the step: `executed`
         // counts completed instructions and pc is the next one, so a resume
         // re-enters this loop in exactly the state the write saw.

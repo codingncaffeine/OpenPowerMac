@@ -125,6 +125,11 @@ void PmuVia::reqEdge(bool asserted, u64 now)
             if (lastDirIn_)
                 frame_.clear(); // a receive phase ended: new command frame
             frame_.push_back(sr_);
+            // PMU_RESET is acted on when the COMMAND BYTE lands, not when a
+            // reply is built: `reset-all` sends it and never reads back,
+            // so a handler in buildReply() is never reached.
+            if (frame_.size() == 1 && sr_ == 0xD0u)
+                resetRequest = true;
             if (log.size() < 65536)
                 log.push_back({now, frame_.size() == 1 ? 'c' : 'd', sr_});
         } else {

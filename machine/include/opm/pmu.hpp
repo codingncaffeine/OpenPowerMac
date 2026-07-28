@@ -48,6 +48,10 @@ public:
     // OS calibrates its tick chain against these timers; pacing them per
     // instruction while the TB runs compressed splits the machine into
     // two clocks and stretches every tick-timed wait by the same factor.
+    // Set by PMU_RESET (0xD0). Open Firmware sends it from `reset-all` and
+    // then spins until the machine restarts, so a PMU that acknowledges the
+    // command without resetting leaves the firmware waiting forever.
+    bool resetRequest = false;
     const u64* tbRef = nullptr;
 
     // Snapshot: VIA register file, both timer load/latch pairs in their

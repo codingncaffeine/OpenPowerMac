@@ -16,6 +16,13 @@ static constexpr u32 kMemCntl = 0x0140;
 static constexpr u32 kCrtcGenCntl = 0x0050;
 static constexpr u32 kGpioMonid = 0x0068;    // DDC bit-bang
 static constexpr u32 kGpioDvi = 0x006C;
+// The I/O-aperture GPIO trio Open Firmware bit-bangs during monitor sense:
+// it drives bits 22 and 23 through 0x00A0 and 0x00A8 and reads 0x00A4 back.
+// Answering zero is a line held LOW, which on a two-wire bus is a stuck bus
+// and not "no monitor" — undriven lines float high on their pull-ups.
+static constexpr u32 kGpioA0 = 0x00A0;
+static constexpr u32 kGpioA4 = 0x00A4;
+static constexpr u32 kGpioA8 = 0x00A8;
 static constexpr u32 kPllTest = 0x0000;
 
 u32 R128Cell::regRead(u32 idx)
@@ -37,6 +44,9 @@ u32 R128Cell::regRead(u32 idx)
         // spin-until-lock loops fall through.
         return it != pll_.end() ? it->second : 0x00000000u;
     }
+    case kGpioA0:
+    case kGpioA4:
+    case kGpioA8:
     case kGpioMonid:
     case kGpioDvi: {
         // DDC lines read back as driven; pulled-up (idle high) when

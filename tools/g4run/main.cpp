@@ -250,6 +250,7 @@ int main(int argc, char** argv)
     bool trace = false;
     int excShow = 16;
     u32 disStart = 0, disEnd = 0;
+    u32 ofSymAt[8] = {}, ofSymN = 0; // --of-word VA: name it
     u32 fastTb = 0; // extra TB cycles per instruction: compresses the
                     // ROM's wall-clock waits (harness lever, not machine
                     // truth — timings scale, ordering is preserved)
@@ -325,6 +326,11 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--rom")) romPath = next();
         else if (!strcmp(a, "--dump-rom")) romDumpPath = next();
         else if (!strcmp(a, "--coverage-all")) coverageAll = true;
+        else if (!strcmp(a, "--of-word")) {
+            if (ofSymN < 8)
+                ofSymAt[ofSymN++] =
+                    static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
         else if (!strcmp(a, "--ati-hide")) {
             atiHideFrom = strtoull(next(), nullptr, 0);
             atiHideTo = strtoull(next(), nullptr, 0);
@@ -3141,14 +3147,74 @@ int main(int argc, char** argv)
         // The whole list with --coverage-all: two deterministic runs that
         // end differently diverge at a first-entry, and the last 32 cannot
         // show where.
+    // Open Firmware word names, read out of its own dictionary.
+    //
+    // Every colon definition is laid out [len][name][pad to 4][code], which
+    // is how `eol>` and `do-esc#` were identified by hand from a hex dump.
+    // Doing that by hand for a 456-entry coverage timeline is why three
+    // separate OF questions this session were answered with "some address
+    // in ff82xxxx".
+    //
+    // Through the MMU, never through the ROM-in-RAM shortcut: that
+    // shortcut already disassembled live Forth as a data table once today.
+    cpu.l1dFlushAll(true);
+    cpu.l2FlushAll(true);
+    const CpuState ofSaved = cpu.st;
+    cpu.st.msr |= 0x30u;
+    const CpuState ofArmed = cpu.st;
+    auto ofByte = [&](u32 va, u8& out) -> bool {
+        u32 pa = 0;
+        cpu.st = ofArmed;
+        const bool ok = cpu.translate(va, false, false, pa);
+        cpu.st = ofArmed;
+        if (!ok)
+            return false;
+        if (pa >= bus.ramBytes())
+            return false;
+        out = static_cast<u8>(bus.read32(pa & ~3u) >> (8 * (3 - (pa & 3u))));
+        return true;
+    };
+    auto ofWordName = [&](u32 va) -> std::string {
+        if (va < 0xFF800000u || va >= 0xFFA00000u || (va & 3u))
+            return std::string();
+        for (u32 len = 1; len <= 31; ++len) {
+            const u32 hdr = va - ((1u + len + 3u) & ~3u);
+            u8 b = 0;
+            if (!ofByte(hdr, b) || b != len)
+                continue;
+            std::string s;
+            bool ok = true;
+            for (u32 k = 0; k < len && ok; ++k) {
+                if (!ofByte(hdr + 1u + k, b) || b < 0x21 || b > 0x7E)
+                    ok = false;
+                else
+                    s.push_back(static_cast<char>(b));
+            }
+            for (u32 k = 1u + len; ok && k < ((1u + len + 3u) & ~3u); ++k)
+                if (!ofByte(hdr + k, b) || b != 0)
+                    ok = false;
+            if (ok)
+                return s;
+        }
+        return std::string();
+    };
         printf("-- coverage timeline (%zu regions; %s):\n", firsts.size(),
                coverageAll ? "all first-entries" : "last 32 first-entries");
         const size_t start =
             (!coverageAll && firsts.size() > 32) ? firsts.size() - 32 : 0;
-        for (size_t k = start; k < firsts.size(); ++k)
-            printf("   @%-11llu %08x\n",
+        for (u32 k = 0; k < ofSymN; ++k) {
+            const std::string nm = ofWordName(ofSymAt[k]);
+            printf("-- of word %08x: %s\n", ofSymAt[k],
+                   nm.empty() ? "<no header here>" : nm.c_str());
+        }
+        cpu.st = ofSaved;
+        cpu.raisedThisStep = false;
+        for (size_t k = start; k < firsts.size(); ++k) {
+            const std::string nm = ofWordName(firsts[k].second);
+            printf("   @%-11llu %08x%s%s\n",
                    static_cast<unsigned long long>(firsts[k].first),
-                   firsts[k].second);
+                   firsts[k].second, nm.empty() ? "" : "  ", nm.c_str());
+        }
     }
     {
         const auto& ul = bus.uninLog();
@@ -3230,7 +3296,10 @@ int main(int argc, char** argv)
         const auto& cl = bus.cfgLog();
         printf("-- pci config accesses (%zu; bus latch val pc r/w):\n",
                cl.size());
-        const size_t cfs = cl.size() > 100 ? cl.size() - 100 : 0;
+        // All of them with --coverage-all: which BUSES the firmware probes
+        // is the question, and the last 100 accesses cannot answer it.
+        const size_t cfs =
+            (!coverageAll && cl.size() > 100) ? cl.size() - 100 : 0;
         for (size_t k = cfs; k < cl.size(); ++k)
             printf("   f%u %08x %08x pc=%08x %c @%llu\n",
                    ((cl[k].pa >> 28) & 7u) * 2u, cl[k].pa & 0x00FFFFFFu,

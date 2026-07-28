@@ -250,6 +250,7 @@ int main(int argc, char** argv)
     u32 fastTb = 0; // extra TB cycles per instruction: compresses the
                     // ROM's wall-clock waits (harness lever, not machine
                     // truth — timings scale, ordering is preserved)
+    u32 fastTbAfter = 0; // --fast-tb-after N: rate past the cutoff
     u64 fastTbUntil = ~0ull; // compression cutoff: the OS era runs its
                              // scheduler off the DEC and livelocks if
                              // the timebase runs tens of times fast
@@ -332,6 +333,8 @@ int main(int argc, char** argv)
             fastTb = static_cast<u32>(strtoul(next(), nullptr, 0));
             fastTbSet = true;
         }
+        else if (!strcmp(a, "--fast-tb-after"))
+            fastTbAfter = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--fast-tb-until"))
             fastTbUntil = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dump-ram")) ramDumpPath = next();
@@ -495,58 +498,107 @@ int main(int argc, char** argv)
                    kv.c_str());
             continue;
         }
-        // Locate the partition: signature 0x70 then the name "common".
-        size_t part = 0;
-        for (size_t p = 0; p + 16 <= rom.size(); p += 16) {
-            if (rom[p] == 0x70 && memcmp(&rom[p + 4], "common", 6) == 0) {
-                part = p;
-                break;
-            }
-        }
-        if (!part) {
+        // EVERY "common" partition, not the first. This ROM carries two —
+        // the factory defaults and the live NVRAM image — and patching only
+        // the defaults changes nothing, because Open Firmware reads the live
+        // copy for as long as its checksum holds.
+        std::vector<size_t> parts;
+        for (size_t p = 0; p + 16 <= rom.size(); p += 4)
+            if (rom[p] == 0x70 && memcmp(&rom[p + 4], "common", 6) == 0)
+                parts.push_back(p);
+        if (parts.empty()) {
             printf("-- nvram-set: no \"common\" partition in this rom\n");
             break;
         }
-        const size_t dataAt = part + 16;
-        const size_t dataEnd =
-            part + size_t((rom[part + 2] << 8) | rom[part + 3]) * 16u;
-        if (dataEnd <= dataAt || dataEnd > rom.size()) {
-            printf("-- nvram-set: partition length is implausible\n");
-            break;
-        }
-        const std::string key = kv.substr(0, eq + 1); // "name="
-        size_t at = std::string::npos;
-        for (size_t p = dataAt; p + key.size() < dataEnd; ++p) {
-            if ((p == dataAt || rom[p - 1] == 0) &&
-                memcmp(&rom[p], key.data(), key.size()) == 0) {
-                at = p;
-                break;
+        for (const size_t part : parts) {
+            const size_t dataAt = part + 16;
+            const size_t dataEnd =
+                part + size_t((rom[part + 2] << 8) | rom[part + 3]) * 16u;
+            if (dataEnd <= dataAt || dataEnd > rom.size()) {
+                printf("-- nvram-set: partition at %04zx has an "
+                       "implausible length\n",
+                       part);
+                continue;
             }
+            const std::string key = kv.substr(0, eq + 1); // "name="
+            size_t at = std::string::npos;
+            for (size_t p = dataAt; p + key.size() < dataEnd; ++p) {
+                if ((p == dataAt || rom[p - 1] == 0) &&
+                    memcmp(&rom[p], key.data(), key.size()) == 0) {
+                    at = p;
+                    break;
+                }
+            }
+            if (at == std::string::npos) {
+                printf("-- nvram-set: %s not in the partition at %04zx\n",
+                       key.c_str(), part);
+                continue;
+            }
+            size_t oldEnd = at;
+            while (oldEnd < dataEnd && rom[oldEnd] != 0)
+                ++oldEnd;
+            ++oldEnd; // include the terminator
+            const size_t oldLen = oldEnd - at;
+            const size_t newLen = kv.size() + 1;
+            if (newLen > oldLen) {
+                printf("-- nvram-set: %s is longer than the entry it "
+                       "replaces (%zu > %zu)\n",
+                       kv.c_str(), newLen, oldLen);
+                continue;
+            }
+            // Pad in place rather than shifting the rest of the list up.
+            // Shifting looked harmless and was not: Open Firmware answered
+            // "NVRAM corrupted (init-nvram), cleaning it up..." on the very
+            // next boot, so something in this partition is position-
+            // sensitive. The slack becomes a second entry, `oem-banner=`
+            // padding, which `oem-banner?=false` makes inert.
+            const size_t slack = oldLen - newLen;
+            static const char kPad[] = "oem-banner=";
+            const size_t padMin = sizeof kPad; // name + '=' + terminator
+            if (slack != 0 && slack < padMin) {
+                printf("-- nvram-set: %s leaves %zu bytes of slack, too "
+                       "little for a filler entry\n",
+                       kv.c_str(), slack);
+                continue;
+            }
+            // Preserve the partition's byte sum. Open Firmware answered
+            // "NVRAM corrupted (init-nvram), cleaning it up..." to an edit
+            // that kept every entry and moved nothing, so something beyond
+            // the CHRP header checksum is being verified; the cheapest
+            // invariant to keep is the sum itself, restored by biasing one
+            // padding byte.
+            u32 before[2] = {0, 0};
+            for (size_t p = part; p < dataEnd; ++p)
+                before[(p - part) & 1u] += rom[p];
+            memcpy(&rom[at], kv.data(), kv.size());
+            rom[at + kv.size()] = 0;
+            if (slack) {
+                memcpy(&rom[at + newLen], kPad, sizeof kPad - 1);
+                std::fill(rom.begin() +
+                              static_cast<long>(at + newLen + sizeof kPad - 1),
+                          rom.begin() + static_cast<long>(at + oldLen - 1),
+                          u8('x'));
+                rom[at + oldLen - 1] = 0;
+                // Bias one padding byte at each parity, so a 16-bit word
+                // sum is preserved as well as a byte sum.
+                for (u32 par = 0; par < 2; ++par) {
+                    u32 after = 0;
+                    for (size_t p = part; p < dataEnd; ++p)
+                        if (((p - part) & 1u) == par)
+                            after += rom[p];
+                    size_t bias = at + oldLen - 2;
+                    while (bias > at + newLen + sizeof kPad - 1 &&
+                           ((bias - part) & 1u) != par)
+                        --bias;
+                    if (((bias - part) & 1u) != par)
+                        continue;
+                    rom[bias] =
+                        static_cast<u8>(rom[bias] + (before[par] - after));
+                }
+            }
+            printf("-- nvram-set: %s at %04zx (%zu bytes, %zu padded)\n",
+                   kv.c_str(), part, oldLen - 1, slack);
         }
-        if (at == std::string::npos) {
-            printf("-- nvram-set: %s not present in the defaults\n",
-                   key.c_str());
-            continue;
-        }
-        size_t oldEnd = at;
-        while (oldEnd < dataEnd && rom[oldEnd] != 0)
-            ++oldEnd;
-        ++oldEnd; // include the terminator
-        const size_t oldLen = oldEnd - at;
-        const size_t newLen = kv.size() + 1;
-        std::vector<u8> tail(rom.begin() + static_cast<long>(oldEnd),
-                             rom.begin() + static_cast<long>(dataEnd));
-        if (at + newLen + tail.size() > dataEnd) {
-            printf("-- nvram-set: %s does not fit\n", kv.c_str());
-            continue;
-        }
-        memcpy(&rom[at], kv.data(), kv.size());
-        rom[at + kv.size()] = 0;
-        memcpy(&rom[at + newLen], tail.data(), tail.size());
-        std::fill(rom.begin() + static_cast<long>(at + newLen + tail.size()),
-                  rom.begin() + static_cast<long>(dataEnd), u8(0));
-        printf("-- nvram-set: %s (was %zu bytes, now %zu)\n", kv.c_str(),
-               oldLen - 1, newLen - 1);
     }
     printf("-- rom: %zu bytes, ram: %zu MiB\n", rom.size(), ramMb);
     SawtoothBus bus(ramMb * 1024 * 1024, std::move(rom));
@@ -748,6 +800,16 @@ int main(int argc, char** argv)
             }
         } else if (fastTb && executed < fastTbUntil) {
             cpu.tick(fastTb);
+        } else if (fastTbAfter) {
+            // Two rates, not one. Open Firmware's display bring-up contains
+            // a wait long enough that at the OS-era rate it never ends —
+            // 2.5 billion instructions parked in the Forth interpreter,
+            // which reads as a hang and is not one; at 900 it clears and OF
+            // reaches its boot code. The OS era cannot run at that rate,
+            // because the NanoKernel reloads the decrementer about every
+            // 6800 instructions and fifteen times that is a livelock. So
+            // compress firmware time hard and hand the OS a sane clock.
+            cpu.tick(fastTbAfter);
         }
         bus.ohciTick(cpu.st.tb);
         bus.syncIrqs();
@@ -1239,8 +1301,16 @@ int main(int argc, char** argv)
                     const bool ok = cpu.translate(va, false, false, pa);
                     cpu.st = armedDis;
                     if (!ok) {
-                        printf("   %08x: <untranslatable>\n", va);
-                        continue;
+                        // Real mode, or a range this context does not map:
+                        // a low EA is its own physical address. Open
+                        // Firmware runs its early world with MSR[IR/DR]
+                        // clear, so refusing here refuses to look at
+                        // firmware at all.
+                        if (va >= bus.ramBytes()) {
+                            printf("   %08x: <untranslatable>\n", va);
+                            continue;
+                        }
+                        pa = va;
                     }
                 }
                 const u32 w = bus.read32(pa);

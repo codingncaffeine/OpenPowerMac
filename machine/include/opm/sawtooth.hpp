@@ -197,6 +197,7 @@ public:
     static constexpr u32 kUniNSize = 0x3000u;
 
     const std::vector<RegWr>& uninLog() const { return uninLog_; }
+    const std::vector<RegWr>& flashLog() const { return flashLog_; }
 
     // A system reset, as the PMU's 0xD0 command performs it. The ASICs
     // come back at power-on values; RAM, the attached media and the flash
@@ -429,8 +430,15 @@ private:
         }
         if (pa < ram_.size() && pa + len <= ram_.size())
             return get(ram_.data() + pa, len);
-        if (pa >= kRomBase && pa - kRomBase + len <= rom_.size())
+        if (pa >= kRomBase && pa - kRomBase + len <= rom_.size()) {
+            if (flashMode_ != kFlashArray) {
+                u32 st = 0; // WSM ready, no erase or program error
+                for (u32 k = 0; k < len && k < 4; ++k)
+                    st = (st << 8) | 0x80u;
+                return st;
+            }
             return get(rom_.data() + (pa - kRomBase), len);
+        }
         if (pa >= kI2cBase && pa + len <= kI2cBase + 0x100u)
             return i2cRead(0, pa - kI2cBase);
         if (pa >= kUniNBase && pa + len <= kUniNBase + kUniNSize)
@@ -559,6 +567,59 @@ private:
         if (const int b = cfgBus(pa); b >= 0) {
             cfgAccess(static_cast<u32>(b), pa, v, len, true);
             return;
+        }
+        if (pa >= kRomBase && pa - kRomBase + len <= rom_.size()) {
+            // The boot flash, in sequence. Open Firmware commits NVRAM here
+            // on `reset-all` and announces "erasing fff06000" first, so the
+            // command protocol is the last link between `setenv` and a
+            // setting that survives a reboot. Per-address totals cannot show
+            // a protocol; the order of the bytes is the protocol.
+            if (flashLog_.size() < 256)
+                flashLog_.push_back({stamp ? *stamp : 0, pa, v,
+                                     pcRef ? *pcRef : 0});
+            const u32 off = pa - kRomBase;
+            const u8 cmd = static_cast<u8>(v);
+            if (flashMode_ == kFlashProgram) {
+                // Flash programming can only clear bits; the erase is what
+                // sets them. Modelling it as a plain store would let a
+                // driver "write" ones into an unerased block and hide its
+                // own bug.
+                for (u32 k = 0; k < len && off + k < rom_.size(); ++k)
+                    rom_[off + k] &= static_cast<u8>(v >> (8 * (len - 1 - k)));
+                flashMode_ = kFlashStatus;
+                return;
+            }
+            switch (cmd) {
+            case 0xFF: // read array
+            case 0x50: // clear status register
+                flashMode_ = kFlashArray;
+                return;
+            case 0x20: // block erase setup — the confirm carries the block
+                flashErase_ = off;
+                flashMode_ = kFlashEraseSetup;
+                return;
+            case 0xD0: // erase confirm
+                if (flashMode_ == kFlashEraseSetup) {
+                    // 8 KB blocks: Open Firmware erases at fff06000 to
+                    // rewrite the NVRAM partition that begins at fff06200.
+                    const u32 base = flashErase_ & ~0x1FFFu;
+                    for (u32 k = 0; k < 0x2000u && base + k < rom_.size();
+                         ++k)
+                        rom_[base + k] = 0xFF;
+                }
+                flashMode_ = kFlashStatus;
+                return;
+            case 0x40: // word/byte program setup
+            case 0x10:
+                flashMode_ = kFlashProgram;
+                return;
+            case 0x70: // read status register
+                flashMode_ = kFlashStatus;
+                return;
+            default:
+                flashMode_ = kFlashStatus;
+                return;
+            }
         }
         note(pa, v, true); // ROM/flash writes land here too, unapplied
     }
@@ -872,6 +933,13 @@ private:
     u8 unin_[kUniNSize] = {};
     std::vector<u8> kl_ = std::vector<u8>(kMacIoSize, 0);
     std::vector<RegWr> uninLog_;
+    std::vector<RegWr> flashLog_;
+    // Intel/CFI command state for the boot flash. Reads answer the status
+    // register while a command is in flight; 0x80 is WSM-ready, and Open
+    // Firmware polls it for 8.2 million instructions before giving up.
+    enum { kFlashArray, kFlashStatus, kFlashEraseSetup, kFlashProgram };
+    u32 flashMode_ = kFlashArray;
+    u32 flashErase_ = 0;
     std::map<u32, Acc> log_, klLog_;
     PmuVia pmu_;
     u32 sccPtr_[2] = {0, 0};

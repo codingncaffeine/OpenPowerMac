@@ -2977,6 +2977,14 @@ int main(int argc, char** argv)
             printf(" %08x", cpu.st.sr[i]);
         printf("\n");
     }
+    {
+        const auto& fl = bus.flashLog();
+        printf("-- boot flash writes (%zu; addr <- val pc @insn):\n",
+               fl.size());
+        for (const auto& w : fl)
+            printf("   %08x <- %08x pc=%08x @%llu\n", w.pa, w.val, w.pc,
+                   static_cast<unsigned long long>(w.at));
+    }
     // Guest time, measured rather than assumed. The 68K park at ffc03664 is
     // `moveq #15,d0; add.l Ticks,d0; cmp.l Ticks,d0; bcc *-4` — a quarter-
     // second delay off the 60 Hz tick — so how fast Ticks runs IS whether

@@ -47,7 +47,7 @@ public:
     // wider than a driver's arming sequence, which is a fixed number of
     // instructions, and it must not change meaning when the harness
     // compresses guest time.
-    void tick();
+    bool tick(); // true when a deferred command ran: wake the DMA list
     u64 cmdDelay_ = 4000;
 
     // DBDMA drain of the current data phase: same completion semantics

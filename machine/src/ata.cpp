@@ -386,12 +386,22 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 }
 
 
-void AtaCell::tick()
+// Returns true when a deferred command actually ran, so the caller can wake
+// the channel's DBDMA engine. A DMA read arms the list BEFORE writing the
+// command register, so by the time the command is issued the engine has
+// already looked once, found no data and parked on its descriptor. It is
+// only woken again by a task-file write — and a driver waiting on DMA does
+// not write registers. The command completing IS the event the engine is
+// waiting for, and nothing was reporting it: the list sat on a valid
+// descriptor with data available until the driver timed out and reset,
+// about every 390 M instructions.
+bool AtaCell::tick()
 {
     if (!pending_ || !stamp || *stamp < pendAt_)
-        return;
+        return false;
     pending_ = false;
     ataCommand(pendCmd_);
+    return true;
 }
 void AtaCell::ataCommand(u8 cmd)
 {

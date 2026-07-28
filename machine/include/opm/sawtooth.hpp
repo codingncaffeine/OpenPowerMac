@@ -283,8 +283,15 @@ public:
     {
         ohci_[0].tick(tb);
         ohci_[1].tick(tb);
-        cd_.tick(); // deferred ATA commands: see AtaCell::write case 0x070
-        hd_.tick();
+        // Deferred ATA commands (see AtaCell::write case 0x070). When one
+        // fires, its data phase has just opened, so resume any DBDMA list
+        // parked on that channel — a DMA read arms the list before the
+        // command register is written, and register writes are the only
+        // other thing that wakes it.
+        if (cd_.tick())
+            ataDma_.wake();
+        if (hd_.tick())
+            hdDma_.wake();
     }
 
     // DBDMA channels, one per ATA cell, at the mac-io offsets the ROM's

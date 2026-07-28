@@ -1642,9 +1642,16 @@ int main(int argc, char** argv)
                 // carry the TVector on every cross-fragment call — the
                 // callee address lives at *r12, so a breakpoint that cannot
                 // see r12 cannot name what is about to be called.
-                for (u32 g = 3; g <= 12; ++g) {
+                // r3-r31: the argument registers, plus Open Firmware's Forth
+                // stacks — r30 is the return stack and the data stack sits
+                // in the high registers, so a breakpoint that stops at r12
+                // cannot read the arguments of any OF word.
+                for (u32 g = 3; g <= 31; ++g) {
                     const u32 ea = cpu.st.gpr[g];
-                    if (ea < 0x1000u || ea >= 0xF0000000u)
+                    // Open Firmware lives above 0xF0000000, so an upper bound
+                    // there silently skipped every register worth reading.
+                    // Let translation decide what is dereferenceable.
+                    if (ea < 0x1000u)
                         continue;
                     u32 pa = 0;
                     cpu.st = armedBp;

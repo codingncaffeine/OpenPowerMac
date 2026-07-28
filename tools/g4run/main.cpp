@@ -246,6 +246,9 @@ int main(int argc, char** argv)
     u32 peekAddr = 0, peekLen = 64;    // --peek VA [LEN] (guest virtual)
     u64 peekAt = 0;                    // --peek-at N
     u64 heartbeat = 0;                 // --heartbeat N: periodic digest
+    u32 findVal = 0;                   // --find VALUE: scan RAM for a word
+    u64 findAt = 0;                    // --find-at N
+    bool findSet = false;
     bool dumpStructsEnd = false;       // --dump-structs
     const char* eventsPath = nullptr;  // --events FILE (JSONL)
     u32 watchVa = 0;                   // --watch-va ADDR
@@ -338,6 +341,12 @@ int main(int argc, char** argv)
             peekAddr = static_cast<u32>(strtoul(next(), nullptr, 0));
             peekLen = static_cast<u32>(strtoul(next(), nullptr, 0));
         }
+        else if (!strcmp(a, "--find")) {
+            findVal = static_cast<u32>(strtoul(next(), nullptr, 0));
+            findSet = true;
+        }
+        else if (!strcmp(a, "--find-at"))
+            findAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--heartbeat"))
             heartbeat = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--peek-at"))
@@ -1038,6 +1047,29 @@ int main(int argc, char** argv)
             lastRegions = seen.size();
             lastCd = bus.cd().log.size();
             lastHd = bus.hd().log.size();
+        }
+        // Scan physical RAM for a 32-bit value at a chosen instant. Live
+        // structures move between runs, so hunting a sentinel in a saved
+        // dump finds an address that is stale by the time it is watched —
+        // which is exactly how a watch on a hand-found 'nope' marker landed
+        // on an unrelated word. Search the machine that is running.
+        if (findSet && executed == findAt) {
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            const std::vector<u8>& r = bus.ram();
+            u32 hits = 0;
+            printf("== find %08x @%llu\n", findVal,
+                   static_cast<unsigned long long>(executed));
+            for (size_t p = 0; p + 4 <= r.size() && hits < 40; p += 2) {
+                const u32 w = (u32(r[p]) << 24) | (u32(r[p + 1]) << 16) |
+                              (u32(r[p + 2]) << 8) | r[p + 3];
+                if (w == findVal) {
+                    ++hits;
+                    printf("   PA %08zx\n", p);
+                }
+            }
+            printf("   (%u hit%s)\n", hits, hits == 1 ? "" : "s");
+            fflush(stdout);
         }
         if (dumpStructsAt && executed == dumpStructsAt)
             dumpStructs("--dump-structs-at");

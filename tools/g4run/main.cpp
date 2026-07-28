@@ -766,6 +766,11 @@ int main(int argc, char** argv)
     bus.atiHideTo = atiHideTo;
     bus.ataDma().stamp = &executed;
     bus.ataDma().pcRef = &cpu.st.pc;
+    // The hard disk has its own DBDMA channel and it was never stamped nor
+    // reported: "ata dbdma events (0)" was the CD channel, idle by
+    // definition, while every disk transfer went unobserved.
+    bus.hdDma().stamp = &executed;
+    bus.hdDma().pcRef = &cpu.st.pc;
 
     // One-shot diagnostic pokes. These are the only instruments that write
     // guest memory, so unlike every other counter here they are snapshot
@@ -3765,6 +3770,18 @@ int main(int argc, char** argv)
     {
         const auto& dl = bus.ataDma().log;
         printf("-- ata dbdma events (%zu; 0=ctl 1=desc 2=input 3=stop "
+               "4=dead):\n",
+               dl.size());
+        for (size_t k = 0; k < dl.size() && k < 80; ++k)
+            printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
+                   dl[k].b, static_cast<unsigned long long>(dl[k].at));
+    }
+    {
+        // The DISK's channel. Never stamped and never printed, so every
+        // READ DMA the boot issued went unobserved while the CD's idle
+        // channel was being read as though it were the disk's.
+        const auto& dl = bus.hdDma().log;
+        printf("-- hd dbdma events (%zu; 0=ctl 1=desc 2=input 3=stop "
                "4=dead):\n",
                dl.size());
         for (size_t k = 0; k < dl.size() && k < 80; ++k)

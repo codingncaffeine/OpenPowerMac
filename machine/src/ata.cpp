@@ -405,8 +405,17 @@ void AtaCell::ataCommand(u8 cmd)
     pulled_ = 0;
     if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
+    // Log the LBA and sector count with the command. Ev has carried fields
+    // for them since it was written and they were always passed as zero, so
+    // "the guest issued 205 reads" could never become "the guest read the
+    // driver partition and then stopped" — which is the only question that
+    // matters when a disk with a valid driver set still ends at a flashing
+    // question mark.
     if (true)
-        log.push_back({stamp ? *stamp : 0, 'c', cmd, 0, 0, pcRef ? *pcRef : 0});
+        log.push_back({stamp ? *stamp : 0, 'c', cmd,
+                       disk_ ? diskLba() : 0u,
+                       disk_ ? (nsect_ ? u32(nsect_) : 256u) : 0u,
+                       pcRef ? *pcRef : 0});
     error_ = 0;
     if (disk_) { // ATA hard disk: a different command set entirely
         diskCommand(cmd);

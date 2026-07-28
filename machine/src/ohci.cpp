@@ -1,4 +1,5 @@
 #include "opm/ohci.hpp"
+#include <cstring>
 
 namespace opm {
 
@@ -83,17 +84,33 @@ void OhciCell::regWrite(u32 idx, u32 v)
         break;
     case 0x54 >> 2:
     case 0x58 >> 2: {
-        u32& p = rhPort_[idx - (0x54 >> 2)];
-        // With nothing attached: SetPortEnable/SetPortReset on an empty
-        // port set CSC per spec ("attempt on disconnected port"), the
-        // status-change W1C bits clear, power bits track.
+        const u32 n = idx - (0x54 >> 2);
+        u32& p = rhPort_[n];
+        // Port 1 carries the keyboard; port 2 is genuinely empty.
+        const bool populated = (n == 0);
         if (v & 0x00000100u) // SetPortPower
             p |= 0x00000100u;
         if (v & 0x00000200u) // ClearPortPower
             p &= ~0x00000100u;
-        if (v & 0x00000002u || v & 0x00000010u) // SPE / SPR on empty port
-            p |= 0x00010000u;                   // CSC
-        p &= ~((v & 0x001F0000u)); // W1C of change bits
+        if (v & 0x00000002u) { // SetPortEnable
+            if (populated)
+                p |= 0x00000002u;
+            else
+                p |= 0x00010000u; // CSC: enable attempt on a dead port
+        }
+        if (v & 0x00000001u) // ClearPortEnable
+            p &= ~0x00000002u;
+        if (v & 0x00000010u) { // SetPortReset
+            if (populated) {
+                // Reset completes and leaves the port enabled, with the
+                // reset-change bit set so the driver knows to look.
+                p |= 0x00000002u | 0x00100000u;
+                p &= ~0x00000010u;
+            } else {
+                p |= 0x00010000u;
+            }
+        }
+        p &= ~(v & 0x001F0000u); // W1C of the change bits
         break;
     }
     default: break;
@@ -150,6 +167,244 @@ void OhciCell::tick(u64 tb)
         ram[hcca_ + 0x83] = 0;
     }
     intStatus_ |= 0x00000004u; // SF
+
+    // Service the lists once per frame. Nothing walked them before, so a
+    // host could enumerate forever and never get a descriptor back.
+    if (control_ & 0x10u) // CLE: control list enable
+        runList(ctrlHead_, true);
+    if (control_ & 0x20u) // BLE: bulk list enable
+        runList(bulkHead_, false);
+    if ((control_ & 0x04u) && hcca_ && ram) {
+        // PLE: the periodic list hangs off the HCCA interrupt table; a
+        // boot keyboard lives on exactly one of its 32 entries.
+        const u32 slot = (fmNumber_ & 31u) * 4u;
+        if (hcca_ + slot + 4 <= ramSize)
+            runList(ldLe(hcca_ + slot) & ~0xFu, false);
+    }
+    if (doneHead_ && hcca_ && ram && hcca_ + 0x84u <= ramSize) {
+        // HccaDoneHead, then hand the queue over: the driver reads it and
+        // acknowledges WDH.
+        stLe(hcca_ + 0x84u - 4u, doneHead_);
+        doneHead_ = 0;
+    }
 }
 
+
+// ---------------------------------------------------------------------
+// USB: root-hub port 1 carries a low-speed HID boot keyboard.
+//
+// Open Firmware's console input is the keyboard package, not the serial
+// port: with a display present it blocks in $call-method "read" on stdin,
+// and injecting into the SCC changes nothing. The port reported nothing
+// attached and no list was ever walked, so the controller had nothing to
+// find and nothing to do.
+// ---------------------------------------------------------------------
+
+u32 OhciCell::ldLe(u32 pa) const
+{
+    if (!ram || pa + 4 > ramSize)
+        return 0;
+    return u32(ram[pa]) | (u32(ram[pa + 1]) << 8) |
+           (u32(ram[pa + 2]) << 16) | (u32(ram[pa + 3]) << 24);
+}
+
+void OhciCell::stLe(u32 pa, u32 v)
+{
+    if (!ram || pa + 4 > ramSize)
+        return;
+    ram[pa] = u8(v);
+    ram[pa + 1] = u8(v >> 8);
+    ram[pa + 2] = u8(v >> 16);
+    ram[pa + 3] = u8(v >> 24);
+}
+
+// The reply owed to the SETUP packet now in setup_. Descriptors are built
+// here rather than kept as byte tables so the fields a host actually reads
+// stay legible.
+void OhciCell::buildDescriptor()
+{
+    reply_.clear();
+    const u8 type = setup_[0];
+    const u8 req = setup_[1];
+    const u16 val = static_cast<u16>(setup_[2] | (setup_[3] << 8));
+    const u16 len = static_cast<u16>(setup_[6] | (setup_[7] << 8));
+    auto push = [&](std::initializer_list<u8> b) {
+        for (u8 x : b)
+            reply_.push_back(x);
+    };
+    if (type == 0x80 && req == 0x06) { // GET_DESCRIPTOR
+        switch (val >> 8) {
+        case 1: // DEVICE
+            push({18, 1, 0x10, 0x01, 0, 0, 0, 8, 0xAC, 0x05, 0x01, 0x02,
+                  0x00, 0x01, 1, 2, 0, 1});
+            break;
+        case 2: // CONFIGURATION + INTERFACE + HID + ENDPOINT
+            push({9, 2, 34, 0, 1, 1, 0, 0xA0, 25});
+            push({9, 4, 0, 0, 1, 3, 1, 1, 0}); // HID, boot subclass, keyboard
+            push({9, 0x21, 0x11, 0x01, 0, 1, 0x22, 63, 0});
+            push({7, 5, 0x81, 3, 8, 0, 10}); // EP1 IN, interrupt, 10 ms
+            break;
+        case 3: // STRING
+            if ((val & 0xFF) == 0)
+                push({4, 3, 0x09, 0x04});
+            else {
+                const char* s =
+                    (val & 0xFF) == 1 ? "OpenPowerMac" : "Keyboard";
+                reply_.push_back(static_cast<u8>(2 + 2 * strlen(s)));
+                reply_.push_back(3);
+                for (const char* p = s; *p; ++p) {
+                    reply_.push_back(static_cast<u8>(*p));
+                    reply_.push_back(0);
+                }
+            }
+            break;
+        default: break;
+        }
+    } else if (type == 0x81 && req == 0x06 && (val >> 8) == 0x22) {
+        // HID REPORT descriptor: the standard boot-keyboard layout - eight
+        // modifier bits, one reserved byte, six key slots.
+        push({0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0,
+              0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08,
+              0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x03, 0x95, 0x05,
+              0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,
+              0x95, 0x01, 0x75, 0x03, 0x91, 0x03, 0x95, 0x06, 0x75, 0x08,
+              0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
+              0x81, 0x00, 0xC0});
+    } else if (type == 0x00 && req == 0x05) { // SET_ADDRESS
+        pendingAddress_ = static_cast<u8>(val & 0x7F);
+    }
+    if (reply_.size() > len)
+        reply_.resize(len);
+}
+
+// One transfer descriptor. Returns the next TD pointer, or 0 to leave the
+// TD in place (a NAK).
+u32 OhciCell::doTd(u32 ed0, u32 td)
+{
+    const u32 t0 = ldLe(td);
+    const u32 cbp = ldLe(td + 4);
+    const u32 next = ldLe(td + 8) & ~0xFu;
+    const u32 be = ldLe(td + 12);
+    const u32 dp = (t0 >> 19) & 3u;
+    const u32 epn = (ed0 >> 7) & 0xFu;
+    const u32 avail = (cbp && be >= cbp) ? (be - cbp + 1u) : 0u;
+    u32 moved = 0;
+    if (dp == 0) { // SETUP
+        for (u32 k = 0; k < 8 && cbp + k < ramSize; ++k)
+            setup_[k] = ram[cbp + k];
+        ++setupsSeen;
+        buildDescriptor();
+        moved = 8;
+    } else if (dp == 2) { // IN
+        ++inTds;
+        if (epn == 0) {
+            moved = avail < reply_.size() ? avail
+                                          : static_cast<u32>(reply_.size());
+            for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
+                ram[cbp + k] = reply_[k];
+            reply_.erase(reply_.begin(), reply_.begin() + moved);
+        } else if (pending_.size() >= 8) {
+            moved = avail < 8u ? avail : 8u;
+            for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
+                ram[cbp + k] = pending_[k];
+            pending_.erase(pending_.begin(), pending_.begin() + 8);
+            ++reportsSent;
+        } else {
+            // No key down. A keyboard must NAK rather than hand back a
+            // stale frame, so leave the descriptor where it is.
+            return 0;
+        }
+    } else { // OUT or STATUS
+        moved = avail;
+        if (pendingAddress_) {
+            address_ = pendingAddress_;
+            pendingAddress_ = 0;
+        }
+    }
+    stLe(td + 4, (moved && cbp + moved <= be) ? cbp + moved : 0);
+    retire(td, 0);
+    return next;
+}
+
+// Move a finished descriptor onto the done queue with a completion code.
+void OhciCell::retire(u32 td, u32 cc)
+{
+    u32 t0 = ldLe(td);
+    t0 = (t0 & 0x0FFFFFFFu) | (cc << 28);
+    stLe(td, t0);
+    stLe(td + 8, doneHead_); // NextTD doubles as the done-queue link
+    doneHead_ = td;
+    intStatus_ |= 0x02u; // WritebackDoneHead
+}
+
+// Walk one endpoint-descriptor list.
+u32 OhciCell::runList(u32 head, bool control)
+{
+    (void)control;
+    u32 done = 0;
+    for (u32 ed = head; ed && done < 64;) {
+        const u32 e0 = ldLe(ed);
+        const u32 tail = ldLe(ed + 4) & ~0xFu;
+        u32 hp = ldLe(ed + 8);
+        const u32 nextEd = ldLe(ed + 12) & ~0xFu;
+        const bool skip = (e0 & 0x4000u) != 0;
+        const bool halted = (hp & 1u) != 0;
+        u32 h = hp & ~0xFu;
+        while (!skip && !halted && h && h != tail && done < 64) {
+            const u32 nx = doTd(e0, h);
+            if (!nx)
+                break; // NAK, or the end of the chain
+            h = nx;
+            ++done;
+        }
+        stLe(ed + 8, (hp & 0xFu) | h);
+        ed = nextEd;
+    }
+    return done;
+}
+
+// Queue an ASCII string as HID boot-keyboard reports.
+void OhciCell::typeAscii(const std::string& s)
+{
+    for (char c : s) {
+        u8 usage = 0, mod = 0;
+        if (c >= 'a' && c <= 'z')
+            usage = static_cast<u8>(4 + (c - 'a'));
+        else if (c >= 'A' && c <= 'Z') {
+            usage = static_cast<u8>(4 + (c - 'A'));
+            mod = 0x02; // left shift
+        } else if (c >= '1' && c <= '9')
+            usage = static_cast<u8>(30 + (c - '1'));
+        else if (c == '0')
+            usage = 39;
+        else if (c == '\r' || c == '\n')
+            usage = 40;
+        else if (c == ' ')
+            usage = 44;
+        else if (c == '-')
+            usage = 45;
+        else if (c == '.')
+            usage = 55;
+        else if (c == '/')
+            usage = 56;
+        else if (c == '\\')
+            usage = 49;
+        else if (c == ',')
+            usage = 54;
+        else if (c == ';')
+            usage = 51;
+        else if (c == ':') {
+            usage = 51;
+            mod = 0x02;
+        } else
+            continue;
+        // Press then release: a host that only ever sees the key down
+        // repeats it forever.
+        const u8 down[8] = {mod, 0, usage, 0, 0, 0, 0, 0};
+        for (u8 b : down)
+            pending_.push_back(b);
+        for (u32 k = 0; k < 8; ++k)
+            pending_.push_back(0);
+    }
+}
 } // namespace opm

@@ -2,6 +2,7 @@
 #include "opm/types.hpp"
 
 #include <map>
+#include <string>
 #include <vector>
 
 namespace opm {
@@ -59,7 +60,36 @@ public:
     void snapSave(SnapWriter& w) const;
     void snapLoad(SnapReader& r);
 
+    // A USB HID boot keyboard on root-hub port 1.
+    //
+    // Open Firmware's console input is the keyboard package, not the serial
+    // port: with a display present it blocks in $call-method "read" on
+    // stdin, and injecting into the SCC changes nothing. The ROM carries
+    // usb-kbd FCode, so a keyboard that enumerates is what unblocks the
+    // prompt — and the desktop needs one regardless.
+    //
+    // The port reported nothing attached and no list was ever walked, so
+    // the controller had nothing to find and nothing to do.
+    void typeAscii(const std::string& s); // queue keystrokes
+    bool keyboardIdle() const { return pending_.empty() && !reportDue_; }
+    u64 setupsSeen = 0, inTds = 0, reportsSent = 0; // census
+
 private:
+    // Control-transfer state for the single attached device.
+    u8 setup_[8] = {};
+    std::vector<u8> reply_;  // data still owed to an IN transfer
+    u8 address_ = 0;         // address assigned by SET_ADDRESS
+    u8 pendingAddress_ = 0;
+    std::vector<u8> pending_; // queued HID reports, 8 bytes each
+    bool reportDue_ = false;  // a key is down and its release still owed
+
+    u32 ldLe(u32 pa) const;
+    void stLe(u32 pa, u32 v);
+    void buildDescriptor();
+    u32 runList(u32 head, bool control);
+    u32 doTd(u32 ed0, u32 td);
+    void retire(u32 td, u32 cc);
+
     static u32 swap32(u32 v)
     {
         return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) |
@@ -84,7 +114,9 @@ private:
     u32 rhDescA_ = 0x02000002u; // POTPGT=2, NDP=2, ports powered on
     u32 rhDescB_ = 0;
     u32 rhStatus_ = 0;
-    u32 rhPort_[2] = {0, 0}; // no CCS ever: nothing attached
+    // Port 1 reports a low-speed device attached from power-on: CCS,
+    // LSDA and the connect-status change. Port 2 is empty.
+    u32 rhPort_[2] = {0x00010201u, 0};
     u64 lastFrameTb_ = 0;
 };
 

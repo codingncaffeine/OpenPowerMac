@@ -243,6 +243,8 @@ int main(int argc, char** argv)
     const char* romPath = nullptr;
     const char* romDumpPath = nullptr; // --dump-rom FILE
     bool coverageAll = false; // --coverage-all
+    const char* typeText = nullptr; // --type STR --type-at N: USB keystrokes
+    u64 typeAt = 0;
     u64 atiHideFrom = 0, atiHideTo = 0; // --ati-hide FROM TO
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
@@ -332,6 +334,8 @@ int main(int argc, char** argv)
             traceOfAt = strtoull(next(), nullptr, 0);
             traceOfLeft = static_cast<u32>(strtoul(next(), nullptr, 0));
         }
+        else if (!strcmp(a, "--type")) typeText = next();
+        else if (!strcmp(a, "--type-at")) typeAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--coverage-all")) coverageAll = true;
         else if (!strcmp(a, "--of-word")) {
             if (ofSymN < 8)
@@ -1607,7 +1611,7 @@ int main(int argc, char** argv)
             const auto it = ofNames.find(pc);
             if (it != ofNames.end()) {
                 --traceOfLeft;
-                printf("OF %s\n", it->second.c_str());
+                printf("OF %08x %s\n", pc, it->second.c_str());
             }
         }
         if (bpN && executed >= bpFrom) {
@@ -2418,6 +2422,18 @@ int main(int argc, char** argv)
             fprintf(stderr, "%08x: %s\n", pc, text);
         }
         tickPeripherals();
+        if (typeText && executed == typeAt) {
+            // Keystrokes over USB, which is where Open Firmware actually
+            // listens once a display exists.
+            std::string t(typeText);
+            for (char& c : t)
+                if (c == ';')
+                    c = '\r';
+            bus.ohci(0).typeAscii(t + "\r");
+            printf("-- typed on usb @%llu: %s\n",
+                   static_cast<unsigned long long>(executed), typeText);
+            fflush(stdout);
+        }
         if (serialInput && executed == serialAt) {
             std::string s(serialInput);
             for (char& c : s)

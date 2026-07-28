@@ -299,6 +299,20 @@ int main(int argc, char** argv)
     u64 traceOfAt = 0;      // --trace-of AT N: OF word trace
     u32 traceOfLeft = 0;
     std::map<u32, std::string> ofNames;
+    // The raw word trace is 90% stack primitives (swap/tuck/exit/(field)),
+    // so 900 lines cover five thousand instructions and hide the shape of
+    // the window. These three narrow it: --of-find dumps the dictionary,
+    // --of-only keeps just the words worth reading, --of-hist counts every
+    // entry over a window instead of listing them.
+    std::vector<u32> ofSee;            // --of-see VA (repeatable)
+    std::vector<u32> ofRefs;           // --of-refs VA (repeatable)
+    std::vector<u32> ofCallers;        // --of-callers VA (repeatable)
+    u32 ofSeeN = 160;                  // --of-see-n N
+    std::vector<std::string> ofFind;   // --of-find SUBSTR (repeatable)
+    std::vector<std::string> ofOnly;   // --of-only SUBSTR (repeatable)
+    u64 ofHistFrom = 0, ofHistTo = 0;  // --of-hist FROM TO
+    std::map<std::string, u64> ofHist;
+    std::vector<std::pair<u64, std::string>> ofHistFirst;
     u32 bpPc[8] = {}, bpHit[8] = {}, bpN = 0; // --bp VA: register breakpoints
     u32 bp68Pc[8] = {}, bp68Hit[8] = {}, bp68N = 0; // --bp68 VA
     u32 bpMax = 4, bpDeref = 96;       // --bp-max N, --bp-deref BYTES
@@ -333,6 +347,20 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--trace-of")) {
             traceOfAt = strtoull(next(), nullptr, 0);
             traceOfLeft = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
+        else if (!strcmp(a, "--of-callers"))
+            ofCallers.push_back(static_cast<u32>(strtoul(next(), nullptr, 0)));
+        else if (!strcmp(a, "--of-refs"))
+            ofRefs.push_back(static_cast<u32>(strtoul(next(), nullptr, 0)));
+        else if (!strcmp(a, "--of-see"))
+            ofSee.push_back(static_cast<u32>(strtoul(next(), nullptr, 0)));
+        else if (!strcmp(a, "--of-see-n"))
+            ofSeeN = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--of-find")) ofFind.push_back(next());
+        else if (!strcmp(a, "--of-only")) ofOnly.push_back(next());
+        else if (!strcmp(a, "--of-hist")) {
+            ofHistFrom = strtoull(next(), nullptr, 0);
+            ofHistTo = strtoull(next(), nullptr, 0);
         }
         else if (!strcmp(a, "--type")) typeText = next();
         else if (!strcmp(a, "--type-at")) typeAt = strtoull(next(), nullptr, 0);
@@ -1596,6 +1624,14 @@ int main(int argc, char** argv)
                             ok = false;
                     if (ok) {
                         ofNames[va] = s;
+                        // Some headers carry a zero cell between the padded
+                        // name and the code field (probe-slots is one), so
+                        // the word is entered at va+4 and a trace keyed on
+                        // va alone never sees it run.
+                        u8 z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+                        if (rd(va, z0) && rd(va + 1, z1) && rd(va + 2, z2) &&
+                            rd(va + 3, z3) && !z0 && !z1 && !z2 && !z3)
+                            ofNames[va + 4] = s;
                         break;
                     }
                 }
@@ -1604,14 +1640,152 @@ int main(int argc, char** argv)
             cpu.raisedThisStep = false;
             printf("-- of trace armed @%llu: %zu named words\n",
                    static_cast<unsigned long long>(executed), ofNames.size());
+            for (const std::string& needle : ofFind) {
+                u32 hits = 0;
+                for (const auto& nv : ofNames)
+                    if (nv.second.find(needle) != std::string::npos) {
+                        printf("-- of-find \"%s\": %08x %s\n", needle.c_str(),
+                               nv.first, nv.second.c_str());
+                        ++hits;
+                    }
+                if (!hits)
+                    printf("-- of-find \"%s\": no match\n", needle.c_str());
+            }
+            // "Which word writes this value?" is the question a Forth image
+            // answers worst. Scan the loaded dictionary for the literal and
+            // name the definition each hit falls inside.
+            for (u32 ref : ofRefs) {
+                printf("-- of-refs %08x %s:\n", ref,
+                       ofNames.count(ref) ? ofNames[ref].c_str() : "?");
+                u32 hits = 0;
+                std::string owner = "<before first word>";
+                for (u32 va = 0xFF800000u; va < 0xFF930000u; va += 4) {
+                    const auto nit = ofNames.find(va);
+                    if (nit != ofNames.end())
+                        owner = nit->second;
+                    u8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+                    if (!rd(va, b0) || !rd(va + 1, b1) || !rd(va + 2, b2) ||
+                        !rd(va + 3, b3))
+                        continue;
+                    const u32 w = (u32(b0) << 24) | (u32(b1) << 16) |
+                                  (u32(b2) << 8) | b3;
+                    if (w != ref)
+                        continue;
+                    printf("   %08x  in %s\n", va, owner.c_str());
+                    if (++hits >= 64)
+                        break;
+                }
+                if (!hits)
+                    printf("   <no literal reference>\n");
+            }
+            // The complement of of-refs: subroutine threading means "who
+            // calls this word" is a scan for `bl <va>`, and that is the only
+            // way to walk the startup sequence upward from a leaf.
+            for (u32 tgt : ofCallers) {
+                printf("-- of-callers %08x %s:\n", tgt,
+                       ofNames.count(tgt) ? ofNames[tgt].c_str() : "?");
+                u32 hits = 0;
+                std::string owner = "<before first word>";
+                for (u32 va = 0xFF800000u; va < 0xFF930000u; va += 4) {
+                    const auto nit = ofNames.find(va);
+                    if (nit != ofNames.end())
+                        owner = nit->second;
+                    u8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+                    if (!rd(va, b0) || !rd(va + 1, b1) || !rd(va + 2, b2) ||
+                        !rd(va + 3, b3))
+                        continue;
+                    const u32 w = (u32(b0) << 24) | (u32(b1) << 16) |
+                                  (u32(b2) << 8) | b3;
+                    if ((w >> 26) != 18u)
+                        continue;
+                    i32 li = static_cast<i32>(w & 0x03FFFFFCu);
+                    if (li & 0x02000000)
+                        li |= static_cast<i32>(0xFC000000u);
+                    const u32 dst = (w & 2u) ? static_cast<u32>(li)
+                                             : va + static_cast<u32>(li);
+                    if (dst != tgt)
+                        continue;
+                    printf("   %08x  %s  in %s\n", va,
+                           (w & 1u) ? "bl" : "b ", owner.c_str());
+                    if (++hits >= 64)
+                        break;
+                }
+                if (!hits)
+                    printf("   <no caller>\n");
+            }
+            // Apple's Open Firmware is subroutine-threaded: a colon
+            // definition compiles to a run of `bl <word>`. With the name
+            // table in hand that is decompilable, so a word can be read
+            // instead of inferred from which of its callees happened to
+            // show up in a trace.
+            for (u32 seeVa : ofSee) {
+                printf("-- of-see %08x %s:\n", seeVa,
+                       ofNames.count(seeVa) ? ofNames[seeVa].c_str() : "?");
+                char dtext[128];
+                for (u32 k = 0; k < ofSeeN; ++k) {
+                    const u32 va = seeVa + 4u * k;
+                    u32 pa = 0;
+                    cpu.st = tArmed;
+                    const bool ok = cpu.translate(va, false, false, pa);
+                    cpu.st = tArmed;
+                    if (!ok || pa >= bus.ramBytes()) {
+                        printf("   %08x: <untranslatable>\n", va);
+                        break;
+                    }
+                    const u32 w = bus.read32(pa);
+                    disassemble(w, va, dtext, sizeof dtext, Style::Gnu);
+                    std::string ann;
+                    if ((w >> 26) == 18u) { // b / bl / ba / bla
+                        i32 li = static_cast<i32>(w & 0x03FFFFFCu);
+                        if (li & 0x02000000)
+                            li |= static_cast<i32>(0xFC000000u);
+                        const u32 tgt = (w & 2u)
+                                            ? static_cast<u32>(li)
+                                            : va + static_cast<u32>(li);
+                        const auto nit = ofNames.find(tgt);
+                        if (nit != ofNames.end())
+                            ann = "   <" + nit->second + ">";
+                    }
+                    printf("   %08x: %08x  %s%s\n", va, w, dtext,
+                           ann.c_str());
+                    if (w == 0x4E800020u) // blr ends the definition
+                        break;
+                }
+            }
             fflush(stdout);
         }
+        // The name table is built over ff800000..ff930000, but this gate used
+        // to mask to ff8xxxxx and so dropped every word above ff900000 —
+        // which is where the whole PCI-node method set lives (probe-slots,
+        // ?probe-slot, pci-probe-mask). Match the table, not a prefix.
         if (!ofNames.empty() && executed >= traceOfAt &&
-            traceOfLeft && (pc & 0xFFF00000u) == 0xFF800000u) {
+            pc >= 0xFF800000u && pc < 0xFF930000u) {
             const auto it = ofNames.find(pc);
             if (it != ofNames.end()) {
-                --traceOfLeft;
-                printf("OF %08x %s\n", pc, it->second.c_str());
+                const bool keep =
+                    ofOnly.empty() ||
+                    [&] {
+                        for (const std::string& s : ofOnly)
+                            if (it->second.find(s) != std::string::npos)
+                                return true;
+                        return false;
+                    }();
+                if (traceOfLeft && keep) {
+                    --traceOfLeft;
+                    printf("OF %08x %s @%llu\n", pc, it->second.c_str(),
+                           static_cast<unsigned long long>(executed));
+                }
+                if (ofHistTo && executed >= ofHistFrom &&
+                    executed < ofHistTo) {
+                    // Key on the address: this ROM carries three copies of
+                    // probe-slots and pci-probe-mask, one per PCI bus node,
+                    // and collapsing them by name hides which bus ran.
+                    char key[64];
+                    snprintf(key, sizeof key, "%08x %s", pc,
+                             it->second.c_str());
+                    if (ofHist[key]++ == 0)
+                        ofHistFirst.push_back({executed, key});
+                }
             }
         }
         if (bpN && executed >= bpFrom) {
@@ -3288,6 +3462,29 @@ int main(int argc, char** argv)
         }
         return std::string();
     };
+    if (!ofHist.empty()) {
+        std::vector<std::pair<u64, std::string>> byCount;
+        for (const auto& hv : ofHist)
+            byCount.push_back({hv.second, hv.first});
+        std::sort(byCount.begin(), byCount.end(),
+                  [](const std::pair<u64, std::string>& a,
+                     const std::pair<u64, std::string>& b) {
+                      return a.first > b.first;
+                  });
+        printf("-- of word histogram over [%llu,%llu): %zu distinct\n",
+               static_cast<unsigned long long>(ofHistFrom),
+               static_cast<unsigned long long>(ofHistTo), byCount.size());
+        for (size_t k = 0; k < byCount.size() && k < 60; ++k)
+            printf("   %8llu  %s\n",
+                   static_cast<unsigned long long>(byCount[k].first),
+                   byCount[k].second.c_str());
+        printf("-- of words in first-entry order (%zu):\n",
+               ofHistFirst.size());
+        for (const auto& fv : ofHistFirst)
+            printf("   @%-12llu %s\n",
+                   static_cast<unsigned long long>(fv.first),
+                   fv.second.c_str());
+    }
         printf("-- coverage timeline (%zu regions; %s):\n", firsts.size(),
                coverageAll ? "all first-entries" : "last 32 first-entries");
         const size_t start =

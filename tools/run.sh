@@ -20,5 +20,5 @@ exec ./build/tools/g4run/Release/g4run.exe \
  --hd "../scratch/openpowermac/hd.img" \
  --ati-rom "../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom" \
  --ati-at "${OPM_ATI_AT:-236000000}" \
- --serial-input "${OPM_SERIAL:-$DEFAULT_SERIAL}" \
+ --serial-input "${OPM_SERIAL-$DEFAULT_SERIAL}" \
  "$@"

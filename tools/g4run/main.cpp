@@ -51,6 +51,51 @@ struct Ring {
     void push(u32 pc, u32 insn) { e[n++ & 127u] = {pc, insn}; }
 };
 
+// ATA Manager function codes, from Apple's ATA Device Software Guide and
+// TN1192/TN1098. 0x96 and 0x98 appear in no Apple document — 0x98 was
+// decoded here as a driver-list ENUMERATOR (PB+0x32 selects the list,
+// PB+0x18 is an index), so it is named from measurement, not a manual.
+const char* ataFnName(u32 fn)
+{
+    switch (fn) {
+    case 0x00: return "NOP";
+    case 0x01: return "ExecIO";
+    case 0x03: return "BusInquiry";
+    case 0x04: return "QRelease";
+    case 0x10: return "Abort";
+    case 0x11: return "ResetBus";
+    case 0x12: return "RegAccess";
+    case 0x13: return "Identify";
+    case 0x85: return "DrvrRegister";
+    case 0x86: return "FindRefNum";
+    case 0x87: return "DrvrDeregister";
+    case 0x88: return "ModifyEventMask";
+    case 0x89: return "EjectDrive";
+    case 0x8A: return "GetDevConfig";
+    case 0x8B: return "SetDevConfig";
+    case 0x90: return "MgrInquiry";
+    case 0x93: return "AddATABus";
+    case 0x94: return "RemoveATABus";
+    case 0x96: return "undocumented-96";
+    case 0x98: return "EnumDrivers(decoded)";
+    default: return "?";
+    }
+}
+
+// Only codes whose ORIGIN has been located in this ROM get a name. Inventing
+// plausible names for the rest is how a number quietly becomes a belief;
+// everything else prints as bare decimal and hex so it stays a measurement.
+// Use --find-code to locate a new one and then add it here.
+const char* ataErrName(int e)
+{
+    switch (e) {
+    case -56: return " nsDrvErr/no-such-drive";
+    case -9325: return " ATALoad give-up (ffd9c74a)";
+    case -9356: return " 'nope' sentinel at rec+0x74 (ffdc9a10)";
+    default: return "";
+    }
+}
+
 // Toolbox trap names, for the ones this dig actually meets. A trace line
 // reading "$A03D" costs a lookup every time it is read; one reading
 // "_DrvrInstall" does not — and _DrvrInstall and _AddDrive are precisely the
@@ -216,6 +261,8 @@ int main(int argc, char** argv)
     u32 viaA = 0x00;                   // VIA port A strap levels
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
+    u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
+                                          // store watchpoint (CPU side)
     u32 watchMemPa = 0, watchMemEnd = 0;  // --watch-mem [--watch-mem-end]
     u32 stackAt = 0;                   // --stack-at ADDR: 68K backchain dump
     u32 watchReg = 99;                 // --watch-reg N: value-origin watch
@@ -241,12 +288,17 @@ int main(int argc, char** argv)
     u32 t68Cap = 4000;                 // --trace-68k-lines N
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
+    u32 bpPc[8] = {}, bpHit[8] = {}, bpN = 0; // --bp VA: register breakpoints
+    u32 bpMax = 4, bpDeref = 96;       // --bp-max N, --bp-deref BYTES
+    u64 bpFrom = 0;                    // --bp-from N: ignore hits before N
     u64 dumpStructsAt = 0;             // --dump-structs-at N
     u64 dumpRamAt = 0;                 // --dump-ram-at N
     u32 peekAddr = 0, peekLen = 64;    // --peek VA [LEN] (guest virtual)
     u64 peekAt = 0;                    // --peek-at N
     u64 heartbeat = 0;                 // --heartbeat N: periodic digest
     u32 findVal = 0;                   // --find VALUE: scan RAM for a word
+    int findCode = 0;                  // --find-code N: where is N generated
+    u64 disAt = 0;                     // --dis-at N: disassemble live VAs
     u64 findAt = 0;                    // --find-at N
     bool findSet = false;
     bool dumpStructsEnd = false;       // --dump-structs
@@ -290,6 +342,12 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
             atiAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--wp")) {
+            wpPa = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!wpEnd) wpEnd = wpPa + 3u;
+        }
+        else if (!strcmp(a, "--wp-end"))
+            wpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-mem"))
             watchMemPa = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-mem-end"))
@@ -334,6 +392,16 @@ int main(int argc, char** argv)
             t68Cap = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-from"))
             watchFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--bp")) {
+            if (bpN < 8)
+                bpPc[bpN++] = static_cast<u32>(strtoul(next(), nullptr, 0));
+        }
+        else if (!strcmp(a, "--bp-max"))
+            bpMax = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--bp-deref"))
+            bpDeref = static_cast<u32>(strtoul(next(), nullptr, 0)) & ~3u;
+        else if (!strcmp(a, "--bp-from"))
+            bpFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--arm-on-pc"))
             armOnPc = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--dump-structs")) dumpStructsEnd = true;
@@ -345,6 +413,10 @@ int main(int argc, char** argv)
             findVal = static_cast<u32>(strtoul(next(), nullptr, 0));
             findSet = true;
         }
+        else if (!strcmp(a, "--dis-at"))
+            disAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--find-code"))
+            findCode = static_cast<int>(strtol(next(), nullptr, 0));
         else if (!strcmp(a, "--find-at"))
             findAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--heartbeat"))
@@ -396,7 +468,7 @@ int main(int argc, char** argv)
     SawtoothBus bus(ramMb * 1024 * 1024, std::move(rom));
 
     char text[128];
-    if (disStart && disEnd > disStart) {
+    if (!disAt && disStart && disEnd > disStart) {
         for (u32 a = disStart & ~3u; a < disEnd; a += 4) {
             const u32 w = bus.read32(a);
             disassemble(w, a, text, sizeof text, Style::Gnu);
@@ -433,6 +505,8 @@ int main(int argc, char** argv)
     Cpu cpu;
     cpu.attach(bus);
     cpu.reset(); // pc = 0xFFF00100, MSR[IP]: vectors in ROM — authentic
+    cpu.wpPa = wpPa;   // physical store watchpoint, set before any stepping
+    cpu.wpEnd = wpEnd;
     u64 executed = 0;
     // Instrument census. A watch that emits nothing is ambiguous between
     // "never fired", "fired with nothing to say", and "its gate never
@@ -1053,6 +1127,75 @@ int main(int argc, char** argv)
         // dump finds an address that is stale by the time it is watched —
         // which is exactly how a watch on a hand-found 'nope' marker landed
         // on an unrelated word. Search the machine that is running.
+        // Disassemble a live virtual range. The startup --dis reads the boot
+        // ROM through the bus before the Mac OS ROM is even loaded, so every
+        // look at driver or ROM-in-RAM code so far has meant dumping bytes
+        // and decoding PowerPC by hand. Translate through the guest's own
+        // MMU, so a VA printed by any other instrument can be pasted here
+        // verbatim.
+        if (disAt && executed == disAt && disEnd > disStart) {
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            const CpuState savedDis = cpu.st;
+            cpu.st.msr |= 0x30u;
+            const CpuState armedDis = cpu.st;
+            char dtext[128];
+            printf("== dis %08x..%08x @%llu\n", disStart, disEnd,
+                   static_cast<unsigned long long>(executed));
+            for (u32 va = disStart & ~3u; va < disEnd; va += 4) {
+                u32 pa = 0;
+                if (va >= 0xFF000000u) {
+                    // ROM-in-RAM. The identity BAT translates FFxxxxxx to
+                    // itself, which is unmapped bus space reading as all
+                    // ones; the Mac OS ROM image actually lives in the low
+                    // copy. Same convention dis68k.sh and --find-code use.
+                    pa = va & 0x00FFFFFFu;
+                } else {
+                    cpu.st = armedDis;
+                    const bool ok = cpu.translate(va, false, false, pa);
+                    cpu.st = armedDis;
+                    if (!ok) {
+                        printf("   %08x: <untranslatable>\n", va);
+                        continue;
+                    }
+                }
+                const u32 w = bus.read32(pa);
+                disassemble(w, va, dtext, sizeof dtext, Style::Gnu);
+                printf("   %08x: %08x  %s\n", va, w, dtext);
+            }
+            cpu.st = savedDis;
+            cpu.raisedThisStep = false;
+            fflush(stdout);
+        }
+        // Where is an error code GENERATED? Locating -9356 meant hand-
+        // searching a dump for `li r3,-9356` and computing the VA by hand,
+        // twice. Scan for `addi rD,0,N` (li) across the loaded ROM and print
+        // the virtual addresses, so a new completion code names its own
+        // origin instead of staying a bare number.
+        if (findCode && executed == findAt) {
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            const std::vector<u8>& r = bus.ram();
+            const u32 want = 0x38000000u |
+                             (static_cast<u32>(findCode) & 0xFFFFu);
+            u32 hits = 0;
+            printf("== find-code %d (li rD,%d) @%llu\n", findCode, findCode,
+                   static_cast<unsigned long long>(executed));
+            for (size_t p = 0x00C00000; p + 4 <= r.size() &&
+                                        p < 0x00E00000 && hits < 30;
+                 p += 4) {
+                const u32 w = (u32(r[p]) << 24) | (u32(r[p + 1]) << 16) |
+                              (u32(r[p + 2]) << 8) | r[p + 3];
+                if ((w & 0xFC1FFFFFu) == want) {
+                    ++hits;
+                    printf("   VA %08llx  (li r%u,%d)\n",
+                           0xFF000000ull + p, (w >> 21) & 31u, findCode);
+                }
+            }
+            printf("   (%u site%s in the loaded ROM)\n", hits,
+                   hits == 1 ? "" : "s");
+            fflush(stdout);
+        }
         if (findSet && executed == findAt) {
             cpu.l1dFlushAll(true);
             cpu.l2FlushAll(true);
@@ -1148,6 +1291,53 @@ int main(int argc, char** argv)
         }
         // Event-based arming. Hard-coded instruction gates go stale the
         // moment any fix shifts the timeline — one did this session, by
+        // A real breakpoint. Every dig so far has reached "which instruction
+        // produced this?" and then stopped, because the only ways to see
+        // register state were a park dump (too late) or an instruction count
+        // (goes stale the moment timing shifts). Naming a PC is durable, and
+        // the state that matters at an error site is almost always behind a
+        // pointer, so dereference the argument registers too.
+        if (bpN && executed >= bpFrom) {
+            for (u32 bi = 0; bi < bpN; ++bi) {
+                if (pc != bpPc[bi] || bpHit[bi] >= bpMax)
+                    continue;
+                ++bpHit[bi];
+                printf("== BP%u %08x hit#%u @%llu lr=%08x ctr=%08x cr=%08x\n",
+                       bi, pc, bpHit[bi],
+                       static_cast<unsigned long long>(executed),
+                       cpu.st.lr, cpu.st.ctr, cpu.st.cr);
+                for (u32 g = 0; g < 32; g += 8) {
+                    printf("   r%-2u:", g);
+                    for (u32 k = 0; k < 8; ++k)
+                        printf(" %08x", cpu.st.gpr[g + k]);
+                    printf("\n");
+                }
+                const CpuState savedBp = cpu.st;
+                cpu.st.msr |= 0x30u;
+                const CpuState armedBp = cpu.st;
+                for (u32 g = 3; g <= 6; ++g) {
+                    const u32 ea = cpu.st.gpr[g];
+                    if (ea < 0x1000u || ea >= 0xF0000000u)
+                        continue;
+                    u32 pa = 0;
+                    cpu.st = armedBp;
+                    const bool ok = cpu.translate(ea, false, false, pa);
+                    cpu.st = armedBp;
+                    if (!ok)
+                        continue;
+                    printf("   *r%u %08x (pa %08x):", g, ea, pa);
+                    for (u32 o = 0; o < bpDeref; o += 4) {
+                        if ((o & 31u) == 0 && o)
+                            printf("\n            +%04x:", o);
+                        printf(" %08x", bus.read32(pa + o));
+                    }
+                    printf("\n");
+                }
+                cpu.st = savedBp;
+                cpu.raisedThisStep = false;
+                fflush(stdout);
+            }
+        }
         // 830M instructions, and silently disarmed every instrument.
         // Arming on a CONDITION instead is durable: the park is the 68K
         // Start Manager's tick spin at ffc03666, so the Nth time we see it
@@ -1322,9 +1512,26 @@ int main(int argc, char** argv)
                         static_cast<u8>(bus.read32(pa & ~3u) >>
                                         (8 * (3 - (pa & 3u)))));
                 };
-                printf("ATARES pb=%08x result=%d fn=%02x @%llu\n", rpb, res,
-                       rb(0x12) & 0xFF,
-                       static_cast<unsigned long long>(executed));
+                {
+                    const int fnb = rb(0x12) & 0xFF;
+                    const auto& cl2 = bus.cd().log;
+                    const auto& hl2 = bus.hd().log;
+                    // Tie the manager's complaint to the WIRE: which ATA
+                    // command each cell last saw and how many bytes moved.
+                    // A manager error and a device that never transferred
+                    // are the same event seen from two ends.
+                    printf("ATARES pb=%08x result=%d (0x%04x)%s fn=%02x %s "
+                           "lastCD=%c%02x[%uB] lastHD=%c%02x[%uB] @%llu\n",
+                           rpb, res, res & 0xFFFF, ataErrName(res), fnb,
+                           ataFnName(static_cast<u32>(fnb)),
+                           cl2.empty() ? '-' : cl2.back().kind,
+                           cl2.empty() ? 0 : cl2.back().val,
+                           cl2.empty() ? 0u : cl2.back().xfer,
+                           hl2.empty() ? '-' : hl2.back().kind,
+                           hl2.empty() ? 0 : hl2.back().val,
+                           hl2.empty() ? 0u : hl2.back().xfer,
+                           static_cast<unsigned long long>(executed));
+                }
                 snprintf(evb, sizeof evb,
                          "\"pb\":%u,\"result\":%d,\"fn\":%d", rpb, res,
                          rb(0x12) & 0xFF);
@@ -2488,6 +2695,39 @@ int main(int argc, char** argv)
     // saw nothing, or the watch never started looking. Three instruments
     // this session reported silence of the second kind and it was read as
     // silence of the first.
+    if (cpu.wpEnd) {
+        printf("-- watchpoint %08x..%08x: %zu store%s%s\n", cpu.wpPa,
+               cpu.wpEnd, cpu.wpLog.size(), cpu.wpLog.size() == 1 ? "" : "s",
+               cpu.wpLog.size() >= cpu.wpMax ? " (capped)" : "");
+        for (const Cpu::WpHit& h : cpu.wpLog)
+            printf("   pa %08x <- %0*x  by pc=%08x tb=%llu\n", h.pa,
+                   static_cast<int>(h.len * 2), h.val, h.pc,
+                   static_cast<unsigned long long>(h.tb));
+    }
+    // Guest time, measured rather than assumed. The 68K park at ffc03664 is
+    // `moveq #15,d0; add.l Ticks,d0; cmp.l Ticks,d0; bcc *-4` — a quarter-
+    // second delay off the 60 Hz tick — so how fast Ticks runs IS whether
+    // the boot proceeds. Print the guest's own decrementer programming next
+    // to what it got, because "the tick is slow" and "the tick was never
+    // programmed" call for opposite fixes.
+    {
+        const u32 ticksPa = 0x4000u + 0x016Au; // 68K lowmem Ticks
+        const u32 tk = bus.read32(ticksPa);
+        printf("-- guest time: Ticks=%u tb=%llu dec=%08x "
+               "dec-writes=%llu dec-irqs=%llu last-reload=%u min-reload=%s\n",
+               tk, static_cast<unsigned long long>(cpu.st.tb), cpu.st.dec,
+               static_cast<unsigned long long>(cpu.decWrites),
+               static_cast<unsigned long long>(cpu.decIrqs),
+               cpu.decLastWrite,
+               cpu.decMinPeriod == ~0ull
+                   ? "none"
+                   : std::to_string(cpu.decMinPeriod).c_str());
+        if (cpu.decMinPeriod != ~0ull && cpu.decMinPeriod)
+            printf("--   implied tick rate: one 0x900 per %llu TB ticks "
+                   "= %.2f Hz at 25 MHz\n",
+                   static_cast<unsigned long long>(cpu.decMinPeriod),
+                   25000000.0 / static_cast<double>(cpu.decMinPeriod));
+    }
     printf("-- gates: arm-at-park=%u (park seen %u times, %s) "
            "arm-on-pc=%08x watch-from=%llu (%s) events=%s\n",
            armAtPark, parkSeen, parkArmed ? "ARMED" : "never armed", armOnPc,

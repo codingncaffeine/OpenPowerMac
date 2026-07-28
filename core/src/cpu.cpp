@@ -73,6 +73,7 @@ void Cpu::step()
         }
         if (decPending) {
             decPending = false;
+            ++decIrqs;
             raiseExc(Exc::Decrementer, st.pc, 0);
             return;
         }

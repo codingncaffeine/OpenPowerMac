@@ -41,6 +41,15 @@ public:
     u32 read(u32 off, u32 len);
     void write(u32 off, u32 v, u32 len);
 
+    // Run the deferred command, if its BSY window has elapsed. Called once
+    // per instruction from the machine's peripheral tick. The delay is in
+    // INSTRUCTIONS rather than timebase ticks on purpose: it exists to be
+    // wider than a driver's arming sequence, which is a fixed number of
+    // instructions, and it must not change meaning when the harness
+    // compresses guest time.
+    void tick();
+    u64 cmdDelay_ = 4000;
+
     // DBDMA drain of the current data phase: same completion semantics
     // as PIO reads (chunked READs refill through finishPio).
     u32 dmaAvail() const
@@ -111,6 +120,11 @@ private:
     u32 readLeft_ = 0;
     u8 sense_ = 0; // last sense key
     u32 pulled_ = 0; // data-register bytes served since the last command
+    // Deferred command: the write lands, BSY goes up, and the command runs
+    // cmdDelay_ instructions later. See write() case 0x070.
+    bool pending_ = false;
+    u8 pendCmd_ = 0;
+    u64 pendAt_ = 0;
     bool irq_ = false;
     // Cell (not drive) registers at +0x200 and up: PIO/DMA timing. They sit
     // in mac-io, so drive select and an absent slave are irrelevant to them

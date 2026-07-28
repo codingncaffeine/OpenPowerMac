@@ -339,12 +339,33 @@ void AtaCell::write(u32 off, u32 v, u32 len)
     case 0x060: dev_ = b; break;
     case 0x070:
         irq_ = false;
-        if (!(dev_ & 0x10u))
-            ataCommand(b);
+        if (!(dev_ & 0x10u)) {
+            // A real drive does not finish a command in zero time: it raises
+            // BSY on the command write and only later clears BSY, sets DRQ
+            // and asserts INTRQ. Completing instantly is not merely optimistic
+            // — it inverts the ORDER a driver depends on. Open Firmware's ATA
+            // driver writes the command, then arms its interrupt path (a
+            // store to the cell's +0x200 control word ~700 instructions
+            // later), then waits. With an instant device the whole transfer
+            // was already done and the interrupt already consumed by the
+            // status read before arming, so the wait never ended: measured on
+            // the boot HD, eight 16 KiB READ MULTIPLEs succeeded and the
+            // ninth hung with DRQ asserted and the driver polling forever.
+            // Hold the command for a window wider than that arming sequence.
+            if (!stamp) { // no clock to defer against: run it now
+                ataCommand(b);
+                break;
+            }
+            pendCmd_ = b;
+            pendAt_ = (stamp ? *stamp : 0) + cmdDelay_;
+            pending_ = true;
+            status_ = kBsy;
+        }
         break;
     case 0x160:
         devctl_ = b;
         if (b & 0x04u) {
+            pending_ = false; // a reset cancels the command in flight
             // Software reset: the device places ITS OWN signature, and that
             // signature is how the host decides which command set to use.
             // This arm handed out the ATAPI 01 01 14 EB unconditionally, so
@@ -364,6 +385,14 @@ void AtaCell::write(u32 off, u32 v, u32 len)
     }
 }
 
+
+void AtaCell::tick()
+{
+    if (!pending_ || !stamp || *stamp < pendAt_)
+        return;
+    pending_ = false;
+    ataCommand(pendCmd_);
+}
 void AtaCell::ataCommand(u8 cmd)
 {
     // Attribute the bytes the host pulled to the command that produced

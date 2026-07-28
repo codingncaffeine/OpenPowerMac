@@ -926,6 +926,11 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
     if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception
         const u32 old = c.st.dec;
         c.st.dec = v;
+        ++c.decWrites;
+        c.decLastWrite = v;
+        c.decLastWriteTb = c.st.tb;
+        if (v && !(v & 0x80000000u) && v < c.decMinPeriod)
+            c.decMinPeriod = v;
         if (!(old & 0x80000000u) && (v & 0x80000000u))
             c.decPending = true;
         return;

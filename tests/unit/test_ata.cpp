@@ -123,3 +123,46 @@ TEST_CASE("ATA disk IDENTIFY reports a capacity the host can read")
 
     remove(kIso);
 }
+
+// A command must not complete in zero time.
+//
+// Open Firmware's ATA driver writes the command register, then arms its
+// interrupt path some hundreds of instructions later, then waits. A drive
+// that finishes instantly has already asserted and lost its interrupt by the
+// time the driver is listening — measured on the boot disk, eight 16 KiB
+// READ MULTIPLEs succeeded and the ninth hung forever with DRQ asserted and
+// the driver polling. The device must hold BSY across the arming window.
+TEST_CASE("an ATA command asserts BSY and completes only after its delay")
+{
+    REQUIRE(makeIso());
+    AtaCell hd;
+    REQUIRE(hd.attachDisk(kIso));
+
+    u64 clock = 0;
+    hd.stamp = &clock;
+    hd.cmdDelay_ = 100;
+
+    hd.write(0x060, 0xE0, 1); // LBA mode, device 0
+    hd.write(0x020, 0x01, 1); // one sector
+    hd.write(0x030, 0x00, 1);
+    hd.write(0x040, 0x00, 1);
+    hd.write(0x050, 0x00, 1);
+    hd.write(0x070, 0x20, 1); // READ SECTOR(S)
+
+    // Immediately after the write the drive is busy, not ready, not DRQ.
+    CHECK((hd.read(0x160, 1) & 0x80u) != 0); // BSY via alt-status
+    CHECK((hd.read(0x160, 1) & 0x08u) == 0); // no DRQ yet
+    CHECK(!hd.irqLine());
+
+    for (clock = 1; clock < 100; ++clock)
+        hd.tick();
+    CHECK((hd.read(0x160, 1) & 0x80u) != 0); // still busy one tick short
+
+    clock = 100;
+    hd.tick();
+    CHECK((hd.read(0x160, 1) & 0x80u) == 0);
+    CHECK((hd.read(0x160, 1) & 0x08u) != 0); // DRQ: data is ready
+    CHECK(hd.irqLine());                     // and INTRQ is asserted
+
+    remove(kIso);
+}

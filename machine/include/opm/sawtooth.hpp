@@ -236,6 +236,8 @@ public:
     {
         ohci_[0].tick(tb);
         ohci_[1].tick(tb);
+        cd_.tick(); // deferred ATA commands: see AtaCell::write case 0x070
+        hd_.tick();
     }
 
     // DBDMA channels, one per ATA cell, at the mac-io offsets the ROM's

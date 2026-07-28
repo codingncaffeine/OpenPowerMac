@@ -116,6 +116,19 @@ struct Cpu {
     u32 cycleAccum = 0;
     u32 cyclesPerTbTick = 4;   // TB = bus clock / 4; provisional 1 cycle/insn
 
+    // Timebase/decrementer accounting. Whether the guest's 60 Hz tick is
+    // driven off the decrementer is a question the whole boot hangs on —
+    // Ticks ($016A) advanced once in 1.45 billion instructions — and it is
+    // answerable only by counting what the guest actually does with DEC:
+    // how often it reloads it, with what period, and how many 0x900s it
+    // takes. Guessing from the interrupt total alone cannot separate "never
+    // programmed" from "programmed far too long".
+    u64 decWrites = 0;         // mtspr DEC by the guest
+    u64 decIrqs = 0;           // 0x900 exceptions actually delivered
+    u32 decLastWrite = 0;      // last value written
+    u64 decLastWriteTb = 0;    // TB at that write
+    u64 decMinPeriod = ~0ull;  // smallest reload seen (TB ticks)
+
     void tick(u32 cycles)
     {
         cycleAccum += cycles;
@@ -209,6 +222,20 @@ struct Cpu {
     bool dceOn() const { return (st.hid0 & 0x00004000u) != 0; }
     u64 memRead(u32 pa, u32 len, u32 wimg);
     void memWrite(u32 pa, u32 len, u64 v, u32 wimg);
+
+    // Physical data watchpoint. Bus::watchPa only sees traffic that reaches
+    // the bus, so an ordinary cached store to a low-memory global — Ticks,
+    // a DCE field, a queue header — is invisible to it: the write lands in
+    // an L1 line and the watch never fires, which reads exactly like "the
+    // guest never wrote it". This sits on the store path itself, so it sees
+    // the write whether or not the line is ever cast out.
+    u32 wpPa = 0, wpEnd = 0; // inclusive byte range; wpEnd 0 disables
+    struct WpHit {
+        u32 pc, pa, val, len;
+        u64 tb;
+    };
+    std::vector<WpHit> wpLog;
+    u32 wpMax = 64;
     bool l1dPeek32(u32 pa, u32& w); // fetch path coherence peek
     void dcbzLine(u32 pa);          // allocate + zero, no fill
     void dcbClean(u32 pa, bool invalidate); // dcbst / dcbf

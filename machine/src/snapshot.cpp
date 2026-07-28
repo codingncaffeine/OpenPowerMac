@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 4;
+constexpr u32 kSnapVersion = 5;
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -398,6 +398,12 @@ void AtaCell::snapSave(SnapWriter& w) const
     w.u64v(readLba_);
     w.u32v(readLeft_);
     w.u8v(sense_);
+    // Deferred command: a snapshot taken inside the BSY window must resume
+    // with the command still owed, or the drive silently drops it.
+    w.b(pending_);
+    w.u8v(pendCmd_);
+    w.u64v(pendAt_);
+    w.u64v(cmdDelay_);
     w.b(irq_);
     w.arr32(ctl_, 16);
     w.u64v(log.size());
@@ -449,6 +455,10 @@ void AtaCell::snapLoad(SnapReader& r)
     readLba_ = r.u64v();
     readLeft_ = r.u32v();
     sense_ = r.u8v();
+    pending_ = r.b();
+    pendCmd_ = r.u8v();
+    pendAt_ = r.u64v();
+    cmdDelay_ = r.u64v();
     irq_ = r.b();
     r.arr32(ctl_, 16);
     const u64 n = r.u64v();

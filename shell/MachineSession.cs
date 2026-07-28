@@ -70,7 +70,12 @@ public sealed class MachineSession
             if (!string.IsNullOrWhiteSpace(s.AtiRomPath) && s.AtiAt > 0)
                 Native.opm_ati_at(m, s.AtiAt);
 
+            // Report the hard disk too. Without it in this line there was no
+            // way to tell a machine booting from disk apart from one that
+            // never had a disk at all — and that is the whole question when
+            // the screen shows a flashing "?" folder.
             ConsoleQ.Enqueue($"[shell] machine up — {s.RamMb} MB, fast-tb {s.FastTb}" +
+                             (string.IsNullOrWhiteSpace(s.HdPath) ? ", NO HD" : ", HD attached") +
                              (string.IsNullOrWhiteSpace(s.CdPath) ? "" : ", CD attached") +
                              (string.IsNullOrWhiteSpace(s.AtiRomPath) ? "" : $", ATI at {s.AtiAt / 1_000_000}M") + "\n");
 

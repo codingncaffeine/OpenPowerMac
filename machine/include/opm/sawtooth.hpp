@@ -151,6 +151,13 @@ public:
     // injected probe (~245M) — with the card invisible at choice time
     // the console stays serial, and the FCode still runs at probe time.
     u64 atiVisibleAt = 0;
+    // …and hide it again for a window. The FCode runs during Open
+    // Firmware's PCI probe and builds the display node with the
+    // properties Mac OS needs; the console choice happens later, and a
+    // display present at that moment takes the console with it into a
+    // framebuffer terminal that never paints. Hiding the card across the
+    // choice keeps the node and leaves the console on serial.
+    u64 atiHideFrom = 0, atiHideTo = 0;
     // Memory write-watch bounds (inclusive); see write().
     u32 watchPa = 0;
     u32 watchPaEnd = 0;
@@ -699,7 +706,10 @@ private:
         }
         const u32 reg = (cfgAddr_[b] & 0xFCu) | (pa & 7u);
         if (b == 0u && (cfgAddr_[b] & 0x0FFFFF00u) == 0x00010000u &&
-            atiVisibleAt && stamp && *stamp < atiVisibleAt) {
+            stamp &&
+            ((atiVisibleAt && *stamp < atiVisibleAt) ||
+             (atiHideTo > atiHideFrom && *stamp >= atiHideFrom &&
+              *stamp < atiHideTo))) {
             if (!wr)
                 return len == 1 ? 0xFFu : len == 2 ? 0xFFFFu : 0xFFFFFFFFu;
             return 0; // absent card: master-abort both ways

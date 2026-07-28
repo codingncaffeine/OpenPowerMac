@@ -242,6 +242,8 @@ int main(int argc, char** argv)
 {
     const char* romPath = nullptr;
     const char* romDumpPath = nullptr; // --dump-rom FILE
+    bool coverageAll = false; // --coverage-all
+    u64 atiHideFrom = 0, atiHideTo = 0; // --ati-hide FROM TO
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
     size_t ramMb = 256;
@@ -322,6 +324,11 @@ int main(int argc, char** argv)
         };
         if (!strcmp(a, "--rom")) romPath = next();
         else if (!strcmp(a, "--dump-rom")) romDumpPath = next();
+        else if (!strcmp(a, "--coverage-all")) coverageAll = true;
+        else if (!strcmp(a, "--ati-hide")) {
+            atiHideFrom = strtoull(next(), nullptr, 0);
+            atiHideTo = strtoull(next(), nullptr, 0);
+        }
         else if (!strcmp(a, "--nvram-set")) nvramSet.push_back(next());
         else if (!strcmp(a, "--ram")) ramMb = strtoul(next(), nullptr, 0);
         else if (!strcmp(a, "--max")) maxInsns = strtoull(next(), nullptr, 0);
@@ -681,6 +688,8 @@ int main(int argc, char** argv)
     bus.ati().stamp = &executed;
     bus.ati().pcRef = &cpu.st.pc;
     bus.atiVisibleAt = atiAt;
+    bus.atiHideFrom = atiHideFrom;
+    bus.atiHideTo = atiHideTo;
     bus.ataDma().stamp = &executed;
     bus.ataDma().pcRef = &cpu.st.pc;
 
@@ -3129,9 +3138,13 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(top[k].first));
     }
     {
-        printf("-- coverage timeline (%zu regions; last 32 first-entries):\n",
-               firsts.size());
-        const size_t start = firsts.size() > 32 ? firsts.size() - 32 : 0;
+        // The whole list with --coverage-all: two deterministic runs that
+        // end differently diverge at a first-entry, and the last 32 cannot
+        // show where.
+        printf("-- coverage timeline (%zu regions; %s):\n", firsts.size(),
+               coverageAll ? "all first-entries" : "last 32 first-entries");
+        const size_t start =
+            (!coverageAll && firsts.size() > 32) ? firsts.size() - 32 : 0;
         for (size_t k = start; k < firsts.size(); ++k)
             printf("   @%-11llu %08x\n",
                    static_cast<unsigned long long>(firsts[k].first),

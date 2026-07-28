@@ -312,6 +312,11 @@ public:
     // firmware's 5-second escape window selects the serial console.
     const std::string& console() const { return console_; }
     void injectSerial(const std::string& s) { rxQueue_ += s; }
+    // Instructions between delivered receive bytes. Un-paced delivery
+    // overflows the firmware.s input ring and drops the tail, but 3M was
+    // picked for a short script: a 300-character setup takes 900M
+    // instructions to type, which is most of a boot.
+    u64 rxPaceInsns = 3000000ull;
 
     // Uni-North "Keywest" I2C at 0xF8001000 — the DIMM SPD bus. Byte
     // registers at +3 of each 0x10-strided word, protocol as the ROM's
@@ -943,7 +948,7 @@ private:
             if (rxReady) {
                 const u8 b = static_cast<u8>(rxQueue_.front());
                 rxQueue_.erase(rxQueue_.begin());
-                rxNextAt_ = *stamp + 3000000ull;
+                rxNextAt_ = *stamp + rxPaceInsns;
                 return b;
             }
             return 0;

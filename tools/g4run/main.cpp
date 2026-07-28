@@ -329,6 +329,8 @@ int main(int argc, char** argv)
     bool findSet = false;
     bool dumpStructsEnd = false;       // --dump-structs
     const char* eventsPath = nullptr;  // --events FILE (JSONL)
+    const char* serialLogPath = nullptr; // --serial-log FILE
+    u64 serialRate = 0;                // --serial-rate N
     u32 watchVa = 0;                   // --watch-va ADDR
     u64 traceFrom = 0;                 // --trace-from N: full trace window
     u64 traceLines = 2000;             // --trace-lines M
@@ -493,6 +495,9 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--dump-structs-at"))
             dumpStructsAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--events")) eventsPath = next();
+        else if (!strcmp(a, "--serial-log")) serialLogPath = next();
+        else if (!strcmp(a, "--serial-rate"))
+            serialRate = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
             traceFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-lines"))
@@ -689,6 +694,8 @@ int main(int argc, char** argv)
             printf("-- cd attach FAILED: %s\n", cdPath);
     }
 
+    if (serialRate)
+        bus.rxPaceInsns = serialRate;
     if (serialCr)
         bus.injectSerial("\r"); // CR in the escape window -> serial console
 
@@ -3633,6 +3640,22 @@ int main(int argc, char** argv)
             putchar('\n');
         if (con.size() > 8192)
             printf("   ... (%zu more bytes)\n", con.size() - 8192);
+        // Open Firmware's own words are the best instrument this machine
+        // has — printenv, dev, .properties, words — but their answers are
+        // long and the digest above truncates. Write the stream verbatim so
+        // a script can ask a real question and read the whole reply.
+        if (serialLogPath) {
+            FILE* sf = fopen(serialLogPath, "wb");
+            if (sf) {
+                fwrite(con.data(), 1, con.size(), sf);
+                fclose(sf);
+                printf("-- serial console written to %s (%zu bytes)\n",
+                       serialLogPath, con.size());
+            } else {
+                printf("-- serial console: cannot write %s\n",
+                       serialLogPath);
+            }
+        }
     }
     {
         const auto& pl = bus.pmu().log;

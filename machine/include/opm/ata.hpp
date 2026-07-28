@@ -65,6 +65,11 @@ public:
         u32 a = 0, b = 0; // READ ops: LBA + sector count
         u32 pc = 0;    // the instruction that issued it
         u32 xfer = 0;  // bytes the host actually pulled for this command
+        // The whole CDB for packet ops. Logging only cdb[0] meant every
+        // MMC failure read as a bare opcode: "READ TOC was refused" could
+        // not be told from "READ TOC in MSF form with a 4-byte buffer was
+        // refused", and those call for different fixes.
+        u8 cdb[12] = {};
     };
     std::vector<Ev> log;
     const u64* stamp = nullptr;

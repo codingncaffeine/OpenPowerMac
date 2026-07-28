@@ -26,6 +26,9 @@ public:
     // Framebuffer aperture (BAR0): raw memory, both endian apertures
     // land here (the FCode/driver picks its own swap discipline).
     std::vector<u8> vram;
+    // Framebuffer write census — see Sawtooth::write.
+    u64 fbWrites = 0;
+    u32 fbLo = 0xFFFFFFFFu, fbHi = 0;
 
     R128Cell() : vram(32u << 20, 0) {}
 

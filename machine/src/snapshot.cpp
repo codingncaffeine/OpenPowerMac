@@ -414,6 +414,7 @@ void AtaCell::snapSave(SnapWriter& w) const
         w.u32v(ev.a);
         w.u32v(ev.b);
         w.u32v(ev.pc);
+        w.raw(ev.cdb, 12);
         w.u32v(ev.xfer);
     }
 }
@@ -471,6 +472,7 @@ void AtaCell::snapLoad(SnapReader& r)
         ev.a = r.u32v();
         ev.b = r.u32v();
         ev.pc = r.u32v();
+        r.raw(ev.cdb, 12);
         ev.xfer = r.u32v();
         log.push_back(ev);
     }

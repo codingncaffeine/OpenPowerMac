@@ -501,6 +501,15 @@ private:
             return;
         }
         if (atiFbBar_ && pa - atiFbBar_ < (32u << 20)) {
+            // Framebuffer traffic, counted. "Is the OS drawing anything?"
+            // is otherwise answerable only through the CRTC gate, which
+            // stays shut until the display driver programs it — so a guest
+            // that paints into VRAM without ever setting the mode looks
+            // identical to one that never ran.
+            ++ati_.fbWrites;
+            const u32 fo = pa - atiFbBar_;
+            if (fo < ati_.fbLo) ati_.fbLo = fo;
+            if (fo > ati_.fbHi) ati_.fbHi = fo;
             put(ati_.vram.data() + (pa - atiFbBar_), v, len);
             return;
         }

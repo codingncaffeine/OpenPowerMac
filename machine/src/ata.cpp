@@ -483,8 +483,8 @@ void AtaCell::packet(const u8* cdb)
     irq_ = true; // every packet resolution interrupts
     if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);
-    if (true)
-        log.push_back({stamp ? *stamp : 0, 'p', cdb[0], 0, 0, pcRef ? *pcRef : 0});
+    log.push_back({stamp ? *stamp : 0, 'p', cdb[0], 0, 0, pcRef ? *pcRef : 0});
+    memcpy(log.back().cdb, cdb, 12);
     error_ = 0;
     data_.clear();
     dataAt_ = 0;
@@ -492,6 +492,13 @@ void AtaCell::packet(const u8* cdb)
     auto complete = [&] {
         nsect_ = kIo | kCoD;
         status_ = kDrdy;
+        // Command complete is an INTERRUPT, not just a status change. Without
+        // it a driver that waits on INTRQ never learns the command finished:
+        // the boot hung here after the CD driver's START STOP UNIT, spinning
+        // on a parameter block whose ioResult stayed 1 (in progress) at
+        // ffdd5764 for 2.5 billion instructions. Same defect shape as the
+        // zero-latency command — the device did the work and never said so.
+        irq_ = true;
     };
     switch (cdb[0]) {
     case 0x00: // TEST UNIT READY
@@ -518,6 +525,11 @@ void AtaCell::packet(const u8* cdb)
     }
     case 0x1B: // START STOP UNIT
     case 0x1E: // PREVENT ALLOW MEDIUM REMOVAL
+    case 0x35: // SYNCHRONIZE CACHE — nothing is buffered here
+    case 0xBB: // SET CD SPEED: a rate request, not a data transfer. Apple's
+               // CD driver issues it during setup and treats the ABORT we
+               // used to return as a hard failure — ATA Manager ExecIO
+               // answered -9393 and the drive was rejected before use.
         complete();
         break;
     case 0x25: { // READ CAPACITY(10)
@@ -546,20 +558,42 @@ void AtaCell::packet(const u8* cdb)
     case 0x2B: // SEEK
         complete();
         break;
-    case 0x43: { // READ TOC: one data track at LBA 0
+    case 0x43: { // READ TOC/PMA/ATIP
+        // One data track plus the lead-out. Two fields were ignored here
+        // and both are ones a real driver acts on: the MSF bit (cdb[1] bit
+        // 1) selects min/sec/frame addresses instead of LBA, and the
+        // allocation length (cdb[7..8]) caps the reply — a driver that asks
+        // for four bytes and is handed twenty has been lied to about the
+        // size of its own buffer.
+        const bool msf = (cdb[1] & 0x02u) != 0;
+        const u64 blocks = isoBytes_ / 2048;
+        auto addr = [&](size_t at, u64 lba) {
+            if (!msf) {
+                data_[at] = static_cast<u8>(lba >> 24);
+                data_[at + 1] = static_cast<u8>(lba >> 16);
+                data_[at + 2] = static_cast<u8>(lba >> 8);
+                data_[at + 3] = static_cast<u8>(lba);
+                return;
+            }
+            const u64 f = lba + 150; // MSF counts from 00:02:00
+            data_[at] = 0;
+            data_[at + 1] = static_cast<u8>(f / (60 * 75));
+            data_[at + 2] = static_cast<u8>((f / 75) % 60);
+            data_[at + 3] = static_cast<u8>(f % 75);
+        };
         data_.assign(20, 0);
-        data_[1] = 18;
-        data_[2] = 1;
-        data_[3] = 1;
-        data_[5] = 0x14;
+        data_[1] = 18; // TOC data length, not counting these two bytes
+        data_[2] = 1;  // first track
+        data_[3] = 1;  // last track
+        data_[5] = 0x14; // ADR 1, control 4: a data track
         data_[6] = 1;
+        addr(8, 0);
         data_[13] = 0x14;
         data_[14] = 0xAA; // lead-out
-        const u64 blocks = isoBytes_ / 2048;
-        data_[16] = static_cast<u8>(blocks >> 24);
-        data_[17] = static_cast<u8>(blocks >> 16);
-        data_[18] = static_cast<u8>(blocks >> 8);
-        data_[19] = static_cast<u8>(blocks);
+        addr(16, blocks);
+        const u32 alloc = (u32(cdb[7]) << 8) | cdb[8];
+        if (alloc && alloc < data_.size())
+            data_.resize(alloc);
         break;
     }
     case 0x5A: { // MODE SENSE(10)
@@ -593,9 +627,10 @@ void AtaCell::packet(const u8* cdb)
     }
     default:
         if (log.size() >= 4096)
-        log.erase(log.begin(), log.begin() + 2048);
-    if (true)
-            log.push_back({stamp ? *stamp : 0, 'e', cdb[0], 0, 0, pcRef ? *pcRef : 0});
+            log.erase(log.begin(), log.begin() + 2048);
+        log.push_back(
+            {stamp ? *stamp : 0, 'e', cdb[0], 0, 0, pcRef ? *pcRef : 0});
+        memcpy(log.back().cdb, cdb, 12);
         sense_ = 0x05; // illegal request
         error_ = 0x04 | (0x05 << 4);
         nsect_ = kIo | kCoD;
@@ -608,6 +643,7 @@ void AtaCell::packet(const u8* cdb)
         bcLo_ = static_cast<u8>(data_.size());
         bcHi_ = static_cast<u8>(data_.size() >> 8);
         status_ = kDrq | kDrdy;
+        irq_ = true; // data-ready is an interrupt too, per ATA/ATAPI-4 9.5
     } else {
         complete();
     }

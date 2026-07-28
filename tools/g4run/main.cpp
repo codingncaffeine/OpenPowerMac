@@ -2840,19 +2840,23 @@ int main(int argc, char** argv)
     }
     {
         const auto& cl = bus.cd().log;
-        printf("-- cd command log (%zu; c=ata p=packet e=err):\n   ",
+        printf("-- cd command log (%zu; c=ata p=packet e=err; packet ops\n"
+               "   carry their full CDB, which is what a refusal is about):\n",
                cl.size());
         const size_t cs = cl.size() > 200 ? cl.size() - 200 : 0;
         for (size_t k = cs; k < cl.size(); ++k) {
+            printf("   %c%02x @%-12llu pc=%08x xfer=%-6u", cl[k].kind,
+                   cl[k].val, static_cast<unsigned long long>(cl[k].at),
+                   cl[k].pc, cl[k].xfer);
             if (cl[k].a || cl[k].b)
-                printf("%c%02x:%x+%x@%llu/%08x ", cl[k].kind, cl[k].val,
-                       cl[k].a, cl[k].b,
-                       static_cast<unsigned long long>(cl[k].at), cl[k].pc);
-            else
-                printf("%c%02x@%llu/%08x ", cl[k].kind, cl[k].val,
-                       static_cast<unsigned long long>(cl[k].at), cl[k].pc);
+                printf(" lba=%x+%x", cl[k].a, cl[k].b);
+            if (cl[k].kind != 'c') {
+                printf(" cdb=");
+                for (u32 c = 0; c < 12; ++c)
+                    printf("%02x", cl[k].cdb[c]);
+            }
+            printf("\n");
         }
-        printf("\n");
     }
     {
         // The disk's own command log, the same way the CD's is reported.
@@ -3030,6 +3034,9 @@ int main(int argc, char** argv)
         printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
                "offset=%08x\n",
                gen, w, h, fmt, pitch8, offset);
+        printf("-- ati framebuffer: %llu writes, span %08x..%08x\n",
+               static_cast<unsigned long long>(bus.ati().fbWrites),
+               bus.ati().fbWrites ? bus.ati().fbLo : 0u, bus.ati().fbHi);
         if ((gen & 0x02000000u) && w >= 64 && w <= 2048 && h >= 64 &&
             h <= 1536 && (fmt == 2u || fmt == 6u)) {
             const u32 bypp = fmt == 2u ? 1u : 4u;

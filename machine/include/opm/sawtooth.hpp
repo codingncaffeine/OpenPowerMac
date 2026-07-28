@@ -279,6 +279,7 @@ public:
     // DSI on a plausible-looking address rather than as anything about
     // video — the boot died on lwzx from 0x92000104 with these at 0.
     u32 atiRegBar() const { return atiRegBar_; }
+    u32 atiIoBar() const { return atiIoBar_; }
     u32 atiFbBar() const { return atiFbBar_; }
     u32 atiRomBar() const { return atiRomBar_; }
     u32 ohciBar(u32 i) const { return ohciBar_[i & 1u]; }
@@ -417,6 +418,19 @@ private:
                     (ro + k < atiRom_.size() ? atiRom_[ro + k] : 0xFFu);
             return v;
         }
+        // The card's PCI I/O aperture, on the AGP bus's I/O window. Two
+        // registers: MM_INDEX at +0x00 selects a memory-mapped register by
+        // byte offset, MM_DATA at +0x04 reads or writes it. Bit 31 of the
+        // index selects the "aperture" form and is not part of the offset.
+        if (atiIoBar_ && atiIoBar_ < 0x00100000u &&
+            pa - (0xF0000000u + atiIoBar_) < 0x100u) {
+            const u32 o = pa - (0xF0000000u + atiIoBar_);
+            if (o < 4u)
+                return atiMmIndex_;
+            if (o < 8u)
+                return ati_.read((atiMmIndex_ & 0x7FFFFFFCu) + (o - 4u), len);
+            return 0;
+        }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u)
             return ati_.read(pa - atiRegBar_, len);
         if (atiFbBar_ && pa - atiFbBar_ < (32u << 20))
@@ -526,6 +540,19 @@ private:
                 ohci_[f].write(pa - ohciBar_[f], v, len);
                 return;
             }
+        if (atiIoBar_ && atiIoBar_ < 0x00100000u &&
+            pa - (0xF0000000u + atiIoBar_) < 0x100u) {
+            const u32 o = pa - (0xF0000000u + atiIoBar_);
+            if (o < 4u) {
+                atiMmIndex_ = v;
+                return;
+            }
+            if (o < 8u) {
+                ati_.write((atiMmIndex_ & 0x7FFFFFFCu) + (o - 4u), v, len);
+                return;
+            }
+            return;
+        }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
             ati_.write(pa - atiRegBar_, v, len);
             return;
@@ -703,7 +730,20 @@ private:
                     atiFbBar_ = (word != 0xFE000000u) ? word : atiFbBar_;
                     break;
                 case 0x14u:
+                    // The I/O BAR is not decoration: Open Firmware drives
+                    // this card through it. With the FCode running, 415
+                    // writes and 190 reads landed at 0xf0000400 — the AGP
+                    // bus I/O window plus this BAR — and vanished, because
+                    // we accepted the BAR in config space and routed
+                    // nothing to it.
                     word = (word & 0xFFFFFF00u) | 1u;
+                    // Sizing writes all-ones and reads back; a real
+                    // assignment is a low I/O address. Latching the probe
+                    // value put the window on top of the config latch and
+                    // took every BAR in the machine down with it.
+                    if ((word & 0xFFFFFF00u) != 0xFFFFFF00u &&
+                        (word & 0xFFFFFF00u) < 0x00100000u)
+                        atiIoBar_ = word & 0xFFFFFF00u;
                     break;
                 case 0x18u:
                     word &= 0xFFFFC000u;
@@ -962,6 +1002,8 @@ private:
     DbdmaChannel ataDma_, hdDma_;
     std::vector<u8> atiRom_;
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;
+    u32 atiIoBar_ = 0; // PCI I/O aperture, 256 B: MM_INDEX / MM_DATA
+    u32 atiMmIndex_ = 0;
 };
 
 } // namespace opm

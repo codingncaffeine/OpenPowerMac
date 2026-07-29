@@ -4054,6 +4054,29 @@ int main(int argc, char** argv)
         for (const auto& [off, n] : bus.ohci(f).readCount)
             printf("   +%03x x%llu\n", off,
                    static_cast<unsigned long long>(n));
+        // What the list walker read, as it read it. A host stuck polling
+        // HcInterruptStatus is waiting for a transfer to retire, and only
+        // the descriptors the controller actually fetched can tell "the
+        // host queued nothing" from "we walked them wrong".
+        const auto& wl = bus.ohci(f).walkLog;
+        printf("-- ohci%u list walk (%zu%s):\n", f, wl.size(),
+               wl.size() >= bus.ohci(f).walkMax ? ", capped" : "");
+        for (const auto& w : wl) {
+            if (w.kind == 0)
+                printf("   ED %08x flags=%08x headP=%08x tailP=%08x "
+                       "next=%08x\n",
+                       w.a, w.b, w.c, w.d, w.e);
+            else if (w.kind == 2)
+                printf("   SETUP %08x  %02x %02x %02x %02x %02x %02x %02x "
+                       "%02x  reply=%u\n",
+                       w.a, w.b & 0xFF, (w.b >> 8) & 0xFF,
+                       (w.b >> 16) & 0xFF, (w.b >> 24) & 0xFF, w.c & 0xFF,
+                       (w.c >> 8) & 0xFF, (w.c >> 16) & 0xFF,
+                       (w.c >> 24) & 0xFF, w.d);
+            else
+                printf("   TD %08x ctl=%08x cbp=%08x be=%08x moved=%u\n",
+                       w.a, w.b, w.c, w.d, w.e);
+        }
     }
     {
         // Head AND tail: the head is the card's own FCode bring-up, the

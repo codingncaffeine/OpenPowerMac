@@ -80,26 +80,32 @@ public:
         // vendor 0x106B, device 0x0022, class ff (other), rev 3.
         // Remaining registers of the device start as zero (writable
         // store) rather than master-abort all-ones.
-        cfgSeed(1, 0x00800000u, 0x0022106Bu);
-        cfgSeed(1, 0x00800008u, 0xFF000003u);
+        cfgSeed(1, kMacIoSel | 0x00u, 0x0022106Bu);
+        cfgSeed(1, kMacIoSel | 0x08u, 0xFF000003u);
         for (u32 r = 0x04; r <= 0x3C; r += 4)
             if (r != 0x08)
-                cfgSeed(1, 0x00800000u | r, 0);
-        // KeyLargo's two OHCI USB functions: usb@18 / usb@19 on the f2
-        // bus (one-hot bits 24/25). Apple id 0x0019, class 0x0C0310
-        // (serial bus / USB / OHCI), INT pin A; BAR0 is a 4 KB memory
-        // window with real sizing-mask behavior (cfgAccess below). The
-        // Boot ROM carries ohci+usb-hid FCode; the USB Expert seeds the
-        // boot-keyboard shim chain per controller it registers — no
-        // controllers is the path Apple never booted.
+                cfgSeed(1, kMacIoSel | r, 0);
+        // KeyLargo's two OHCI USB functions. They live on the SECONDARY bus
+        // of the PCI-to-PCI bridge above, as usb@8 / usb@9 — not on the f2
+        // bus itself. Open Firmware reaches them with type-1 configuration
+        // cycles, latch (bus << 16) | (devfn << 8) | reg | 1, and it probes
+        // exactly devfn 0x40 and 0x48 there because the ROM's own
+        // built-in-names list for this bus reads
+        // "7,MAC-IO,8,USB0,9,USB1,10,FireWire,11,Ethernet".
+        // Apple id 0x0019, class 0x0C0310 (serial bus / USB / OHCI), INT
+        // pin A; BAR0 is a 4 KB memory window with real sizing-mask
+        // behaviour (cfgAccess below). The Boot ROM carries ohci+usb-hid
+        // FCode; the USB Expert seeds the boot-keyboard shim chain per
+        // controller it registers — no controllers is the path Apple never
+        // booted, and is what put the sad Mac on the screen.
         for (u32 f = 0; f < 2; ++f) {
-            const u32 hot = 0x01000000u << f;
-            cfgSeed(1, hot | 0x00u, 0x0019106Bu);
-            cfgSeed(1, hot | 0x08u, 0x0C031001u);
-            cfgSeed(1, hot | 0x3Cu, 0x00000100u);
+            const u32 sel = kOhciSel[f];
+            cfgSeed(1, sel | 0x00u, 0x0019106Bu);
+            cfgSeed(1, sel | 0x08u, 0x0C031001u);
+            cfgSeed(1, sel | 0x3Cu, 0x00000100u);
             for (u32 r = 0x04; r <= 0x38; r += 4)
                 if (r != 0x08)
-                    cfgSeed(1, hot | r, 0);
+                    cfgSeed(1, sel | r, 0);
         }
         for (u32 f = 0; f < 2; ++f) {
             ohci_[f].ram = ram_.data();
@@ -291,6 +297,20 @@ public:
     static constexpr u8 kGpioOutEnable = 4u;
     static constexpr u32 kMacIoBar = 0x80000000u; // OF's PCI BAR assignment
     static constexpr u32 kMacIoSize = 0x80000u;
+    // Type-1 configuration selectors for the devices on the PCI-to-PCI
+    // bridge's secondary bus: (bus 1 << 16) | (devfn << 8). usb@8 is
+    // devfn 0x40 and usb@9 is devfn 0x48, which is what Open Firmware
+    // actually puts on the wire once `mlb-bridge?` is true. The low type
+    // bit is dropped by the config key, and no one-hot type-0 latch can
+    // collide with these (they have three device bits set, not one).
+    static constexpr u32 kOhciSel[2] = {0x00014000u, 0x00014800u};
+    // mac-io is devfn 0x38 = device 7 on that same secondary bus. Leaving it
+    // at one-hot 23 on the primary side while USB moved was not a halfway
+    // house, it was a broken machine: the Mac OS ROM's FCode looks a unit's
+    // interrupt up in the bridge's interrupt-map, the ROM builds that map for
+    // devices 7..11, and a mac-io that is not at 7 makes the lookup fail with
+    // "MacOS: unit-interrupt-specifier not found in map" and stops the boot.
+    static constexpr u32 kMacIoSel = 0x00013800u;
     const std::map<u32, Acc>& macioLog() const { return klLog_; }
     std::vector<u32> macioOrder;
 
@@ -460,6 +480,13 @@ private:
             return pa - kMacIoBase;
         if (pa - kMacIoBar < kMacIoSize)
             return pa - kMacIoBar;
+        // Behind the PCI-to-PCI bridge the firmware allocates out of the
+        // bridge's memory window, so the assignment is no longer the fixed
+        // 0x80000000 this decode used to assume. Follow the BAR the guest
+        // actually wrote; the two constants above stay as the early hard
+        // decode and the historical assignment.
+        if (macioBar_ && pa - macioBar_ < kMacIoSize)
+            return pa - macioBar_;
         return 0xFFFFFFFFu;
     }
 
@@ -903,9 +930,15 @@ private:
             // writes relocate the register cell. BARs 1-5 and the
             // expansion-ROM BAR are hardwired zero (a single-BAR
             // function; a writable store here grows phantom BARs).
+            // mac-io BAR0: a 512 KB memory window, sized the same way.
+            if (b == 1u && (cfgAddr_[b] & 0x0FFFFF00u) == kMacIoSel &&
+                reg == 0x10u) {
+                word &= 0xFFF80000u;
+                if (word != 0xFFF80000u && word) macioBar_ = word;
+            }
             for (u32 f = 0; f < 2; ++f) {
-                if (b == 1u && (cfgAddr_[b] & 0x0FFFFF00u) ==
-                                   (0x01000000u << f)) {
+                if (b == 1u &&
+                    (cfgAddr_[b] & 0x0FFFFF00u) == kOhciSel[f]) {
                     if (reg == 0x10u) {
                         word &= 0xFFFFF000u;
                         ohciBar_[f] =
@@ -1212,6 +1245,7 @@ private:
     AtaCell hd_; // ata-4@1f000: the internal drive a Sawtooth boots from
     OpenPic pic_;
     OhciCell ohci_[2];
+    u32 macioBar_ = 0;        // OF-assigned mac-io BAR0 (bridge window)
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
     R128Cell ati_;
     DbdmaChannel ataDma_, hdDma_;

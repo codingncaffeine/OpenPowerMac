@@ -564,6 +564,8 @@ void OhciCell::snapSave(SnapWriter& w) const
     w.u32v(rhStatus_);
     w.u32v(rhPort_[0]);
     w.u32v(rhPort_[1]);
+    w.u32v(portReset_[0]);
+    w.u32v(portReset_[1]);
     w.u64v(lastFrameTb_);
     w.u64v(log.size());
     for (const Ev& ev : log) {
@@ -597,6 +599,8 @@ void OhciCell::snapLoad(SnapReader& r)
     rhStatus_ = r.u32v();
     rhPort_[0] = r.u32v();
     rhPort_[1] = r.u32v();
+    portReset_[0] = r.u32v();
+    portReset_[1] = r.u32v();
     lastFrameTb_ = r.u64v();
     const u64 n = r.u64v();
     log.clear();
@@ -852,6 +856,7 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     saveMapU32(w, cfgSpace_);
     w.u32v(ohciBar_[0]);
     w.u32v(ohciBar_[1]);
+    w.u32v(macioBar_);
     w.u32v(atiFbBar_);
     w.u32v(atiRegBar_);
     w.u32v(atiRomBar_);
@@ -957,6 +962,7 @@ void SawtoothBus::snapLoad(SnapReader& r)
     loadMapU32(r, cfgSpace_);
     ohciBar_[0] = r.u32v();
     ohciBar_[1] = r.u32v();
+    macioBar_ = r.u32v();
     atiFbBar_ = r.u32v();
     atiRegBar_ = r.u32v();
     atiRomBar_ = r.u32v();

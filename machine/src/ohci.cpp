@@ -54,6 +54,11 @@ void OhciCell::regWrite(u32 idx, u32 v)
             intEnable_ = 0;
             hcca_ = 0;
             fmNumber_ = 0;
+            // A change bit that survived the reset still owes the host an
+            // RHSC: port 1 reports its connect-status change from power-on,
+            // and a host that resets the controller and then waits on
+            // HcInterruptStatus must still be told the port has news.
+            if ((rhPort_[0] | rhPort_[1]) & 0x001F0000u) intStatus_ |= 0x40u;
         }
         cmdStatus_ = v & ~1u & 0x0000000Eu; // OCR/BLF/CLF latch, no lists
         break;
@@ -86,6 +91,7 @@ void OhciCell::regWrite(u32 idx, u32 v)
     case 0x58 >> 2: {
         const u32 n = idx - (0x54 >> 2);
         u32& p = rhPort_[n];
+        const u32 before = p;
         // Port 1 carries the keyboard; port 2 is genuinely empty.
         const bool populated = (n == 0);
         if (v & 0x00000100u) // SetPortPower
@@ -102,15 +108,17 @@ void OhciCell::regWrite(u32 idx, u32 v)
             p &= ~0x00000002u;
         if (v & 0x00000010u) { // SetPortReset
             if (populated) {
-                // Reset completes and leaves the port enabled, with the
-                // reset-change bit set so the driver knows to look.
-                p |= 0x00000002u | 0x00100000u;
-                p &= ~0x00000010u;
+                // Reset is IN PROGRESS: report PRS and finish it on a later
+                // frame (see kResetFrames). The driver arms what it waits on
+                // after this store, so completing inside it is invisible.
+                p |= 0x00000010u;
+                portReset_[n] = kResetFrames;
             } else {
                 p |= 0x00010000u;
             }
         }
         p &= ~(v & 0x001F0000u); // W1C of the change bits
+        rhSignal(before, p);
         break;
     }
     default: break;
@@ -168,6 +176,17 @@ void OhciCell::tick(u64 tb)
         ram[hcca_ + 0x83] = 0;
     }
     intStatus_ |= 0x00000004u; // SF
+
+    // Finish any port reset that is running. The port comes out enabled,
+    // with PRSC set, and RHSC raised so a host polling HcInterruptStatus
+    // is told to go and look at the port.
+    for (u32 n = 0; n < 2; ++n) {
+        if (!portReset_[n] || --portReset_[n]) continue;
+        const u32 before = rhPort_[n];
+        rhPort_[n] &= ~0x00000010u;             // PRS clear: reset done
+        rhPort_[n] |= 0x00000002u | 0x00100000u; // PES + PRSC
+        rhSignal(before, rhPort_[n]);
+    }
 
     // Service the lists once per frame. Nothing walked them before, so a
     // host could enumerate forever and never get a descriptor back.
@@ -282,11 +301,11 @@ void OhciCell::buildDescriptor()
 
 // One transfer descriptor. Returns the next TD pointer, or 0 to leave the
 // TD in place (a NAK).
-u32 OhciCell::doTd(u32 ed0, u32 td)
+bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
 {
     const u32 t0 = ldLe(td);
     const u32 cbp = ldLe(td + 4);
-    const u32 next = ldLe(td + 8) & ~0xFu;
+    next = ldLe(td + 8) & ~0xFu;
     const u32 be = ldLe(td + 12);
     const u32 dp = (t0 >> 19) & 3u;
     const u32 epn = (ed0 >> 7) & 0xFu;
@@ -299,6 +318,18 @@ u32 OhciCell::doTd(u32 ed0, u32 td)
         ++setupsSeen;
         buildDescriptor();
         moved = 8;
+        // The eight bytes that decide everything downstream. An unrecognised
+        // request leaves reply_ empty, and the IN that follows then moves
+        // zero bytes -- which on the register bus looks exactly like a
+        // controller that never ran.
+        if (walkLog.size() < walkMax)
+            walkLog.push_back(
+                {2u, td,
+                 u32(setup_[0]) | (u32(setup_[1]) << 8) |
+                     (u32(setup_[2]) << 16) | (u32(setup_[3]) << 24),
+                 u32(setup_[4]) | (u32(setup_[5]) << 8) |
+                     (u32(setup_[6]) << 16) | (u32(setup_[7]) << 24),
+                 static_cast<u32>(reply_.size()), 0u});
     } else if (dp == 2) { // IN
         ++inTds;
         if (epn == 0) {
@@ -308,6 +339,16 @@ u32 OhciCell::doTd(u32 ed0, u32 td)
             for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
                 ram[cbp + k] = reply_[k];
             reply_.erase(reply_.begin(), reply_.begin() + moved);
+            // The status stage of a control transfer with NO data stage is
+            // an IN of zero length, not an OUT -- and SET_ADDRESS is exactly
+            // that shape. Committing the new address only on the OUT path
+            // meant the very first request of enumeration was acknowledged
+            // and then ignored, so every transfer after it went to an
+            // address the device had never adopted.
+            if (reply_.empty() && pendingAddress_) {
+                address_ = pendingAddress_;
+                pendingAddress_ = 0;
+            }
         } else if (pending_.size() >= 8) {
             moved = avail < 8u ? avail : 8u;
             snoopWr(cbp, moved);
@@ -318,7 +359,7 @@ u32 OhciCell::doTd(u32 ed0, u32 td)
         } else {
             // No key down. A keyboard must NAK rather than hand back a
             // stale frame, so leave the descriptor where it is.
-            return 0;
+            return false;
         }
     } else { // OUT or STATUS
         moved = avail;
@@ -327,9 +368,11 @@ u32 OhciCell::doTd(u32 ed0, u32 td)
             pendingAddress_ = 0;
         }
     }
+    if (walkLog.size() < walkMax)
+        walkLog.push_back({1u, td, t0, cbp, be, moved});
     stLe(td + 4, (moved && cbp + moved <= be) ? cbp + moved : 0);
     retire(td, 0);
-    return next;
+    return true;
 }
 
 // Move a finished descriptor onto the done queue with a completion code.
@@ -353,14 +396,16 @@ u32 OhciCell::runList(u32 head, bool control)
         const u32 tail = ldLe(ed + 4) & ~0xFu;
         u32 hp = ldLe(ed + 8);
         const u32 nextEd = ldLe(ed + 12) & ~0xFu;
+        if (walkLog.size() < walkMax)
+            walkLog.push_back({0u, ed, e0, hp, tail, nextEd});
         const bool skip = (e0 & 0x4000u) != 0;
         const bool halted = (hp & 1u) != 0;
         u32 h = hp & ~0xFu;
         while (!skip && !halted && h && h != tail && done < 64) {
-            const u32 nx = doTd(e0, h);
-            if (!nx)
-                break; // NAK, or the end of the chain
-            h = nx;
+            u32 nx = 0;
+            if (!doTd(e0, h, nx))
+                break; // NAKed: the descriptor stays where it is
+            h = nx;    // retired: advance, and 0 legitimately empties the queue
             ++done;
         }
         stLe(ed + 8, (hp & 0xFu) | h);

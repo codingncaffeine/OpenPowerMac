@@ -105,7 +105,27 @@ private:
     void stLe(u32 pa, u32 v);
     void buildDescriptor();
     u32 runList(u32 head, bool control);
-    u32 doTd(u32 ed0, u32 td);
+
+public:
+    // The list walk is the one part of this cell nothing outside can see:
+    // "the host queued nothing", "the descriptors read back as junk" and "we
+    // walked them wrong" all produce the same silence on the register bus,
+    // which is a host polling HcInterruptStatus forever. Record what the
+    // walker actually reads.
+    struct Walk {
+        u32 kind; // 0 = ED, 1 = TD
+        u32 a, b, c, d, e;
+    };
+    std::vector<Walk> walkLog;
+    u32 walkMax = 400;
+
+private:
+    // Returns false when the endpoint NAKed and the descriptor must stay
+    // where it is; true when the TD was retired, with `next` set to the rest
+    // of the chain -- which is legitimately 0 at the end of a transfer.
+    // Returning the next pointer alone cannot express that difference, and
+    // conflating them leaves a retired TD sitting at HeadP to be run again.
+    bool doTd(u32 ed0, u32 td, u32& next);
     void retire(u32 td, u32 cc);
 
     static u32 swap32(u32 v)
@@ -135,6 +155,22 @@ private:
     // Port 1 reports a low-speed device attached from power-on: CCS,
     // LSDA and the connect-status change. Port 2 is empty.
     u32 rhPort_[2] = {0x00010201u, 0};
+    // Port reset is not instantaneous, and it must not be here either: the
+    // driver writes SetPortReset and only THEN arms what it waits on. A reset
+    // that finished inside the store would have its completion wiped by the
+    // very next "clear the status I am about to wait on" — the same ordering
+    // inversion that cost this project two days on the ATA cell. USB gives
+    // reset 10 ms, which is 10 frames.
+    static constexpr u32 kResetFrames = 10;
+    u32 portReset_[2] = {0, 0}; // frames remaining; 0 = idle
+    // OHCI 1.0 §6.5: setting ANY root-hub change bit raises RHSC in
+    // HcInterruptStatus. Without it a host that polls HcInterruptStatus after
+    // a port reset — which is exactly what Open Firmware does, 43,530 times —
+    // waits forever for a bit the controller never sets.
+    void rhSignal(u32 before, u32 after)
+    {
+        if ((after & ~before) & 0x001F0000u) intStatus_ |= 0x40u; // RHSC
+    }
     u64 lastFrameTb_ = 0;
 };
 

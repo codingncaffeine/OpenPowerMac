@@ -239,8 +239,12 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
 
 void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
 {
-    if (wpEnd && pa <= wpEnd && pa + len > wpPa && wpLog.size() < wpMax)
-        wpLog.push_back({st.pc - 4, pa, static_cast<u32>(v), len, st.tb});
+    if (wpEnd && pa <= wpEnd && pa + len > wpPa) {
+        if (wpLog.size() < wpMax)
+            wpLog.push_back(
+                {st.pc - 4, pa, static_cast<u32>(v), len, st.lr, st.tb});
+        if (wpForceSet && len == 4 && pa == wpPa) v = wpForce; // diagnostic
+    }
     if (!dceOn() || (wimg & kWimgI)) {
         switch (len) {
         case 1: bus->write8(pa, static_cast<u8>(v)); return;

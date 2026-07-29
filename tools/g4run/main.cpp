@@ -272,6 +272,8 @@ int main(int argc, char** argv)
     u64 atiAt = 0;                     // hide the card until this insn
     u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
                                           // store watchpoint (CPU side)
+    u32 wpForce = 0;                      // --wp-force V: DIAGNOSTIC, see
+    bool wpForceSet = false;              // Cpu::wpForce — not machine truth
     u32 watchMemPa = 0, watchMemEnd = 0;  // --watch-mem [--watch-mem-end]
     u32 stackAt = 0;                   // --stack-at ADDR: 68K backchain dump
     u32 watchReg = 99;                 // --watch-reg N: value-origin watch
@@ -421,6 +423,10 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--wp-end"))
             wpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--wp-force")) {
+            wpForce = static_cast<u32>(strtoul(next(), nullptr, 0));
+            wpForceSet = true;
+        }
         else if (!strcmp(a, "--watch-mem"))
             watchMemPa = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-mem-end"))
@@ -822,6 +828,8 @@ int main(int argc, char** argv)
     cpu.reset(); // pc = 0xFFF00100, MSR[IP]: vectors in ROM — authentic
     cpu.wpPa = wpPa;   // physical store watchpoint, set before any stepping
     cpu.wpEnd = wpEnd;
+    cpu.wpForce = wpForce;
+    cpu.wpForceSet = wpForceSet;
     u64 executed = 0;
     // Instrument census. A watch that emits nothing is ambiguous between
     // "never fired", "fired with nothing to say", and "its gate never
@@ -1251,6 +1259,8 @@ int main(int argc, char** argv)
             bus.systemReset();
             cpu.wpPa = wpPa;
             cpu.wpEnd = wpEnd;
+            cpu.wpForce = wpForce;
+            cpu.wpForceSet = wpForceSet;
             continue;
         }
         // Snapshot at an instruction boundary, BEFORE the step: `executed`
@@ -3531,9 +3541,21 @@ int main(int argc, char** argv)
         printf("-- watchpoint %08x..%08x: %zu store%s%s\n", cpu.wpPa,
                cpu.wpEnd, cpu.wpLog.size(), cpu.wpLog.size() == 1 ? "" : "s",
                cpu.wpLog.size() >= cpu.wpMax ? " (capped)" : "");
+        // Name the CALLER, not the primitive. With --trace-of the dictionary
+        // is loaded, so the LR resolves to the word the store was compiled
+        // into; without it the bare address still beats naming nothing.
+        auto ofOwner = [&](u32 va) -> std::string {
+            if (ofNames.empty()) return std::string();
+            auto it = ofNames.upper_bound(va);
+            if (it == ofNames.begin()) return std::string();
+            --it;
+            return " <" + it->second + "+" + std::to_string(va - it->first) +
+                   ">";
+        };
         for (const Cpu::WpHit& h : cpu.wpLog)
-            printf("   pa %08x <- %0*x  by pc=%08x tb=%llu\n", h.pa,
-                   static_cast<int>(h.len * 2), h.val, h.pc,
+            printf("   pa %08x <- %0*x  by pc=%08x lr=%08x%s tb=%llu\n", h.pa,
+                   static_cast<int>(h.len * 2), h.val, h.pc, h.lr,
+                   ofOwner(h.lr).c_str(),
                    static_cast<unsigned long long>(h.tb));
     }
     // The MMU as the guest left it. A DSI names an address but not WHY it

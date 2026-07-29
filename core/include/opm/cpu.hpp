@@ -230,12 +230,24 @@ struct Cpu {
     // guest never wrote it". This sits on the store path itself, so it sees
     // the write whether or not the line is ever cast out.
     u32 wpPa = 0, wpEnd = 0; // inclusive byte range; wpEnd 0 disables
+    // The pc of a store is often a shared primitive and names nothing: Open
+    // Firmware's Forth is subroutine-threaded, so every `!` compiled into the
+    // dictionary reports the same ff80b2ac. The LR is the return address
+    // inside the word that CALLED it, which is the answer the question
+    // wanted; without it a watchpoint says a value changed but not by whom.
     struct WpHit {
-        u32 pc, pa, val, len;
+        u32 pc, pa, val, len, lr;
         u64 tb;
     };
     std::vector<WpHit> wpLog;
     u32 wpMax = 64;
+    // DIAGNOSTIC, NOT MACHINE TRUTH. Substitute wpForce for the value of any
+    // 32-bit store landing exactly on wpPa. This exists to supply a positive
+    // control: a chain that is decoded but not yet fixed can be proved end to
+    // end by forcing the one cell it turns on, the way --em294-rts does for
+    // the USB shim. Anything it makes work is evidence, never a fix.
+    u32 wpForce = 0;
+    bool wpForceSet = false;
     bool l1dPeek32(u32 pa, u32& w); // fetch path coherence peek
     void dcbzLine(u32 pa);          // allocate + zero, no fill
     void dcbClean(u32 pa, bool invalidate); // dcbst / dcbf

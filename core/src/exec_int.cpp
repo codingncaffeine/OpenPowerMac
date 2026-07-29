@@ -909,7 +909,17 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
                        sprUserWritable(spr)))
         return;
     if (spr == 1017) { // L2CR: invalidate completes instantly, L2IP reads 0
-        c.st.l2cr = v & ~1u;
+        // L2HWF (bit 20) is a COMMAND, not state. um7400 §3.7.3.8.1: on a
+        // 0->1 transition the processor walks the tags, casts out every
+        // modified line, invalidates them all, and then CLEARS THE BIT
+        // ITSELF. The boot ROM's cache test sets it and spins reading it
+        // back — `mtspr 1017` then `mfspr; and.; bne` at fff81738 — so
+        // storing it verbatim wedges the machine there forever, which is
+        // exactly what happened the first time the L2 was ever enabled.
+        const bool hwf = (v & 0x00000800u) && !(c.st.l2cr & 0x00000800u);
+        c.st.l2cr = v & ~1u & ~0x00000800u;
+        if (hwf)
+            c.l2FlushAll(true);
         if (v & 0x00200000u)
             c.l2WipeAll(); // L2I global invalidate
         if (v & 0x80000000u)

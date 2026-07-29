@@ -105,6 +105,10 @@ void Cpu::l2Resize()
     static const u32 kBytes[4] = {0x200000u, 0x40000u, 0x80000u, 0x100000u};
     const u32 sets = kBytes[(st.l2cr >> 28) & 3u] / 32u / 2u;
     if (sets != l2Sets) {
+        // Re-sizing throws the array away, and with it any MODIFIED line that
+        // memory has never seen. Cast those out first — dropping them loses
+        // the only copy of that data.
+        l2FlushAll(true);
         l2Sets = sets;
         l2.assign(size_t(sets) * 2u, L2Line{});
     }

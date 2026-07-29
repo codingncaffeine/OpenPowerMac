@@ -58,17 +58,24 @@ void OhciCell::regWrite(u32 idx, u32 v)
             // RHSC: port 1 reports its connect-status change from power-on,
             // and a host that resets the controller and then waits on
             // HcInterruptStatus must still be told the port has news.
-            if ((rhPort_[0] | rhPort_[1]) & 0x001F0000u) intStatus_ |= 0x40u;
+            if ((rhPort_[0] | rhPort_[1]) & 0x001F0000u) raise(0x40u);
         }
         cmdStatus_ = v & ~1u & 0x0000000Eu; // OCR/BLF/CLF latch, no lists
         break;
     case 0x0C >> 2:
-        intStatus_ &= ~v; // write-1-to-clear
+        // Write-1-to-clear. Census the bits the driver is actually acking:
+        // half a million round-trips here says it is servicing something it
+        // cannot shake off, and only the per-bit split says which.
+        for (u32 b = 0; b < 32; ++b)
+            if ((v & intStatus_) & (1u << b)) intCleared[b]++;
+        intStatus_ &= ~v;
         break;
     case 0x10 >> 2:
+        intEnWrites[v]++;
         intEnable_ |= v; // write-1-to-set (MIE included)
         break;
     case 0x14 >> 2:
+        intDisWrites[v]++;
         intEnable_ &= ~v; // write-1-to-clear
         break;
     case 0x18 >> 2: hcca_ = v & 0xFFFFFF00u; break;
@@ -79,27 +86,79 @@ void OhciCell::regWrite(u32 idx, u32 v)
     case 0x34 >> 2: fmInterval_ = v; break;
     case 0x40 >> 2: periodicStart_ = v & 0x3FFFu; break;
     case 0x44 >> 2: lsThreshold_ = v & 0xFFFu; break;
-    case 0x48 >> 2: // RhDescriptorA is mostly hardwired; NDP read-only
-        rhDescA_ = (rhDescA_ & 0x000000FFu) | (v & 0xFFFFFF00u);
+    case 0x48 >> 2:
+        // RhDescriptorA is mostly hardwired; NDP read-only.
+        //
+        // With the live power model, the power-switching CAPABILITY bits
+        // (PSM/NPS/DT/OCPM/NOCP, 12:8) are read-only too, because they
+        // describe the BOARD and not a driver preference -- QEMU makes the
+        // whole register read-only (OHCI_RHA_RW_MASK is 0). Mac OS's UIM
+        // writes 0a001002, which would clear PSM and silently turn a per-port
+        // hub back into a ganged one; the global-power write that follows
+        // would then fire the port connect ~22M instructions before the hub
+        // driver is ready to enumerate it, which is exactly the bug.
+        if (livePortPower)
+            rhDescA_ = (rhDescA_ & 0x00001FFFu) | (v & 0xFF000000u);
+        else
+            rhDescA_ = (rhDescA_ & 0x000000FFu) | (v & 0xFFFFFF00u);
         break;
-    case 0x4C >> 2: rhDescB_ = v; break;
+    case 0x4C >> 2:
+        // HcRhDescriptorB is BOARD WIRING -- DeviceRemovable and
+        // PortPowerControlMask say how the ports are physically attached and
+        // switched -- so with the live power model it is read-only. Open
+        // Firmware writes 0 here during its own init (pc=ff80b6b4), which
+        // wiped our per-port mask and handed the OS a ganged hub again; the
+        // global power write in the UIM's init then attached the device ~22M
+        // instructions before the hub driver could enumerate it.
+        if (!livePortPower)
+            rhDescB_ = v;
+        break;
     case 0x50 >> 2:
-        // LPSC/LPS global power bits: accept and forget (ports report
-        // powered through RhPortStatus PPS).
+        // HcRhStatus. Bit 16 written is SetGlobalPower and bit 0 is
+        // ClearGlobalPower; with HcRhDescriptorB's PortPowerControlMask
+        // clear the hub is ganged, so both reach every port. Mac OS's hub
+        // driver uses this path as well as the per-port bits, and treating
+        // global power as decoration meant the ports never came back up.
+        // (Only when the live power model is on -- otherwise global power is
+        // accepted and forgotten, and ports report powered through PPS.)
+        // A global power command only reaches ports the board wires to the
+        // global switch: HcRhDescriptorB's PortPowerControlMask bit set means
+        // "this port has its own switch" (OHCI 1.0 §7.4.2), and with PSM=1
+        // that is how the hub driver's per-port SetPortPower becomes the thing
+        // that actually attaches the device -- at the moment it is ready.
+        if (livePortPower) {
+            for (u32 n = 0; n < 2; ++n) {
+                if (rhDescB_ & (0x00020000u << n)) continue; // per-port switch
+                if (v & 0x00010000u) portPowerSet(n, true);
+                if (v & 0x00000001u) portPowerSet(n, false);
+            }
+        }
+        // DRWE/OCIC: accepted, nothing downstream reads them.
         break;
     case 0x54 >> 2:
     case 0x58 >> 2: {
         const u32 n = idx - (0x54 >> 2);
+        // Power first: everything below is conditional on the port being
+        // connected, and connection is conditional on power.
+        if (livePortPower) {
+            if (v & 0x00000200u) portPowerSet(n, false); // ClearPortPower
+            if (v & 0x00000100u) portPowerSet(n, true);  // SetPortPower
+        }
         u32& p = rhPort_[n];
         const u32 before = p;
-        // Port 1 carries the keyboard; port 2 is genuinely empty.
-        const bool populated = (n == 0);
-        if (v & 0x00000100u) // SetPortPower
-            p |= 0x00000100u;
-        if (v & 0x00000200u) // ClearPortPower
-            p &= ~0x00000100u;
+        if (!livePortPower) {
+            // Power is a plain bit with no side effects.
+            if (v & 0x00000100u) p |= 0x00000100u;
+            if (v & 0x00000200u) p &= ~0x00000100u;
+        }
+        // "Set if connected": with nothing attached these commands do
+        // nothing but report a change, which is how a driver learns the
+        // port is empty rather than waiting out a timeout. With the live
+        // model that is the CCS bit; without it, a static predicate.
+        const bool connected =
+            livePortPower ? ((p & 1u) != 0) : portPopulated(n);
         if (v & 0x00000002u) { // SetPortEnable
-            if (populated)
+            if (connected)
                 p |= 0x00000002u;
             else
                 p |= 0x00010000u; // CSC: enable attempt on a dead port
@@ -107,10 +166,9 @@ void OhciCell::regWrite(u32 idx, u32 v)
         if (v & 0x00000001u) // ClearPortEnable
             p &= ~0x00000002u;
         if (v & 0x00000010u) { // SetPortReset
-            if (populated) {
+            if (connected) {
                 // Reset is IN PROGRESS: report PRS and finish it on a later
-                // frame (see kResetFrames). The driver arms what it waits on
-                // after this store, so completing inside it is invisible.
+                // frame (see kResetFrames).
                 p |= 0x00000010u;
                 portReset_[n] = kResetFrames;
             } else {
@@ -129,6 +187,9 @@ u32 OhciCell::read(u32 off, u32 len)
 {
     readCount[off & ~3u]++;
     const u32 native = regRead(off >> 2);
+    if ((off & ~3u) >= 0x48u && (off & ~3u) <= 0x58u && rhLog.size() < rhMax)
+        rhLog.push_back({stamp ? *stamp : 0, off & ~3u, native,
+                         pcRef ? *pcRef : 0, false});
     if (len == 4)
         return swap32(native);
     // sub-word: serve the addressed LE byte lanes, BE-composed
@@ -151,21 +212,57 @@ void OhciCell::write(u32 off, u32 v, u32 len)
                      (((v >> (8 * (len - 1 - k))) & 0xFFu) << (8 * lane));
         }
     }
+    writeCount[off & ~3u]++;
     if (log.size() < 2048)
         log.push_back({stamp ? *stamp : 0, off, native,
                        pcRef ? *pcRef : 0});
+    if ((off & ~3u) >= 0x48u && (off & ~3u) <= 0x58u && rhLog.size() < rhMax)
+        rhLog.push_back({stamp ? *stamp : 0, off & ~3u, native,
+                         pcRef ? *pcRef : 0, true});
     regWrite(off >> 2, native);
 }
 
 void OhciCell::tick(u64 tb)
 {
-    if (((control_ >> 6) & 3u) != 2u) { // not operational
-        lastFrameTb_ = tb;
-        return;
-    }
     if (tb - lastFrameTb_ < kTbPerFrame)
         return;
     lastFrameTb_ = tb;
+    const u64 now = stamp ? *stamp : 0;
+    if (!frames++) firstFrameAt = now;
+    lastFrameAt = now;
+
+    // THE ROOT HUB IS LIVE WHENEVER THE CONTROLLER HAS POWER, and these two
+    // timers must run OUTSIDE the operational gate below.
+    //
+    // A host powers a port and polls its status long before it sets HCFS to
+    // UsbOperational -- Open Firmware does exactly that to find the boot
+    // keyboard. Counting power-on-to-power-good only while operational meant
+    // the countdown never advanced, the connect event never arrived, and the
+    // port read empty forever: OF found no keyboard, blocked in its console
+    // read on stdin, and the machine never reached the desktop at all.
+    // Frame GENERATION is what the operational state gates (HcFmNumber, SF,
+    // the ED lists); root-hub electrical behaviour is not.
+    for (u32 n = 0; n < 2; ++n) {
+        if (!portPower_[n] || --portPower_[n]) continue;
+        const u32 before = rhPort_[n];
+        rhPort_[n] |= 0x00000001u   // CCS
+                    | 0x00000200u   // LSDA: the HID devices are low speed
+                    | 0x00010000u;  // CSC
+        rhSignal(before, rhPort_[n]);
+    }
+    // Finish any port reset that is running. The port comes out enabled, with
+    // PRSC set, and RHSC raised so a host polling HcInterruptStatus is told to
+    // go and look at the port.
+    for (u32 n = 0; n < 2; ++n) {
+        if (!portReset_[n] || --portReset_[n]) continue;
+        const u32 before = rhPort_[n];
+        rhPort_[n] &= ~0x00000010u;              // PRS clear: reset done
+        rhPort_[n] |= 0x00000002u | 0x00100000u; // PES + PRSC
+        rhSignal(before, rhPort_[n]);
+    }
+
+    if (((control_ >> 6) & 3u) != 2u)
+        return; // not operational: no frames, no list service
     fmNumber_ = (fmNumber_ + 1) & 0xFFFFu;
     if (hcca_ && ram && hcca_ + 0x84u <= ramSize) {
         // HccaFrameNumber: 16-bit little-endian at HCCA+0x80, pad zero.
@@ -175,18 +272,7 @@ void OhciCell::tick(u64 tb)
         ram[hcca_ + 0x82] = 0;
         ram[hcca_ + 0x83] = 0;
     }
-    intStatus_ |= 0x00000004u; // SF
-
-    // Finish any port reset that is running. The port comes out enabled,
-    // with PRSC set, and RHSC raised so a host polling HcInterruptStatus
-    // is told to go and look at the port.
-    for (u32 n = 0; n < 2; ++n) {
-        if (!portReset_[n] || --portReset_[n]) continue;
-        const u32 before = rhPort_[n];
-        rhPort_[n] &= ~0x00000010u;             // PRS clear: reset done
-        rhPort_[n] |= 0x00000002u | 0x00100000u; // PES + PRSC
-        rhSignal(before, rhPort_[n]);
-    }
+    raise(0x00000004u); // SF
 
     // Service the lists once per frame. Nothing walked them before, so a
     // host could enumerate forever and never get a descriptor back.
@@ -215,7 +301,7 @@ void OhciCell::tick(u64 tb)
         snoopWr(hcca_ + 0x84u, 4);
         stLe(hcca_ + 0x84u, doneHead_);
         doneHead_ = 0;
-        intStatus_ |= 0x02u; // WritebackDoneHead
+        raise(0x02u); // WritebackDoneHead
     }
 }
 
@@ -359,6 +445,11 @@ bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
                  static_cast<u32>(reply_.size()), 0u});
     } else if (dp == 2) { // IN
         ++inTds;
+        if (epn != 0) {
+            const u64 now = stamp ? *stamp : 0;
+            if (!firstInTd) firstInTd = now;
+            lastInTd = now;
+        }
         if (epn == 0) ++inEp0;
         if (epn != 0 && !avail) ++noBuffer;
         if (epn != 0 && (hid_ == Hid::Mouse

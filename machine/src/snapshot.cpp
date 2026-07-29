@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 5;
+constexpr u32 kSnapVersion = 6;
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -566,6 +566,8 @@ void OhciCell::snapSave(SnapWriter& w) const
     w.u32v(rhPort_[1]);
     w.u32v(portReset_[0]);
     w.u32v(portReset_[1]);
+    w.u32v(portPower_[0]);
+    w.u32v(portPower_[1]);
     w.u64v(lastFrameTb_);
     w.u64v(log.size());
     for (const Ev& ev : log) {
@@ -574,7 +576,12 @@ void OhciCell::snapSave(SnapWriter& w) const
         w.u32v(ev.val);
         w.u32v(ev.pc);
     }
-    saveMapU64(w, readCount);
+    // readCount/writeCount/rhLog and the interrupt census are DELIBERATELY not
+    // saved. They exist to measure the OS era, and a resumed run must not
+    // inherit Open Firmware's counts: `readCount` used to be saved while
+    // `writeCount` was not, so the same report mixed a whole-boot read census
+    // with an OS-era write census and "+048 RhDescriptorA r=18" looked like
+    // the OS reading a register it had never touched.
 }
 
 void OhciCell::snapLoad(SnapReader& r)
@@ -601,6 +608,8 @@ void OhciCell::snapLoad(SnapReader& r)
     rhPort_[1] = r.u32v();
     portReset_[0] = r.u32v();
     portReset_[1] = r.u32v();
+    portPower_[0] = r.u32v();
+    portPower_[1] = r.u32v();
     lastFrameTb_ = r.u64v();
     const u64 n = r.u64v();
     log.clear();
@@ -612,7 +621,7 @@ void OhciCell::snapLoad(SnapReader& r)
         ev.pc = r.u32v();
         log.push_back(ev);
     }
-    loadMapU64(r, readCount);
+    // (readCount is no longer part of the stream — see snapSave.)
 }
 
 void DbdmaChannel::snapSave(SnapWriter& w) const

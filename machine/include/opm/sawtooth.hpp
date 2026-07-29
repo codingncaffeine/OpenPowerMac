@@ -246,6 +246,23 @@ public:
     const std::vector<RegWr>& sizeLog() const { return szLog_; }
     const std::vector<RegWr>& i2cLog() const { return i2cLog_; }
 
+    // The processor module's I2C cache descriptor at slave 0xAC — OFF by
+    // default, and deliberately so.
+    //
+    // Answering it is correct: a real Sawtooth has that EEPROM, and with it
+    // the boot ROM detects the 1 MB backside L2, programs L2CR (0x38000000 =
+    // L2SIZ 1 MB, L2CLK ÷2), runs the documented test, and sets L2E — the
+    // whole um7400 §3.7.4 sequence this machine has never executed. But that
+    // switches on an L2 data path that has never been exercised, and the boot
+    // then dies in a program-exception loop at vector 0x700. Until that is
+    // chased down, the default must be a machine that boots.
+    //
+    // It does not close the cache dialog on its own either: Open Firmware's
+    // `l2-cache` word reads its code from startvec+0xE8, copied from
+    // [0x00100004], and nothing writes that even once the L2 is running. See
+    // --cpu-cache-rom in g4run.
+    bool cpuModuleRom = false;
+
     // Uni-North host-bridge register block at 0xF8000000: a plain
     // word-register store, all-zero at power-on. Zero in HWINIT_STATE
     // (+0x70) is what tells the ROM this is a cold boot rather than a
@@ -1116,10 +1133,18 @@ private:
     {
         if (n != 0)
             return false; // mac-io cell: nothing on the bus yet
-        return (i2c_[0].addr & 0xFEu) == 0xA0u; // one DIMM, slot 1
+        const u8 a = i2c_[0].addr & 0xFEu;
+        return a == 0xA0u                       // one DIMM, slot 1
+            || (a == 0xACu && cpuModuleRom);    // the cache descriptor
     }
-    u8 slaveByte(u32 n) const { return n == 0 ? spdByte() : 0xFFu; }
+    u8 slaveByte(u32 n) const
+    {
+        if (n != 0)
+            return 0xFFu;
+        return (i2c_[0].addr & 0xFEu) == 0xACu ? cacheRomByte() : spdByte();
+    }
     u8 spdByte() const;
+    u8 cacheRomByte() const;
 
     // Z8530, just enough for a polled console: pointer-register protocol
     // per channel, RR0 reports TX-empty always, data writes append to the

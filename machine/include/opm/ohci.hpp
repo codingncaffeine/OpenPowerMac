@@ -42,6 +42,17 @@ public:
         return (intEnable_ & 0x80000000u) &&
                (intStatus_ & intEnable_ & 0x7FFFFFFFu);
     }
+    // Read-only views for the end-of-run report. An interrupt only reaches the
+    // CPU when the guest has ARMED it, so "SF raised 1.17M times" is a storm
+    // only if the driver actually enabled SF -- otherwise those assertions go
+    // nowhere and the half-million InterruptStatus round-trips are something
+    // else entirely. Member functions, so sizeof (and every snapshot) is
+    // unaffected.
+    u32 intEnableView() const { return intEnable_; }
+    u32 intStatusView() const { return intStatus_; }
+    u32 controlView() const { return control_; }
+    u32 rhDescAView() const { return rhDescA_; }
+    u32 portView(u32 n) const { return rhPort_[n & 1u]; }
 
     // DMA writeback target (guest RAM) for the HCCA mirror.
     u8* ram = nullptr;
@@ -70,6 +81,26 @@ public:
     };
     std::vector<Ev> log;          // write traffic
     std::map<u32, u64> readCount; // steady-state poll census per offset
+    // `log` is capped at 2048 AND snapshotted, so it fills with Open
+    // Firmware's traffic and silently drops everything the OS does after a
+    // resume — which is how "the OS never writes an OHCI register" was
+    // concluded when in fact it writes plenty. These two are uncapped and
+    // deliberately NOT snapshotted, so a resumed run measures the OS era
+    // alone.
+    std::map<u32, u64> writeCount;
+    // The root-hub registers (0x48-0x58) are where enumeration lives or
+    // dies, and they are touched tens of times, not thousands: log every
+    // access to them in full.
+    struct RhEv {
+        u64 at;
+        u32 off, val, pc;
+        bool wr;
+    };
+    std::vector<RhEv> rhLog;
+    // Uncapped in practice -- these registers are touched tens of times, not
+    // thousands -- but a guest that polls a port forever must not be able to
+    // exhaust memory. Deliberately NOT snapshotted.
+    size_t rhMax = 50000;
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;
 
@@ -91,16 +122,91 @@ public:
     void typeAscii(const std::string& s); // queue keystrokes
     bool keyboardIdle() const { return pending_.empty() && !reportDue_; }
     u64 setupsSeen = 0, inTds = 0, reportsSent = 0; // census
+    // WHEN the guest polled, not just how often. "18,548 polls, 0 reports"
+    // reads as a broken delivery path, but it is the same number you get when
+    // every poll happened before anything was injected — and those are
+    // opposite bugs.
+    u64 firstInTd = 0, lastInTd = 0;
     // Which branch an interrupt IN took. "Polled but nothing delivered" has
     // three causes that look identical from outside: the ED names endpoint
     // zero so it fell into the control path, the report queue was empty, or
     // the TD offered no buffer to write into.
     u64 inEp0 = 0, nakEmpty = 0, noBuffer = 0;
 
+    // WHICH HcInterruptStatus bit the guest is servicing. An OS-era census of
+    // half a million InterruptStatus round-trips says the driver is stuck in
+    // an interrupt it cannot get rid of, but not which one -- and SF (raised
+    // every frame, ordinary) and RHSC (a port event the driver failed to
+    // consume) call for opposite fixes. Counts every assertion, not just
+    // 0->1 edges: a bit the driver never clears would otherwise show up once.
+    // Not snapshotted, so a resumed run measures the OS era alone.
+    u64 intRaised[32] = {};
+    u64 intCleared[32] = {};
+    // WHAT the guest arms and disarms, by value. The OS ends a boot with
+    // intEnable = 8000003b -- RHSC (bit 6) CLEAR -- so the root-hub connect
+    // interrupt reaches nobody and the hub driver never resets the port it
+    // just powered. Counts alone cannot say whether RHSC was never armed or
+    // armed and then disarmed, and those are different bugs.
+    std::map<u32, u64> intEnWrites;  // via 0x10 (write-1-to-SET)
+    std::map<u32, u64> intDisWrites; // via 0x14 (write-1-to-CLEAR)
+    // Frames, and when. `--fast-tb` accelerates the timebase this clock is
+    // derived from, so a frame can land every few thousand instructions
+    // instead of every ~900,000 -- which shrinks every frame-counted device
+    // delay inside the window the driver expected to be long. That is the
+    // ordering inversion that has already cost this project the ATA cell and
+    // the port reset, so measure the rate rather than assuming it.
+    u64 frames = 0, firstFrameAt = 0, lastFrameAt = 0;
+
+    // DIAGNOSTIC (--ohci-ndp), not machine truth: force the number of
+    // downstream ports the root hub reports. Mac OS publishes NumPorts 0 for
+    // both root hubs while we report NDP 2; driving NDP to a distinctive
+    // value says whether the OS is reading this field at all. 0x02000002 is
+    // byte-palindromic, so it cannot distinguish a correct read from a
+    // swapped one -- an odd count can.
+    void setNdp(u32 n)
+    {
+        rhDescA_ = (rhDescA_ & ~0x000000FFu) | (n & 0xFFu);
+    }
+
     // Two controllers, one device each: usb@8 carries the boot keyboard and
     // usb@9 the boot mouse. Both devices on one cell would need per-device
     // control-transfer state (each has its own address and its own EP0); a
     // device per controller is how the machine is wired anyway.
+    // Root-hub port-power model. OFF BY DEFAULT, and the default is the one
+    // that boots.
+    //
+    //  false -- the pre-session-16 model: port 1 reports a device from
+    //    power-on, SetPortPower/ClearPortPower are a bit with no side effects,
+    //    and enable/reset act on a STATIC "is this port populated" predicate.
+    //    Mac OS's USB Family finds nothing it has to wait for and moves on, so
+    //    the boot reaches the desktop and the cache dialog.
+    //
+    //  true (--ohci-port-power) -- the honest model, measured from a real
+    //    boot: an unpowered port reports CCS 0, power-up schedules a real
+    //    connect kConnectFrames later, and enable/reset act on the live CCS
+    //    bit. The OS gets MEASURABLY FURTHER with this -- it powers both
+    //    ports and reads the hub descriptor (pc=ffdfacb0/ffe01e50/ffe02220) --
+    //    but it never arms RHSC (intEnable settles at 8000003b, bit 6 clear),
+    //    so the connect interrupt reaches nobody, it never issues the
+    //    SetPortReset that Open Firmware does issue, and the boot stalls
+    //    before the welcome screen. Opt-in until that is closed.
+    bool livePortPower = false;
+    void setLivePortPower(bool on)
+    {
+        livePortPower = on;
+        rhPort_[0] = on ? 0u : 0x00010201u;
+        rhPort_[1] = 0u;
+        portPower_[0] = portPower_[1] = 0;
+        portReset_[0] = portReset_[1] = 0;
+        if (on) {
+            // PSM (bit 8): power is switched PER PORT, as on real hardware.
+            rhDescA_ = 0x02000102u;
+            // PortPowerControlMask for ports 1 and 2 (bits 17,18): both have
+            // their own switch, so a global power command does not attach them.
+            rhDescB_ = 0x00060000u;
+        }
+    }
+
     enum class Hid { Keyboard, Mouse };
     void setHid(Hid k)
     {
@@ -181,24 +287,80 @@ private:
     u32 rhDescA_ = 0x02000002u; // POTPGT=2, NDP=2, ports powered on
     u32 rhDescB_ = 0;
     u32 rhStatus_ = 0;
-    // Port 1 reports a low-speed device attached from power-on: CCS,
-    // LSDA and the connect-status change. Port 2 is empty.
+    // A port starts UNPOWERED, and an unpowered port sees nothing: with no
+    // VBUS there is no pull-up to sense, so CCS reads 0 no matter what is
+    // plugged in. Reporting a permanent connection instead is what cost the
+    // mouse. Open Firmware powers the ports, enumerates, and then — measured,
+    // at 1,686,375,933 — writes ClearPortPower to both and clears every
+    // change bit before handing the machine over. Mac OS's OHCIUIM then
+    // powers the ports back up and waits to be told a device arrived. A port
+    // that had simply kept CCS asserted throughout looked like a device that
+    // was always there and never changed, so the hub driver had nothing to
+    // act on and never enumerated.
+    // Port 1 reports a low-speed device attached from power-on: CCS, LSDA and
+    // the connect-status change. Port 2 is empty. This is the DEFAULT, and it
+    // is deliberately the pre-session-16 model -- see livePortPower.
     u32 rhPort_[2] = {0x00010201u, 0};
-    // Port reset is not instantaneous, and it must not be here either: the
-    // driver writes SetPortReset and only THEN arms what it waits on. A reset
-    // that finished inside the store would have its completion wiped by the
-    // very next "clear the status I am about to wait on" — the same ordering
-    // inversion that cost this project two days on the ATA cell. USB gives
-    // reset 10 ms, which is 10 frames.
+    // Port 1 carries this controller's HID device; port 2 is genuinely empty.
+    bool portPopulated(u32 n) const { return n == 0; }
+    // Power on, power off. Powering down drops the connection along with
+    // everything that depends on it (enable, suspend, reset) and reports the
+    // disconnect as a change; powering up starts the power-on-to-power-good
+    // delay, after which the device is detected.
+    void portPowerSet(u32 n, bool on)
+    {
+        const u32 before = rhPort_[n];
+        if (on) {
+            if (before & 0x00000100u) return; // already powered
+            rhPort_[n] |= 0x00000100u;
+            // POWER-ON TO POWER-GOOD IS POTPGT, AND THE DRIVER CHOSE IT.
+            //
+            // HcRhDescriptorA bits 31:24 are POTPGT in 2 ms units, and Mac OS
+            // programs 0x0a = 20 ms. A hardcoded 3 frames delivered the
+            // connect ~5,000 instructions after SetPortPower -- while the hub
+            // driver was still walking its ports powering them up, before it
+            // had queued the status-change transfer that the event is supposed
+            // to complete. So it saw the port, and had nowhere to put it.
+            // Honouring POTPGT lands the connect after the driver is ready,
+            // which is the whole reason the field exists.
+            const u32 potpgt = ((rhDescA_ >> 24) & 0xFFu) * 2u;
+            portPower_[n] =
+                portPopulated(n) ? (potpgt ? potpgt : kConnectFrames) : 0;
+        } else {
+            rhPort_[n] &= ~0x00000317u; // PPS|LSDA|PRS|PSS|PES|CCS
+            portPower_[n] = 0;
+            portReset_[n] = 0;
+            if (before & 1u) rhPort_[n] |= 0x00010000u; // CSC: it went away
+        }
+        rhSignal(before, rhPort_[n]);
+    }
+    // Neither the connect nor the reset may complete inside the store that
+    // starts it: the driver writes the command and only THEN arms what it
+    // waits on, so a completion delivered synchronously is wiped by the very
+    // next "clear the status I am about to wait on". That ordering inversion
+    // has now cost this project the ATA cell, the port reset, and the mouse.
+    // USB gives reset 10 ms; power-on-to-power-good is POTPGT, and the driver
+    // programs 0x0a = 20 ms, so landing the connect a few frames in is well
+    // inside its wait.
     static constexpr u32 kResetFrames = 10;
+    static constexpr u32 kConnectFrames = 3;
     u32 portReset_[2] = {0, 0}; // frames remaining; 0 = idle
+    u32 portPower_[2] = {0, 0}; // frames to power-good; 0 = idle
     // OHCI 1.0 §6.5: setting ANY root-hub change bit raises RHSC in
     // HcInterruptStatus. Without it a host that polls HcInterruptStatus after
     // a port reset — which is exactly what Open Firmware does, 43,530 times —
     // waits forever for a bit the controller never sets.
     void rhSignal(u32 before, u32 after)
     {
-        if ((after & ~before) & 0x001F0000u) intStatus_ |= 0x40u; // RHSC
+        if ((after & ~before) & 0x001F0000u) raise(0x40u); // RHSC
+    }
+    // Every assertion of HcInterruptStatus goes through here so the per-bit
+    // census cannot drift out of step with the register.
+    void raise(u32 bits)
+    {
+        intStatus_ |= bits;
+        for (u32 b = 0; b < 32; ++b)
+            if (bits & (1u << b)) intRaised[b]++;
     }
     u64 lastFrameTb_ = 0;
 };

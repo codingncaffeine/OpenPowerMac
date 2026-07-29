@@ -96,6 +96,39 @@ const char* ataErrName(int e)
     }
 }
 
+// OHCI operational-register names. A census line reading "+054 x3" says
+// nothing; one reading "+054 RhPortStatus1 r=3" says the host looked at the
+// port exactly three times and then stopped, which is the whole question.
+const char* ohciRegName(u32 off)
+{
+    switch (off) {
+    case 0x00: return "Revision       ";
+    case 0x04: return "Control        ";
+    case 0x08: return "CommandStatus  ";
+    case 0x0C: return "InterruptStatus";
+    case 0x10: return "InterruptEnable";
+    case 0x14: return "InterruptDisabl";
+    case 0x18: return "HCCA           ";
+    case 0x1C: return "PeriodCurrentED";
+    case 0x20: return "ControlHeadED  ";
+    case 0x24: return "ControlCurrent ";
+    case 0x28: return "BulkHeadED     ";
+    case 0x2C: return "BulkCurrentED  ";
+    case 0x30: return "DoneHead       ";
+    case 0x34: return "FmInterval     ";
+    case 0x38: return "FmRemaining    ";
+    case 0x3C: return "FmNumber       ";
+    case 0x40: return "PeriodicStart  ";
+    case 0x44: return "LSThreshold    ";
+    case 0x48: return "RhDescriptorA  ";
+    case 0x4C: return "RhDescriptorB  ";
+    case 0x50: return "RhStatus       ";
+    case 0x54: return "RhPortStatus1  ";
+    case 0x58: return "RhPortStatus2  ";
+    default: return "?              ";
+    }
+}
+
 // Toolbox trap names, for the ones this dig actually meets. A trace line
 // reading "$A03D" costs a lookup every time it is read; one reading
 // "_DrvrInstall" does not — and _DrvrInstall and _AddDrive are precisely the
@@ -331,6 +364,26 @@ int main(int argc, char** argv)
     bool em294Rts = false;             // --em294-rts: reseed the USB shim cell
     const char* findStr = nullptr;     // --find-str TEXT: search RAM
     int findCode = 0;                  // --find-code N: where is N generated
+    // --cpu-cache-rom: answer the processor module's I2C cache descriptor at
+    // slave 0xAC, so the boot ROM finds, sizes, tests and ENABLES the 1 MB
+    // backside L2 (the full um7400 §3.7.4 sequence). Opt-in: it works, and
+    // then the machine dies in a program-exception loop at 0x700 because the
+    // L2 data path has never run before. Same footing as --em294-rts.
+    bool cpuCacheRom = false;
+    // --ohci-ndp N: force the root hub's downstream port count (DIAGNOSTIC).
+    // Mac OS publishes NumPorts 0 for both root hubs while HcRhDescriptorA
+    // reports NDP 2; driving NDP to a distinctive ODD value says whether the
+    // OS reads this field at all, and settles the byte order at the same time
+    // (the default 0x02000002 is byte-palindromic, so a swapped read of it is
+    // indistinguishable from a correct one).
+    u32 ohciNdp = 0;
+    bool ohciNdpSet = false;
+    // --ohci-port-power: model root-hub port power honestly (unpowered ports,
+    // a real connect a few frames after power-up) instead of a port that
+    // always reports a device. Opt-in: it takes the OS further into USB
+    // enumeration but stalls the boot before the welcome screen. See
+    // OhciCell::livePortPower.
+    bool ohciPortPower = false;
     u64 disAt = 0;                     // --dis-at N: disassemble live VAs
     u64 findAt = 0;                    // --find-at N
     bool findSet = false;
@@ -504,6 +557,12 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--dis-at"))
             disAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--em294-rts")) em294Rts = true;
+        else if (!strcmp(a, "--cpu-cache-rom")) cpuCacheRom = true;
+        else if (!strcmp(a, "--ohci-port-power")) ohciPortPower = true;
+        else if (!strcmp(a, "--ohci-ndp")) {
+            ohciNdp = static_cast<u32>(strtoul(next(), nullptr, 0));
+            ohciNdpSet = true;
+        }
         else if (!strcmp(a, "--find-str")) findStr = next();
         else if (!strcmp(a, "--find-code"))
             findCode = static_cast<int>(strtol(next(), nullptr, 0));
@@ -834,6 +893,14 @@ int main(int argc, char** argv)
     cpu.wpEnd = wpEnd;
     cpu.wpForce = wpForce;
     cpu.wpForceSet = wpForceSet;
+    if (ohciPortPower) {
+        bus.ohci(0).setLivePortPower(true);
+        bus.ohci(1).setLivePortPower(true);
+    }
+    if (ohciNdpSet) {
+        bus.ohci(0).setNdp(ohciNdp);
+        bus.ohci(1).setNdp(ohciNdp);
+    }
     u64 executed = 0;
     // Instrument census. A watch that emits nothing is ambiguous between
     // "never fired", "fired with nothing to say", and "its gate never
@@ -864,6 +931,10 @@ int main(int argc, char** argv)
     bus.pic().stamp = &executed;
     bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
     bus.pmu().portAIn = static_cast<u8>(viaA);
+    bus.cpuModuleRom = cpuCacheRom;
+    if (cpuCacheRom)
+        printf("-- cpu module cache descriptor answered at i2c 0xac: the ROM "
+               "will find, size and ENABLE the L2 (and then fault at 0x700)\n");
     for (u32 f = 0; f < 2; ++f) {
         bus.ohci(f).stamp = &executed;
         bus.ohci(f).pcRef = &cpu.st.pc;
@@ -918,6 +989,18 @@ int main(int argc, char** argv)
         bus.watchPa = watchMemPa;
         bus.watchPaEnd = watchMemEnd ? watchMemEnd : watchMemPa;
         bus.watchHits = 0;
+        // The port MODEL is a configuration choice, so it is re-applied from
+        // the command line -- but by assignment, not through
+        // setLivePortPower(), which resets live port state and would corrupt a
+        // resumed machine. Pass the same flag you snapshotted with.
+        bus.ohci(0).livePortPower = ohciPortPower;
+        bus.ohci(1).livePortPower = ohciPortPower;
+        // --ohci-ndp is a diagnostic override, not machine state, so it must
+        // be re-applied on top of whatever the snapshot restored.
+        if (ohciNdpSet) {
+            bus.ohci(0).setNdp(ohciNdp);
+            bus.ohci(1).setNdp(ohciNdp);
+        }
         printf("-- resumed from %s @%llu insns: pc=%08x msr=%08x tb=%llu "
                "park=%s fingerprint=%016llx\n",
                resumeFrom, static_cast<unsigned long long>(executed),
@@ -4064,10 +4147,69 @@ int main(int argc, char** argv)
             printf("   +%03x <- %08x pc=%08x @%llu\n", ol[k].off,
                    ol[k].val, ol[k].pc,
                    static_cast<unsigned long long>(ol[k].at));
-        printf("-- ohci%u read census:\n", f);
-        for (const auto& [off, n] : bus.ohci(f).readCount)
-            printf("   +%03x x%llu\n", off,
-                   static_cast<unsigned long long>(n));
+        // `log` above is capped AND snapshotted, so after a resume it still
+        // holds Open Firmware's traffic and shows none of the OS's. These
+        // two censuses are uncapped and unsnapshotted: on a resumed run they
+        // describe the OS era and nothing else.
+        printf("-- ohci%u register census (read / write per offset):\n", f);
+        {
+            std::map<u32, std::pair<u64, u64>> both;
+            for (const auto& [off, n] : bus.ohci(f).readCount)
+                both[off].first = n;
+            for (const auto& [off, n] : bus.ohci(f).writeCount)
+                both[off].second = n;
+            for (const auto& [off, rw] : both)
+                printf("   +%03x %s r=%llu w=%llu\n", off, ohciRegName(off),
+                       static_cast<unsigned long long>(rw.first),
+                       static_cast<unsigned long long>(rw.second));
+        }
+        // Enumeration lives or dies in the root-hub registers, and they are
+        // touched tens of times, not thousands — so log them in full rather
+        // than counting them.
+        // WHICH interrupt the guest is servicing. SF every frame is ordinary;
+        // an RHSC it acks thousands of times is a port event it keeps being
+        // told about and never acts on. Those need opposite fixes and the
+        // aggregate InterruptStatus counts cannot tell them apart.
+        {
+            static const char* kIntBit[8] = {
+                "SO  scheduling-overrun", "WDH writeback-done",
+                "SF  start-of-frame",     "RD  resume-detected",
+                "UE  unrecoverable-err",  "FNO frame-no-overflow",
+                "RHSC root-hub-change",   "OC  ownership-change"};
+            const auto& oc = bus.ohci(f);
+            printf("-- ohci%u interrupts (raised / acked), %llu frames "
+                   "from @%llu to @%llu:\n",
+                   f, static_cast<unsigned long long>(oc.frames),
+                   static_cast<unsigned long long>(oc.firstFrameAt),
+                   static_cast<unsigned long long>(oc.lastFrameAt));
+            // An assertion the guest never armed reaches nobody: SF raised a
+            // million times is only a storm if SF is set in intEnable.
+            printf("   final: control=%08x intEnable=%08x intStatus=%08x "
+                   "irq=%d rhDescA=%08x port1=%08x port2=%08x\n",
+                   oc.controlView(), oc.intEnableView(), oc.intStatusView(),
+                   oc.irqLine() ? 1 : 0, oc.rhDescAView(), oc.portView(0),
+                   oc.portView(1));
+            for (u32 b = 0; b < 8; ++b)
+                if (oc.intRaised[b] || oc.intCleared[b])
+                    printf("   %-24s raised=%llu acked=%llu\n", kIntBit[b],
+                           static_cast<unsigned long long>(oc.intRaised[b]),
+                           static_cast<unsigned long long>(oc.intCleared[b]));
+            for (const auto& [v, n] : oc.intEnWrites)
+                printf("   arm   %08x x%llu%s\n", v,
+                       static_cast<unsigned long long>(n),
+                       (v & 0x40u) ? "   <-- includes RHSC" : "");
+            for (const auto& [v, n] : oc.intDisWrites)
+                printf("   disarm %08x x%llu%s\n", v,
+                       static_cast<unsigned long long>(n),
+                       (v & 0x40u) ? "   <-- includes RHSC" : "");
+        }
+        const auto& rh = bus.ohci(f).rhLog;
+        printf("-- ohci%u root hub (%zu accesses):\n", f, rh.size());
+        for (size_t k = 0; k < rh.size() && k < 600; ++k)
+            printf("   %s +%03x %s %08x pc=%08x @%llu\n",
+                   rh[k].wr ? "W" : "R", rh[k].off, ohciRegName(rh[k].off),
+                   rh[k].val, rh[k].pc,
+                   static_cast<unsigned long long>(rh[k].at));
         // What the list walker read, as it read it. A host stuck polling
         // HcInterruptStatus is waiting for a transfer to retire, and only
         // the descriptors the controller actually fetched can tell "the
@@ -4086,6 +4228,9 @@ int main(int argc, char** argv)
                static_cast<unsigned long long>(bus.ohci(f).inEp0),
                static_cast<unsigned long long>(bus.ohci(f).nakEmpty),
                static_cast<unsigned long long>(bus.ohci(f).noBuffer));
+        printf("   polled from @%llu to @%llu\n",
+               static_cast<unsigned long long>(bus.ohci(f).firstInTd),
+               static_cast<unsigned long long>(bus.ohci(f).lastInTd));
         const auto& wl = bus.ohci(f).walkLog;
         printf("-- ohci%u list walk (%zu%s):\n", f, wl.size(),
                wl.size() >= bus.ohci(f).walkMax ? ", capped" : "");

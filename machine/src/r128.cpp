@@ -1,5 +1,7 @@
 #include "opm/r128.hpp"
 
+#include <cstdio> // the CRTC mode-change report; MSVC pulls this in, gcc does not
+
 namespace opm {
 
 // Rage 128 register offsets the bring-up touches (register names per

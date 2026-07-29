@@ -53,9 +53,64 @@ bool AtaCell::attachDisk(const char* path)
     return true;
 }
 
+// mac-io ATA interrupt register, cell offset +0x300. It exists only on
+// KeyLargo and later, which is why no Heathrow-era model carries it — and
+// it is what Open Firmware's ATA driver actually waits on. Measured: after
+// a DMA read completed, OF read this register 1.7 MILLION times in a row
+// (32-bit reads at +0x300, nothing else touched) and then timed out, every
+// ~390 M instructions, because our cell aliased +0x300 onto the timing
+// register at +0x200 and answered with the timing word OF had just written.
+//
+//   bit 31  DMA interrupt, LATCHED — cleared by writing a 1 back
+//   bit 30  image of the drive's INTRQ line (level, not latched)
+//
+// Those are the register's NATIVE (little-endian) bit numbers: mac-io's
+// 32-bit registers are little-endian on the 60x side, the same edge the
+// DBDMA channel registers are swapped at, so the value the guest's
+// byte-reversed load sees has the flags in the low byte — 0x40 for the
+// device interrupt, which is exactly how the bit is documented at the
+// byte level elsewhere.
+u32 AtaCell::intRegRead(u32 lane, u32 len) const
+{
+    const u32 nat = (irq_ ? 0x40000000u : 0u) |
+                    (dmaIrqLatch_ ? 0x80000000u : 0u);
+    u32 r = 0;
+    for (u32 k = 0; k < len; ++k)
+        r = (r << 8) | ((nat >> (8 * ((lane + k) & 3u))) & 0xFFu);
+    return r;
+}
+
+void AtaCell::dumpState(const char* who) const
+{
+    printf("-- %s ata cell: present=%d disk=%d status=%02x err=%02x "
+           "nsect=%02x lba=%02x%02x%02x dev=%02x devctl=%02x irq=%d\n",
+           who, present() ? 1 : 0, disk_ ? 1 : 0, status_, error_, nsect_,
+           bcHi_, bcLo_, lba0_, dev_, devctl_, irq_ ? 1 : 0);
+    printf("--   data phase: %zu bytes, %zu drained; readLba=%llu "
+           "readLeft=%u wrLeft=%u pulled=%u\n",
+           data_.size(), dataAt_,
+           static_cast<unsigned long long>(readLba_), readLeft_, wrLeft_,
+           pulled_);
+    printf("--   dmaArmed=%d pending=%d pendCmd=%02x pendAt=%llu "
+           "cmdDelay=%llu multiple=%u\n",
+           dmaArmed_ ? 1 : 0, pending_ ? 1 : 0, pendCmd_,
+           static_cast<unsigned long long>(pendAt_),
+           static_cast<unsigned long long>(cmdDelay_), multiple_);
+    printf("--   cell regs +200..+2f0:");
+    for (u32 k = 0; k < 16; ++k)
+        printf(" %08x", ctl_[k]);
+    printf("\n");
+}
+
 void AtaCell::diskStartRead()
 {
     if (readLeft_ == 0) {
+        // Command complete: sector count reads back zero (sectors still
+        // owed), and the data phase is OVER. Leaving the drained buffer in
+        // place left the cell answering "a chunk just drained" to every
+        // later poke — see dmaTake and the data-register read path.
+        data_.clear();
+        dataAt_ = 0;
         nsect_ = 0;
         status_ = (kDrdy | kDsc);
         irq_ = true;
@@ -179,10 +234,14 @@ void AtaCell::diskCommand(u8 cmd)
         dataAt_ = 0;
         status_ = kDrq | (kDrdy | kDsc); // host may deliver the first sector
         break;
+    case 0xC6: // SET MULTIPLE MODE: nsect is the agreed block size
+        multiple_ = nsect_;
+        status_ = (kDrdy | kDsc);
+        irq_ = true;
+        break;
     case 0x40:
     case 0x41: // READ VERIFY SECTOR(S)
     case 0x91: // INITIALIZE DEVICE PARAMETERS
-    case 0xC6: // SET MULTIPLE MODE
     case 0xE7: // FLUSH CACHE
     case 0xEA: // FLUSH CACHE EXT
     case 0xEF: // SET FEATURES
@@ -229,10 +288,33 @@ void AtaCell::diskCommand(u8 cmd)
 u32 AtaCell::dmaTake(u8* dst, u32 n)
 {
     u32 moved = 0;
-    while (moved < n && dataAt_ < data_.size())
-        dst[moved++] = data_[dataAt_++];
-    if (!data_.empty() && dataAt_ >= data_.size())
-        finishPio(true); // chunk drained: stream more or complete
+    // A DMA burst is not one sector. The cell presents 512 bytes at a time
+    // internally, but the transfer the host asked for spans as many sectors
+    // as the command's count — so keep streaming until the caller's request
+    // is filled or the drive has nothing left to give. Handing back a single
+    // sector and stopping is what a driver reads as "the drive ran dry":
+    // measured, Open Firmware asked for a 16 KiB INPUT_LAST covering the 32
+    // sectors it had just commanded, was given 512 bytes, and abandoned the
+    // boot volume.
+    while (moved < n) {
+        while (moved < n && dataAt_ < data_.size())
+            dst[moved++] = data_[dataAt_++];
+        if (dataAt_ < data_.size() || data_.empty())
+            break; // request filled, or no data phase open
+        finishPio(true); // this chunk drained: stage the next one
+        if (data_.empty())
+            break; // command complete
+    }
+    // NOTE the guard above: an ALREADY-EMPTY buffer is not a chunk that
+    // just drained. This used to end a chunk unconditionally, and the
+    // channel is woken by every task-file write — so while Open Firmware
+    // was loading the registers for a DMA read, each store ran the standing
+    // list, took zero bytes, and was answered with a "chunk drained" that
+    // walked into diskStartRead's completion path and reset the sector
+    // count. The drive received READ DMA with nsect=0 (= 256 sectors) when
+    // the host had written 1, and no single-sector list could ever finish
+    // it: measured as `LATCH cmd=c8 nsect=00`, with eight wake events
+    // between arming the channel and issuing the command.
     return moved;
 }
 
@@ -251,6 +333,8 @@ u32 AtaCell::read(u32 off, u32 len)
     // different one back. Same family as the DD7 truth, opposite direction:
     // that one is about what an ABSENT DRIVE drives; this is about a
     // register no drive drives at all.
+    if (off >= 0x300u && off < 0x310u)
+        return intRegRead(off - 0x300u, len);
     if (off >= 0x200u)
         return ctl_[(off - 0x200u) >> 4 & 15u];
     // No slave on this channel. Nothing drives the bus when device 1 is
@@ -267,7 +351,10 @@ u32 AtaCell::read(u32 off, u32 len)
         pulled_ += len;
         for (u32 k = 0; k < len && dataAt_ < data_.size(); ++k)
             v = (v << 8) | data_[dataAt_++];
-        if (dataAt_ >= data_.size())
+        // An empty buffer is not a chunk that just drained. Reading the
+        // data register with no data phase open must be inert, not an
+        // event that advances the transfer state machine.
+        if (!data_.empty() && dataAt_ >= data_.size())
             finishPio(true); // chunk drained: continue or complete
         return v;
     }
@@ -289,6 +376,16 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 {
     if (!present())
         return;
+    if (off >= 0x300u && off < 0x310u) { // interrupt register: see read()
+        // Only the DMA latch is writable, and only to clear it (write-1).
+        u32 nat = 0;
+        for (u32 k = 0; k < len; ++k)
+            nat |= ((v >> (8 * (len - 1 - k))) & 0xFFu)
+                   << (8 * ((off - 0x300u + k) & 3u));
+        if (nat & 0x80000000u)
+            dmaIrqLatch_ = false;
+        return;
+    }
     if (off >= 0x200u) { // cell timing registers — see read()
         ctl_[(off - 0x200u) >> 4 & 15u] = v;
         return;
@@ -333,6 +430,12 @@ void AtaCell::write(u32 off, u32 v, u32 len)
                 --wrLeft_;
                 dataAt_ = 0;
                 status_ = wrLeft_ ? (kDrq | kDrdy | kDsc) : (kDrdy | kDsc);
+                // The last sector ends the data phase. A full buffer left
+                // standing here is indistinguishable from read data, and
+                // the DMA engine would happily hand the host back its own
+                // write payload.
+                if (!wrLeft_)
+                    data_.clear();
                 irq_ = true;
             }
         }
@@ -385,6 +488,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
             pendBcLo_ = bcLo_;
             pendBcHi_ = bcHi_;
             pendDev_ = dev_;
+            pendPc_ = pcRef ? *pcRef : 0;
             pendAt_ = (stamp ? *stamp : 0) + cmdDelay_;
             pending_ = true;
             status_ = kBsy;
@@ -462,7 +566,9 @@ void AtaCell::ataCommand(u8 cmd)
                        (disk_ && dmaArmed_) ? 'D' : 'c', cmd,
                        disk_ ? diskLba() : 0u,
                        disk_ ? (nsect_ ? u32(nsect_) : 256u) : 0u,
-                       pcRef ? *pcRef : 0});
+                       // The pc that wrote the command byte, not the one
+                       // running when the deferred command fires.
+                       pendPc_ ? pendPc_ : (pcRef ? *pcRef : 0)});
     error_ = 0;
     if (disk_) { // ATA hard disk: a different command set entirely
         diskCommand(cmd);

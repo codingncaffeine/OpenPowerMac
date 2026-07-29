@@ -199,6 +199,11 @@ public:
     struct RegWr {
         u64 at;
         u32 pa, val, pc;
+        // Access WIDTH. The ATA traffic log printed `val & 0xFF` and no
+        // width at all, so a 32-bit write of 0x00000180 and a byte write of
+        // 0x80 to the same cell register were the same line — and the
+        // question at +0x200 is exactly which of those it is.
+        u32 len = 1;
     };
     const std::vector<RegWr>& sizeLog() const { return szLog_; }
     const std::vector<RegWr>& i2cLog() const { return i2cLog_; }
@@ -278,6 +283,16 @@ public:
         pic_.setLine(28, ohci_[1].irqLine());
     }
 
+    // Every bus master in the machine answers to the same snoop responder.
+    // The DBDMA channels reach it through Bus::snoop; the OHCI cells hold
+    // a raw pointer into guest RAM and need it handed to them.
+    void attachSnoop(SnoopSink* s)
+    {
+        snoop = s;
+        ohci_[0].snoop = s;
+        ohci_[1].snoop = s;
+    }
+
     OhciCell& ohci(u32 i) { return ohci_[i & 1u]; }
     void ohciTick(u64 tb)
     {
@@ -288,6 +303,10 @@ public:
         // can present a data phase.
         cd_.setDmaArmed(ataDma_.running());
         hd_.setDmaArmed(hdDma_.running());
+        // The cell's +0x300 interrupt register carries a latched image of
+        // its DBDMA channel's interrupt, not just the drive's INTRQ.
+        cd_.setDmaIrq(ataDma_.irqLine());
+        hd_.setDmaIrq(hdDma_.irqLine());
         // Deferred ATA commands (see AtaCell::write case 0x070). When one
         // fires, its data phase has just opened, so resume any DBDMA list
         // parked on that channel — a DMA read arms the list before the
@@ -375,6 +394,12 @@ public:
     std::vector<u32> logOrder; // first-touch order
 
     const u32* pcRef = nullptr;
+    // Open Firmware reaches every device register through a handful of
+    // shared access primitives (ff80b5f8 is its 32-bit load), so the pc of
+    // a device access names the primitive and never the driver. The LINK
+    // register names the word that called it, which is the only useful
+    // attribution here — and the ATA traffic log was quoting the pc.
+    const u32* lrRef = nullptr;
     const u64* stamp = nullptr;
 
     size_t ramBytes() const { return ram_.size(); }
@@ -455,8 +480,14 @@ private:
                     if (ataLog_.size() >= 6000)
                         ataLog_.erase(ataLog_.begin(),
                                       ataLog_.begin() + 3000);
-                    ataLog_.push_back({stamp ? *stamp : 0, off | 1u, v,
-                                       pcRef ? *pcRef : 0});
+                    // Bit 31 marks a read, not bit 0: the cell registers at
+                    // +0x200 are byte-addressable, so an odd offset is a
+                    // real lane and `off | 1` turned a byte read of +0x201
+                    // into a read of +0x200.
+                    ataLog_.push_back({stamp ? *stamp : 0,
+                                       off | 0x80000000u, v,
+                                       lrRef ? *lrRef : (pcRef ? *pcRef : 0),
+                                       len});
                 }
                 return v;
             }
@@ -605,7 +636,8 @@ private:
                         ataLog_.erase(ataLog_.begin(),
                                       ataLog_.begin() + 3000);
                     ataLog_.push_back({stamp ? *stamp : 0, off, v,
-                                       pcRef ? *pcRef : 0});
+                                       lrRef ? *lrRef : (pcRef ? *pcRef : 0),
+                                       len});
                 }
                 if (off - 0x20000u < 0x1000u && cd_.present()) {
                     cd_.write(off - 0x20000u, v, len);

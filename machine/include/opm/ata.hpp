@@ -37,11 +37,23 @@ public:
     bool present() const { return iso_ != nullptr; }
     bool irqLine() const { return irq_; }
     void setDmaArmed(bool a) { dmaArmed_ = a; }
+    // The channel's DBDMA engine raised its interrupt: latch it into the
+    // cell's +0x300 register, which is where the driver looks.
+    void setDmaIrq(bool a)
+    {
+        if (a)
+            dmaIrqLatch_ = true;
+    }
     bool latchTrace = false; // --ata-latch: print the task file per command
     u8 devSel() const { return dev_; } // diagnostic: drive-select bits
 
     u32 read(u32 off, u32 len);
     void write(u32 off, u32 v, u32 len);
+
+    // Everything a stalled data phase depends on, in one line. "The host
+    // stopped reading" and "the drive stopped offering" look identical from
+    // the register trace; only the cell's own counters tell them apart.
+    void dumpState(const char* who) const;
 
     // Run the deferred command, if its BSY window has elapsed. Called once
     // per instruction from the machine's peripheral tick. The delay is in
@@ -103,6 +115,8 @@ private:
                p[5];
     }
 
+    // Cell interrupt register at +0x300 (KeyLargo and later only).
+    u32 intRegRead(u32 lane, u32 len) const;
     void diskCommand(u8 cmd);  // ATA (non-packet) command set
     void diskStartRead();      // present the next sector run through DRQ
     u32 diskLba() const        // LBA28 out of the task file
@@ -142,7 +156,21 @@ private:
     u32 latchShown_ = 0;
     u8 pendNsect_ = 0, pendLba0_ = 0, pendBcLo_ = 0, pendBcHi_ = 0,
        pendDev_ = 0;
+    // The pc that WROTE the command byte. The command log sampled the live
+    // pc inside ataCommand(), which runs from tick() cmdDelay_ instructions
+    // later — so its "issuer" column was whatever code happened to be
+    // executing 4000 instructions afterwards, and it was quoted as the
+    // driver's address.
+    u32 pendPc_ = 0;
+    // Sectors per DRQ block, from SET MULTIPLE MODE. Advertised as 16 in
+    // IDENTIFY word 59 and then never recorded, so the drive could not
+    // report what it had agreed to.
+    u8 multiple_ = 0;
     bool irq_ = false;
+    // Latched DMA-complete bit of the +0x300 interrupt register. Set when
+    // this cell's DBDMA channel raises its interrupt, cleared only by the
+    // host writing a 1 back.
+    bool dmaIrqLatch_ = false;
     // Cell (not drive) registers at +0x200 and up: PIO/DMA timing. They sit
     // in mac-io, so drive select and an absent slave are irrelevant to them
     // and they always read back what was written.

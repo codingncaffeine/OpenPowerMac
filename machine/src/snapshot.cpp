@@ -404,7 +404,18 @@ void AtaCell::snapSave(SnapWriter& w) const
     w.u8v(pendCmd_);
     w.u64v(pendAt_);
     w.u64v(cmdDelay_);
+    // The latched task file travels WITH the pending command. Saving the
+    // command without the registers it sampled resumes the drive running a
+    // different transfer than the host asked for.
+    w.u8v(pendNsect_);
+    w.u8v(pendLba0_);
+    w.u8v(pendBcLo_);
+    w.u8v(pendBcHi_);
+    w.u8v(pendDev_);
+    w.u32v(pendPc_);
+    w.u8v(multiple_);
     w.b(irq_);
+    w.b(dmaIrqLatch_);
     w.arr32(ctl_, 16);
     w.u64v(log.size());
     for (const Ev& ev : log) {
@@ -460,7 +471,15 @@ void AtaCell::snapLoad(SnapReader& r)
     pendCmd_ = r.u8v();
     pendAt_ = r.u64v();
     cmdDelay_ = r.u64v();
+    pendNsect_ = r.u8v();
+    pendLba0_ = r.u8v();
+    pendBcLo_ = r.u8v();
+    pendBcHi_ = r.u8v();
+    pendDev_ = r.u8v();
+    pendPc_ = r.u32v();
+    multiple_ = r.u8v();
     irq_ = r.b();
+    dmaIrqLatch_ = r.b();
     r.arr32(ctl_, 16);
     const u64 n = r.u64v();
     log.clear();

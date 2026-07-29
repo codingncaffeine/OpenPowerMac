@@ -640,10 +640,61 @@ int main(int argc, char** argv)
             const size_t slack = oldLen - newLen;
             static const char kPad[] = "oem-banner=";
             const size_t padMin = sizeof kPad; // name + '=' + terminator
+            // Slack smaller than a filler entry: SHIFT the rest of the
+            // list up and let the freed bytes fall off the end of the
+            // partition data, where they are already NUL padding.
+            //
+            // The in-place padding path exists because an earlier attempt
+            // to shift produced "NVRAM corrupted (init-nvram), cleaning it
+            // up..." — but the comment below records that the SAME message
+            // followed an edit that moved nothing at all, and that the real
+            // cure was preserving the partition's byte sums. So "position
+            // sensitive" was never established; only "sum sensitive" was.
+            // The sums are restored either way, and the boot-flash write
+            // log is the positive control: OF rewriting the partition is
+            // exactly what "cleaning it up" looks like from outside.
+            //
+            // Without this, shortening output-device=screen to scca is
+            // refused over 2 bytes, and there is no way to move Open
+            // Firmware's console onto the serial port — which is the only
+            // way to talk to it once a display exists.
             if (slack != 0 && slack < padMin) {
-                printf("-- nvram-set: %s leaves %zu bytes of slack, too "
-                       "little for a filler entry\n",
-                       kv.c_str(), slack);
+                u32 pre[2] = {0, 0};
+                for (size_t p = part; p < dataEnd; ++p)
+                    pre[(p - part) & 1u] += rom[p];
+                memmove(&rom[at + newLen], &rom[oldEnd], dataEnd - oldEnd);
+                memcpy(&rom[at], kv.data(), kv.size());
+                rom[at + kv.size()] = 0;
+                std::fill(rom.begin() + static_cast<long>(dataEnd - slack),
+                          rom.begin() + static_cast<long>(dataEnd), u8(0));
+                // Put the sum-restoring bias at the very END of the
+                // partition, not immediately after the shifted list. The
+                // bytes right after the last entry's terminator are where
+                // Open Firmware looks for the NEXT entry name, so a
+                // non-zero byte there is a nameless variable — which is
+                // exactly what "NVRAM corrupted (init-nvram), cleaning it
+                // up..." was reporting. The tail of the partition is empty
+                // padding and nobody parses it.
+                for (u32 par = 0; par < 2; ++par) {
+                    u32 after = 0;
+                    for (size_t p = part; p < dataEnd; ++p)
+                        if (((p - part) & 1u) == par)
+                            after += rom[p];
+                    for (size_t b = dataEnd; b-- > part + 16;)
+                        if (((b - part) & 1u) == par && rom[b] == 0) {
+                            rom[b] = static_cast<u8>(pre[par] - after);
+                            break;
+                        }
+                }
+                printf("-- nvram-set: %s at %04zx (shifted %zu bytes up)\n"
+                       "--   WARNING: shifting entries TRIPS Open "
+                       "Firmware's NVRAM validator — measured, twice, with "
+                       "the sum-restoring bias in two different places. It "
+                       "answers `NVRAM-status: 2` and `NVRAM corrupted "
+                       "(init-nvram), cleaning it up...` and reinitialises "
+                       "the partition, so the edit does NOT stick. Only "
+                       "same-length or filler-padded edits survive.\n",
+                       kv.c_str(), part, slack);
                 continue;
             }
             // Preserve the partition's byte sum. Open Firmware answered
@@ -4021,6 +4072,17 @@ int main(int argc, char** argv)
                        dl[k].b, static_cast<unsigned long long>(dl[k].at));
         }
     }
+    // The serial console census sat INSIDE the ATI report, so hiding the
+    // card to force the console onto serial also hid the only evidence of
+    // whether the firmware read a byte of it. That turns every injected
+    // script into a null result with no positive control: "nothing
+    // happened" and "nothing was typed" looked identical.
+    printf("-- scc: %llu reads, %llu writes\n",
+           static_cast<unsigned long long>(bus.sccReads),
+           static_cast<unsigned long long>(bus.sccWrites));
+    for (const auto& e : bus.sccOffHist)
+        printf("--   scc +%03x read %llu times\n", e.first,
+               static_cast<unsigned long long>(e.second));
     if (bus.atiPresent()) {
         // CRTC-aware screen dump: geometry straight from the live CRTC
         // registers, palette from the DAC; the PPM is the machine's
@@ -4036,12 +4098,6 @@ int main(int argc, char** argv)
         printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
                "offset=%08x\n",
                gen, w, h, fmt, pitch8, offset);
-        printf("-- scc: %llu reads, %llu writes\n",
-               static_cast<unsigned long long>(bus.sccReads),
-               static_cast<unsigned long long>(bus.sccWrites));
-        for (const auto& e : bus.sccOffHist)
-            printf("--   scc +%03x read %llu times\n", e.first,
-                   static_cast<unsigned long long>(e.second));
         printf("-- ddc: %u starts, %u address matches, %u EDID bytes\n",
                bus.ati().ddcStarts, bus.ati().ddcMatches,
                bus.ati().ddcBytes);

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="OpenPowerMac" width="100%">
+</p>
+
 # OpenPowerMac
 
 A from-scratch, clean-room Power Macintosh emulator.

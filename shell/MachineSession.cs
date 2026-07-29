@@ -12,6 +12,8 @@ public sealed class MachineSession
     private Thread? _thread;
     private volatile bool _stop;
     private readonly ConcurrentQueue<string> _serialQ = new();
+    private readonly ConcurrentQueue<string> _keyQ = new();
+    private readonly ConcurrentQueue<(int dx, int dy, uint buttons)> _mouseQ = new();
 
     /// <summary>Raw console bytes drained from the machine (VT stream).</summary>
     public readonly ConcurrentQueue<string> ConsoleQ = new();
@@ -48,6 +50,15 @@ public sealed class MachineSession
     /// separate lines (the Forth-bridge convention); a CR is appended.</summary>
     public void SendSerial(string line) =>
         _serialQ.Enqueue(line.Replace(';', '\r') + "\r");
+
+    /// <summary>Queue typed text for the USB keyboard (usb@8).</summary>
+    public void SendKeys(string text) => _keyQ.Enqueue(text);
+
+    /// <summary>Queue a USB mouse report (usb@9): relative motion plus the
+    /// button mask held at the time. Every capi call runs on the worker, so
+    /// UI events only ever enqueue.</summary>
+    public void SendMouse(int dx, int dy, uint buttons) =>
+        _mouseQ.Enqueue((dx, dy, buttons));
 
     private void Run(ShellSettings s)
     {
@@ -107,6 +118,12 @@ public sealed class MachineSession
 
                 while (_serialQ.TryDequeue(out var text))
                     Native.opm_serial(m, text);
+
+                while (_keyQ.TryDequeue(out var keys))
+                    Native.opm_key(m, keys);
+
+                while (_mouseQ.TryDequeue(out var mv))
+                    Native.opm_mouse(m, mv.dx, mv.dy, mv.buttons);
 
                 if (scriptPending && executed >= s.ScriptAt)
                 {

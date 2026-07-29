@@ -12,7 +12,17 @@
     <Product>OpenPowerMac</Product>
     <AssemblyTitle>OpenPowerMac</AssemblyTitle>
     <UseWindowsForms>false</UseWindowsForms>
+    <!-- Executable icon: the .exe in Explorer and the taskbar button. Built
+         from the project logo at 16/32/48/64/128/256 so Windows never has to
+         scale one large bitmap down to a title bar. -->
+    <ApplicationIcon>OpenPowerMac.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Also a resource, so the Window can name it: a WPF window does not
+         reliably inherit the executable icon for its title bar. -->
+    <Resource Include="OpenPowerMac.ico" />
+  </ItemGroup>
 
   <!-- Ship the native core DLL (built by CMake into shell/native) beside the app. -->
   <ItemGroup>

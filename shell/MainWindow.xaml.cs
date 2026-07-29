@@ -29,6 +29,75 @@ public partial class MainWindow : Window
         };
         _timer.Tick += OnTimer;
         _timer.Start();
+
+        // Guest input. The screen is the pointer surface: motion is sent as
+        // the delta since the last report, because a USB boot mouse is a
+        // RELATIVE device, and the button mask rides along with every motion
+        // so a drag keeps its button down. Keys are taken at the window so
+        // the guest gets them without the image having to hold focus.
+        imgScreen.MouseMove += OnScreenMouseMove;
+        imgScreen.MouseDown += OnScreenMouseButton;
+        imgScreen.MouseUp += OnScreenMouseButton;
+        PreviewKeyDown += OnGuestKeyDown;
+        PreviewTextInput += OnGuestTextInput;
+    }
+
+    // ---- guest input ----
+
+    private Point? _lastMouse;
+
+    private static uint ButtonMask(MouseEventArgs e) =>
+        (e.LeftButton == MouseButtonState.Pressed ? 1u : 0u) |
+        (e.RightButton == MouseButtonState.Pressed ? 2u : 0u) |
+        (e.MiddleButton == MouseButtonState.Pressed ? 4u : 0u);
+
+    // The image is letterboxed and scaled, so a window pixel is not a guest
+    // pixel; scale the delta by guest resolution over rendered size, or a
+    // fast flick moves the guest cursor a fraction of the distance.
+    private void OnScreenMouseMove(object sender, MouseEventArgs e)
+    {
+        if (_session is not { Running: true } s)
+            return;
+        Point p = e.GetPosition(imgScreen);
+        if (_lastMouse is { } prev && imgScreen.ActualWidth > 0 &&
+            imgScreen.ActualHeight > 0 && _bmp != null)
+        {
+            double sx = _bmp.PixelWidth / imgScreen.ActualWidth;
+            double sy = _bmp.PixelHeight / imgScreen.ActualHeight;
+            int dx = (int)Math.Round((p.X - prev.X) * sx);
+            int dy = (int)Math.Round((p.Y - prev.Y) * sy);
+            if (dx != 0 || dy != 0)
+                s.SendMouse(dx, dy, ButtonMask(e));
+        }
+        _lastMouse = p;
+    }
+
+    private void OnScreenMouseButton(object sender, MouseButtonEventArgs e)
+    {
+        if (_session is not { Running: true } s)
+            return;
+        imgScreen.Focus();
+        // Zero motion, current buttons: press and release are each a report
+        // of their own, which is what the guest edge-detects on.
+        s.SendMouse(0, 0, ButtonMask(e));
+    }
+
+    private void OnGuestKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_session is not { Running: true } s)
+            return;
+        // Return never arrives as text input, so it needs taking here.
+        if (e.Key == Key.Return)
+        {
+            s.SendKeys("\r");
+            e.Handled = true;
+        }
+    }
+
+    private void OnGuestTextInput(object sender, TextCompositionEventArgs e)
+    {
+        if (_session is { Running: true } s && !string.IsNullOrEmpty(e.Text))
+            s.SendKeys(e.Text);
     }
 
     // ---- machine control ----

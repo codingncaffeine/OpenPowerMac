@@ -46,6 +46,15 @@ OPM_API void opm_serial(OpmMachine* m, const char* text);
 // Drain newly produced serial-console output into buf (returns bytes).
 OPM_API uint32_t opm_console(OpmMachine* m, char* buf, uint32_t cap);
 
+// USB HID input. The keyboard is usb@8 and the mouse usb@9; both speak the
+// boot protocol, so the guest needs nothing beyond the driver Mac OS already
+// loads. Motion is RELATIVE in the mouse's own units, so a host with an
+// absolute pointer sends the delta since its last report, and `buttons` is a
+// bitmask (bit 0 = left) that must be resent while a button is held.
+OPM_API void opm_key(OpmMachine* m, const char* text);
+OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
+                       uint32_t buttons);
+
 // Snapshot the display. Returns 1 and fills w/h if the CRTC is live and
 // the caller's buffer (BGRA, w*h*4 bytes, cap in bytes) was big enough;
 // returns 0 with w/h set when only the size query succeeded; returns -1

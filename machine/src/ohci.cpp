@@ -257,15 +257,23 @@ void OhciCell::buildDescriptor()
     if (type == 0x80 && req == 0x06) { // GET_DESCRIPTOR
         switch (val >> 8) {
         case 1: // DEVICE
-            push({18, 1, 0x10, 0x01, 0, 0, 0, 8, 0xAC, 0x05, 0x01, 0x02,
-                  0x00, 0x01, 1, 2, 0, 1});
+            push({18, 1, 0x10, 0x01, 0, 0, 0, 8, 0xAC, 0x05,
+                  static_cast<u8>(hid_ == Hid::Mouse ? 0x01 : 0x01),
+                  static_cast<u8>(hid_ == Hid::Mouse ? 0x03 : 0x02), 0x00,
+                  0x01, 1, 2, 0, 1});
             break;
-        case 2: // CONFIGURATION + INTERFACE + HID + ENDPOINT
+        case 2: { // CONFIGURATION + INTERFACE + HID + ENDPOINT
+            // bInterfaceProtocol 1 = keyboard, 2 = mouse; the boot protocol
+            // is what a firmware and the Mac OS USB Expert bind to, and the
+            // protocol byte is the only thing that tells them which is which.
+            const u8 proto = hid_ == Hid::Mouse ? 2 : 1;
+            const u8 rlen = hid_ == Hid::Mouse ? 50 : 63;
             push({9, 2, 34, 0, 1, 1, 0, 0xA0, 25});
-            push({9, 4, 0, 0, 1, 3, 1, 1, 0}); // HID, boot subclass, keyboard
-            push({9, 0x21, 0x11, 0x01, 0, 1, 0x22, 63, 0});
-            push({7, 5, 0x81, 3, 8, 0, 10}); // EP1 IN, interrupt, 10 ms
+            push({9, 4, 0, 0, 1, 3, 1, proto, 0}); // HID, boot subclass
+            push({9, 0x21, 0x11, 0x01, 0, 1, 0x22, rlen, 0});
+            push({7, 5, 0x81, 3, static_cast<u8>(reportLen_), 0, 10});
             break;
+        }
         case 3: // STRING
             if ((val & 0xFF) == 0)
                 push({4, 3, 0x09, 0x04});
@@ -282,6 +290,15 @@ void OhciCell::buildDescriptor()
             break;
         default: break;
         }
+    } else if (type == 0x81 && req == 0x06 && (val >> 8) == 0x22 &&
+               hid_ == Hid::Mouse) {
+        // HID REPORT descriptor, boot mouse: three button bits, five bits of
+        // padding, then signed 8-bit X and Y as RELATIVE values.
+        push({0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
+              0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
+              0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05,
+              0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81,
+              0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, 0xC0, 0xC0});
     } else if (type == 0x81 && req == 0x06 && (val >> 8) == 0x22) {
         // HID REPORT descriptor: the standard boot-keyboard layout - eight
         // modifier bits, one reserved byte, six key slots.
@@ -349,12 +366,13 @@ bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
                 address_ = pendingAddress_;
                 pendingAddress_ = 0;
             }
-        } else if (pending_.size() >= 8) {
-            moved = avail < 8u ? avail : 8u;
+        } else if (pending_.size() >= reportLen_) {
+            moved = avail < reportLen_ ? avail : reportLen_;
             snoopWr(cbp, moved);
             for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
                 ram[cbp + k] = pending_[k];
-            pending_.erase(pending_.begin(), pending_.begin() + 8);
+            pending_.erase(pending_.begin(),
+                           pending_.begin() + static_cast<int>(reportLen_));
             ++reportsSent;
         } else {
             // No key down. A keyboard must NAK rather than hand back a
@@ -415,6 +433,21 @@ u32 OhciCell::runList(u32 head, bool control)
 }
 
 // Queue an ASCII string as HID boot-keyboard reports.
+void OhciCell::moveMouse(int dx, int dy, u8 buttons)
+{
+    // Boot protocol: one byte of buttons, then X and Y as signed 8-bit
+    // RELATIVE deltas. A host that receives an unchanged report still has to
+    // see the button state, so a pure click queues a report with zero motion.
+    auto clamp = [](int v) -> u8 {
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        return static_cast<u8>(static_cast<int8_t>(v));
+    };
+    pending_.push_back(buttons & 0x07u);
+    pending_.push_back(clamp(dx));
+    pending_.push_back(clamp(dy));
+}
+
 void OhciCell::typeAscii(const std::string& s)
 {
     for (char c : s) {

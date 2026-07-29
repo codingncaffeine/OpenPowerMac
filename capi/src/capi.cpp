@@ -109,6 +109,18 @@ OPM_API void opm_serial(OpmMachine* m, const char* text)
         m->bus->injectSerial(text);
 }
 
+OPM_API void opm_key(OpmMachine* m, const char* text)
+{
+    if (text && *text)
+        m->bus->ohci(0).typeAscii(text);
+}
+
+OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
+                       uint32_t buttons)
+{
+    m->bus->ohci(1).moveMouse(dx, dy, static_cast<uint8_t>(buttons));
+}
+
 OPM_API uint32_t opm_console(OpmMachine* m, char* buf, uint32_t cap)
 {
     const std::string& con = m->bus->console();
@@ -161,9 +173,15 @@ OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
                     g = static_cast<uint8_t>(c >> 8);
                     b = static_cast<uint8_t>(c);
                 } else {
-                    b = vr[o + 0];
-                    g = vr[o + 1];
-                    r = vr[o + 2];
+                    // A Mac 32-bpp pixel is big-endian xRGB: byte 0 is the
+                    // unused/alpha lane and R, G, B follow. Reading bytes
+                    // 0,1,2 as B,G,R put the unused lane in blue and shifted
+                    // the other two, so a 50% grey desktop (00 80 80 80) came
+                    // out as r=80 g=80 b=00 -- olive. The whole screen was
+                    // yellow, which is what named the bug.
+                    r = vr[o + 1];
+                    g = vr[o + 2];
+                    b = vr[o + 3];
                 }
             }
             out[x * 4 + 0] = b;

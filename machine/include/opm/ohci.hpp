@@ -92,14 +92,30 @@ public:
     bool keyboardIdle() const { return pending_.empty() && !reportDue_; }
     u64 setupsSeen = 0, inTds = 0, reportsSent = 0; // census
 
+    // Two controllers, one device each: usb@8 carries the boot keyboard and
+    // usb@9 the boot mouse. Both devices on one cell would need per-device
+    // control-transfer state (each has its own address and its own EP0); a
+    // device per controller is how the machine is wired anyway.
+    enum class Hid { Keyboard, Mouse };
+    void setHid(Hid k)
+    {
+        hid_ = k;
+        reportLen_ = (k == Hid::Mouse) ? 3u : 8u;
+    }
+    Hid hid() const { return hid_; }
+    // Boot-protocol mouse report: buttons, then signed X and Y deltas.
+    void moveMouse(int dx, int dy, u8 buttons);
+
 private:
     // Control-transfer state for the single attached device.
     u8 setup_[8] = {};
     std::vector<u8> reply_;  // data still owed to an IN transfer
     u8 address_ = 0;         // address assigned by SET_ADDRESS
     u8 pendingAddress_ = 0;
-    std::vector<u8> pending_; // queued HID reports, 8 bytes each
+    std::vector<u8> pending_; // queued HID reports, reportLen_ bytes each
     bool reportDue_ = false;  // a key is down and its release still owed
+    Hid hid_ = Hid::Keyboard;
+    u32 reportLen_ = 8;
 
     u32 ldLe(u32 pa) const;
     void stLe(u32 pa, u32 v);

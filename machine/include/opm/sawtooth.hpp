@@ -111,6 +111,11 @@ public:
             ohci_[f].ram = ram_.data();
             ohci_[f].ramSize = static_cast<u32>(ram_.size());
         }
+        // usb@8 carries the boot keyboard, usb@9 the boot mouse. Both cells
+        // reported a keyboard before, which is two keyboards and no pointer:
+        // a machine that cannot dismiss a dialog.
+        ohci_[0].setHid(OhciCell::Hid::Keyboard);
+        ohci_[1].setHid(OhciCell::Hid::Mouse);
         // The PCI-to-PCI bridge at f2 device 13 (one-hot bit 13). A real
         // Sawtooth carries its built-in devices on this bridge's SECONDARY
         // bus -- pci-bridge@d/{mac-io@7, usb@8, usb@9, firewire@a,

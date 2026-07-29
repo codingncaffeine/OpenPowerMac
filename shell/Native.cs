@@ -29,6 +29,15 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_console(IntPtr m, byte[] buf, uint cap);
 
+    // USB HID: keyboard on usb@8, mouse on usb@9. Motion is RELATIVE, so the
+    // caller sends the delta since its last report, and resends `buttons`
+    // while a button is held.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern void opm_key(IntPtr m, string text);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void opm_mouse(IntPtr m, int dx, int dy, uint buttons);
+
     // 1 = frame filled (BGRA, w*h*4), 0 = size query only, -1 = no picture.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int opm_screen(IntPtr m, byte[]? bgra, uint cap,

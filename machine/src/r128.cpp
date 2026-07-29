@@ -187,6 +187,7 @@ void R128Cell::note(u32 off, u32 val, bool wr)
 
 u32 R128Cell::read(u32 off, u32 len)
 {
+    readCount[off & ~3u]++;
     const u32 native = regRead(off >> 2);
     note(off & ~3u, native, false);
     if (len == 4)
@@ -199,6 +200,7 @@ u32 R128Cell::read(u32 off, u32 len)
 
 void R128Cell::write(u32 off, u32 v, u32 len)
 {
+    writeCount[off & ~3u]++;
     u32 native;
     if (len == 4)
         native = swap32(v);

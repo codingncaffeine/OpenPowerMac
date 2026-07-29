@@ -42,6 +42,13 @@ public:
     };
     std::vector<Ev> log; // first-touch + write traffic
     u64 logFrom = 0;     // --ati-log-from N: ignore traffic before N
+    // A COMPLETE census of which registers the guest ever touches. `log` is
+    // capped and printed head-and-tail, so "offset X never appears in it" is
+    // NOT evidence that the guest never wrote X — exactly the truncation trap
+    // that has produced several wrong conclusions on this project. This map is
+    // uncapped, and is the only honest answer to questions of the form "does
+    // the driver ever use the hardware cursor".
+    std::map<u32, u64> writeCount, readCount;
     u32 crtcShown_ = 0;  // mode-change reports emitted (see write())
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;

@@ -190,6 +190,60 @@ OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
             out[x * 4 + 3] = 0xFF;
         }
     }
+
+    // The hardware cursor. Mac OS draws its pointer with the card's cursor
+    // engine, not into the framebuffer, so a scanout that reads VRAM alone
+    // shows no pointer at all however well the USB side works -- which is
+    // exactly what it looked like from the outside.
+    //
+    // 64x64 at two bits per pixel, 16 bytes per row: eight bytes of AND bits
+    // then eight of XOR bits, each big-endian with the most significant bit
+    // leftmost. AND=0 selects colour 0 or 1 from XOR; AND=1 with XOR=0 is
+    // transparent, and with XOR=1 complements what is underneath -- which is
+    // how the classic arrow keeps its black outline over any background.
+    // CUR_HORZ_VERT_OFF is how many cursor rows/columns to skip, which is how
+    // the driver clips the pointer against the top and left edges.
+    if (ati.peek(0x0050) & 0x00010000u) { // CRTC_GEN_CNTL: cursor enable
+        const u32 curOff = ati.peek(0x0260) & 0x07FFFFFFu;
+        const u32 posn = ati.peek(0x0264);
+        const u32 hvoff = ati.peek(0x0268);
+        const u32 clr[2] = {ati.peek(0x026C), ati.peek(0x0270)};
+        const u32 cx = (posn >> 16) & 0xFFFFu, cy = posn & 0xFFFFu;
+        const u32 ox = (hvoff >> 16) & 0x3Fu, oy = hvoff & 0x3Fu;
+        for (u32 row = oy; row < 64u; ++row) {
+            const u32 sy = cy + (row - oy);
+            if (sy >= sh)
+                break;
+            const size_t so = size_t(curOff) + size_t(row) * 16u;
+            if (so + 16u > vr.size())
+                break;
+            uint64_t abits = 0, xbits = 0;
+            for (u32 k = 0; k < 8; ++k) {
+                abits = (abits << 8) | vr[so + k];
+                xbits = (xbits << 8) | vr[so + 8u + k];
+            }
+            for (u32 col = ox; col < 64u; ++col) {
+                const u32 sx = cx + (col - ox);
+                if (sx >= sw)
+                    break;
+                const uint64_t bit = uint64_t(1) << (63u - col);
+                uint8_t* px = bgra + (size_t(sy) * sw + sx) * 4u;
+                if (abits & bit) {
+                    if (!(xbits & bit))
+                        continue; // transparent
+                    px[0] = static_cast<uint8_t>(~px[0]);
+                    px[1] = static_cast<uint8_t>(~px[1]);
+                    px[2] = static_cast<uint8_t>(~px[2]);
+                } else {
+                    const u32 c = clr[(xbits & bit) ? 1 : 0];
+                    px[0] = static_cast<uint8_t>(c);
+                    px[1] = static_cast<uint8_t>(c >> 8);
+                    px[2] = static_cast<uint8_t>(c >> 16);
+                }
+                px[3] = 0xFF;
+            }
+        }
+    }
     return 1;
 }
 

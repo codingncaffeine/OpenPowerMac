@@ -4185,6 +4185,43 @@ int main(int argc, char** argv)
         printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
                "offset=%08x\n",
                gen, w, h, fmt, pitch8, offset);
+        // The hardware cursor as the guest left it. Mac OS draws its pointer
+        // with the cursor engine rather than into the framebuffer, so this is
+        // the only place a missing pointer shows up at all.
+        {
+            const auto& ac = bus.ati();
+            const u32 cgen = ac.peek(0x0050), posn = ac.peek(0x0264);
+            const u32 coff = ac.peek(0x0260) & 0x07FFFFFFu;
+            u32 nonBlank = 0;
+            for (u32 k = 0; k < 1024u && coff + k < ac.vram.size(); ++k)
+                if (ac.vram[coff + k])
+                    ++nonBlank;
+            printf("-- ati cursor: %s at (%u,%u) off=%08x hv-off=%08x "
+                   "clr0=%06x clr1=%06x, %u/1024 non-zero bitmap bytes\n",
+                   (cgen & 0x00010000u) ? "ENABLED" : "disabled",
+                   (posn >> 16) & 0xFFFFu, posn & 0xFFFFu, coff,
+                   ac.peek(0x0268), ac.peek(0x026C) & 0xFFFFFFu,
+                   ac.peek(0x0270) & 0xFFFFFFu, nonBlank);
+        }
+        // Complete and uncapped: every register the guest ever touched. The
+        // traffic log is head-and-tail truncated, so it cannot answer "was
+        // this register never written" — only this can.
+        {
+            const auto& ac = bus.ati();
+            printf("-- ati register census (off:w/r):\n  ");
+            for (const auto& [o, n] : ac.writeCount) {
+                const auto rit = ac.readCount.find(o);
+                printf(" %03x:w%llu/r%llu", o,
+                       static_cast<unsigned long long>(n),
+                       static_cast<unsigned long long>(
+                           rit == ac.readCount.end() ? 0 : rit->second));
+            }
+            for (const auto& [o, n] : ac.readCount)
+                if (!ac.writeCount.count(o))
+                    printf(" %03x:w0/r%llu", o,
+                           static_cast<unsigned long long>(n));
+            printf("\n");
+        }
         printf("-- ddc: %u starts, %u address matches, %u EDID bytes\n",
                bus.ati().ddcStarts, bus.ati().ddcMatches,
                bus.ati().ddcBytes);
@@ -4296,9 +4333,14 @@ int main(int argc, char** argv)
                                 rgb[1] = static_cast<u8>(c >> 8);
                                 rgb[2] = static_cast<u8>(c);
                             } else {
-                                rgb[0] = vr[o + 2];
-                                rgb[1] = vr[o + 1];
-                                rgb[2] = vr[o + 0];
+                                // Big-endian xRGB: byte 0 is the unused lane.
+                                // This read 0,1,2 as B,G,R and rendered a grey
+                                // desktop olive -- the same defect the C API
+                                // scanout had, and the reason the two must be
+                                // kept saying the same thing.
+                                rgb[0] = vr[o + 1];
+                                rgb[1] = vr[o + 2];
+                                rgb[2] = vr[o + 3];
                             }
                         }
                         fwrite(rgb, 1, 3, pf);

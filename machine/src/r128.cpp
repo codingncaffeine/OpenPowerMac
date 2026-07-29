@@ -217,6 +217,28 @@ void R128Cell::write(u32 off, u32 v, u32 len)
         pal_[palIdx_ & 0xFFu] = native & 0x00FFFFFFu;
         palIdx_ = (palIdx_ + 1u) & 0xFFu;
     }
+    // Mode changes, called out by name. The register log is a 4096-entry
+    // ring and the OS driver bit-bangs DDC through the GPIO registers
+    // thousands of times, so the one write that decides the pixel format
+    // is always trimmed away — and getting the format wrong is
+    // indistinguishable from the guest painting garbage. Print the CRTC
+    // registers whenever they CHANGE, with the WIDTH of the access that
+    // did it: a read-modify-write through the wrong lane is exactly how a
+    // depth field ends up holding two depths at once (2 | 4 = 6).
+    if ((aligned == kCrtcGenCntl || aligned == 0x0224u ||
+         aligned == 0x022Cu || aligned == 0x0200u || aligned == 0x0208u) &&
+        regs_[aligned] != native && crtcShown_ < 48) {
+        ++crtcShown_;
+        printf("-- ati crtc %s +%04x %08x -> %08x (len %u) @%llu pc=%08x\n",
+               aligned == kCrtcGenCntl ? "GEN_CNTL"
+               : aligned == 0x0224u    ? "OFFSET  "
+               : aligned == 0x022Cu    ? "PITCH   "
+               : aligned == 0x0200u    ? "H_TOTAL "
+                                       : "V_TOTAL ",
+               aligned, regs_[aligned], native, len,
+               static_cast<unsigned long long>(at), pcRef ? *pcRef : 0);
+        fflush(stdout);
+    }
     regs_[aligned] = native;
     (void)kMmIndex;
     (void)kBiosScratch;

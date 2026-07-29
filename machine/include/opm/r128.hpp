@@ -41,6 +41,7 @@ public:
     };
     std::vector<Ev> log; // first-touch + write traffic
     u64 logFrom = 0;     // --ati-log-from N: ignore traffic before N
+    u32 crtcShown_ = 0;  // mode-change reports emitted (see write())
     const u64* stamp = nullptr;
     const u32* pcRef = nullptr;
 

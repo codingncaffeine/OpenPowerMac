@@ -45,6 +45,15 @@ public:
         // junk there gives a patient wait, zero gives an instant-timeout
         // complaint spiral. A deterministic non-zero fill models the
         // physical truth while keeping runs reproducible.
+        // Digest of the boot flash AS LOADED, before Open Firmware writes
+        // its NVRAM partition into it. A snapshot has to be able to say
+        // "this is a different ROM" without saying it about its own NVRAM
+        // edits, and the live image cannot answer that question.
+        romBase_ = 0xcbf29ce484222325ull;
+        for (u8 b : rom_) {
+            romBase_ ^= b;
+            romBase_ *= 0x100000001b3ull;
+        }
         for (size_t i = 0; i < ram_.size(); ++i)
             ram_[i] = static_cast<u8>(0x5Au ^ (i * 0x21u) ^ (i >> 11));
         // GPIO-region byte +0x61: the ROM polls bit 1 (TB-bounded) right
@@ -1185,6 +1194,7 @@ private:
     R128Cell ati_;
     DbdmaChannel ataDma_, hdDma_;
     std::vector<u8> atiRom_;
+    u64 romBase_ = 0; // FNV-1a of the boot flash as loaded (see the ctor)
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;
     // PCI I/O space is little-endian and this processor is not.
     static u32 ioSwap(u32 v, u32 len)

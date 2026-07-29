@@ -825,6 +825,7 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     w.u64v(ram_.size());
     w.raw(ram_.data(), ram_.size());
     w.bytes(rom_);
+    w.u64v(romBase_); // the ROM this run STARTED from - see snapLoad
     w.bytes(atiRom_);
     w.end(sec);
 
@@ -908,8 +909,22 @@ void SawtoothBus::snapLoad(SnapReader& r)
     {
         std::vector<u8> img;
         r.bytes(img);
-        if (r.ok && img != rom_)
-            r.fail("the boot ROM in this run differs from the snapshot's");
+        // The boot flash is WRITABLE - Open Firmware keeps its NVRAM
+        // partition inside it and rewrites the checksum on the way up - so
+        // by the time a snapshot is taken the image no longer matches the
+        // file it was loaded from, and comparing the LIVE images rejected
+        // every snapshot this machine has ever produced. The identity that
+        // matters is the ROM the run STARTED from, which is what romBase_
+        // digests; the live image is machine state and gets restored.
+        const u64 base = r.u64v();
+        if (r.ok && base != romBase_)
+            r.fail("the boot ROM in this run is not the one the snapshot "
+                   "was taken with");
+        else if (r.ok && img.size() != rom_.size())
+            r.fail("the boot ROM in this run is a different size than the "
+                   "snapshot's");
+        else if (r.ok)
+            rom_ = std::move(img);
         r.bytes(img);
         if (r.ok) {
             if (!atiRom_.empty() && atiRom_ != img)

@@ -250,6 +250,7 @@ int main(int argc, char** argv)
     u64 maxInsns = 50000000ull;
     size_t ramMb = 256;
     bool trace = false;
+    u64 faultFrom = 0;                 // --fault-from N: skip firmware faults
     int excShow = 16;
     u32 disStart = 0, disEnd = 0;
     u32 ofSymAt[8] = {}, ofSymN = 0; // --of-word VA: name it
@@ -323,6 +324,7 @@ int main(int argc, char** argv)
     u64 peekAt = 0;                    // --peek-at N
     u64 heartbeat = 0;                 // --heartbeat N: periodic digest
     u32 findVal = 0;                   // --find VALUE: scan RAM for a word
+    const char* findStr = nullptr;     // --find-str TEXT: search RAM
     int findCode = 0;                  // --find-code N: where is N generated
     u64 disAt = 0;                     // --dis-at N: disassemble live VAs
     u64 findAt = 0;                    // --find-at N
@@ -387,6 +389,8 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--max")) maxInsns = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace")) trace = true;
         else if (!strcmp(a, "--exc")) excShow = atoi(next());
+        else if (!strcmp(a, "--fault-from"))
+            faultFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--dis")) {
             disStart = static_cast<u32>(strtoul(next(), nullptr, 0));
             disEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
@@ -488,6 +492,7 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--dis-at"))
             disAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--find-str")) findStr = next();
         else if (!strcmp(a, "--find-code"))
             findCode = static_cast<int>(strtol(next(), nullptr, 0));
         else if (!strcmp(a, "--find-at"))
@@ -1452,6 +1457,47 @@ int main(int argc, char** argv)
             }
             cpu.st = savedDis;
             cpu.raisedThisStep = false;
+            fflush(stdout);
+        }
+        // What does the DEVICE TREE actually say? Open Firmware's tree and
+        // the Name Registry copy the OS builds from it both store property
+        // names as plain strings in RAM, so the question "does the display
+        // node have an AAPL,address" is answerable by searching for the
+        // name and reading what follows it. Every previous attempt to
+        // answer it went through an interactive Forth prompt — which does
+        // not exist once the display is up, because the console moves to
+        // the screen and injected serial input is never consumed (proved:
+        // a run with an injected script was byte-identical to one without,
+        // to the instruction).
+        if (findStr && executed == findAt) {
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            const std::vector<u8>& r = bus.ram();
+            const size_t n = strlen(findStr);
+            u32 hits = 0;
+            printf("== find-str \"%s\" @%llu\n", findStr,
+                   static_cast<unsigned long long>(executed));
+            for (size_t p = 0; p + n <= r.size() && hits < 24; ++p) {
+                if (memcmp(r.data() + p, findStr, n) != 0)
+                    continue;
+                ++hits;
+                printf("   PA %08zx:", p);
+                // 48 bytes of context after the name: for a Name Registry
+                // property the value follows, and for an OF property the
+                // neighbouring names say which node this is.
+                for (size_t k = 0; k < 48 && p + n + k < r.size(); ++k) {
+                    const u8 b = r[p + n + k];
+                    printf(" %02x", b);
+                }
+                printf("\n     text:");
+                for (size_t k = 0; k < 48 && p + n + k < r.size(); ++k) {
+                    const u8 b = r[p + n + k];
+                    printf("%c", (b >= 0x20 && b < 0x7F) ? char(b) : '.');
+                }
+                printf("\n");
+            }
+            if (!hits)
+                printf("   <not present anywhere in RAM>\n");
             fflush(stdout);
         }
         // Where is an error code GENERATED? Locating -9356 meant hand-
@@ -3176,7 +3222,12 @@ int main(int argc, char** argv)
             // interrupts every time.
             static u32 faultShown = 0;
             const u32 v = cpu.st.pc & 0x0000FF00u;
-            if (v != 0x0900u && v != 0x0500u && faultShown < 12) {
+            // Open Firmware probes the PCI buses by faulting on purpose,
+            // so the first dozen non-timer exceptions of any boot are its
+            // master aborts and the OS-era fault never gets a slot.
+            // --fault-from moves the window past the firmware.
+            if (v != 0x0900u && v != 0x0500u && faultShown < 16 &&
+                executed >= faultFrom) {
                 ++faultShown;
                 printf("-- FAULT #%u @%llu -> %08x srr0=%08x srr1=%08x "
                        "dsisr=%08x dar=%08x lr=%08x r24=%08x\n",

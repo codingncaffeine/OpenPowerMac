@@ -329,6 +329,63 @@ void Cpu::dcbKill(u32 pa)
     l2Invalidate(pa & ~31u);
 }
 
+// Snoop response for a bus master. Unlike dcbf/dcbst this must NOT honour
+// L2CR[L2TS]: that idiom parks a pushed block in the L2 instead of memory,
+// and a DMA engine cannot see the L2 any more than it can see the L1. The
+// data has to reach RAM.
+//
+// A master READ takes the push and leaves the line valid. A master WRITE
+// takes the push and then kills the line, because the memory it describes
+// is about to change underneath the processor.
+void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
+{
+    if (!len)
+        return;
+    const u32 first = pa & ~31u;
+    const u32 last = (pa + len - 1u) & ~31u;
+    for (u32 a = first;; a += 32u) {
+        if (dceOn()) {
+            const u32 set = setOf(a), tag = tagOf(a);
+            for (u32 w = 0; w < 8; ++w) {
+                DLine& e = l1d[set][w];
+                if (!e.v || e.tag != tag)
+                    continue;
+                if (e.d) {
+                    busWriteLine(*this, a, e.b);
+                    e.d = false;
+                    // The L1 held the newest copy; any L2 copy is stale.
+                    l2Invalidate(a);
+                }
+                if (invalidate)
+                    e.v = false;
+                break;
+            }
+        }
+        if (L2Line* q = l2Find(a)) {
+            if (q->d) {
+                busWriteLine(*this, a, q->b);
+                q->d = false;
+            }
+            if (invalidate)
+                q->v = false;
+        }
+        if (a == last || a + 32u < a) // range done, or address wrap
+            break;
+    }
+}
+
+void CpuSnoop::snoopRead(u32 pa, u32 len)
+{
+    if (cpu)
+        cpu->snoopPush(pa, len, false);
+}
+
+void CpuSnoop::snoopWrite(u32 pa, u32 len)
+{
+    if (cpu)
+        cpu->snoopPush(pa, len, true);
+}
+
 // Harness/instrument coherence: dirty lines go straight to the bus so the
 // observed memory image is the architectural one.
 void Cpu::l1dFlushAll(bool writeback)

@@ -230,6 +230,11 @@ int main(int argc, char** argv)
 
     Cpu cpu;
     cpu.attach(bus);
+    // 60x bus snooping: the mac-io DBDMA engine is a bus master and the
+    // descriptor lists it walks are written by ordinary cached stores.
+    CpuSnoop snoop;
+    snoop.cpu = &cpu;
+    bus.snoop = &snoop;
     cpu.reset(); // pc = 0xFFF00100, MSR[IP] set: vectors in ROM — authentic
     bus.ati().pcRef = &cpu.st.pc;
     bus.ati().lrRef = &cpu.st.lr;

@@ -161,6 +161,7 @@ void OhciCell::tick(u64 tb)
     fmNumber_ = (fmNumber_ + 1) & 0xFFFFu;
     if (hcca_ && ram && hcca_ + 0x84u <= ramSize) {
         // HccaFrameNumber: 16-bit little-endian at HCCA+0x80, pad zero.
+        snoopWr(hcca_ + 0x80u, 4);
         ram[hcca_ + 0x80] = static_cast<u8>(fmNumber_);
         ram[hcca_ + 0x81] = static_cast<u8>(fmNumber_ >> 8);
         ram[hcca_ + 0x82] = 0;
@@ -204,6 +205,7 @@ u32 OhciCell::ldLe(u32 pa) const
 {
     if (!ram || pa + 4 > ramSize)
         return 0;
+    snoopRd(pa, 4);
     return u32(ram[pa]) | (u32(ram[pa + 1]) << 8) |
            (u32(ram[pa + 2]) << 16) | (u32(ram[pa + 3]) << 24);
 }
@@ -212,6 +214,7 @@ void OhciCell::stLe(u32 pa, u32 v)
 {
     if (!ram || pa + 4 > ramSize)
         return;
+    snoopWr(pa, 4);
     ram[pa] = u8(v);
     ram[pa + 1] = u8(v >> 8);
     ram[pa + 2] = u8(v >> 16);
@@ -290,6 +293,7 @@ u32 OhciCell::doTd(u32 ed0, u32 td)
     const u32 avail = (cbp && be >= cbp) ? (be - cbp + 1u) : 0u;
     u32 moved = 0;
     if (dp == 0) { // SETUP
+        snoopRd(cbp, 8);
         for (u32 k = 0; k < 8 && cbp + k < ramSize; ++k)
             setup_[k] = ram[cbp + k];
         ++setupsSeen;
@@ -300,11 +304,13 @@ u32 OhciCell::doTd(u32 ed0, u32 td)
         if (epn == 0) {
             moved = avail < reply_.size() ? avail
                                           : static_cast<u32>(reply_.size());
+            snoopWr(cbp, moved);
             for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
                 ram[cbp + k] = reply_[k];
             reply_.erase(reply_.begin(), reply_.begin() + moved);
         } else if (pending_.size() >= 8) {
             moved = avail < 8u ? avail : 8u;
+            snoopWr(cbp, moved);
             for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
                 ram[cbp + k] = pending_[k];
             pending_.erase(pending_.begin(), pending_.begin() + 8);

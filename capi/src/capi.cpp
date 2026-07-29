@@ -13,6 +13,12 @@ using namespace opm;
 struct OpmMachine {
     SawtoothBus* bus = nullptr;
     Cpu cpu;
+    // 60x bus snooping for every DMA engine in the machine. Wired before
+    // the first instruction: a DBDMA channel with no snoop responder reads
+    // its descriptor list out of RAM while the firmware's stores are still
+    // sitting dirty in the L1, and transfers into memory the processor is
+    // still caching.
+    CpuSnoop snoop;
     uint64_t executed = 0;
     uint32_t fastTb = 0;
     size_t consoleAt = 0; // drained-up-to mark
@@ -54,6 +60,8 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
         m->bus->attachAtiRom(atiRomPath);
     m->fastTb = fastTb;
     m->cpu.attach(*m->bus);
+    m->snoop.cpu = &m->cpu;
+    m->bus->attachSnoop(&m->snoop);
     m->cpu.reset();
     m->bus->pcRef = &m->cpu.st.pc;
     m->bus->stamp = &m->executed;

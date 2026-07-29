@@ -184,6 +184,10 @@ void MacIo::dbdmaRun(u32 chan)
                                 ((v >> 8) & 0xFF00u) | (v >> 24));
     };
     for (u32 steps = 0; steps < 4096; ++steps) {
+        // A bus master on a snooped 60x bus: push the processor's dirty
+        // copy of the descriptor and drop it, since this walk both reads
+        // the command word and writes the status word back. See SnoopSink.
+        dmaBus->snoopBeforeDmaWrite(ch.cmdPtr, 16);
         const u32 w0 = rd32le(ch.cmdPtr);
         const u32 op = w0 >> 28;
         if (op == 7) { // STOP: the list is done, the channel goes idle

@@ -1,4 +1,5 @@
 #pragma once
+#include "opm/bus.hpp"
 #include "opm/types.hpp"
 
 #include <map>
@@ -45,6 +46,23 @@ public:
     // DMA writeback target (guest RAM) for the HCCA mirror.
     u8* ram = nullptr;
     u32 ramSize = 0;
+    // This controller is a bus master, and the 60x bus is snooped: the ED
+    // and TD lists the host builds are ordinary cached stores, and the
+    // buffers it reads back go through the cache. Reaching straight into
+    // the RAM array models a machine with no coherency at all — the same
+    // defect that made DBDMA read power-on junk for descriptors. See
+    // SnoopSink in bus.hpp.
+    SnoopSink* snoop = nullptr;
+    void snoopRd(u32 pa, u32 len) const
+    {
+        if (snoop)
+            snoop->snoopRead(pa, len);
+    }
+    void snoopWr(u32 pa, u32 len) const
+    {
+        if (snoop)
+            snoop->snoopWrite(pa, len);
+    }
 
     struct Ev {
         u64 at;

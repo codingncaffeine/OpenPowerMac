@@ -241,6 +241,11 @@ struct Cpu {
     void dcbClean(u32 pa, bool invalidate); // dcbst / dcbf
     void dcbKill(u32 pa);                   // dcbi
     void l1dFlushAll(bool writeback);
+    // Snoop response for a bus master (see SnoopSink in bus.hpp). Pushes
+    // every modified line covering [pa, pa+len) all the way to MEMORY —
+    // not into the L2, which a DMA engine cannot see either — and
+    // invalidates the processor's copy as well when the master is writing.
+    void snoopPush(u32 pa, u32 len, bool invalidate);
 
     // Backside L2 (UM ch.3.7: L2CR-governed, 256K-2MB, 2-way here). The
     // boot ROM runs its pre-DRAM world in it via L2CR[L2TS]: dcbf/dcbst
@@ -307,6 +312,15 @@ struct Cpu {
         else
             st.xer &= ~0x40000000u;
     }
+};
+
+// Hands a Bus its snoop responder. Kept as a separate object rather than
+// making Cpu itself a SnoopSink: a vtable would change sizeof(Cpu), and the
+// snapshot format's layout digest is computed from exactly that.
+struct CpuSnoop final : SnoopSink {
+    Cpu* cpu = nullptr;
+    void snoopRead(u32 pa, u32 len) override;
+    void snoopWrite(u32 pa, u32 len) override;
 };
 
 // Binds every implemented handler into the dispatch used by Cpu::step.

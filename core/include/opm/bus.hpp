@@ -3,6 +3,29 @@
 
 namespace opm {
 
+// Cache coherency for bus masters. On a 60x bus every DMA transaction is
+// SNOOPED: the address goes out on the bus, the processor's L1 and backside
+// L2 check their tags, a modified line is pushed so the master reads current
+// data, and a master WRITE kills the processor's stale copy. New World Macs
+// depend on that — Open Firmware builds a DBDMA descriptor list with ordinary
+// cached stores and arms the channel without flushing anything.
+//
+// A DMA engine that reads and writes host memory directly models a machine
+// with no snooping at all, and the symptom is not subtle: measured on the
+// boot disk, the first DBDMA read fetched its descriptor list out of RAM
+// while Open Firmware's stores were still sitting dirty in the L1, got
+// power-on junk (0x287ec3ff), transferred 512 bytes to a garbage address and
+// marked the channel DEAD. The second transfer's list read correctly only
+// because the line had been evicted by then — and its data landed in memory
+// underneath a cache line the firmware then read stale.
+struct SnoopSink {
+    virtual ~SnoopSink() = default;
+    // A bus master is about to READ this range: push modified lines.
+    virtual void snoopRead(u32 pa, u32 len) = 0;
+    // A bus master is about to WRITE this range: push, then invalidate.
+    virtual void snoopWrite(u32 pa, u32 len) = 0;
+};
+
 // Physical-address bus. The 7400 has a 32-bit physical address space (52-bit
 // virtual, translated by the MMU before reaching here). All multi-byte
 // accesses are big-endian: implementations assemble from big-endian byte
@@ -10,6 +33,20 @@ namespace opm {
 class Bus {
 public:
     virtual ~Bus() = default;
+
+    // Wired by the front end to the processor. Null means "no snooping",
+    // which is only correct for a machine with no caches.
+    SnoopSink* snoop = nullptr;
+    void snoopBeforeDmaRead(u32 pa, u32 len)
+    {
+        if (snoop)
+            snoop->snoopRead(pa, len);
+    }
+    void snoopBeforeDmaWrite(u32 pa, u32 len)
+    {
+        if (snoop)
+            snoop->snoopWrite(pa, len);
+    }
 
     virtual u8  read8(u32 pa) = 0;
     virtual u16 read16(u32 pa) = 0;

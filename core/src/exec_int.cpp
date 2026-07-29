@@ -914,10 +914,13 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
             c.l2WipeAll(); // L2I global invalidate
         if (v & 0x80000000u)
             c.l2Resize(); // L2E: size the model per L2SIZ
-        { // TEMP-DEBUG: L2 bring-up timeline
+        { // L2 bring-up timeline. The pc and LR matter: "the backside L2 is
+          // never enabled" only becomes actionable once the code that decided
+          // so can be found and read.
             static int n = 0;
             if (n < 40)
-                fprintf(stderr, "l2cr <= %08x tb=%llu\n", v,
+                fprintf(stderr, "l2cr <= %08x pc=%08x lr=%08x tb=%llu\n", v,
+                        c.st.pc - 4u, c.st.lr,
                         static_cast<unsigned long long>(c.st.tb)),
                     ++n;
         }

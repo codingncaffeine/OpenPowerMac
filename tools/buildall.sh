@@ -1,0 +1,109 @@
+#!/bin/bash
+# Build EVERY artifact this project ships, Release, and prove the shell got the
+# right one.
+#
+#   build-gcc/   MinGW g++ + Ninja  -- a second compiler is a real portability
+#                                      check; each rejects what the other allows
+#   build/       MSVC multi-config  -- THE SHIPPING BUILD: g4run, opmcapi, tests
+#   shell/       .NET net11.0-windows
+#
+# Two ways this has silently shipped a broken app, both guarded below:
+#
+#  1. The shell COPIES opmcapi.dll at its own build time, so a native-only
+#     rebuild leaves the app running yesterday's machine code -- and
+#     `dotnet build` prints "Build succeeded" even when the native build it
+#     depends on failed.
+#  2. capi/CMakeLists.txt publishes opmcapi.dll into shell/native/. That copy
+#     used to be guarded by `if(WIN32)`, and MinGW IS WIN32 -- so building
+#     build-gcc/ as a portability check overwrote the MSVC DLL with a gcc one,
+#     the shell shipped it, and the emulator stopped booting while every
+#     native build and all 4 tests still passed. The CMake guard is now
+#     `WIN32 AND MSVC`; step 5 here is the backstop.
+#
+# ORDER IS LOAD-BEARING: gcc first, MSVC second, so the shipping compiler is
+# always the last writer even if a guard regresses. And the DLL gate runs even
+# when an earlier stage fails, so a bail-out can never leave a foreign DLL in
+# place unreported.
+#
+#   tools/buildall.sh            # everything
+#   tools/buildall.sh --no-gcc   # skip the second compiler (quick iteration)
+#
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+# cmake is not on PATH in this environment.
+CMAKE="/c/Program Files/Microsoft Visual Studio/18/Professional/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+CTEST="${CMAKE%cmake.exe}ctest.exe"
+[ -x "$CMAKE" ] || { echo "FAIL: cmake not found at $CMAKE"; exit 1; }
+
+# MinGW's cc1plus lives in lib/gcc/..., not in bin/, so Windows resolves its
+# libgmp/libmpc/libisl imports through PATH. Without mingw64/bin on PATH the
+# compiler fails to start and g++ returns 1 having printed NOTHING AT ALL --
+# which reads exactly like a source error on every file in the project.
+export PATH="/c/msys64/mingw64/bin:$PATH"
+
+SRC=build/capi/Release/opmcapi.dll
+NATIVE=shell/native/opmcapi.dll
+SHIPPED=shell/bin/Release/net11.0-windows/opmcapi.dll
+
+WANT_GCC=1
+[ "${1:-}" = "--no-gcc" ] && WANT_GCC=0
+
+RC=0
+note() { echo; echo "########## $1"; RC=1; }
+
+echo "===== 1/5  portability check: MinGW g++/Ninja Release ====="
+if [ "$WANT_GCC" -eq 1 ] && [ -f build-gcc/build.ninja ]; then
+    "$CMAKE" --build build-gcc 2>&1 | tail -25
+    [ "${PIPESTATUS[0]}" -eq 0 ] || note "FAIL: MinGW Release build"
+else
+    echo "(skipped)"
+fi
+
+echo "===== 2/5  native Release (MSVC) -- the shipping build ====="
+"$CMAKE" --build build --config Release 2>&1 | tail -20
+[ "${PIPESTATUS[0]}" -eq 0 ] || note "FAIL: MSVC Release build"
+
+echo "===== 3/5  ctest Release ====="
+"$CTEST" --test-dir build -C Release 2>&1 | tail -8
+[ "${PIPESTATUS[0]}" -eq 0 ] || note "FAIL: ctest"
+
+echo "===== 4/5  shell Release (.NET) ====="
+# --no-incremental: the csproj copies the native DLL in a target that an
+# incremental build is happy to consider up to date.
+(cd shell && dotnet build -c Release --no-incremental 2>&1 | tail -12)
+[ "${PIPESTATUS[0]}" -eq 0 ] || note "FAIL: shell build"
+
+echo "===== 5/5  the app ships the MSVC DLL that was just built ====="
+# This gate runs unconditionally: if anything above bailed, a foreign or stale
+# DLL may be sitting in the shell and the user would find out by watching the
+# emulator fail to boot.
+for f in "$SRC" "$NATIVE" "$SHIPPED"; do
+    [ -f "$f" ] || note "FAIL: missing $f"
+done
+if [ -f "$SRC" ] && [ -f "$NATIVE" ] && [ -f "$SHIPPED" ]; then
+    A=$(md5sum "$SRC"     | cut -d' ' -f1)
+    B=$(md5sum "$NATIVE"  | cut -d' ' -f1)
+    C=$(md5sum "$SHIPPED" | cut -d' ' -f1)
+    echo "  MSVC build   ${A:0:12}  $SRC"
+    echo "  shell/native ${B:0:12}  $NATIVE"
+    echo "  shipped      ${C:0:12}  $SHIPPED"
+    [ "$A" = "$B" ] || note "FAIL: shell/native/ holds a DLL that is NOT the MSVC build (gcc build clobbered it?)"
+    [ "$A" = "$C" ] || note "FAIL: the app is shipping a STALE or FOREIGN opmcapi.dll"
+
+    # Independent of md5: a gcc-built DLL imports the MinGW runtime. Catches
+    # the same class of mistake even if both copies were clobbered together.
+    for f in "$NATIVE" "$SHIPPED"; do
+        if grep -aqE 'libstdc\+\+-6\.dll|libgcc_s_seh-1\.dll|libwinpthread-1\.dll' "$f"; then
+            note "FAIL: $f imports the MinGW runtime -- it is a gcc build, not MSVC"
+        fi
+    done
+fi
+
+echo
+if [ "$RC" -eq 0 ]; then
+    echo "ALL GREEN (MinGW Release, MSVC Release, ctest, shell Release, DLL is MSVC + fresh)"
+else
+    echo "BUILD NOT CLEAN -- see the ########## lines above"
+fi
+exit "$RC"

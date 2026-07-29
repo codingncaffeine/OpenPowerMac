@@ -201,11 +201,21 @@ void OhciCell::tick(u64 tb)
         if (hcca_ + slot + 4 <= ramSize)
             runList(ldLe(hcca_ + slot) & ~0xFu, false);
     }
-    if (doneHead_ && hcca_ && ram && hcca_ + 0x84u <= ramSize) {
-        // HccaDoneHead, then hand the queue over: the driver reads it and
-        // acknowledges WDH.
-        stLe(hcca_ + 0x84u - 4u, doneHead_);
+    // HccaDoneHead lives at HCCA +0x84. This wrote it to +0x80, which is
+    // HccaFrameNumber -- so the done queue landed in the frame counter, the
+    // driver never saw a list of finished descriptors, and it could not
+    // reclaim them. One report would be delivered and the endpoint then went
+    // quiet.
+    //
+    // The handoff is also once per acknowledgement, not once per frame: while
+    // WritebackDoneHead is still set the driver has not read the list yet, so
+    // the controller accumulates internally rather than overwriting it.
+    if (doneHead_ && !(intStatus_ & 0x02u) && hcca_ && ram &&
+        hcca_ + 0x88u <= ramSize) {
+        snoopWr(hcca_ + 0x84u, 4);
+        stLe(hcca_ + 0x84u, doneHead_);
         doneHead_ = 0;
+        intStatus_ |= 0x02u; // WritebackDoneHead
     }
 }
 
@@ -349,6 +359,12 @@ bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
                  static_cast<u32>(reply_.size()), 0u});
     } else if (dp == 2) { // IN
         ++inTds;
+        if (epn == 0) ++inEp0;
+        if (epn != 0 && !avail) ++noBuffer;
+        if (epn != 0 && (hid_ == Hid::Mouse
+                          ? (!accDx_ && !accDy_ && buttons_ == sentButtons_)
+                          : pending_.size() < reportLen_))
+            ++nakEmpty;
         if (epn == 0) {
             moved = avail < reply_.size() ? avail
                                           : static_cast<u32>(reply_.size());
@@ -366,6 +382,23 @@ bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
                 address_ = pendingAddress_;
                 pendingAddress_ = 0;
             }
+        } else if (hid_ == Hid::Mouse) {
+            // Report only on change: no motion and no button transition is a
+            // NAK, which is what an idle mouse does on the wire.
+            if (!accDx_ && !accDy_ && buttons_ == sentButtons_)
+                return false;
+            auto take = [](int& acc) -> u8 {
+                int v = acc > 127 ? 127 : (acc < -127 ? -127 : acc);
+                acc -= v; // the rest rides on the next poll
+                return static_cast<u8>(static_cast<int8_t>(v));
+            };
+            const u8 rep[3] = {buttons_, take(accDx_), take(accDy_)};
+            sentButtons_ = buttons_;
+            moved = avail < 3u ? avail : 3u;
+            snoopWr(cbp, moved);
+            for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
+                ram[cbp + k] = rep[k];
+            ++reportsSent;
         } else if (pending_.size() >= reportLen_) {
             moved = avail < reportLen_ ? avail : reportLen_;
             snoopWr(cbp, moved);
@@ -401,7 +434,10 @@ void OhciCell::retire(u32 td, u32 cc)
     stLe(td, t0);
     stLe(td + 8, doneHead_); // NextTD doubles as the done-queue link
     doneHead_ = td;
-    intStatus_ |= 0x02u; // WritebackDoneHead
+    // WritebackDoneHead is raised when the list is actually handed over in
+    // tick(), not per descriptor: the bit tells the driver a queue is waiting
+    // at HccaDoneHead, and setting it before anything was written there is a
+    // promise the controller has not kept.
 }
 
 // Walk one endpoint-descriptor list.
@@ -435,17 +471,10 @@ u32 OhciCell::runList(u32 head, bool control)
 // Queue an ASCII string as HID boot-keyboard reports.
 void OhciCell::moveMouse(int dx, int dy, u8 buttons)
 {
-    // Boot protocol: one byte of buttons, then X and Y as signed 8-bit
-    // RELATIVE deltas. A host that receives an unchanged report still has to
-    // see the button state, so a pure click queues a report with zero motion.
-    auto clamp = [](int v) -> u8 {
-        if (v > 127) v = 127;
-        if (v < -127) v = -127;
-        return static_cast<u8>(static_cast<int8_t>(v));
-    };
-    pending_.push_back(buttons & 0x07u);
-    pending_.push_back(clamp(dx));
-    pending_.push_back(clamp(dy));
+    // Accumulate; the report is built when the host actually polls.
+    accDx_ += dx;
+    accDy_ += dy;
+    buttons_ = buttons & 0x07u;
 }
 
 void OhciCell::typeAscii(const std::string& s)

@@ -91,6 +91,11 @@ public:
     void typeAscii(const std::string& s); // queue keystrokes
     bool keyboardIdle() const { return pending_.empty() && !reportDue_; }
     u64 setupsSeen = 0, inTds = 0, reportsSent = 0; // census
+    // Which branch an interrupt IN took. "Polled but nothing delivered" has
+    // three causes that look identical from outside: the ED names endpoint
+    // zero so it fell into the control path, the report queue was empty, or
+    // the TD offered no buffer to write into.
+    u64 inEp0 = 0, nakEmpty = 0, noBuffer = 0;
 
     // Two controllers, one device each: usb@8 carries the boot keyboard and
     // usb@9 the boot mouse. Both devices on one cell would need per-device
@@ -116,6 +121,14 @@ private:
     bool reportDue_ = false;  // a key is down and its release still owed
     Hid hid_ = Hid::Keyboard;
     u32 reportLen_ = 8;
+    // A mouse ACCUMULATES motion between polls and reports the sum, rather
+    // than queueing one packet per movement: the host polls at its own
+    // cadence, and if it is busy for 50 ms the next poll should return one
+    // larger delta, not a backlog of tiny ones. Travel beyond a signed byte
+    // stays here and goes out on the following poll, so a fast flick becomes
+    // several packets instead of one saturated lie.
+    int accDx_ = 0, accDy_ = 0;
+    u8 buttons_ = 0, sentButtons_ = 0;
 
     u32 ldLe(u32 pa) const;
     void stLe(u32 pa, u32 v);

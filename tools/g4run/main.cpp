@@ -245,6 +245,8 @@ int main(int argc, char** argv)
     bool coverageAll = false; // --coverage-all
     const char* typeText = nullptr; // --type STR --type-at N: USB keystrokes
     u64 typeAt = 0;
+    u64 mouseAt = 0;   // --mouse-at N: inject USB mouse motion from N
+    u64 mouseSent = 0;
     u64 atiHideFrom = 0, atiHideTo = 0; // --ati-hide FROM TO
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
@@ -377,6 +379,8 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--type")) typeText = next();
         else if (!strcmp(a, "--type-at")) typeAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--mouse-at"))
+            mouseAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--coverage-all")) coverageAll = true;
         else if (!strcmp(a, "--of-word")) {
             if (ofSymN < 8)
@@ -2804,6 +2808,16 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(executed), typeText);
             fflush(stdout);
         }
+        // Mouse motion, headless. "The pointer does not move" has two very
+        // different causes -- the shell not delivering events, and the device
+        // never being polled -- and only injecting motion with no GUI in the
+        // way can tell them apart. Repeats so the guest sees sustained travel
+        // rather than one report it may legitimately coalesce away.
+        if (mouseAt && executed >= mouseAt &&
+            (executed - mouseAt) % 2000000ull == 0) {
+            bus.ohci(1).moveMouse(8, 4, 0);
+            ++mouseSent;
+        }
         if (serialInput && executed == serialAt) {
             std::string s(serialInput);
             for (char& c : s)
@@ -4058,6 +4072,20 @@ int main(int argc, char** argv)
         // HcInterruptStatus is waiting for a transfer to retire, and only
         // the descriptors the controller actually fetched can tell "the
         // host queued nothing" from "we walked them wrong".
+        // The HID census answers what the register log cannot: is the guest
+        // actually POLLING this device? Zero interrupt-IN TDs on a controller
+        // that enumerated means the driver bound and then never asked for a
+        // report, which is a different bug from "the reports are wrong".
+        printf("-- ohci%u hid: %llu setups, %llu interrupt-IN TDs, %llu "
+               "reports delivered, %llu injected\n",
+               f, static_cast<unsigned long long>(bus.ohci(f).setupsSeen),
+               static_cast<unsigned long long>(bus.ohci(f).inTds),
+               static_cast<unsigned long long>(bus.ohci(f).reportsSent),
+               static_cast<unsigned long long>(f == 1 ? mouseSent : 0));
+        printf("   branches: ep0=%llu nak-empty=%llu no-buffer=%llu\n",
+               static_cast<unsigned long long>(bus.ohci(f).inEp0),
+               static_cast<unsigned long long>(bus.ohci(f).nakEmpty),
+               static_cast<unsigned long long>(bus.ohci(f).noBuffer));
         const auto& wl = bus.ohci(f).walkLog;
         printf("-- ohci%u list walk (%zu%s):\n", f, wl.size(),
                wl.size() >= bus.ohci(f).walkMax ? ", capped" : "");

@@ -717,8 +717,15 @@ int main(int argc, char** argv)
         bus.rxPaceInsns = serialRate;
     if (atiLogFrom)
         bus.ati().logFrom = atiLogFrom;
-    if (ataLogFrom)
+    if (ataLogFrom) {
         bus.ataLogFrom = ataLogFrom;
+        // One window, every ATA instrument. The DBDMA logs were unwindowed
+        // and capped, so an --ata-log-from that put the register traffic on
+        // the stall still reported DMA descriptors from the first second of
+        // the boot — two views of "the same moment" that were 4 G apart.
+        bus.ataDma().logFrom = ataLogFrom;
+        bus.hdDma().logFrom = ataLogFrom;
+    }
     if (ataLatch) {
         bus.hd().latchTrace = true;
         bus.cd().latchTrace = true;
@@ -734,6 +741,12 @@ int main(int argc, char** argv)
 
     Cpu cpu;
     cpu.attach(bus);
+    // Bus-master coherency. Every DMA engine in this machine now announces
+    // its transfers so the processor's L1/L2 answer them, exactly as the
+    // 60x snoop does on real hardware.
+    CpuSnoop snoop;
+    snoop.cpu = &cpu;
+    bus.attachSnoop(&snoop);
     cpu.reset(); // pc = 0xFFF00100, MSR[IP]: vectors in ROM — authentic
     cpu.wpPa = wpPa;   // physical store watchpoint, set before any stepping
     cpu.wpEnd = wpEnd;
@@ -758,6 +771,7 @@ int main(int argc, char** argv)
         kCenQsel, kCenCtl, kCenDrv, kCenPoke, kCen68kGate
     };
     bus.pcRef = &cpu.st.pc;
+    bus.lrRef = &cpu.st.lr;
     bus.stamp = &executed;
     bus.cd().stamp = &executed;
     bus.cd().pcRef = &cpu.st.pc;
@@ -3582,7 +3596,11 @@ int main(int argc, char** argv)
         // what it ASKED FOR, which is the question when a boot device is
         // probed but never read.
         const auto& hl = bus.hd().log;
-        printf("-- hd command log (%zu; c=ata p=packet e=err):\n   ",
+        // The cell's own counters at the moment the run stopped. "The host
+        // stopped reading" and "the drive stopped offering" produce the
+        // same register trace; only these tell them apart.
+        bus.hd().dumpState("hd");
+        printf("-- hd command log (%zu; c=ata D=ata/dma p=packet e=err):\n   ",
                hl.size());
         // Head AND tail: the head is how a probe STARTED, which is what
         // decides everything after it, and a tail-only view hid it.
@@ -3616,13 +3634,15 @@ int main(int argc, char** argv)
         // first 120 entries are an arbitrary window that has nothing to do
         // with what the run was asked to investigate.
         const auto& al = bus.ataLog();
-        printf("-- ata traffic (%zu; last 1200; off r/w val pc):\n",
+        printf("-- ata traffic (%zu; last 1200; off r/w.width val pc):\n",
                al.size());
         const size_t as = al.size() > 1200 ? al.size() - 1200 : 0;
         for (size_t k = as; k < al.size(); ++k)
-            printf("   +%05x %c %02x pc=%08x @%llu\n", al[k].pa & ~1u,
-                   (al[k].pa & 1u) ? 'r' : 'w', al[k].val & 0xFFu,
-                   al[k].pc, static_cast<unsigned long long>(al[k].at));
+            printf("   +%05x %c%u %08x pc=%08x @%llu\n",
+                   al[k].pa & 0x7FFFFFFFu,
+                   (al[k].pa & 0x80000000u) ? 'r' : 'w', al[k].len,
+                   al[k].val, al[k].pc,
+                   static_cast<unsigned long long>(al[k].at));
     }
     {
         const auto& cl = bus.cfgLog();
@@ -3781,11 +3801,18 @@ int main(int argc, char** argv)
     {
         const auto& dl = bus.ataDma().log;
         printf("-- ata dbdma events (%zu; 0=ctl 1=desc 2=input 3=stop "
-               "4=dead):\n",
+               "4=dead 5=storequad):\n",
                dl.size());
-        for (size_t k = 0; k < dl.size() && k < 80; ++k)
+        for (size_t k = 0; k < dl.size() && k < 40; ++k)
             printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
                    dl[k].b, static_cast<unsigned long long>(dl[k].at));
+        if (dl.size() > 40) {
+            printf("   ... tail ...\n");
+            for (size_t k = dl.size() > 120 ? dl.size() - 120 : 40;
+                 k < dl.size(); ++k)
+                printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
+                       dl[k].b, static_cast<unsigned long long>(dl[k].at));
+        }
     }
     {
         // The DISK's channel. Never stamped and never printed, so every
@@ -3793,11 +3820,18 @@ int main(int argc, char** argv)
         // channel was being read as though it were the disk's.
         const auto& dl = bus.hdDma().log;
         printf("-- hd dbdma events (%zu; 0=ctl 1=desc 2=input 3=stop "
-               "4=dead):\n",
+               "4=dead 5=storequad):\n",
                dl.size());
-        for (size_t k = 0; k < dl.size() && k < 80; ++k)
+        for (size_t k = 0; k < dl.size() && k < 40; ++k)
             printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
                    dl[k].b, static_cast<unsigned long long>(dl[k].at));
+        if (dl.size() > 40) {
+            printf("   ... tail ...\n");
+            for (size_t k = dl.size() > 120 ? dl.size() - 120 : 40;
+                 k < dl.size(); ++k)
+                printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
+                       dl[k].b, static_cast<unsigned long long>(dl[k].at));
+        }
     }
     if (bus.atiPresent()) {
         // CRTC-aware screen dump: geometry straight from the live CRTC

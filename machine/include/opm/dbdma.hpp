@@ -43,9 +43,14 @@ public:
 
     struct Ev {
         u64 at;
-        u32 kind, a, b; // 0=ctl 1=desc 2=input 3=stop 4=dead
+        u32 kind, a, b; // 0=ctl 1=desc 2=input 3=stop 4=dead 5=storequad
     };
     std::vector<Ev> log;
+    // The log used to stop recording once it held 2048 events, so it was a
+    // record of the FIRST DMA the machine ever did and nothing else — a
+    // question about a stall at 4.8 G was being answered with traffic from
+    // 0.9 G. Ring it, and gate it the way the ATA traffic log is gated.
+    u64 logFrom = 0;
 
     // Snapshot; the bus and ATA-cell pointers are wired by the machine's
     // constructor and stay valid across a load.

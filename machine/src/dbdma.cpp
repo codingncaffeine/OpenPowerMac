@@ -10,8 +10,11 @@ static constexpr u32 kRun = 0x8000, kPause = 0x4000, kFlush = 0x2000,
 
 void DbdmaChannel::note(u32 kind, u32 a, u32 b)
 {
-    if (log.size() < 2048)
-        log.push_back({stamp ? *stamp : 0, kind, a, b});
+    if (stamp && *stamp < logFrom)
+        return;
+    if (log.size() >= 4096)
+        log.erase(log.begin(), log.begin() + 2048);
+    log.push_back({stamp ? *stamp : 0, kind, a, b});
 }
 
 u32 DbdmaChannel::read(u32 off, u32 len)
@@ -74,7 +77,15 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
         break;
     }
     case 3:
-        cmdPtr_ = native;
+        // commandPtrLo is ignored while the channel is ACTIVE, and the low
+        // four bits are ignored always (descriptors are 16-byte aligned).
+        // A driver retargets a running channel by clearing RUN first; a
+        // write that lands mid-list would otherwise teleport the engine.
+        if (status_ & kActive) {
+            note(6, native, status_);
+            break;
+        }
+        cmdPtr_ = native & ~15u;
         break;
     case 4: intSel_ = native; break;
     case 5: brSel_ = native; break;
@@ -101,6 +112,14 @@ void DbdmaChannel::run()
     for (u32 steps = 0; steps < 65536; ++steps) {
         if (!(status_ & kRun))
             return;
+        // The descriptor is both read (command, address, literal) and
+        // written (xferStatus/resCount), so snoop it as a master WRITE:
+        // push whatever the processor still holds dirty, then drop its
+        // copy. Open Firmware builds this list with ordinary cached stores
+        // and arms the channel without a single dcbf — on real hardware
+        // the 60x snoop covers it, and without this the engine reads
+        // power-on junk and marks itself DEAD.
+        dmaBus->snoopBeforeDmaWrite(cmdPtr_, 16);
         const u32 w0 = rd32le(cmdPtr_);
         const u32 op = w0 >> 28;
         const u32 req = w0 & 0xFFFFu;
@@ -117,6 +136,12 @@ void DbdmaChannel::run()
             if (ata) {
                 std::vector<u8> tmp(req);
                 moved = ata->dmaTake(tmp.data(), req);
+                // The processor's copy of the destination is about to be
+                // wrong. Without this the bytes land in RAM underneath a
+                // live cache line and the driver reads back whatever it
+                // had before the transfer — a DMA that "worked" and
+                // delivered nothing.
+                dmaBus->snoopBeforeDmaWrite(addr, moved);
                 for (u32 k = 0; k < moved; ++k)
                     dmaBus->write8(addr + k, tmp[k]);
             }
@@ -141,6 +166,8 @@ void DbdmaChannel::run()
         }
         case 4: { // STORE_QUAD: literal (word2) -> addr, width by req
             const u32 lit = rd32le(cmdPtr_ + 8);
+            dmaBus->snoopBeforeDmaWrite(addr, req ? req : 4u);
+            note(5, addr, lit);
             if (req >= 4)
                 wr32le(addr, lit);
             else if (req == 2)
@@ -162,10 +189,17 @@ void DbdmaChannel::run()
             note(4, cmdPtr_, w0);
             return;
         }
-        // interrupt-select: fire on _LAST ops when the condition field
-        // requests it (coarse: any nonzero select interrupts on LAST).
-        if ((op == 1 || op == 3) &&
-            ((w0 >> 20) & 3u) != 0) // 'i' field: interrupt condition
+        // Interrupt control. The descriptor is a LITTLE-ENDIAN struct —
+        //   u16 reqCount · u8 cmdBits · u8 cmdKey · u32 address · …
+        // so in the assembled word cmdKey is 31:24 (cmd = key>>4) and
+        // cmdBits is 23:16, and inside cmdBits w=1:0, b=3:2, i=5:4. The
+        // interrupt select therefore sits at word bits 21:20 — NOT at
+        // 23:22, which is where the spec's big-endian bit numbering puts
+        // it and where reading it costs you the branch field instead.
+        // It applies to every command, not only the _LAST forms.
+        // (01/10 are conditional on the channel's s0-s7 against intSelect;
+        // no list in this machine uses them, so they read as "always".)
+        if (((w0 >> 20) & 3u) != 0)
             irq_ = true;
         cmdPtr_ += 16;
     }

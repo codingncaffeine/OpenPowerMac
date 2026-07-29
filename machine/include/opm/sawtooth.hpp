@@ -105,6 +105,24 @@ public:
             ohci_[f].ram = ram_.data();
             ohci_[f].ramSize = static_cast<u32>(ram_.size());
         }
+        // The PCI-to-PCI bridge at f2 device 13 (one-hot bit 13). A real
+        // Sawtooth carries its built-in devices on this bridge's SECONDARY
+        // bus -- pci-bridge@d/{mac-io@7, usb@8, usb@9, firewire@a,
+        // ethernet@b} -- and the boot ROM tests for it directly: the payload
+        // at 0x00200920 reads config latch 0x6808 (device 13, register 8),
+        // compares the class to 0x00060400, and stores the answer to
+        // [startvec+0x74], which Open Firmware reads back as `mlb-bridge?`.
+        // With nothing there the read is all-ones, the flag is false, and
+        // bridge 1's probe-slots skips the one call that would create that
+        // secondary bus -- which is why no OHCI controller is ever
+        // enumerated and the USB shim later calls through a null pointer.
+        // Header type 1 (register 0x0C byte 2) marks the bridge layout.
+        cfgSeed(1, 0x00002000u, 0x00261011u); // DEC 21154, 1011:0026
+        cfgSeed(1, 0x00002008u, 0x06040002u); // class 060400, rev 2
+        cfgSeed(1, 0x0000200Cu, 0x00010000u); // header type 1
+        for (u32 r = 0x04; r <= 0x3C; r += 4)
+            if (r != 0x08 && r != 0x0C)
+                cfgSeed(1, 0x00002000u | r, 0);
         // Uni-North's own host-bridge PCI functions at device 11 of
         // each bus ("11,UNI-N" in the ROM's slot names; the AGP-slot
         // probe consults its bridge): AGP = 106b:0020, internal 66MHz =

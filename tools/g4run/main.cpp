@@ -576,6 +576,27 @@ int main(int argc, char** argv)
     // The variables are a packed list of NAME=VALUE\0 inside the partition,
     // and the CHRP header checksum covers only the header, so an entry can
     // be rewritten and the remainder shifted up without touching it.
+    // ⚠ MEASURED 2026-07-28: on the 4.2.8f1 Sawtooth ROM, **every** edit
+    // to this partition trips Open Firmware's own validator, which answers
+    //
+    //   NVRAM-status: 2  at: 0
+    //   NVRAM corrupted (init-nvram), cleaning it up...
+    //
+    // and reinitialises it, so the edit does NOT stick. Established with a
+    // SAME-LENGTH replacement that shifted nothing and padded nothing
+    // (`output-device=scca  ` for `output-device=screen`), which rules out
+    // both the shift path and the sum-restoring bias — the earlier belief
+    // that same-length edits were safe, and that shifting was what broke
+    // them, are both wrong. Something beyond the byte sums is checked.
+    //
+    // Keep the tool: it is how that was established, and `--dump-rom` after
+    // letting OF write its own NVRAM (setenv + reset-all) remains the way
+    // to produce an image with valid checksums. But do not trust an edit to
+    // survive a boot until this validator is understood.
+    if (!nvramSet.empty())
+        printf("-- nvram-set: NOTE — measured on this ROM, any edit to the "
+               "config partition is rejected by OF's validator and the "
+               "partition is reinitialised. See the comment above.\n");
     for (const std::string& kv : nvramSet) {
         const size_t eq = kv.find('=');
         if (eq == std::string::npos || eq == 0) {
@@ -686,14 +707,7 @@ int main(int argc, char** argv)
                             break;
                         }
                 }
-                printf("-- nvram-set: %s at %04zx (shifted %zu bytes up)\n"
-                       "--   WARNING: shifting entries TRIPS Open "
-                       "Firmware's NVRAM validator — measured, twice, with "
-                       "the sum-restoring bias in two different places. It "
-                       "answers `NVRAM-status: 2` and `NVRAM corrupted "
-                       "(init-nvram), cleaning it up...` and reinitialises "
-                       "the partition, so the edit does NOT stick. Only "
-                       "same-length or filler-padded edits survive.\n",
+                printf("-- nvram-set: %s at %04zx (shifted %zu bytes up)\n",
                        kv.c_str(), part, slack);
                 continue;
             }

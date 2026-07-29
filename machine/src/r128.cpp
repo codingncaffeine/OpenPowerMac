@@ -12,7 +12,13 @@ static constexpr u32 kBiosScratch = 0x0010;  // BIOS_0_SCRATCH..
 static constexpr u32 kGenReset = 0x00F0;     // GEN_RESET_CNTL
 static constexpr u32 kConfigMemsize = 0x00F8;
 static constexpr u32 kConfigAper0Base = 0x0100; // CONFIG_APER_0_BASE
+static constexpr u32 kConfigAper1Base = 0x0104; // CONFIG_APER_1_BASE
 static constexpr u32 kConfigAperSize = 0x0108;  // CONFIG_APER_SIZE
+static constexpr u32 kConfigReg1Base = 0x010C;  // CONFIG_REG_1_BASE
+static constexpr u32 kConfigRegAperSize = 0x0110;
+// The big-endian alias of the same VRAM: BAR0 is 64 MB and the upper half
+// is the byte-swapped view of the lower 32 MB.
+static constexpr u32 kAper1Offset = 0x02000000;
 static constexpr u32 kMemCntl = 0x0140;
 static constexpr u32 kCrtcGenCntl = 0x0050;
 static constexpr u32 kGpioMonid = 0x0068;    // DDC bit-bang
@@ -63,6 +69,27 @@ u32 R128Cell::regRead(u32 idx)
         // every run. CONFIG_APER_SIZE is 0x0108.
         return fbBase;
     }
+    case kConfigAper1Base:
+        // The SECOND aperture: the same 32 MB of VRAM seen through the
+        // big-endian alias, which is the one a Mac driver paints through
+        // and which the card's own FCode publishes in its `address`
+        // property (BAR0 + 0x02000000 + the CRTC offset).
+        //
+        // This register was not modelled and read back as zero. Measured
+        // consequence: the OS display driver stores it as its framebuffer
+        // base (device record +0x8c), adds the CRTC offset it programmed
+        // (+0x138 = 0x8000), and fills 640x480x32 from address 0x00008000 —
+        // 1.2 MB straight over low memory. That wipes ExpandMem, the next
+        // dereference of the poisoned cell raises a bus error, and the ROM
+        // sad-Macs into `bra.s *` at ffc046ee. The screen staying blank was
+        // the mildest symptom of it.
+        return fbBase + kAper1Offset;
+    case kConfigReg1Base:
+        // Same shape, for the register aperture: a driver that asks where
+        // its own registers are must not be told zero.
+        return regBase;
+    case kConfigRegAperSize:
+        return 0x00004000u; // 16 KB, matching the BAR we advertise
     case kConfigMemsize:
     case kConfigAperSize: {
         // Power-on default 32 MB; if the init code programs the field,

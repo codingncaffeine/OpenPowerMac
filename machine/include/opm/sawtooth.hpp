@@ -936,6 +936,10 @@ private:
                     word &= 0xFFFFC000u;
                     atiRegBar_ =
                         (word != 0xFFFFC000u) ? word : atiRegBar_;
+                    // The card reports its own apertures back through
+                    // CONFIG_REG_1_BASE; a driver that asks where its
+                    // registers are must not be told zero.
+                    ati_.regBase = atiRegBar_;
                     break;
                 case 0x30u:
                     if (atiRom_.empty())

@@ -28,6 +28,12 @@
 #   tools/buildall.sh            # everything
 #   tools/buildall.sh --no-gcc   # skip the second compiler (quick iteration)
 #
+# ⛔ NEVER PUSH AFTER --no-gcc. CI builds with gcc, and gcc rejects things MSVC
+# accepts silently -- -Wunused-function is an error there, so deleting the last
+# caller of a static helper breaks the Linux jobs while MSVC and all four tests
+# pass locally. That is exactly how ed930d3 had to happen. --no-gcc is for
+# iterating between measurements, not for the build you commit.
+#
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 

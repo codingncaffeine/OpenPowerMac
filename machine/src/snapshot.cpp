@@ -91,23 +91,6 @@ void loadMapU32(SnapReader& r, std::map<u32, u32>& m)
         m[key] = r.u32v();
     }
 }
-void saveMapU64(SnapWriter& w, const std::map<u32, u64>& m)
-{
-    w.u64v(m.size());
-    for (const auto& [k, v] : m) {
-        w.u32v(k);
-        w.u64v(v);
-    }
-}
-void loadMapU64(SnapReader& r, std::map<u32, u64>& m)
-{
-    m.clear();
-    const u64 n = r.u64v();
-    for (u64 k = 0; k < n && r.ok; ++k) {
-        const u32 key = r.u32v();
-        m[key] = r.u64v();
-    }
-}
 void saveVecU32(SnapWriter& w, const std::vector<u32>& v)
 {
     w.u64v(v.size());

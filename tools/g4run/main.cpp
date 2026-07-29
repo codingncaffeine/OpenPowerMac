@@ -1509,11 +1509,18 @@ int main(int argc, char** argv)
         // PA 0x4308. Sampled rather than hooked: a dirty cache line can
         // delay the observation, but the queue going non-empty is a
         // one-way event, so a late report is still a true one.
+        // $308 is the QHdr's qFlags WORD; the head pointer is the long at
+        // $30A and the tail at $30E. Reading a long at $308 samples
+        // qFlags in the top half and only the HIGH half of qHead in the
+        // bottom - so a queue whose element sits below 64 KB reads as
+        // exactly zero, i.e. "still empty", forever. Watch qHead.
         if ((executed & 0x3FFFFFu) == 0) {
             static u32 lastDq = 0xFFFFFFFFu;
-            const u32 dq = bus.read32(0x4308u);
+            const u32 dq = bus.read32(0x430Au);
             if (dq != lastDq) {
-                printf("DRVQ $308 = %08x @%llu\n", dq,
+                printf("DRVQ $30A qHead = %08x (qFlags=%04x tail=%08x) "
+                       "@%llu\n",
+                       dq, bus.read16(0x4308u), bus.read32(0x430Eu),
                        static_cast<unsigned long long>(executed));
                 fflush(stdout);
                 lastDq = dq;
@@ -2866,6 +2873,51 @@ int main(int argc, char** argv)
         if (cpu.st.gpr[24] != prev68k) {
             prev68k = cpu.st.gpr[24];
             ring68[ring68At++ & 127u] = {prev68k, cpu.st.gpr[27], pc};
+            // 0x60fe is BRA.S *-2: a 68K branch to itself, i.e. a
+            // deliberate halt. The system reaching one is the single most
+            // informative event in an OS-era boot and there was no
+            // instrument for it - the 300M-interval spin sampler reported
+            // the halt as much as a third of a billion instructions late,
+            // by which time the fetch ring held only the halt itself.
+            // Report the FIRST few, each with the ring that led into it.
+            // NOT simply "op == 60fe": r24 is a FETCH pointer, so the word
+            // after any short branch is crossed before the branch applies.
+            // A `bra.s +$24` two bytes earlier makes the 60fe at the next
+            // address look executed when it never was — that false positive
+            // fired six times at ffc0ab16 before this test existed. A real
+            // self-branch shows up as the fetch pointer ALTERNATING between
+            // X and X+2 and never leaving, so require the pattern twice.
+            static u32 haltShown = 0;
+            bool selfLoop = false;
+            if ((cpu.st.gpr[27] & 0xFFFFu) == 0x60FEu && ring68At >= 5) {
+                const u32 a1 = ring68[(ring68At - 1u) & 127u].pc68;
+                const u32 a2 = ring68[(ring68At - 2u) & 127u].pc68;
+                const u32 a3 = ring68[(ring68At - 3u) & 127u].pc68;
+                const u32 a4 = ring68[(ring68At - 4u) & 127u].pc68;
+                selfLoop = a1 == a3 && a2 == a4 && a2 == a1 + 2u;
+            }
+            if (selfLoop && haltShown < 6 &&
+                (pc & 0xFFC00000u) == 0x68000000u) {
+                ++haltShown;
+                const char* hs = sym(prev68k);
+                printf("-- 68K HALT (bra.s *) #%u @%llu pc68=%08x%s%s%s\n",
+                       haltShown,
+                       static_cast<unsigned long long>(executed), prev68k,
+                       hs ? " <" : "", hs ? hs : "", hs ? ">" : "");
+                printf("   how it got here (last 24 fetches):\n");
+                for (u32 k = 0; k < 24; k += 4) {
+                    printf("   ");
+                    for (u32 j = 0; j < 4; ++j) {
+                        const Ent68& e =
+                            ring68[(ring68At + 128u - 25u + k + j) & 127u];
+                        const char* s = sym(e.pc68);
+                        printf(" %08x/%04x%s%s%s", e.pc68, e.op & 0xFFFFu,
+                               s ? "<" : "", s ? s : "", s ? ">" : "");
+                    }
+                    printf("\n");
+                }
+                fflush(stdout);
+            }
             // 60Hz tick delivery tracer: the 68K tick handler increments
             // lowmem Ticks at ffc0bc00 (ADDQ.L #1,($016A).W); entries
             // into the handler region name the delivery mechanism.
@@ -3022,6 +3074,24 @@ int main(int argc, char** argv)
             for (u32 k = 24; k < 32; ++k)
                 printf("%08x ", cpu.st.gpr[k]);
             printf("\n");
+            // The registers alone never said WHERE. r24 is the emulator's
+            // 68K fetch pointer and the ring carries the last 128 fetch
+            // positions, so the loop can be named instead of guessed at —
+            // and with the MacsBug table loaded, named literally.
+            printf("   68k fetch ring (oldest first, pc/op):\n");
+            for (u32 k = 0; k < 32; k += 4) {
+                printf("   ");
+                for (u32 j = 0; j < 4; ++j) {
+                    const Ent68& e =
+                        ring68[(ring68At + 128u - 32u + k + j) & 127u];
+                    const char* s = sym(e.pc68);
+                    printf(" %08x/%04x%s%s", e.pc68, e.op & 0xFFFFu,
+                           s ? "<" : "", s ? s : "");
+                    if (s)
+                        printf(">");
+                }
+                printf("\n");
+            }
         }
         if (lockTrace < 0 && cpu.st.pc == 0x00F25350u)
             lockTrace = 300;
@@ -3098,6 +3168,24 @@ int main(int argc, char** argv)
             excRing[excRingAt % 16] = {executed, cpu.st.pc, cpu.st.srr0,
                                        cpu.st.srr1, cpu.st.dsisr, cpu.st.dar};
             ++excRingAt;
+            // The decrementer fires ~170,000 times in an OS-era boot, so a
+            // 16-deep ring holds nothing but timer ticks and the FAULT that
+            // ended the boot is never in it. Report the first few of every
+            // OTHER kind, once each: a DSI on a poisoned pointer is the
+            // event worth seeing, and it was being flushed out by clock
+            // interrupts every time.
+            static u32 faultShown = 0;
+            const u32 v = cpu.st.pc & 0x0000FF00u;
+            if (v != 0x0900u && v != 0x0500u && faultShown < 12) {
+                ++faultShown;
+                printf("-- FAULT #%u @%llu -> %08x srr0=%08x srr1=%08x "
+                       "dsisr=%08x dar=%08x lr=%08x r24=%08x\n",
+                       faultShown,
+                       static_cast<unsigned long long>(executed), cpu.st.pc,
+                       cpu.st.srr0, cpu.st.srr1, cpu.st.dsisr, cpu.st.dar,
+                       cpu.st.lr, cpu.st.gpr[24]);
+                fflush(stdout);
+            }
         }
     }
 
@@ -3893,6 +3981,58 @@ int main(int argc, char** argv)
         printf("-- ati framebuffer: %llu writes, span %08x..%08x\n",
                static_cast<unsigned long long>(bus.ati().fbWrites),
                bus.ati().fbWrites ? bus.ati().fbLo : 0u, bus.ati().fbHi);
+        // What the guest ACTUALLY painted, measured rather than decoded.
+        // A framebuffer's rows are strongly correlated with their
+        // neighbours whatever the picture is, so the true row stride is
+        // the one that minimises the mean absolute difference between
+        // row n and row n+1. Two candidates matter here — 8/16/32 bpp at
+        // this width — and reading the CRTC's pixel-width field wrong is
+        // indistinguishable by any other means from the guest painting
+        // garbage. Also reports each byte lane's distinct-value count:
+        // a 32-bpp ARGB surface has a constant alpha lane, a 16-bpp one
+        // has no such periodicity.
+        if (bus.ati().fbWrites && bus.ati().fbHi > bus.ati().fbLo) {
+            const auto& vr = bus.ati().vram;
+            // fbLo/fbHi are APERTURE offsets and the aperture is twice the
+            // size of VRAM (the second half is the byte-swapped view), so
+            // they must be folded before they can index vram — unfolded,
+            // every probe below silently skipped its whole loop and printed
+            // nothing, which reads exactly like "there is nothing there".
+            const size_t lo = bus.ati().fbLo & 0x01FFFFFFu;
+            const size_t hi = bus.ati().fbHi & 0x01FFFFFFu;
+            const size_t span = hi - lo + 1;
+            printf("-- ati paint: %zu bytes touched; w*h*1=%u w*h*2=%u "
+                   "w*h*4=%u\n",
+                   span, w * h, w * h * 2u, w * h * 4u);
+            printf("--   row-stride probe (lower = more likely):\n");
+            for (u32 stride : {w, w * 2u, w * 3u, w * 4u,
+                               pitch8 * 8u, pitch8 * 16u, pitch8 * 32u}) {
+                if (!stride || lo + 2 * size_t(stride) > vr.size())
+                    continue;
+                u64 sum = 0, n = 0;
+                for (size_t a = lo; a + stride <= hi && a + stride < vr.size();
+                     a += 7) { // prime step: no alignment bias
+                    const int d = int(vr[a]) - int(vr[a + stride]);
+                    sum += u64(d < 0 ? -d : d);
+                    ++n;
+                }
+                printf("--     stride %5u (%u bpp if w=%u): mean|diff| "
+                       "%.2f over %llu\n",
+                       stride, w ? stride / w : 0, w,
+                       n ? double(sum) / double(n) : 0.0,
+                       static_cast<unsigned long long>(n));
+            }
+            u32 laneN[4] = {0, 0, 0, 0};
+            for (u32 lane = 0; lane < 4; ++lane) {
+                bool laneSeen[256] = {};
+                for (size_t a = lo + lane; a <= hi && a < vr.size(); a += 4)
+                    laneSeen[vr[a]] = true;
+                for (bool s : laneSeen)
+                    laneN[lane] += s ? 1u : 0u;
+            }
+            printf("--   distinct values per byte lane: %u %u %u %u\n",
+                   laneN[0], laneN[1], laneN[2], laneN[3]);
+        }
         if ((gen & 0x02000000u) && w >= 64 && w <= 2048 && h >= 64 &&
             h <= 1536 && (fmt == 2u || fmt == 6u)) {
             const u32 bypp = fmt == 2u ? 1u : 4u;

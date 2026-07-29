@@ -332,6 +332,8 @@ int main(int argc, char** argv)
     const char* serialLogPath = nullptr; // --serial-log FILE
     u64 serialRate = 0;                // --serial-rate N
     u64 atiLogFrom = 0;                // --ati-log-from N
+    u64 ataLogFrom = 0;                // --ata-log-from N
+    bool ataLatch = false;             // --ata-latch
     u64 wmapFrom = 0, wmapTo = 0;      // --wmap FROM TO
     u32 wmapPcBucket = 0;              // --wmap-pc BUCKET
     bool wmapPcSet = false;
@@ -510,6 +512,9 @@ int main(int argc, char** argv)
             wmapFrom = strtoull(next(), nullptr, 0);
             wmapTo = strtoull(next(), nullptr, 0);
         }
+        else if (!strcmp(a, "--ata-latch")) ataLatch = true;
+        else if (!strcmp(a, "--ata-log-from"))
+            ataLogFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--ati-log-from"))
             atiLogFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
@@ -712,6 +717,12 @@ int main(int argc, char** argv)
         bus.rxPaceInsns = serialRate;
     if (atiLogFrom)
         bus.ati().logFrom = atiLogFrom;
+    if (ataLogFrom)
+        bus.ataLogFrom = ataLogFrom;
+    if (ataLatch) {
+        bus.hd().latchTrace = true;
+        bus.cd().latchTrace = true;
+    }
     if (wmapTo) {
         bus.wmapFrom = wmapFrom;
         bus.wmapTo = wmapTo;

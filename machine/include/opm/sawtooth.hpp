@@ -318,6 +318,10 @@ public:
     // ISO is attached; the other buses stay empty. Non-data register
     // traffic is logged bus-tagged.
     const std::vector<RegWr>& ataLog() const { return ataLog_; }
+    // --ata-log-from N: the ring trims as it grows, so a command at 3.7 G
+    // is long gone by the end of a 5 G run. Gate it and the window lands
+    // where the question is.
+    u64 ataLogFrom = 0;
     // Where Open Firmware actually put the display. An NDRV computes its
     // register base from the device tree, so an unrouted BAR shows up as a
     // DSI on a plausible-looking address rather than as anything about
@@ -446,7 +450,8 @@ private:
                 u32 v = isCd   ? cd_.read(off - 0x20000u, len)
                         : isHd ? hd_.read(off - 0x1F000u, len)
                                : ((~0u >> (32 - 8 * len)) & ~0x80u);
-                if ((off & 0xFF0u) != 0) {
+                if ((off & 0xFF0u) != 0 &&
+                    !(stamp && *stamp < ataLogFrom)) {
                     if (ataLog_.size() >= 6000)
                         ataLog_.erase(ataLog_.begin(),
                                       ataLog_.begin() + 3000);
@@ -594,7 +599,8 @@ private:
                 return;
             }
             if (off - 0x1F000u < 0x3000u) {
-                if ((off & 0xFF0u) != 0) {
+                if ((off & 0xFF0u) != 0 &&
+                    !(stamp && *stamp < ataLogFrom)) {
                     if (ataLog_.size() >= 6000)
                         ataLog_.erase(ataLog_.begin(),
                                       ataLog_.begin() + 3000);

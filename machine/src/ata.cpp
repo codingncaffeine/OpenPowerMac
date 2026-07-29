@@ -1,6 +1,7 @@
 #include "opm/ata.hpp"
 
 #include <cstring>
+#include <cstdio>
 
 namespace opm {
 
@@ -361,7 +362,29 @@ void AtaCell::write(u32 off, u32 v, u32 len)
                 ataCommand(b);
                 break;
             }
+            // Latch the task file NOW. The command is deferred behind BSY,
+            // and in between a previous transfer can drain and call
+            // diskStartRead, whose completion path sets nsect_ = 0. The
+            // deferred command then read 256 sectors where the host had
+            // asked for 1, held DRQ for 255 sectors nobody wanted, and the
+            // driver polled a status that could never change. A real drive
+            // samples its registers when the command byte lands.
             pendCmd_ = b;
+            pendNsect_ = nsect_;
+            // Opt-in: the task file exactly as the drive samples it. Proved
+            // the capture was never the fault — the PIO reads latch
+            // nsect=01/20/20 cleanly — and named what Open Firmware's first
+            // READ DMA actually asks for.
+            if (disk_ && latchTrace && latchShown_ < 60) {
+                ++latchShown_;
+                printf("LATCH cmd=%02x nsect=%02x lba0=%02x dev=%02x @%llu\n",
+                       b, nsect_, lba0_, dev_,
+                       static_cast<unsigned long long>(stamp ? *stamp : 0));
+            }
+            pendLba0_ = lba0_;
+            pendBcLo_ = bcLo_;
+            pendBcHi_ = bcHi_;
+            pendDev_ = dev_;
             pendAt_ = (stamp ? *stamp : 0) + cmdDelay_;
             pending_ = true;
             status_ = kBsy;
@@ -405,6 +428,11 @@ bool AtaCell::tick()
     if (!pending_ || !stamp || *stamp < pendAt_)
         return false;
     pending_ = false;
+    nsect_ = pendNsect_;
+    lba0_ = pendLba0_;
+    bcLo_ = pendBcLo_;
+    bcHi_ = pendBcHi_;
+    dev_ = pendDev_;
     ataCommand(pendCmd_);
     return true;
 }

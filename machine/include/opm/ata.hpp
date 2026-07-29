@@ -37,6 +37,7 @@ public:
     bool present() const { return iso_ != nullptr; }
     bool irqLine() const { return irq_; }
     void setDmaArmed(bool a) { dmaArmed_ = a; }
+    bool latchTrace = false; // --ata-latch: print the task file per command
     u8 devSel() const { return dev_; } // diagnostic: drive-select bits
 
     u32 read(u32 off, u32 len);
@@ -137,6 +138,10 @@ private:
     bool pending_ = false;
     u8 pendCmd_ = 0;
     u64 pendAt_ = 0;
+    // Task file as it stood when the command byte landed.
+    u32 latchShown_ = 0;
+    u8 pendNsect_ = 0, pendLba0_ = 0, pendBcLo_ = 0, pendBcHi_ = 0,
+       pendDev_ = 0;
     bool irq_ = false;
     // Cell (not drive) registers at +0x200 and up: PIO/DMA timing. They sit
     // in mac-io, so drive select and an absent slave are irrelevant to them

@@ -32,6 +32,9 @@ public:
     void wake(); // device has fresh data: resume a standing list
 
     bool irqLine() const { return irq_; }
+    // RUN set: the channel is armed, so a read command on this cell is a
+    // DMA transfer whatever its opcode says.
+    bool running() const { return (status_ & 0x8000u) != 0; }
 
     Bus* dmaBus = nullptr;
     AtaCell* ata = nullptr;

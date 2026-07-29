@@ -283,6 +283,11 @@ public:
     {
         ohci_[0].tick(tb);
         ohci_[1].tick(tb);
+        // DMA on this hardware is selected by the channel, not the opcode:
+        // tell each cell whether its DBDMA list is armed before any command
+        // can present a data phase.
+        cd_.setDmaArmed(ataDma_.running());
+        hd_.setDmaArmed(hdDma_.running());
         // Deferred ATA commands (see AtaCell::write case 0x070). When one
         // fires, its data phase has just opened, so resume any DBDMA list
         // parked on that channel — a DMA read arms the list before the

@@ -36,6 +36,7 @@ public:
     bool attachDisk(const char* path);
     bool present() const { return iso_ != nullptr; }
     bool irqLine() const { return irq_; }
+    void setDmaArmed(bool a) { dmaArmed_ = a; }
     u8 devSel() const { return dev_; } // diagnostic: drive-select bits
 
     u32 read(u32 off, u32 len);
@@ -49,7 +50,12 @@ public:
     // compresses guest time.
     bool tick(); // true when a deferred command ran: wake the DMA list
     u64 cmdDelay_ = 4000;
-    bool dmaXfer_ = false; // current read is a DMA transfer, so no DRQ
+    // Set by the bus from the channel.s RUN bit. On this hardware DMA is
+    // selected by the mac-io cell and its DBDMA channel, NOT by the ATA
+    // opcode: Open Firmware arms the channel and then issues an ordinary
+    // READ MULTIPLE. Keying off the opcode made every such transfer assert
+    // DRQ and wait for data-register reads that never came.
+    bool dmaArmed_ = false;
 
     // DBDMA drain of the current data phase: same completion semantics
     // as PIO reads (chunked READs refill through finishPio).

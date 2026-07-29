@@ -57,7 +57,6 @@ void AtaCell::diskStartRead()
     if (readLeft_ == 0) {
         nsect_ = 0;
         status_ = (kDrdy | kDsc);
-        dmaXfer_ = false; // transfer over: back to PIO handshaking
         irq_ = true;
         return;
     }
@@ -83,7 +82,7 @@ void AtaCell::diskStartRead()
     // and the host is waiting for the transfer to END: BSY clear, DRQ
     // clear, DRDY set. Asserting DRQ for every sector of a DMA read means
     // that condition never arrives, however many sectors actually move.
-    status_ = static_cast<u8>((dmaXfer_ ? 0u : kDrq) | (kDrdy | kDsc));
+    status_ = static_cast<u8>((dmaArmed_ ? 0u : kDrq) | (kDrdy | kDsc));
     irq_ = true;
 }
 
@@ -164,7 +163,6 @@ void AtaCell::diskCommand(u8 cmd)
     case 0xC4: // READ MULTIPLE
     case 0xC8: // READ DMA
     case 0xC9: // READ DMA (no retry)
-        dmaXfer_ = (cmd == 0xC8 || cmd == 0xC9);
         readLba_ = diskLba();
         readLeft_ = nsect_ ? nsect_ : 256u;
         diskStartRead();
@@ -429,7 +427,11 @@ void AtaCell::ataCommand(u8 cmd)
     // matters when a disk with a valid driver set still ends at a flashing
     // question mark.
     if (true)
-        log.push_back({stamp ? *stamp : 0, 'c', cmd,
+        // Kind 'D' when the channel was armed at command time, 'c' when
+        // not: whether a transfer is DMA is a property of the cell, not
+        // the opcode, and nothing recorded which one each command was.
+        log.push_back({stamp ? *stamp : 0,
+                       (disk_ && dmaArmed_) ? 'D' : 'c', cmd,
                        disk_ ? diskLba() : 0u,
                        disk_ ? (nsect_ ? u32(nsect_) : 256u) : 0u,
                        pcRef ? *pcRef : 0});

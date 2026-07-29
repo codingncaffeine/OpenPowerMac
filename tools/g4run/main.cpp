@@ -324,6 +324,7 @@ int main(int argc, char** argv)
     u64 peekAt = 0;                    // --peek-at N
     u64 heartbeat = 0;                 // --heartbeat N: periodic digest
     u32 findVal = 0;                   // --find VALUE: scan RAM for a word
+    bool em294Rts = false;             // --em294-rts: reseed the USB shim cell
     const char* findStr = nullptr;     // --find-str TEXT: search RAM
     int findCode = 0;                  // --find-code N: where is N generated
     u64 disAt = 0;                     // --dis-at N: disassemble live VAs
@@ -492,6 +493,7 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--dis-at"))
             disAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--em294-rts")) em294Rts = true;
         else if (!strcmp(a, "--find-str")) findStr = next();
         else if (!strcmp(a, "--find-code"))
             findCode = static_cast<int>(strtol(next(), nullptr, 0));
@@ -2880,6 +2882,35 @@ int main(int argc, char** argv)
                 printf("-- em+294 baseline %08x @%llu\n", cv,
                        static_cast<unsigned long long>(executed));
             }
+            // DIAGNOSTIC (opt-in, not machine truth). USBShim chain-calls
+            // the previous boot-keyboard proc from [ExpandMem+0x294] with
+            // no null check, and the seed it expects comes from the USB
+            // Expert's per-controller shim reference - absent while this
+            // machine's OHCI controllers are never probed or assigned a
+            // BAR. Calling through the zero lands the 68K at address 0,
+            // which raises a Line-F: `[$0AF0] = 0x0A = dsLineFErr`, sad
+            // Mac, `bra.s *`. That is the SAME wall session 5 found and it
+            // is back because the recipe no longer runs a Forth script.
+            //
+            // The old poke keyed on the shim's entry pc (ffe2325c), which
+            // belongs to the CD's Mac OS ROM and never executes on this
+            // one. Key on the CELL instead: if it is ever cleared to zero
+            // in the OS era, put a bare ROM RTS back. Real fix = USB.
+            if (em294Rts && cv == 0 && emPrev != 0) {
+                // ffc002d6 is `moveq #0,d0 / rts` in THIS Mac OS ROM,
+                // located by scanning the loaded image for 70 00 4e 75 on
+                // a word boundary. The old poke used ffc339a2, which is an
+                // RTS in the CD's ROM and something else in this one - and
+                // that announced itself honestly: the sad-Mac code moved
+                // from 0A (Line-F, calling through zero) to 03 (illegal
+                // instruction, calling into data).
+                bus.write32(0x000116C4u, 0xFFC002D6u);
+                cpu.dcbKill(0x000116C4u & ~31u);
+                printf("-- DIAGNOSTIC poke: [EM+294] was cleared @%llu, "
+                       "reseeded with a return-zero stub (--em294-rts)\n",
+                       static_cast<unsigned long long>(executed));
+                cv = 0xFFC002D6u;
+            }
             if (cv != emPrev && emShown < 24) {
                 ++emShown;
                 printf("-- em+294 %08x -> %08x @%llu pc=%08x lr=%08x "
@@ -2950,7 +2981,19 @@ int main(int argc, char** argv)
                        haltShown,
                        static_cast<unsigned long long>(executed), prev68k,
                        hs ? " <" : "", hs ? hs : "", hs ? ">" : "");
-                printf("   how it got here (last 24 fetches):\n");
+                // The sad-Mac handler reads the system-error code out of
+                // 68K lowmem $0AF0 into D6 on its way here, so the 68K
+                // data registers ARE the diagnosis: D6 = 1 is dsBusError,
+                // 3 dsIllInstErr, 10 dsLineFErr, and so on. Printing only
+                // the fetch ring meant reading the code required a second
+                // run with a register sampler that fired every 300 M.
+                printf("   D0-D7:");
+                for (u32 k = 8; k < 16; ++k)
+                    printf(" %08x", cpu.st.gpr[k]);
+                printf("\n   A0-A7:");
+                for (u32 k = 16; k < 24; ++k)
+                    printf(" %08x", cpu.st.gpr[k]);
+                printf("\n   how it got here (last 24 fetches):\n");
                 for (u32 k = 0; k < 24; k += 4) {
                     printf("   ");
                     for (u32 j = 0; j < 4; ++j) {
@@ -3226,8 +3269,14 @@ int main(int argc, char** argv)
             // so the first dozen non-timer exceptions of any boot are its
             // master aborts and the OS-era fault never gets a slot.
             // --fault-from moves the window past the firmware.
-            if (v != 0x0900u && v != 0x0500u && faultShown < 16 &&
-                executed >= faultFrom) {
+            // Also skip the 68K emulator's own `twi` ladder and the OS's
+            // system calls: program exceptions with SRR1[TRAP] set are the
+            // nanokernel's SERVICE-CALL mechanism, not faults, and sixteen
+            // of them filled this report every time and hid the real one.
+            const bool kernelTrap =
+                v == 0x0700u && (cpu.st.srr1 & 0x00020000u);
+            if (v != 0x0900u && v != 0x0500u && v != 0x0C00u &&
+                !kernelTrap && faultShown < 16 && executed >= faultFrom) {
                 ++faultShown;
                 printf("-- FAULT #%u @%llu -> %08x srr0=%08x srr1=%08x "
                        "dsisr=%08x dar=%08x lr=%08x r24=%08x\n",

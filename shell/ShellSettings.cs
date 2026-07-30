@@ -25,11 +25,24 @@ public sealed class ShellSettings
     // has to MATCH what the DIMMs advertise — it does not set it.
     public uint RamMb { get; set; } = 64;
 
-    // 60 was the practiced value for reaching the firmware, but it runs guest
-    // time about seven times fast and drives the OS era into a decrementer
-    // storm — measured at one 60 Hz tick per host second against a real
-    // sixty. 7 lands near real time at present host speed.
-    public uint FastTb { get; set; } = 7;
+    // Extra timebase cycles per instruction. 60 is a COMPROMISE and both
+    // directions off it are worse — measured, one variable, same run length:
+    //
+    //   fast-tb  60 -> 11.0 MIPS, 857,259 exceptions, the OS sets its own
+    //                  32bpp mode and paints 1,261,505 bytes
+    //   fast-tb 300 ->  8.7 MIPS, 4,997,821 exceptions, and the 68K world
+    //                  never even starts inside the same 3.3 B instructions
+    //
+    // Raising it is the decrementer storm: the guest spends so much of itself
+    // in exception handling that it stops making progress. Lowering it slows
+    // guest time further, and guest time is ALREADY slow — 3.9 ticks per host
+    // second against a real 60, or about 12 once the Open Firmware era, where
+    // the counter is not running, is discounted.
+    //
+    // (An earlier note here claimed 60 ran guest time seven times fast and
+    // that 7 landed near real time. The instrument says otherwise in the
+    // direction that matters, and the instrument wins.)
+    public uint FastTb { get; set; } = 60;
 
     // The card must be visible from the start. Held invisible until 236M it
     // misses Open Firmware's PCI probe entirely, its FCode never runs, and no

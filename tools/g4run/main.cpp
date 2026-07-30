@@ -279,6 +279,8 @@ int main(int argc, char** argv)
     const char* typeText = nullptr; // --type STR --type-at N: USB keystrokes
     u64 typeAt = 0;
     u64 mouseAt = 0;   // --mouse-at N: inject USB mouse motion from N
+    u64 clickAt = 0;   // --mouse-click-at N: one button down/up at N
+    u64 mouseEvery = 2000000ull; // --mouse-every N: injection cadence
     u64 mouseSent = 0;
     u64 atiHideFrom = 0, atiHideTo = 0; // --ati-hide FROM TO
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
@@ -382,8 +384,11 @@ int main(int argc, char** argv)
     // a real connect a few frames after power-up) instead of a port that
     // always reports a device. Opt-in: it takes the OS further into USB
     // enumeration but stalls the boot before the welcome screen. See
-    // OhciCell::livePortPower.
-    bool ohciPortPower = false;
+    // OhciCell::livePortPower. DEFAULT SINCE SESSION 18 -- it is the only model
+    // that reaches a usable machine (USB input works, so the startup cache
+    // dialog can be dismissed and Mac OS 9.1 boots to the Finder).
+    // `--no-ohci-port-power` restores the pre-session-16 model.
+    bool ohciPortPower = true;
     u64 disAt = 0;                     // --dis-at N: disassemble live VAs
     u64 findAt = 0;                    // --find-at N
     bool findSet = false;
@@ -434,6 +439,12 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--type-at")) typeAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-at"))
             mouseAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--mouse-click-at"))
+            clickAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--mouse-every")) {
+            mouseEvery = strtoull(next(), nullptr, 0);
+            if (!mouseEvery) mouseEvery = 1ull; // never modulo by zero
+        }
         else if (!strcmp(a, "--coverage-all")) coverageAll = true;
         else if (!strcmp(a, "--of-word")) {
             if (ofSymN < 8)
@@ -558,7 +569,8 @@ int main(int argc, char** argv)
             disAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--em294-rts")) em294Rts = true;
         else if (!strcmp(a, "--cpu-cache-rom")) cpuCacheRom = true;
-        else if (!strcmp(a, "--ohci-port-power")) ohciPortPower = true;
+        else if (!strcmp(a, "--ohci-port-power")) ohciPortPower = true; // now the default; kept so old command lines still work
+        else if (!strcmp(a, "--no-ohci-port-power")) ohciPortPower = false;
         else if (!strcmp(a, "--ohci-ndp")) {
             ohciNdp = static_cast<u32>(strtoul(next(), nullptr, 0));
             ohciNdpSet = true;
@@ -893,10 +905,12 @@ int main(int argc, char** argv)
     cpu.wpEnd = wpEnd;
     cpu.wpForce = wpForce;
     cpu.wpForceSet = wpForceSet;
-    if (ohciPortPower) {
-        bus.ohci(0).setLivePortPower(true);
-        bus.ohci(1).setLivePortPower(true);
-    }
+    // Always go through the setter on a cold start: it sets the reset port
+    // state that matches the model, and the two disagree. Calling it only for
+    // the live model was safe while that was the opt-in case; now that it is
+    // the default, --no-ohci-port-power must be able to put the old state back.
+    bus.ohci(0).setLivePortPower(ohciPortPower);
+    bus.ohci(1).setLivePortPower(ohciPortPower);
     if (ohciNdpSet) {
         bus.ohci(0).setNdp(ohciNdp);
         bus.ohci(1).setNdp(ohciNdp);
@@ -2896,10 +2910,34 @@ int main(int argc, char** argv)
         // never being polled -- and only injecting motion with no GUI in the
         // way can tell them apart. Repeats so the guest sees sustained travel
         // rather than one report it may legitimately coalesce away.
+        // --mouse-every controls the cadence. One report every 2 M
+        // instructions is ~150 polls apart, so the guest sees isolated 8-pixel
+        // jumps; a driver that coalesces motion, or requires travel across
+        // consecutive polls, would discard every one of them. Tightening this
+        // to a few frames tells "motion is dropped" from "motion is not
+        // sustained enough to be believed".
         if (mouseAt && executed >= mouseAt &&
-            (executed - mouseAt) % 2000000ull == 0) {
+            (executed - mouseAt) % mouseEvery == 0) {
             bus.ohci(1).moveMouse(8, 4, 0);
             ++mouseSent;
+        }
+        // A CLICK, which reaches the OS by a different route than motion:
+        // the Cursor Device Manager takes button transitions through
+        // CrsrDevButtons and movement through CrsrDevMoveDelta. "Motion is
+        // dropped but a click lands" and "nothing lands at all" are separate
+        // bugs, and only injecting a button can separate them. Down, then up
+        // 200k instructions later, so the OS sees a complete transition.
+        if (clickAt && executed == clickAt) {
+            bus.ohci(1).moveMouse(0, 0, 1);
+            printf("-- mouse button DOWN @%llu\n",
+                   static_cast<unsigned long long>(executed));
+            fflush(stdout);
+        }
+        if (clickAt && executed == clickAt + 200000ull) {
+            bus.ohci(1).moveMouse(0, 0, 0);
+            printf("-- mouse button UP @%llu\n",
+                   static_cast<unsigned long long>(executed));
+            fflush(stdout);
         }
         if (serialInput && executed == serialAt) {
             std::string s(serialInput);

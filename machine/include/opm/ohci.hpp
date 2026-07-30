@@ -189,8 +189,17 @@ public:
     //    but it never arms RHSC (intEnable settles at 8000003b, bit 6 clear),
     //    so the connect interrupt reaches nobody, it never issues the
     //    SetPortReset that Open Firmware does issue, and the boot stalls
-    //    before the welcome screen. Opt-in until that is closed.
-    bool livePortPower = false;
+    //    before the welcome screen.
+    //
+    // The stall above was session 17's POTPGT/per-port-power bug and is fixed.
+    // DEFAULT SINCE SESSION 18, because it is now the only model that reaches
+    // a usable machine: the OS enumerates both HID devices, keyboard keys and
+    // mouse buttons work, and a bare CR dismisses the startup cache dialog so
+    // Mac OS 9.1 boots through to the Finder desktop. With this off there is no
+    // USB input at all, so the dialog can never be dismissed and the desktop is
+    // unreachable -- the "default must be a machine that boots" rule now points
+    // the other way. `--no-ohci-port-power` restores the pre-session-16 model.
+    bool livePortPower = true;
     void setLivePortPower(bool on)
     {
         livePortPower = on;
@@ -204,6 +213,12 @@ public:
             // PortPowerControlMask for ports 1 and 2 (bits 17,18): both have
             // their own switch, so a global power command does not attach them.
             rhDescB_ = 0x00060000u;
+        } else {
+            // Ganged switching, the pre-session-16 descriptors. Symmetric on
+            // purpose: this setter is what --no-ohci-port-power uses to put
+            // the old machine back, so it has to undo every field it sets.
+            rhDescA_ = 0x02000002u;
+            rhDescB_ = 0;
         }
     }
 
@@ -284,8 +299,14 @@ private:
     u32 fmNumber_ = 0;             // 16-bit counter
     u32 periodicStart_ = 0;
     u32 lsThreshold_ = 0x0628u;
-    u32 rhDescA_ = 0x02000002u; // POTPGT=2, NDP=2, ports powered on
-    u32 rhDescB_ = 0;
+    // These must agree with livePortPower's default, which is now TRUE: the
+    // live model REQUIRES per-port switching, and with PSM clear a global
+    // power command attaches the device ~22 M instructions before the hub
+    // driver exists, which is the bug session 17 spent its day on. The capi
+    // never calls setLivePortPower(), so the shell gets exactly these values
+    // -- a mismatch here ships a machine that silently reverts to ganged.
+    u32 rhDescA_ = 0x02000102u; // POTPGT=2, PSM (per-port switching), NDP=2
+    u32 rhDescB_ = 0x00060000u; // PPCM: ports 1 and 2 have their own switch
     u32 rhStatus_ = 0;
     // A port starts UNPOWERED, and an unpowered port sees nothing: with no
     // VBUS there is no pull-up to sense, so CCS reads 0 no matter what is
@@ -297,10 +318,13 @@ private:
     // that had simply kept CCS asserted throughout looked like a device that
     // was always there and never changed, so the hub driver had nothing to
     // act on and never enumerated.
-    // Port 1 reports a low-speed device attached from power-on: CCS, LSDA and
-    // the connect-status change. Port 2 is empty. This is the DEFAULT, and it
-    // is deliberately the pre-session-16 model -- see livePortPower.
-    u32 rhPort_[2] = {0x00010201u, 0};
+    // Both ports start UNPOWERED, which is the live model's reset state: with
+    // no VBUS there is nothing to sense, so CCS reads 0 until the host powers
+    // the port and the power-good delay elapses. `setLivePortPower(false)`
+    // puts back the pre-session-16 value (0x00010201: CCS|PES|PPS|LSDA plus
+    // the connect change on port 1), which must be applied through that
+    // setter -- assigning livePortPower alone would leave this reset state.
+    u32 rhPort_[2] = {0, 0};
     // Port 1 carries this controller's HID device; port 2 is genuinely empty.
     bool portPopulated(u32 n) const { return n == 0; }
     // Power on, power off. Powering down drops the connection along with

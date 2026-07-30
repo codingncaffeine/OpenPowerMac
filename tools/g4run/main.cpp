@@ -7,6 +7,7 @@
 
 #include "opm/cpu.hpp"
 #include "opm/insn.hpp"
+#include "opm/prof.hpp"
 #include "opm/sawtooth.hpp"
 #include "opm/snapshot.hpp"
 
@@ -370,6 +371,20 @@ int main(int argc, char** argv)
     u64 snapAt = 0;                    // --snapshot-at N
     const char* snapOut = nullptr;     // --snapshot-out FILE
     const char* resumeFrom = nullptr;  // --resume-from FILE
+    // --bench: run the loop THE APP RUNS. g4run's own loop carries the whole
+    // instrument set — including a std::map probe per instruction for the
+    // first-visit census — so its MIPS figure is the harness's speed, not the
+    // machine's, and every recorded throughput number in this project was
+    // measured through it. A speed claim has to be made about the shipping
+    // path, which is capi's opm_run: step, tick, sync, deliver.
+    bool bench = false;
+    // --no-dev-gate: service every device on every instruction (the control
+    // for the gate; see SawtoothBus::devGateOff).
+    bool devGate = true;
+    // --no-icache: bypass the fetch block cache, the cached decode and the
+    // instruction translation cache (the control for all three).
+    bool icache = true;
+    unsigned profHz = 0;               // --profile HZ (g4prof only)
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
     bool fastTbSet = false;            // CLI wins over a resumed value
     bool realtime = false;             // --realtime: TB from the host clock
@@ -483,6 +498,18 @@ int main(int argc, char** argv)
             }
             return argv[++i];
         };
+        // The speed flags are matched HERE, ahead of the chain below,
+        // and not inside it. MSVC caps how deeply blocks may nest and
+        // an else-if ladder counts every rung: three more options put
+        // this function over the limit (C1061). A `continue` costs no
+        // depth at all.
+        if (!strcmp(a, "--bench")) { bench = true; continue; }
+        if (!strcmp(a, "--no-dev-gate")) { devGate = false; continue; }
+        if (!strcmp(a, "--no-icache")) { icache = false; continue; }
+        if (!strcmp(a, "--profile")) {
+            profHz = static_cast<unsigned>(strtoul(next(), nullptr, 0));
+            continue;
+        }
         if (!strcmp(a, "--rom")) romPath = next();
         else if (!strcmp(a, "--dump-rom")) romDumpPath = next();
         else if (!strcmp(a, "--trace-of")) {
@@ -736,7 +763,11 @@ int main(int argc, char** argv)
                     "       validation: --verify-snapshot N M  (run to N, "
                     "snapshot, run M, restore,\n"
                     "                   run M again, compare "
-                    "instruction-for-instruction)\n");
+                    "instruction-for-instruction)\n"
+                    "       speed: --bench (the loop the app runs, no "
+                    "instrumentation)\n"
+                    "              --profile HZ (g4prof only: sample where "
+                    "the host time goes)\n");
             return 2;
         }
     }
@@ -1034,6 +1065,8 @@ int main(int argc, char** argv)
     // state that matches the model, and the two disagree. Calling it only for
     // the live model was safe while that was the opt-in case; now that it is
     // the default, --no-ohci-port-power must be able to put the old state back.
+    bus.devGateOff = !devGate;
+    cpu.fetchCacheOff = !icache;
     bus.ohci(0).setLivePortPower(ohciPortPower);
     bus.ohci(1).setLivePortPower(ohciPortPower);
     if (ohciNdpSet) {
@@ -1204,6 +1237,15 @@ int main(int argc, char** argv)
     constexpr u64 kRtNsPerTick = 40;   // 25 MHz = bus/4
     constexpr u64 kRtCatchup = 25000;  // at most 1 ms of debt per sample
     auto tickPeripherals = [&]() {
+        // Mark the clock advance as clock work. It used to inherit whatever
+        // phase the caller was in, so --fast-tb's tick — a real cost, sixty
+        // cycles' worth of accumulator per instruction — was billed to
+        // "instrumentation" in one loop and to "tick" in the other, and the
+        // same 300 M instructions appeared to spend twice as long ticking in
+        // one run as the other. A profiler that moves cost between buckets
+        // depending on who called it is the same failure as a watchpoint that
+        // changes the run.
+        OPM_PH(Tick);
         if (realtime) {
             if ((executed & 0x3FFu) == 0) {
                 const auto now = std::chrono::steady_clock::now();
@@ -1241,9 +1283,9 @@ int main(int argc, char** argv)
             // compress firmware time hard and hand the OS a sane clock.
             cpu.tick(fastTbAfter);
         }
-        bus.ohciTick(cpu.st.tb);
-        bus.syncIrqs();
-        cpu.setExternalIrq(bus.pic().cpuLine());
+        OPM_PH(DevTick);
+        cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb, executed));
+        OPM_PH(Other);
     };
 
     // Symbolize on demand. The table cannot exist until the Mac OS ROM is in
@@ -1475,7 +1517,28 @@ int main(int argc, char** argv)
     std::map<u32, u64> pc68Hist; // 68K-pc (r24) census inside the
                                  // emulator: names the 68K busy loop
 
-    while (executed < maxInsns && !cpu.halted) {
+    if (profHz) {
+#if OPM_PROFILING
+        if (prof::start(profHz, &cpu.st.pc))
+            printf("-- profiling at %u Hz%s\n", profHz,
+                   bench ? " (bench loop)" : "");
+#else
+        printf("-- --profile ignored: this binary carries no markers. Build "
+               "and run g4prof instead.\n");
+#endif
+    }
+    // THE APP'S LOOP, and nothing else. Identical to capi's opm_run: step the
+    // processor, advance the machine's clock, recompute the interrupt lines,
+    // deliver. Everything g4run does around this is measurement, and a speed
+    // number that includes the measurement is a number about g4run.
+    if (bench)
+        while (executed < maxInsns && !cpu.halted) {
+            cpu.step();
+            tickPeripherals();
+            ++executed;
+        }
+
+    while (!bench && executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
         // A machine that cannot restart. Open Firmware's `reset-all` sends
         // PMU_RESET and then spins until the world comes back; without this
@@ -1524,6 +1587,7 @@ int main(int argc, char** argv)
             fflush(stdout);
         }
         cpu.step();
+        OPM_PH(Instr);
         // kATAMgrAddATABus (fn 0x93) fails with -56, and its worker
         // ffdd18d0 is the ONLY thing that populates globals+0x44 — the
         // list whose emptiness makes fn 0x98 answer -56 for the rest of
@@ -3061,6 +3125,7 @@ int main(int argc, char** argv)
                 if (c == ';')
                     c = '\r';
             bus.ohci(0).typeAscii(t + "\r");
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
             printf("-- typed on usb @%llu: %s\n",
                    static_cast<unsigned long long>(executed), typeText);
             fflush(stdout);
@@ -3106,6 +3171,7 @@ int main(int argc, char** argv)
             // Command held for each keystroke -- no trailing Return, because
             // Command-O IS the action.
             bus.ohci(0).typeChord(0x08, std::string(cmdText));
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
             printf("-- typed with COMMAND on usb @%llu: %s\n",
                    static_cast<unsigned long long>(executed), cmdText);
             fflush(stdout);
@@ -3129,6 +3195,7 @@ int main(int argc, char** argv)
                 dy += static_cast<int>(mouseSent % 3u);
             }
             bus.ohci(1).moveMouse(dx, dy, heldButtons);
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
             ++mouseSent;
         }
         // A CLICK, which reaches the OS by a different route than motion:
@@ -3140,6 +3207,7 @@ int main(int argc, char** argv)
         if (clickAt && executed == clickAt) {
             heldButtons = 1; // stays pressed across any motion in between
             bus.ohci(1).moveMouse(0, 0, heldButtons);
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
             printf("-- mouse button DOWN @%llu\n",
                    static_cast<unsigned long long>(executed));
             fflush(stdout);
@@ -3147,6 +3215,7 @@ int main(int argc, char** argv)
         if (clickAt && executed == clickAt + clickHoldFor) {
             heldButtons = 0;
             bus.ohci(1).moveMouse(0, 0, heldButtons);
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
             printf("-- mouse button UP @%llu\n",
                    static_cast<unsigned long long>(executed));
             fflush(stdout);
@@ -3157,6 +3226,7 @@ int main(int argc, char** argv)
                 if (c == ';')
                     c = '\r';
             bus.injectSerial(s + "\r");
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
             printf("-- serial input injected @%llu: %s\n",
                    static_cast<unsigned long long>(executed), serialInput);
         }
@@ -4074,6 +4144,70 @@ int main(int argc, char** argv)
                host > 0 ? cpu.st.tb / host / 1e6 : 0.0, tickText,
                realtime ? (rtSlips ? " [realtime, slipped]" : " [realtime]")
                         : "");
+        if (bench)
+            printf("--   ^ THE APP'S LOOP (--bench): step, tick, sync, "
+                   "deliver, and nothing else.\n");
+    }
+    // Where the host time went. Sampled, so it is a distribution and not a
+    // ledger: percentages under about 1% are noise at any realistic rate.
+    if (prof::running()) {
+        prof::stop();
+        const prof::Result& r = prof::result();
+        printf("-- profile: %llu samples over %.1f host-s"
+               "%s%s\n",
+               static_cast<unsigned long long>(r.samples), r.seconds,
+               bench ? " [bench loop]" : " [instrumented loop]",
+               r.missed ? " (sampler fell behind; see 'missed')" : "");
+        if (r.missed)
+            printf("--   missed=%llu periods — the rate was optimistic, the "
+                   "SHARES are still valid\n",
+                   static_cast<unsigned long long>(r.missed));
+        std::vector<std::pair<u64, u32>> byPh;
+        for (u32 k = 0; k < static_cast<u32>(prof::Ph::N); ++k)
+            if (r.phase[k])
+                byPh.push_back({r.phase[k], k});
+        std::sort(byPh.begin(), byPh.end(),
+                  [](const std::pair<u64, u32>& a,
+                     const std::pair<u64, u32>& b) { return a.first > b.first; });
+        for (const auto& [n, k] : byPh)
+            printf("   %-16s %5.1f%%  %llu\n",
+                   prof::name(static_cast<prof::Ph>(k)),
+                   r.samples ? 100.0 * static_cast<double>(n) /
+                                   static_cast<double>(r.samples)
+                             : 0.0,
+                   static_cast<unsigned long long>(n));
+        // The other half of the answer. A sampler says where the time went; a
+        // hit rate says whether a cache is catching anything. Sequential
+        // execution implies 7 in 8, so anything much below that means
+        // something is dropping the block.
+        const u64 ftot = cpu.fetchHits + cpu.fetchFillsL1 + cpu.fetchFillsL2 +
+                         cpu.fetchFillsMem + cpu.fetchUncached;
+        if (ftot)
+            printf("--   fetch buffer: %.1f%% hit (%llu of %llu); fills "
+                   "L1=%llu L2=%llu mem=%llu, uncacheable=%llu\n",
+                   100.0 * static_cast<double>(cpu.fetchHits) /
+                       static_cast<double>(ftot),
+                   static_cast<unsigned long long>(cpu.fetchHits),
+                   static_cast<unsigned long long>(ftot),
+                   static_cast<unsigned long long>(cpu.fetchFillsL1),
+                   static_cast<unsigned long long>(cpu.fetchFillsL2),
+                   static_cast<unsigned long long>(cpu.fetchFillsMem),
+                   static_cast<unsigned long long>(cpu.fetchUncached));
+        u32 hotPc[24];
+        u64 hotN[24];
+        const size_t np = prof::topPcs(hotPc, hotN, 24);
+        if (np) {
+            printf("--   hottest GUEST pcs (where the machine is spending "
+                   "its own time):\n");
+            for (size_t k = 0; k < np; ++k) {
+                const char* s = sym(hotPc[k]);
+                printf("     %08x %5.2f%%%s%s\n", hotPc[k],
+                       r.samples ? 100.0 * static_cast<double>(hotN[k]) /
+                                       static_cast<double>(r.samples)
+                                 : 0.0,
+                       s ? "  " : "", s ? s : "");
+            }
+        }
     }
     {
         std::vector<std::pair<u64, u32>> top;

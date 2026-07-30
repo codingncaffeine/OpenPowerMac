@@ -363,7 +363,7 @@ void OhciCell::buildDescriptor()
             // is what a firmware and the Mac OS USB Expert bind to, and the
             // protocol byte is the only thing that tells them which is which.
             const u8 proto = hid_ == Hid::Mouse ? 2 : 1;
-            const u8 rlen = hid_ == Hid::Mouse ? 50 : 63;
+            const u8 rlen = hid_ == Hid::Mouse ? 52 : 63;
             push({9, 2, 34, 0, 1, 1, 0, 0xA0, 25});
             push({9, 4, 0, 0, 1, 3, 1, proto, 0}); // HID, boot subclass
             push({9, 0x21, 0x11, 0x01, 0, 1, 0x22, rlen, 0});
@@ -402,13 +402,24 @@ void OhciCell::buildDescriptor()
         }
     } else if (type == 0x81 && req == 0x06 && (val >> 8) == 0x22 &&
                hid_ == Hid::Mouse) {
-        // HID REPORT descriptor, boot mouse: three button bits, five bits of
-        // padding, then signed 8-bit X and Y as RELATIVE values.
+        // HID REPORT descriptor for a standard wheel mouse: FIVE button bits,
+        // three bits of padding, then signed 8-bit X, Y and WHEEL as RELATIVE
+        // values -- a four-byte report.
+        //
+        // This was a three-button, three-byte descriptor with no wheel. The
+        // bytes reaching the wire were measured correct (`00 08 04` = buttons
+        // 0, dx +8, dy +4, relative) and Mac OS still ignored every one of
+        // them, while acting on the button byte of the same reports. The
+        // driver's own GET_REPORT asks for wLength=4, which is the standard
+        // four-byte layout, not our three-byte one. This is the canonical
+        // mouse descriptor that ships in countless devices and that Mac OS 9
+        // is known to drive; the layout is a fact, not borrowed code.
         push({0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
-              0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
-              0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05,
-              0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81,
-              0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, 0xC0, 0xC0});
+              0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01,
+              0x95, 0x05, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03,
+              0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
+              0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
+              0xC0, 0xC0});
     } else if (type == 0x81 && req == 0x06 && (val >> 8) == 0x22) {
         // HID REPORT descriptor: the standard boot-keyboard layout - eight
         // modifier bits, one reserved byte, six key slots.
@@ -433,7 +444,7 @@ void OhciCell::buildDescriptor()
         // Relative axes legitimately read as zero: there is no movement to
         // report until the next poll.
         if (hid_ == Hid::Mouse)
-            push({buttons_, 0, 0});
+            push({buttons_, 0, 0, 0}); // relative axes read as no movement
         else
             reply_.assign(reportLen_, static_cast<u8>(0));
     } else if (type == 0x00 && req == 0x05) { // SET_ADDRESS
@@ -514,13 +525,27 @@ bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
                 acc -= v; // the rest rides on the next poll
                 return static_cast<u8>(static_cast<int8_t>(v));
             };
-            const u8 rep[3] = {buttons_, take(accDx_), take(accDy_)};
+            const int wantDx = accDx_, wantDy = accDy_; // before take() drains
+            // buttons, X, Y, WHEEL -- the four-byte standard mouse report the
+            // descriptor above declares. The wheel is always still.
+            const u8 rep[4] = {buttons_, take(accDx_), take(accDy_), 0};
             sentButtons_ = buttons_;
-            moved = avail < 3u ? avail : 3u;
+            moved = avail < reportLen_ ? avail : reportLen_;
             snoopWr(cbp, moved);
             for (u32 k = 0; k < moved && cbp + k < ramSize; ++k)
                 ram[cbp + k] = rep[k];
             ++reportsSent;
+            // The bytes actually placed on the wire, and the deltas they were
+            // built from. Every previous claim about this report's contents was
+            // read off the source rather than measured, which is the one kind
+            // of evidence this project has repeatedly found to be wrong.
+            if (walkLog.size() < walkMax)
+                walkLog.push_back({3u, td,
+                                   u32(rep[0]) | (u32(rep[1]) << 8) |
+                                       (u32(rep[2]) << 16) |
+                                       (u32(rep[3]) << 24),
+                                   static_cast<u32>(wantDx),
+                                   static_cast<u32>(wantDy), moved});
         } else if (pending_.size() >= reportLen_) {
             moved = avail < reportLen_ ? avail : reportLen_;
             snoopWr(cbp, moved);

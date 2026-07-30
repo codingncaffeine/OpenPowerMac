@@ -280,8 +280,15 @@ int main(int argc, char** argv)
     u64 typeAt = 0;
     u64 mouseAt = 0;   // --mouse-at N: inject USB mouse motion from N
     u64 clickAt = 0;   // --mouse-click-at N: one button down/up at N
+    u64 clickHoldFor = 200000ull; // --mouse-hold N: instructions to hold it
     u64 mouseEvery = 2000000ull; // --mouse-every N: injection cadence
     u64 mouseSent = 0;
+    // The button state a real mouse carries in EVERY report. moveMouse()
+    // assigns buttons_ outright, so injecting motion with a literal 0 cleared
+    // whatever a click had just pressed -- which silently invalidated a
+    // "motion with the button held" experiment: every one of those reports went
+    // out with byte 0 = 0.
+    u8 heldButtons = 0;
     u64 atiHideFrom = 0, atiHideTo = 0; // --ati-hide FROM TO
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
@@ -441,6 +448,8 @@ int main(int argc, char** argv)
             mouseAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-click-at"))
             clickAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--mouse-hold"))
+            clickHoldFor = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-every")) {
             mouseEvery = strtoull(next(), nullptr, 0);
             if (!mouseEvery) mouseEvery = 1ull; // never modulo by zero
@@ -2918,7 +2927,7 @@ int main(int argc, char** argv)
         // sustained enough to be believed".
         if (mouseAt && executed >= mouseAt &&
             (executed - mouseAt) % mouseEvery == 0) {
-            bus.ohci(1).moveMouse(8, 4, 0);
+            bus.ohci(1).moveMouse(8, 4, heldButtons);
             ++mouseSent;
         }
         // A CLICK, which reaches the OS by a different route than motion:
@@ -2928,13 +2937,15 @@ int main(int argc, char** argv)
         // bugs, and only injecting a button can separate them. Down, then up
         // 200k instructions later, so the OS sees a complete transition.
         if (clickAt && executed == clickAt) {
-            bus.ohci(1).moveMouse(0, 0, 1);
+            heldButtons = 1; // stays pressed across any motion in between
+            bus.ohci(1).moveMouse(0, 0, heldButtons);
             printf("-- mouse button DOWN @%llu\n",
                    static_cast<unsigned long long>(executed));
             fflush(stdout);
         }
-        if (clickAt && executed == clickAt + 200000ull) {
-            bus.ohci(1).moveMouse(0, 0, 0);
+        if (clickAt && executed == clickAt + clickHoldFor) {
+            heldButtons = 0;
+            bus.ohci(1).moveMouse(0, 0, heldButtons);
             printf("-- mouse button UP @%llu\n",
                    static_cast<unsigned long long>(executed));
             fflush(stdout);
@@ -4284,6 +4295,18 @@ int main(int argc, char** argv)
                        (w.b >> 16) & 0xFF, (w.b >> 24) & 0xFF, w.c & 0xFF,
                        (w.c >> 8) & 0xFF, (w.c >> 16) & 0xFF,
                        (w.c >> 24) & 0xFF, w.d);
+            else if (w.kind == 3)
+                // The HID report as bytes, signed, next to the deltas it was
+                // built from -- "relative motion was queued" and "relative
+                // motion reached the wire" are different claims.
+                printf("   HIDREP %08x  %02x %02x %02x %02x  (buttons=%u dx=%d "
+                       "dy=%d)  wanted dx=%d dy=%d  moved=%u\n",
+                       w.a, w.b & 0xFF, (w.b >> 8) & 0xFF, (w.b >> 16) & 0xFF,
+                       (w.b >> 24) & 0xFF, w.b & 0xFF,
+                       static_cast<int>(static_cast<int8_t>((w.b >> 8) & 0xFF)),
+                       static_cast<int>(static_cast<int8_t>((w.b >> 16) & 0xFF)),
+                       static_cast<int>(static_cast<int32_t>(w.c)),
+                       static_cast<int>(static_cast<int32_t>(w.d)), w.e);
             else
                 printf("   TD %08x ctl=%08x cbp=%08x be=%08x moved=%u\n",
                        w.a, w.b, w.c, w.d, w.e);

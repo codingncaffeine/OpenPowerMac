@@ -226,7 +226,7 @@ public:
     void setHid(Hid k)
     {
         hid_ = k;
-        reportLen_ = (k == Hid::Mouse) ? 3u : 8u;
+        reportLen_ = (k == Hid::Mouse) ? 4u : 8u; // mouse: buttons,X,Y,wheel
     }
     Hid hid() const { return hid_; }
     // Boot-protocol mouse report: buttons, then signed X and Y deltas.

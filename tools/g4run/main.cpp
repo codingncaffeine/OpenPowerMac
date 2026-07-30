@@ -295,6 +295,13 @@ int main(int argc, char** argv)
     // the mouse module is fine and the whole defect is that nothing supplies
     // motion; if it cannot, the drawing path is broken too.
     u64 crsrDrag = 0;
+    // --poke PA --poke-val V --poke-at N [--poke-every M]: DIAGNOSTIC, not
+    // machine truth. Force one cell and see whether a decoded-but-unfixed
+    // chain completes, exactly as --wp-force and --em294-rts do. Repeats,
+    // because a gate the guest re-reads must stay forced.
+    u32 pokePa = 0, pokeVal = 0;
+    u64 pokeAt = 0, pokeEvery = 0;
+    bool pokeSet = false;
     u64 clickHoldFor = 200000ull; // --mouse-hold N: instructions to hold it
     u64 mouseEvery = 2000000ull; // --mouse-every N: injection cadence
     // --mouse-dx/--mouse-dy: the injected delta. Making it DISTINCTIVE lets the
@@ -479,6 +486,16 @@ int main(int argc, char** argv)
             mouseAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-click-at"))
             clickAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--poke")) {
+            pokePa = static_cast<u32>(strtoul(next(), nullptr, 0));
+            pokeSet = true;
+        }
+        else if (!strcmp(a, "--poke-val"))
+            pokeVal = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--poke-at"))
+            pokeAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--poke-every"))
+            pokeEvery = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--crsr-drag"))
             crsrDrag = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-vary")) mouseVary = true;
@@ -2986,6 +3003,19 @@ int main(int argc, char** argv)
             bus.ohci(0).typeAscii(t + "\r");
             printf("-- typed on usb @%llu: %s\n",
                    static_cast<unsigned long long>(executed), typeText);
+            fflush(stdout);
+        }
+        if (pokeSet && executed >= pokeAt &&
+            (executed == pokeAt ||
+             (pokeEvery && (executed - pokeAt) % pokeEvery == 0))) {
+            // Through the DMA-write snoop so the processor cannot serve a stale
+            // cached copy of the cell we are forcing.
+            bus.snoopBeforeDmaWrite(pokePa, 4);
+            bus.write32(pokePa, pokeVal);
+            static u32 pokeN = 0;
+            if (++pokeN <= 3)
+                printf("-- poke: [%08x] := %08x @%llu\n", pokePa, pokeVal,
+                       static_cast<unsigned long long>(executed));
             fflush(stdout);
         }
         if (crsrDrag && executed >= crsrDrag &&

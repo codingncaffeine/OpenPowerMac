@@ -4632,6 +4632,23 @@ int main(int argc, char** argv)
                     printf(" %03x:w0/r%llu", o,
                            static_cast<unsigned long long>(n));
             printf("\n");
+            // "Is the OS driving the card, or painting with the processor?"
+            // The Rage 128's 2D engine is 0x1400-0x17ff (DST_OFFSET 0x1404,
+            // SRC_X 0x1414, WAIT_UNTIL 0x1720). Every blit is several writes
+            // into that block, so its total against the framebuffer write
+            // count settles the question in one line instead of by reading a
+            // sixty-entry sample of a truncated ring and hoping.
+            u64 engine = 0;
+            for (const auto& [o, n] : ac.writeCount)
+                if (o >= 0x1400u && o < 0x1800u)
+                    engine += n;
+            for (const auto& [o, n] : ac.readCount)
+                if (o >= 0x1400u && o < 0x1800u)
+                    engine += n;
+            printf("-- ati 2D engine (0x1400-0x17ff): %llu accesses against "
+                   "%llu framebuffer writes\n",
+                   static_cast<unsigned long long>(engine),
+                   static_cast<unsigned long long>(ac.fbWrites));
         }
         // The vertical blank, end to end in one line. The register traffic log
         // is a 4096-entry ring printed head-and-tail, so the nineteen

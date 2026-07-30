@@ -417,6 +417,10 @@ int main(int argc, char** argv)
     // own clock runs ~45x slower than the nominal timebase, so the nominal
     // period floods it with interrupts.
     u64 atiVblTb = 0;
+    // --vbl-trace N: the first N latch/ack/iack/eoi events, in sequence. The
+    // aggregate counters could say "acks=2 out of 14 blanks" and could not say
+    // which blank went unanswered, or what the driver wrote when it did.
+    int vblTrace = 0;
     const char* findStr = nullptr;     // --find-str TEXT: search RAM
     int findCode = 0;                  // --find-code N: where is N generated
     // --cpu-cache-rom: answer the processor module's I2C cache descriptor at
@@ -699,6 +703,7 @@ int main(int argc, char** argv)
             atiVbl = true;
         else if (!strcmp(a, "--no-ati-vbl"))
             atiVbl = false;
+        else if (!strcmp(a, "--vbl-trace")) vblTrace = atoi(next());
         else if (!strcmp(a, "--ati-vbl-tb"))
             atiVblTb = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
@@ -950,6 +955,8 @@ int main(int argc, char** argv)
     }
     bus.ati().vblEnabled = atiVbl;
     R128Cell::setVblTbPeriod(atiVblTb);
+    R128Cell::setVblTrace(vblTrace);
+    OpenPic::setTrace(vblTrace * 4); // iack+eoi pairs outnumber latch+ack
     bus.watchPa = watchMemPa;
     bus.watchPaEnd = watchMemEnd ? watchMemEnd : watchMemPa;
     if (hdPath) {
@@ -4621,7 +4628,7 @@ int main(int argc, char** argv)
         // OpenPIC has MASKED reaches nobody at all (see the openpic state).
         printf("-- ati vblank: %s period=%llutb GEN_INT_CNTL=%08x "
                "GEN_INT_STATUS=%08x "
-               "blanks=%llu enabled=%llu acks=%llu line=%d\n",
+               "blanks=%llu enabled=%llu acks=%llu expired=%llu line=%d\n",
                bus.ati().vblEnabled ? "modelled" : "OFF (--no-ati-vbl)",
                static_cast<unsigned long long>(
                    R128Cell::vblTbPeriod() ? R128Cell::vblTbPeriod()
@@ -4630,6 +4637,7 @@ int main(int argc, char** argv)
                static_cast<unsigned long long>(bus.ati().vblanks),
                static_cast<unsigned long long>(bus.ati().vblIrqs),
                static_cast<unsigned long long>(bus.ati().vblAcks),
+               static_cast<unsigned long long>(R128Cell::vblDropped()),
                bus.ati().irqLine() ? 1 : 0);
         printf("-- ddc: %u starts, %u address matches, %u EDID bytes\n",
                bus.ati().ddcStarts, bus.ati().ddcMatches,

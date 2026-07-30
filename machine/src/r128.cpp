@@ -70,6 +70,12 @@ static constexpr u32 kGenIntAckMask = 0x000F040Fu;
 // and the OHCI cell already calls 25000 ticks a millisecond, so the same
 // nominal rate keeps the two devices' notions of time consistent.
 static constexpr u64 kTbPerVblank = 25000000ull / 60ull;
+// Harness knobs, not machine state — see the notes in the header.
+static u64 gVblTbPeriod = 0;
+static int gVblTrace = 0;
+// Census of expired (unserviced) requests. A file-static because censuses are
+// deliberately not snapshotted, and because it keeps sizeof(R128Cell) fixed.
+static u64 gVblDropped = 0;
 
 u32 R128Cell::regRead(u32 idx)
 {
@@ -289,6 +295,14 @@ void R128Cell::write(u32 off, u32 v, u32 len)
         if (cleared != cur)
             ++vblAcks;
         regs_[kGenIntStatus] = cleared;
+        if (gVblTrace > 0) {
+            --gVblTrace;
+            printf("VBL ack    wrote=%08x cur=%08x -> %08x %s pc=%08x @%llu\n",
+                   native, cur, cleared,
+                   cleared != cur ? "CLEARED" : "no-op", pcRef ? *pcRef : 0,
+                   static_cast<unsigned long long>(at));
+            fflush(stdout);
+        }
         return;
     }
     // Mode changes, called out by name. The register log is a 4096-entry
@@ -322,11 +336,10 @@ void R128Cell::write(u32 off, u32 v, u32 len)
     (void)kPllTest;
 }
 
-// Harness knob, not machine state — see the note in the header.
-static u64 gVblTbPeriod = 0;
-
 void R128Cell::setVblTbPeriod(u64 n) { gVblTbPeriod = n; }
 u64 R128Cell::vblTbPeriod() { return gVblTbPeriod; }
+void R128Cell::setVblTrace(int n) { gVblTrace = n; }
+u64 R128Cell::vblDropped() { return gVblDropped; }
 
 u64 R128Cell::vblPeriod() const
 {
@@ -336,7 +349,27 @@ u64 R128Cell::vblPeriod() const
 void R128Cell::tick(u64 tb)
 {
     tbNow_ = tb;
-    if (!vblEnabled || !vblNextTb_ || tb < vblNextTb_)
+    if (!vblEnabled || !vblNextTb_)
+        return;
+    // A REQUEST NOBODY SERVICED HAS TO EXPIRE. Real silicon holds the latch
+    // until the driver acknowledges, and that is fine while a driver is
+    // listening — but there are long stretches where none is: Open Firmware
+    // arms the interrupt during its display bring-up, and a snapshot can carry a
+    // latched blank across a resume. With the line held forever the OS spins
+    // iack -> handler -> eoi -> iack about every 5,000 instructions and never
+    // makes progress, because `cpuLine()` re-offers the same level the instant
+    // the previous one retires. Expiring an unanswered request turns that total
+    // paralysis into a dropped frame, which is the right failure mode; when a
+    // driver IS listening it acknowledges in ~6,100 instructions, four orders of
+    // magnitude inside this window, so serviced behaviour is unchanged.
+    const u64 per = vblPeriod();
+    auto st = regs_.find(kGenIntStatus);
+    if (st != regs_.end() && (st->second & kCrtcVblankInt) &&
+        vblNextTb_ >= per && tb > (vblNextTb_ - per) + per / 4) {
+        st->second &= ~kCrtcVblankInt;
+        ++gVblDropped;
+    }
+    if (tb < vblNextTb_)
         return;
     // Re-base rather than replay. A resume, or an arm that landed before this
     // cell had ever been handed the timebase, leaves the due time billions of
@@ -349,6 +382,13 @@ void R128Cell::tick(u64 tb)
         return; // the panel still retraces; nobody asked to hear about it
     ++vblIrqs;
     regs_[kGenIntStatus] |= kCrtcVblankInt;
+    if (gVblTrace > 0) {
+        --gVblTrace;
+        printf("VBL latch  status=%08x cntl=%08x @%llu\n", regs_[kGenIntStatus],
+               regs_[kGenIntCntl],
+               static_cast<unsigned long long>(stamp ? *stamp : 0));
+        fflush(stdout);
+    }
 }
 
 bool R128Cell::irqLine() const

@@ -36,6 +36,11 @@ public:
     // priority does not beat the task priority, or an earlier interrupt is
     // still in service and was never EOId.
     void dumpState() const;
+    // --vbl-trace N: print the first N iack/eoi events. `log` is capped at 512
+    // AND snapshotted, so on a resume its tail sits in Open Firmware's era and
+    // it cannot answer "which iack went un-EOI'd". A static, so sizeof(OpenPic)
+    // — and every snapshot — is untouched.
+    static void setTrace(int n);
     struct Unc { u64 at; u32 off; u32 val; };
     std::vector<Unc> unclaimed;
 

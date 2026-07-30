@@ -15,6 +15,11 @@ static u32 swap32(u32 v)
            (v << 24);
 }
 
+// Harness instrumentation, not controller state — see the note in the header.
+static int gPicTrace = 0;
+
+void OpenPic::setTrace(int n) { gPicTrace = n; }
+
 u32 OpenPic::read(u32 off, u32 len)
 {
     u32 native = 0;
@@ -64,6 +69,12 @@ void OpenPic::write(u32 off, u32 v, u32 len)
     if (off == 0x200B0u) { // EOI
         if (log.size() < 512)
             log.push_back({stamp ? *stamp : 0, 'e', 0});
+        if (gPicTrace > 0) {
+            --gPicTrace;
+            printf("PIC eoi    inService=%d @%llu\n", inService_,
+                   static_cast<unsigned long long>(stamp ? *stamp : 0));
+            fflush(stdout);
+        }
         inService_ = -1;
         return;
     }
@@ -120,6 +131,13 @@ u32 OpenPic::iack()
     inService_ = s;
     if (log.size() < 512)
         log.push_back({stamp ? *stamp : 0, 'a', static_cast<u32>(s)});
+    if (gPicTrace > 0) {
+        --gPicTrace;
+        printf("PIC iack   src=%d vec=%02x line=%d pending=%d @%llu\n", s,
+               vp_[s] & 0xFFu, line_[s] ? 1 : 0, pending_[s] ? 1 : 0,
+               static_cast<unsigned long long>(stamp ? *stamp : 0));
+        fflush(stdout);
+    }
     return vp_[s] & 0xFFu;
 }
 

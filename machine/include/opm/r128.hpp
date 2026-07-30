@@ -146,6 +146,12 @@ public:
     // retiring USB reports altogether.
     static void setVblTbPeriod(u64 n);
     static u64 vblTbPeriod();
+    // --vbl-trace N: print the first N latch/acknowledge events. Aggregate
+    // counts said "acks=2 out of 14 blanks" and could not say WHICH blank went
+    // unanswered or what the driver wrote; only the sequence can. A static, so
+    // no snapshot is invalidated.
+    static void setVblTrace(int n);
+    static u64 vblDropped();
 
     // Snapshot: register store, PLL file, DAC palette, and the 32 MB
     // framebuffer — the display work after the mount reads all of it.

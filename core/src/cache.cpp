@@ -222,7 +222,19 @@ void Cpu::l2FlushAll(bool writeback)
 // machine misbehaves once the L2 is on" can be attributed rather than guessed.
 void Cpu::noteL2Skew(u32 pa, bool write)
 {
-    if (!l2On() || !l2Find(pa & ~31u))
+    // NOT l2Find: that bumps the line's age, and a census that reorders the
+    // replacement policy it is watching is the same class of mistake as a
+    // flush that rewrites memory.
+    if (!l2On() || l2Sets == 0 || l2Inert)
+        return;
+    const u32 base = pa & ~31u;
+    const u32 set = (base >> 5) % l2Sets, tag = base >> 5;
+    bool held = false;
+    for (u32 w = 0; w < 2 && !held; ++w) {
+        const L2Line& e = l2[size_t(set) * 2 + w];
+        held = e.v && e.tag == tag;
+    }
+    if (!held)
         return;
     if (write)
         ++l2SkewW;

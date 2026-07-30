@@ -428,12 +428,16 @@ int main(int argc, char** argv)
     int vblTrace = 0;
     const char* findStr = nullptr;     // --find-str TEXT: search RAM
     int findCode = 0;                  // --find-code N: where is N generated
-    // --cpu-cache-rom: answer the processor module's I2C cache descriptor at
-    // slave 0xAC, so the boot ROM finds, sizes, tests and ENABLES the 1 MB
-    // backside L2 (the full um7400 §3.7.4 sequence). Opt-in: it works, and
-    // then the machine dies in a program-exception loop at 0x700 because the
-    // L2 data path has never run before. Same footing as --em294-rts.
-    bool cpuCacheRom = false;
+    // The processor module's I2C cache descriptor at slave 0xAC: the boot ROM
+    // finds, sizes, tests and ENABLES the 1 MB backside L2 (the whole um7400
+    // §3.7.7 sequence) and records its size for the OS. Now the default —
+    // `--no-cpu-cache-rom` restores a module that never answers.
+    // `--cpu-cache-rom` is kept so old command lines still parse.
+    bool cpuCacheRom = true;
+    // --l2-inert: DIAGNOSTIC. L2CR is honoured in full, the array holds
+    // nothing. Attributes a change to "the L2 is on" vs "our L2 serves the
+    // wrong bytes".
+    bool l2Inert = false;
     // --ohci-ndp N: force the root hub's downstream port count (DIAGNOSTIC).
     // Mac OS publishes NumPorts 0 for both root hubs while HcRhDescriptorA
     // reports NDP 2; driving NDP to a distinctive ODD value says whether the
@@ -669,7 +673,9 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--dis-at"))
             disAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--em294-rts")) em294Rts = true;
-        else if (!strcmp(a, "--cpu-cache-rom")) cpuCacheRom = true;
+        else if (!strcmp(a, "--cpu-cache-rom")) cpuCacheRom = true; // now the default; kept so old command lines still work
+        else if (!strcmp(a, "--no-cpu-cache-rom")) cpuCacheRom = false;
+        else if (!strcmp(a, "--l2-inert")) l2Inert = true;
         else if (!strcmp(a, "--ohci-port-power")) ohciPortPower = true; // now the default; kept so old command lines still work
         else if (!strcmp(a, "--no-ohci-port-power")) ohciPortPower = false;
         else if (!strcmp(a, "--ohci-ndp")) {
@@ -1065,10 +1071,18 @@ int main(int argc, char** argv)
     bus.pic().stamp = &executed;
     bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
     bus.pmu().portAIn = static_cast<u8>(viaA);
+    cpu.l2Inert = l2Inert;
+    if (l2Inert)
+        printf("-- DIAGNOSTIC --l2-inert: L2CR is honoured but the array holds "
+               "nothing, so every access reaches memory\n");
     bus.cpuModuleRom = cpuCacheRom;
     if (cpuCacheRom)
         printf("-- cpu module cache descriptor answered at i2c 0xac: the ROM "
-               "will find, size and ENABLE the L2 (and then fault at 0x700)\n");
+               "finds, sizes, tests and ENABLES the 1 MB backside L2, and "
+               "records it at [0x00003010]\n");
+    else
+        printf("-- --no-cpu-cache-rom: the processor module is silent, so the "
+               "machine reports NO L2 and Mac OS puts up the cache alert\n");
     for (u32 f = 0; f < 2; ++f) {
         bus.ohci(f).stamp = &executed;
         bus.ohci(f).pcRef = &cpu.st.pc;
@@ -3888,6 +3902,16 @@ int main(int argc, char** argv)
             printf("   lr=%08x  x%llu\n", at,
                    static_cast<unsigned long long>(n));
     }
+    // Accesses that went round the caches while the L2 still held the block.
+    // Printed always, including the zero, because "the L2 is enabled and
+    // nothing reads round it" is the reading that clears the whole class.
+    printf("-- l2 skew (bypassing access over a live L2 line): %llu reads, "
+           "%llu writes by %zu pc%s\n",
+           static_cast<unsigned long long>(cpu.l2SkewR),
+           static_cast<unsigned long long>(cpu.l2SkewW), cpu.l2SkewByPc.size(),
+           cpu.l2SkewByPc.size() == 1 ? "" : "s");
+    for (const auto& [at, n] : cpu.l2SkewByPc)
+        printf("   pc=%08x  x%llu\n", at, static_cast<unsigned long long>(n));
     if (cpu.wpEnd) {
         printf("-- watchpoint %08x..%08x: %zu store%s%s\n", cpu.wpPa,
                cpu.wpEnd, cpu.wpLog.size(), cpu.wpLog.size() == 1 ? "" : "s",

@@ -246,22 +246,28 @@ public:
     const std::vector<RegWr>& sizeLog() const { return szLog_; }
     const std::vector<RegWr>& i2cLog() const { return i2cLog_; }
 
-    // The processor module's I2C cache descriptor at slave 0xAC — OFF by
-    // default, and deliberately so.
+    // The processor module's I2C cache descriptor at slave 0xAC. ON, because
+    // a Power Mac G4 AGP has that EEPROM and 1 MB of backside L2, and a
+    // machine that answers it is the honest one. `--no-cpu-cache-rom`
+    // restores the silent module.
     //
-    // Answering it is correct: a real Sawtooth has that EEPROM, and with it
-    // the boot ROM detects the 1 MB backside L2, programs L2CR (0x38000000 =
-    // L2SIZ 1 MB, L2CLK ÷2), runs the documented test, and sets L2E — the
-    // whole um7400 §3.7.4 sequence this machine has never executed. But that
-    // switches on an L2 data path that has never been exercised, and the boot
-    // then dies in a program-exception loop at vector 0x700. Until that is
-    // chased down, the default must be a machine that boots.
+    // With it the boot ROM detects the cache, builds L2CR by hand
+    // (0x38000000 = L2SIZ 1 MB, L2CLK ÷2), runs the um7400 §3.7.7 test and
+    // sets L2E (0xb8000000) — and, at fff815ac, writes the size into the
+    // configuration block the firmware hands the OS: **[0x00003010] =
+    // 0x00100000**. That word is what closes the cache dialog. Measured, one
+    // hop at a time: HWInit reads it (pc 00a57094/00a57408/00a57a50) and puts
+    // it in NKProcessorInfo+0x34 at PA 0x03ffffb4; the NanoKernel copies the
+    // record to KDP+0xF60 (pc 00f106bc), so ProcessorL2DSize reads
+    // **0x00100000** instead of 0 and `Cache.s`'s `beq cacheFailAbsentL2CR`
+    // is not taken.
     //
-    // It does not close the cache dialog on its own either: Open Firmware's
-    // `l2-cache` word reads its code from startvec+0xE8, copied from
-    // [0x00100004], and nothing writes that even once the L2 is running. See
-    // --cpu-cache-rom in g4run.
-    bool cpuModuleRom = false;
+    // ⛔ Open Firmware's `l2-cache` word is a DIFFERENT chain and NOT this
+    // one: it reads startvec+0xE8 from [0x00100004] and CASEs 3/5/6/7/8 —
+    // legacy cache-CARD codes. Nothing writes that word even with the L2
+    // fully running, so no `l2-cache` node is built, and the dialog goes away
+    // regardless. Two sessions were spent treating it as the missing link.
+    bool cpuModuleRom = true;
 
     // Uni-North host-bridge register block at 0xF8000000: a plain
     // word-register store, all-zero at power-on. Zero in HWINIT_STATE

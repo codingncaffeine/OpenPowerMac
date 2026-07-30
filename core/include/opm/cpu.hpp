@@ -282,6 +282,12 @@ struct Cpu {
     bool l2Peek32(u32 pa, u32& w);
     void l2FlushAll(bool writeback); // instrumentation/harness coherence
 
+    // Thermal Assist Unit: recompute THRM1/THRM2 TIN+TIV from their thresholds
+    // and THRM3[E]. Called on every mtspr to a THRM register, which is what
+    // restarts a comparison (um7400 2.1.5.6). Adding a method, not a field, so
+    // existing snapshots stay valid.
+    void thrmUpdate();
+
     // MMU (mmu.cpp). translate() raises ISI/DSI itself on failure. wimg, if
     // requested, receives the access's WIMG nibble (W=8,I=4,M=2,G=1; real
     // mode reads as 0b0011 per PEM 7.2).

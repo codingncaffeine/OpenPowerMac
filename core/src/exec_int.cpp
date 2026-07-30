@@ -13,6 +13,53 @@
 
 namespace opm {
 
+// ---- Thermal Assist Unit ---------------------------------------------------
+//
+// THRM1/THRM2 bit numbering is the manual's (MSB = bit 0), so a documented
+// bit n is mask 1 << (31 - n). um7400 Table 10-2:
+//   bit 0  TIN        interrupt bit, read-only, valid only while TIV is set
+//   bit 1  TIV        comparison settled, read-only
+//   bits 2-8 THRESHOLD  junction temperature threshold, degrees C
+//   bit 29 TID        0 = TIN when temp EXCEEDS threshold, 1 = when BELOW
+//   bit 30 TIE        raise the thermal interrupt (masked by MSR[EE])
+//   bit 31 V          this SPR holds a valid threshold
+// THRM3 bit 31 is E, the unit enable.
+namespace {
+constexpr u32 kThrmTin = 0x80000000u;
+constexpr u32 kThrmTiv = 0x40000000u;
+constexpr u32 kThrmTid = 0x00000004u;
+constexpr u32 kThrmV = 0x00000001u;
+constexpr u32 kThrm3E = 0x00000001u;
+
+// The die temperature we report. Software successively approximates it by
+// walking THRESHOLD and reading TIN, so this is the value it converges on. A
+// G4 idling in a desktop sits well below any throttling threshold, and
+// reporting something plausible-but-cool is the safe choice: too hot and the
+// OS would have cause to throttle or complain.
+constexpr u32 kJunctionTempC = 45;
+} // namespace
+
+// Recompute both thresholds' status. The comparison settles immediately rather
+// than after THRM3[SITV] -- deliberate: the only consumer polls TIV in a tight
+// loop until it is set, so arriving early is invisible to it, and modelling the
+// interval would need a counter in the snapshotted CPU state.
+void Cpu::thrmUpdate()
+{
+    const bool enabled = (st.thrm[2] & kThrm3E) != 0;
+    for (int i = 0; i < 2; ++i) {
+        u32& r = st.thrm[i];
+        r &= ~(kThrmTin | kThrmTiv);
+        if (!enabled || !(r & kThrmV))
+            continue; // no valid threshold: TIN stays meaningless, TIV clear
+        const u32 threshold = (r >> 23) & 0x7Fu;
+        const bool hit = (r & kThrmTid) ? (kJunctionTempC < threshold)
+                                        : (kJunctionTempC > threshold);
+        if (hit)
+            r |= kThrmTin;
+        r |= kThrmTiv; // the comparison is valid either way
+    }
+}
+
 namespace {
 
 // ---- small helpers ---------------------------------------------------------
@@ -897,6 +944,13 @@ void h_mfspr(Cpu& c, u32 i, const InsnDesc&)
         return;
     if (spr == 268) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb); return; }
     if (spr == 269) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb >> 32); return; }
+    // The thermal unit re-samples on its own interval, so its status is fresh
+    // whenever software looks. Refreshing on the read as well as on the write
+    // matters: the only consumer arms the unit once and then polls THRM1[TIV]
+    // in a tight loop, so a model that updated only on mtspr could never
+    // recover if it were resumed from inside that loop.
+    if (spr == 1020 || spr == 1021)
+        c.thrmUpdate();
     c.st.gpr[f_rt(i)] = *p;
 }
 void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
@@ -934,6 +988,26 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
                         static_cast<unsigned long long>(c.st.tb)),
                     ++n;
         }
+        return;
+    }
+    if (spr == 1020 || spr == 1021 || spr == 1022) { // THRM1/THRM2/THRM3
+        // Thermal Assist Unit. These were plain storage, so THRM1[TIV] could
+        // never become set -- and Mac OS 9 spins on exactly that bit at
+        // 003d1798 (`mfspr r10,1020; andis. r8,r10,32768; andis. r9,r10,16384;
+        // beq`) late in extension loading, which stalled the boot there with
+        // the progress bar ~90% full and four extension icons drawn.
+        //
+        // um7400 2.1.5.6: TIN (bit 0) and TIV (bit 1) are READ-ONLY status
+        // owned by the thermal logic, so a write must not be able to fake a
+        // settled comparison. A write to a THRM register restarts its
+        // comparison, and "changing THRM3 forces the TIV bits of both THRM1
+        // and THRM2 to 0". THRM3 carries only E and SITV, so it takes the
+        // value verbatim.
+        if (spr == 1022)
+            c.st.thrm[2] = v;
+        else
+            c.st.thrm[spr - 1020] = v & ~(kThrmTin | kThrmTiv);
+        c.thrmUpdate();
         return;
     }
     if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception

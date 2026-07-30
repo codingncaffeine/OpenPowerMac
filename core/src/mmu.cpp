@@ -430,64 +430,74 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
     // Translation, from the one-page cache when its inputs are unchanged.
     // MSR and the segment register are compared directly; the BATs, SDR1 and
     // the page table are covered by mmuGen. See Cpu::xlPage.
-    const u32 page = ea >> 12;
-    const u32 msrKey = st.msr & (msr::IR | msr::PR | msr::LE);
-    const u32 srKey = st.sr[ea >> 28];
-    if (xlGen == mmuGen && xlPage == page && xlMsr == msrKey && xlSr == srKey) {
-        pa = xlPa | (ea & 0xFFFu);
-    } else {
-        if (!translate(ea, false, true, pa))
-            return false;
-        xlGen = mmuGen;
-        xlPage = page;
-        xlMsr = msrKey;
-        xlSr = srKey;
-        xlPa = pa & ~0xFFFu;
+    // ⚠ The marker covers the CACHE CHECK as well as the walk. Cpu::translate
+    // marks itself, but on a hit it is never called, so the comparison work
+    // was being billed to the fetch bucket and made "fetch" look like 42.7% of
+    // the machine. Same failure as a clock advance inheriting its caller's
+    // phase: a profiler that bills work to whoever it happened to run inside
+    // sends the next reader to the wrong file.
+    {
+        OPM_MARK(Xlate);
+        const u32 page = ea >> 12;
+        const u32 msrKey = st.msr & (msr::IR | msr::PR | msr::LE);
+        const u32 srKey = st.sr[ea >> 28];
+        if (xlGen == mmuGen && xlPage == page && xlMsr == msrKey &&
+            xlSr == srKey) {
+            pa = xlPa | (ea & 0xFFFu);
+        } else {
+            if (!translate(ea, false, true, pa))
+                return false;
+            xlGen = mmuGen;
+            xlPage = page;
+            xlMsr = msrKey;
+            xlSr = srKey;
+            xlPa = pa & ~0xFFFu;
+        }
     }
     // The block buffer, if it still holds this block. See Cpu::fetchBase for
     // the invalidation contract — every writer of memory or of a cache drops
     // it, so a hit here is the same word the long path below would produce.
     const u32 base = pa & ~31u;
-    const u32 o = pa & 28u;
+    const u32 word = (pa >> 2) & 7u;
     FetchLine& fl = fetchLine[fetchSlot(pa)];
     if (fl.base == base) {
         OPM_COUNT(fetchHits);
-        insn = (u32(fl.b[o]) << 24) | (u32(fl.b[o + 1]) << 16) |
-               (u32(fl.b[o + 2]) << 8) | u32(fl.b[o + 3]);
-        row = fl.row[o >> 2];
+        insn = fl.w[word];
+        row = fl.row[word];
         return true;
     }
     // Fetch coherence: serve from a hitting D-cache or L2 line first.
     // Stronger than real hardware's split caches (which demand dcbst+icbi
     // sweeps), never weaker — deterministic superset, RECEIPT.
+    u8 raw[32];
     bool filled = false;
-    if (l1dReadLine(base, fl.b)) {
+    if (l1dReadLine(base, raw)) {
         OPM_COUNT(fetchFillsL1);
         filled = true;
-    } else if (l2ReadLine(base, fl.b)) {
+    } else if (l2ReadLine(base, raw)) {
         OPM_COUNT(fetchFillsL2);
         filled = true;
     } else if (bus->memoryAt(base, 32)) {
         OPM_COUNT(fetchFillsMem);
-        bus->readLine32(base, fl.b);
+        bus->readLine32(base, raw);
         filled = true;
     }
     if (filled) {
         fl.base = base;
-        // Decode the whole block while it is here. Eighteen instructions are
-        // executed per fill on average, so the seven words that were not asked
-        // for are paid off many times over — and decode has no side effects,
-        // so decoding a word that is never executed costs nothing but this.
+        // Assemble and decode the whole block while it is here. Eighteen
+        // instructions are executed per fill on average, so the seven words
+        // that were not asked for are paid off many times over — and decode
+        // has no side effects, so decoding a word that is never executed
+        // costs nothing but this.
         for (u32 k = 0; k < 8; ++k) {
-            const u32 w = (u32(fl.b[k * 4]) << 24) |
-                          (u32(fl.b[k * 4 + 1]) << 16) |
-                          (u32(fl.b[k * 4 + 2]) << 8) | u32(fl.b[k * 4 + 3]);
-            const InsnDesc* d = decode(w);
+            const u32 v = (u32(raw[k * 4]) << 24) | (u32(raw[k * 4 + 1]) << 16) |
+                          (u32(raw[k * 4 + 2]) << 8) | u32(raw[k * 4 + 3]);
+            fl.w[k] = v;
+            const InsnDesc* d = decode(v);
             fl.row[k] = d ? static_cast<u16>(d - kIsa) : kNoRow;
         }
-        insn = (u32(fl.b[o]) << 24) | (u32(fl.b[o + 1]) << 16) |
-               (u32(fl.b[o + 2]) << 8) | u32(fl.b[o + 3]);
-        row = fl.row[o >> 2];
+        insn = fl.w[word];
+        row = fl.row[word];
         return true;
     }
     fl.base = 1; // a partial fill must not be left looking valid

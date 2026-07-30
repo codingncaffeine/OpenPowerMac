@@ -367,7 +367,12 @@ struct Cpu {
         // describes.
         u16 row[8] = {kNoRow, kNoRow, kNoRow, kNoRow,
                       kNoRow, kNoRow, kNoRow, kNoRow};
-        u8 b[32] = {};
+        // The eight instruction WORDS, already assembled. Held as bytes they
+        // cost four loads, three shifts and three ors on every hit, and after
+        // the caches above landed the fetch path was 42.7% of the machine and
+        // the biggest item in it. The block is assembled once per fill and
+        // read about eighteen times, so the work belongs in the fill.
+        u32 w[8] = {};
     };
     FetchLine fetchLine[kFetchLines];
 

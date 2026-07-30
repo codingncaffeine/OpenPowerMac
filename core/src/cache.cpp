@@ -228,6 +228,12 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
             ++it->second;
         else if (rpByPc.size() < 512) // never let a runaway exhaust memory
             rpByPc[at] = 1;
+        const u32 caller = st.lr;
+        auto lit = rpByLr.find(caller);
+        if (lit != rpByLr.end())
+            ++lit->second;
+        else if (rpByLr.size() < 512)
+            rpByLr[caller] = 1;
     }
     if (!dceOn() || (wimg & kWimgI)) {
         switch (len) {
@@ -258,7 +264,8 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
 
 void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
 {
-    if (wpEnd && pa <= wpEnd && pa + len > wpPa) {
+    if (wpEnd && pa <= wpEnd && pa + len > wpPa &&
+        (!wpFrom || !wpStamp || *wpStamp >= wpFrom)) {
         if (wpLog.size() < wpMax)
             wpLog.push_back(
                 {st.pc - 4, pa, static_cast<u32>(v), len, st.lr, st.tb});

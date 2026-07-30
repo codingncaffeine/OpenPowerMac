@@ -241,6 +241,12 @@ struct Cpu {
     };
     std::vector<WpHit> wpLog;
     u32 wpMax = 64;
+    // --wp-from N: ignore stores before instruction N. A 64-entry log fills
+    // with Open Firmware and boot-payload memsets thousands of times before
+    // the OS era starts, so an ungated watch reports the WRONG WINDOW rather
+    // than nothing -- the same lie a capped log tells about absence.
+    u64 wpFrom = 0;
+    const u64* wpStamp = nullptr;
     // READ watchpoint (--rp): a census of which code READS a range, keyed by
     // the reading pc. Stores answer "who changed this"; only reads answer "does
     // anything consume it", which is the question a device buffer poses. These
@@ -249,6 +255,10 @@ struct Cpu {
     u32 rpPa = 0, rpEnd = 0; // inclusive byte range; rpEnd 0 disables
     u64 rpHits = 0;
     std::map<u32, u64> rpByPc;
+    // ...and by LR. ffcf4598 is a shared copy primitive: its pc names nothing,
+    // exactly like Open Firmware's `!`. The LR is the return address inside the
+    // routine that CALLED it, which is the answer the question wanted.
+    std::map<u32, u64> rpByLr;
     // DIAGNOSTIC, NOT MACHINE TRUTH. Substitute wpForce for the value of any
     // 32-bit store landing exactly on wpPa. This exists to supply a positive
     // control: a chain that is decoded but not yet fixed can be proved end to

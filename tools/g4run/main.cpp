@@ -301,6 +301,11 @@ int main(int argc, char** argv)
     // report be traced through the OS by searching a RAM dump for its bytes;
     // 8 and 4 are far too common to find.
     int mouseDx = 8, mouseDy = 4;
+    // --mouse-vary: make every consecutive report DIFFER. A HID driver that keeps
+    // a previous report to detect change would suppress an endless stream of
+    // byte-identical ones -- which is what a fixed delta produces and what a
+    // real mouse never sends.
+    bool mouseVary = false;
     u64 mouseSent = 0;
     // The button state a real mouse carries in EVERY report. moveMouse()
     // assigns buttons_ outright, so injecting motion with a literal 0 cleared
@@ -334,6 +339,8 @@ int main(int argc, char** argv)
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
     u32 rpPa = 0, rpEnd = 0;  // --rp PA [--rp-end PA]: read census
+    u64 wpFrom = 0;                       // --wp-from N: ignore stores < N
+    u32 wpMaxArg = 0;                     // --wp-max N: raise the 64 cap
     u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
                                           // store watchpoint (CPU side)
     u32 wpForce = 0;                      // --wp-force V: DIAGNOSTIC, see
@@ -431,6 +438,8 @@ int main(int argc, char** argv)
     bool wmapPcSet = false;
     u32 watchVa = 0;                   // --watch-va ADDR
     u64 traceFrom = 0;                 // --trace-from N: full trace window
+    u32 traceAtPc = 0;                 // --trace-at-pc ADDR: arm on arrival
+    bool traceArmed = false;
     u64 traceLines = 2000;             // --trace-lines M
 
     for (int i = 1; i < argc; ++i) {
@@ -472,6 +481,7 @@ int main(int argc, char** argv)
             clickAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--crsr-drag"))
             crsrDrag = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--mouse-vary")) mouseVary = true;
         else if (!strcmp(a, "--mouse-dx"))
             mouseDx = static_cast<int>(strtol(next(), nullptr, 0));
         else if (!strcmp(a, "--mouse-dy"))
@@ -532,6 +542,10 @@ int main(int argc, char** argv)
         }
         else if (!strcmp(a, "--rp-end"))
             rpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--wp-from"))
+            wpFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--wp-max"))
+            wpMaxArg = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--wp-end"))
             wpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--wp-force")) {
@@ -650,6 +664,8 @@ int main(int argc, char** argv)
             atiLogFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
             traceFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--trace-at-pc"))
+            traceAtPc = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--trace-lines"))
             traceLines = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--watch-va"))
@@ -946,6 +962,9 @@ int main(int argc, char** argv)
     cpu.reset(); // pc = 0xFFF00100, MSR[IP]: vectors in ROM — authentic
     cpu.wpPa = wpPa;   // physical store watchpoint, set before any stepping
     cpu.wpEnd = wpEnd;
+    cpu.wpFrom = wpFrom;
+
+    if (wpMaxArg) cpu.wpMax = wpMaxArg;
     cpu.rpPa = rpPa;   // physical READ watchpoint (census by reading pc)
     cpu.rpEnd = rpEnd;
     cpu.wpForce = wpForce;
@@ -961,6 +980,7 @@ int main(int argc, char** argv)
         bus.ohci(1).setNdp(ohciNdp);
     }
     u64 executed = 0;
+    cpu.wpStamp = &executed; // the gate needs the live instruction counter
     // Instrument census. A watch that emits nothing is ambiguous between
     // "never fired", "fired with nothing to say", and "its gate never
     // opened" — this session lost several runs to exactly that, because a
@@ -1405,6 +1425,9 @@ int main(int argc, char** argv)
             bus.systemReset();
             cpu.wpPa = wpPa;
             cpu.wpEnd = wpEnd;
+            cpu.wpFrom = wpFrom;
+            cpu.wpStamp = &executed;
+            if (wpMaxArg) cpu.wpMax = wpMaxArg;
             cpu.rpPa = rpPa;
             cpu.rpEnd = rpEnd;
             cpu.wpForce = wpForce;
@@ -1557,6 +1580,19 @@ int main(int argc, char** argv)
         // missing is "show me every instruction around HERE" — which,
         // resumed from a snapshot, costs seconds and is what a debugger's
         // step button actually provides.
+        // --trace-at-pc ADDR: start the trace window when the pc first ARRIVES
+        // at ADDR, not at an instruction count. A count cannot be aimed at a
+        // routine -- a breakpoint reports the count of one entry, and by the
+        // next run the same count lands somewhere unrelated, which is exactly
+        // how a 44-line window aimed at a shim landed in the idle loop. Code
+        // addresses are stable across resumes of one snapshot; counts are not.
+        if (traceAtPc && !traceArmed && pc == traceAtPc) {
+            traceArmed = true;
+            traceFrom = executed;
+            printf("-- trace armed at pc=%08x @%llu\n", traceAtPc,
+                   static_cast<unsigned long long>(executed));
+            fflush(stdout);
+        }
         if (traceFrom && executed >= traceFrom &&
             executed < traceFrom + traceLines) {
             char tt[128];
@@ -2994,7 +3030,12 @@ int main(int argc, char** argv)
         // sustained enough to be believed".
         if (mouseAt && executed >= mouseAt &&
             (executed - mouseAt) % mouseEvery == 0) {
-            bus.ohci(1).moveMouse(mouseDx, mouseDy, heldButtons);
+            int dx = mouseDx, dy = mouseDy;
+            if (mouseVary) { // never repeat a report byte-for-byte
+                dx += static_cast<int>(mouseSent % 5u);
+                dy += static_cast<int>(mouseSent % 3u);
+            }
+            bus.ohci(1).moveMouse(dx, dy, heldButtons);
             ++mouseSent;
         }
         // A CLICK, which reaches the OS by a different route than motion:
@@ -3760,6 +3801,12 @@ int main(int argc, char** argv)
                cpu.rpByPc.size() == 1 ? "" : "s");
         for (const auto& [at, n] : cpu.rpByPc)
             printf("   pc=%08x  x%llu\n", at,
+                   static_cast<unsigned long long>(n));
+        // And by CALLER. A shared copy primitive's pc names nothing -- the same
+        // reason --wp had to start recording the LR.
+        printf("   -- by caller (LR):\n");
+        for (const auto& [at, n] : cpu.rpByLr)
+            printf("   lr=%08x  x%llu\n", at,
                    static_cast<unsigned long long>(n));
     }
     if (cpu.wpEnd) {

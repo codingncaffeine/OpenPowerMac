@@ -367,15 +367,29 @@ void OhciCell::buildDescriptor()
             push({9, 2, 34, 0, 1, 1, 0, 0xA0, 25});
             push({9, 4, 0, 0, 1, 3, 1, proto, 0}); // HID, boot subclass
             push({9, 0x21, 0x11, 0x01, 0, 1, 0x22, rlen, 0});
-            push({7, 5, 0x81, 3, static_cast<u8>(reportLen_), 0, 10});
+            // wMaxPacketSize is the ENDPOINT's capacity, not the report
+            // length. Declaring it equal to reportLen_ made every report an
+            // exact buffer fill, and OHCI 1.0 4.3.1.2 says a
+            // CurrentBufferPointer of 0 means "a zero-length data packet OR
+            // all bytes transferred" -- ambiguous, and a UIM that reads it as
+            // the former computes an actual count of zero and drops the
+            // report. A real low-speed Apple HID endpoint declares the
+            // low-speed maximum of 8 and short-packets every report, which
+            // leaves CBP non-zero and the count unambiguous.
+            push({7, 5, 0x81, 3, 8, 0, 10});
             break;
         }
         case 3: // STRING
             if ((val & 0xFF) == 0)
                 push({4, 3, 0x09, 0x04});
             else {
-                const char* s =
-                    (val & 0xFF) == 1 ? "OpenPowerMac" : "Keyboard";
+                // Both HID cells shared one product string, so the Name
+                // Registry described the mouse as a "Keyboard" -- cosmetic,
+                // but it is a confounder every time these nodes are read.
+                const char* s = (val & 0xFF) == 1
+                                    ? "OpenPowerMac"
+                                    : (hid_ == Hid::Mouse ? "Mouse"
+                                                          : "Keyboard");
                 reply_.push_back(static_cast<u8>(2 + 2 * strlen(s)));
                 reply_.push_back(3);
                 for (const char* p = s; *p; ++p) {
@@ -405,6 +419,23 @@ void OhciCell::buildDescriptor()
               0x95, 0x01, 0x75, 0x03, 0x91, 0x03, 0x95, 0x06, 0x75, 0x08,
               0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
               0x81, 0x00, 0xC0});
+    } else if (type == 0xA1 && req == 0x01) {
+        // HID GET_REPORT (HID 1.11 7.2.1) is MANDATORY for every HID device,
+        // and it was the ONE request in the whole enumeration this device
+        // answered with nothing -- measured: `a1 01 01 01 00 00 04 00
+        // reply=0`. The mouse module issues it while initializing, so the
+        // step failed, the module never reached its kCreateCursor state and
+        // never registered a cursor device with the Cursor Device Manager.
+        // The interrupt pipe was already open by then, so reports kept
+        // arriving and the button byte still reached the global button state
+        // while every X/Y was discarded -- exactly the asymmetry measured
+        // (MBState toggles on an injected click, the pointer never moves).
+        // Relative axes legitimately read as zero: there is no movement to
+        // report until the next poll.
+        if (hid_ == Hid::Mouse)
+            push({buttons_, 0, 0});
+        else
+            reply_.assign(reportLen_, static_cast<u8>(0));
     } else if (type == 0x00 && req == 0x05) { // SET_ADDRESS
         pendingAddress_ = static_cast<u8>(val & 0x7F);
     }
@@ -541,10 +572,9 @@ u32 OhciCell::runList(u32 head, bool control)
         const u32 tail = ldLe(ed + 4) & ~0xFu;
         u32 hp = ldLe(ed + 8);
         const u32 nextEd = ldLe(ed + 12) & ~0xFu;
-        if (walkLog.size() < walkMax)
-            walkLog.push_back({0u, ed, e0, hp, tail, nextEd});
         const bool skip = (e0 & 0x4000u) != 0;
         const bool halted = (hp & 1u) != 0;
+        const u32 doneBefore = done;
         u32 h = hp & ~0xFu;
         while (!skip && !halted && h && h != tail && done < 64) {
             u32 nx = 0;
@@ -553,6 +583,15 @@ u32 OhciCell::runList(u32 head, bool control)
             h = nx;    // retired: advance, and 0 legitimately empties the queue
             ++done;
         }
+        // Log the ED only once it has actually RETIRED a descriptor. A
+        // skipped ED is interrupt-tree scaffolding, an ED whose HeadP has
+        // caught up with TailP is empty, and a NAKing one carries no data:
+        // logging those refilled the capped log on every frame and crowded
+        // out the TD records entirely -- which is how this log came to hold
+        // 400 endpoint descriptors and not one of the reports the driver was
+        // being handed.
+        if (done != doneBefore && walkLog.size() < walkMax)
+            walkLog.push_back({0u, ed, e0, hp, tail, nextEd});
         stLe(ed + 8, (hp & 0xFu) | h);
         ed = nextEd;
     }

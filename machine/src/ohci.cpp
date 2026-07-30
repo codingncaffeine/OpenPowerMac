@@ -681,4 +681,46 @@ void OhciCell::typeChord(u8 extraMod, const std::string& s)
             pending_.push_back(0);
     }
 }
+
+// One key going down or coming up. See the header for why this exists
+// alongside typeAscii: a person's keyboard sends usage codes, not text, and
+// every non-printing key — Backspace, Tab, the arrows, Delete, the function
+// keys, the modifiers themselves — is unreachable through a text path.
+//
+// The state here is deliberately independent of typeChord above, which builds
+// its own reports and ends every keystroke with an all-zero one. Mixing the
+// two is therefore self-correcting rather than sticky: whichever spoke last
+// has said what is held.
+void OhciCell::keyEvent(u8 usage, bool down)
+{
+    if (hid_ != Hid::Keyboard || !usage)
+        return;
+    if (usage >= 0xE0u && usage <= 0xE7u) {
+        const u8 bit = static_cast<u8>(1u << (usage - 0xE0u));
+        keyMod_ = down ? static_cast<u8>(keyMod_ | bit)
+                       : static_cast<u8>(keyMod_ & ~bit);
+    } else if (down) {
+        bool held = false;
+        for (u8 s : keySlots_)
+            if (s == usage)
+                held = true;
+        if (!held)
+            for (u8& s : keySlots_)
+                if (!s) {
+                    s = usage;
+                    break;
+                }
+        // A seventh simultaneous key is rollover, which a real boot keyboard
+        // answers by filling every slot with 0x01. Six is more than any user
+        // interface asks for, so the extra key is simply not reported.
+    } else {
+        for (u8& s : keySlots_)
+            if (s == usage)
+                s = 0;
+    }
+    pending_.push_back(keyMod_);
+    pending_.push_back(0); // reserved byte
+    for (u8 s : keySlots_)
+        pending_.push_back(s);
+}
 } // namespace opm

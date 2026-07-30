@@ -13,6 +13,7 @@ public sealed class MachineSession
     private volatile bool _stop;
     private readonly ConcurrentQueue<string> _serialQ = new();
     private readonly ConcurrentQueue<string> _keyQ = new();
+    private readonly ConcurrentQueue<(uint usage, uint down)> _keyEvQ = new();
     private readonly ConcurrentQueue<(int dx, int dy, uint buttons)> _mouseQ = new();
 
     /// <summary>Raw console bytes drained from the machine (VT stream).</summary>
@@ -53,6 +54,12 @@ public sealed class MachineSession
 
     /// <summary>Queue typed text for the USB keyboard (usb@8).</summary>
     public void SendKeys(string text) => _keyQ.Enqueue(text);
+
+    /// <summary>Queue one key going down or coming up, as a HID usage code —
+    /// what a person's keyboard actually sends. Usages 0xE0-0xE7 are the
+    /// modifiers; the guest applies its own layout to the rest.</summary>
+    public void SendKeyEvent(uint usage, bool down) =>
+        _keyEvQ.Enqueue((usage, down ? 1u : 0u));
 
     /// <summary>Queue a USB mouse report (usb@9): relative motion plus the
     /// button mask held at the time. Every capi call runs on the worker, so
@@ -121,6 +128,9 @@ public sealed class MachineSession
 
                 while (_keyQ.TryDequeue(out var keys))
                     Native.opm_key(m, keys);
+
+                while (_keyEvQ.TryDequeue(out var ke))
+                    Native.opm_key_event(m, ke.usage, ke.down);
 
                 while (_mouseQ.TryDequeue(out var mv))
                     Native.opm_mouse(m, mv.dx, mv.dy, mv.buttons);

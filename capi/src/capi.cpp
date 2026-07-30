@@ -115,6 +115,11 @@ OPM_API void opm_key(OpmMachine* m, const char* text)
         m->bus->ohci(0).typeAscii(text);
 }
 
+OPM_API void opm_key_event(OpmMachine* m, uint32_t usage, uint32_t down)
+{
+    m->bus->ohci(0).keyEvent(static_cast<uint8_t>(usage), down != 0u);
+}
+
 OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
                        uint32_t buttons)
 {

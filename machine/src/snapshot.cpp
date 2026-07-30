@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 8; // 8: the disk's current CHS translation
+constexpr u32 kSnapVersion = 9; // 9: the keyboard's held keys
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -560,6 +560,11 @@ void OhciCell::snapSave(SnapWriter& w) const
     w.u32v(portPower_[0]);
     w.u32v(portPower_[1]);
     w.u64v(lastFrameTb_);
+    // What the keyboard is currently holding down. A resume that dropped it
+    // would release keys the guest believes are still pressed, and a stuck
+    // modifier is invisible until it changes the meaning of every later key.
+    w.u8v(keyMod_);
+    w.raw(keySlots_, 6);
     w.u64v(log.size());
     for (const Ev& ev : log) {
         w.u64v(ev.at);
@@ -602,6 +607,8 @@ void OhciCell::snapLoad(SnapReader& r)
     portPower_[0] = r.u32v();
     portPower_[1] = r.u32v();
     lastFrameTb_ = r.u64v();
+    keyMod_ = r.u8v();
+    r.raw(keySlots_, 6);
     const u64 n = r.u64v();
     log.clear();
     for (u64 k = 0; k < n && r.ok; ++k) {

@@ -124,7 +124,28 @@ public:
     // 3 LeftGUI (Command). Command-O opens the Finder selection, which is how
     // the machine is drivable while the pointer is still dead.
     void typeChord(u8 mod, const std::string& s);
+    // A REAL key event, which is what a keyboard is. typeAscii above turns
+    // text into keystrokes and is right for a script; it is wrong for a
+    // person, because a keyboard does not send text. It sends a usage code
+    // going down and the same code coming up, and the GUEST decides what
+    // character that is — which is why Backspace, Tab, the arrows, Delete,
+    // the function keys and every modifier are unreachable through the text
+    // path no matter how the host spells them.
+    //
+    // HID usages 0xE0-0xE7 are the modifiers and live in byte 0 of the boot
+    // report as a bitmap (LeftCtrl, LeftShift, LeftAlt, LeftGUI, then the
+    // right-hand four); everything else occupies one of the six key slots in
+    // bytes 2-7. The cell holds the CURRENT state and queues the whole
+    // report on every change, so chords and held modifiers behave the way
+    // the guest expects rather than as isolated characters.
+    void keyEvent(u8 usage, bool down);
     bool keyboardIdle() const { return pending_.empty() && !reportDue_; }
+    // What is queued for the interrupt IN endpoint, one reportLen_ chunk per
+    // report. Exposed because a wrong modifier byte or a wrong key slot is
+    // still a well-formed report — the guest accepts it and the only symptom
+    // is that typing does nothing — so the bytes need asserting somewhere
+    // cheaper than a whole boot.
+    const std::vector<u8>& queuedReports() const { return pending_; }
     u64 setupsSeen = 0, inTds = 0, reportsSent = 0; // census
     // WHEN the guest polled, not just how often. "18,548 polls, 0 reports"
     // reads as a broken delivery path, but it is the same number you get when
@@ -254,6 +275,10 @@ private:
     // several packets instead of one saturated lie.
     int accDx_ = 0, accDy_ = 0;
     u8 buttons_ = 0, sentButtons_ = 0;
+    // The boot keyboard's live state, as keyEvent() maintains it: the
+    // modifier bitmap and the six key slots a boot report carries.
+    u8 keyMod_ = 0;
+    u8 keySlots_[6] = {};
 
     u32 ldLe(u32 pa) const;
     void stLe(u32 pa, u32 v);

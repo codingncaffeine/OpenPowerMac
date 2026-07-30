@@ -35,6 +35,12 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_key(IntPtr m, string text);
 
+    // One key going down or coming up, as a HID usage. Usages 0xE0-0xE7 are
+    // the modifiers. This is the path a person's keyboard takes; opm_key is
+    // for scripted text.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void opm_key_event(IntPtr m, uint usage, uint down);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void opm_mouse(IntPtr m, int dx, int dy, uint buttons);
 

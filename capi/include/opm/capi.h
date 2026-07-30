@@ -52,6 +52,13 @@ OPM_API uint32_t opm_console(OpmMachine* m, char* buf, uint32_t cap);
 // absolute pointer sends the delta since its last report, and `buttons` is a
 // bitmask (bit 0 = left) that must be resent while a button is held.
 OPM_API void opm_key(OpmMachine* m, const char* text);
+// One key going down or coming up, as a HID usage code. This is what a
+// person's keyboard sends; opm_key above turns text into keystrokes, which is
+// right for a script and wrong for a user — Backspace, Tab, the arrows,
+// Delete, the function keys and every modifier have no spelling in text.
+// Usages 0xE0-0xE7 are the modifiers and fold into the report's modifier
+// byte; the guest applies its own keyboard layout to everything else.
+OPM_API void opm_key_event(OpmMachine* m, uint32_t usage, uint32_t down);
 OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
                        uint32_t buttons);
 

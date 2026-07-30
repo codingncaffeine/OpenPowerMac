@@ -39,10 +39,16 @@ public partial class MainWindow : Window
         imgScreen.MouseDown += OnScreenMouseButton;
         imgScreen.MouseUp += OnScreenMouseButton;
         PreviewKeyDown += OnGuestKeyDown;
-        PreviewTextInput += OnGuestTextInput;
+        PreviewKeyUp += OnGuestKeyUp;
         // Alt-tabbing away with the pointer swallowed would leave the host
-        // cursor hidden and pinned with no window to click in.
-        Deactivated += (_, _) => ReleasePointer();
+        // cursor hidden and pinned with no window to click in — and any
+        // modifier held at that moment would still be held on the way back,
+        // silently changing the meaning of every key after it.
+        Deactivated += (_, _) =>
+        {
+            ReleasePointer();
+            ReleaseHeldKeys();
+        };
     }
 
     // ---- guest input ----
@@ -229,31 +235,80 @@ public partial class MainWindow : Window
         s.SendMouse(0, 0, ButtonMask(e));
     }
 
+    // Everything the guest currently believes is held down, so it can be let
+    // go when this window stops receiving key-ups.
+    private readonly HashSet<uint> _held = new();
+
+    /// <summary>The key WPF really means. While Alt is down every keystroke
+    /// arrives as Key.System with the true key in SystemKey, so reading e.Key
+    /// alone loses every Alt combination.</summary>
+    private static Key RealKey(KeyEventArgs e) =>
+        e.Key == Key.System ? e.SystemKey : e.Key;
+
     private void OnGuestKeyDown(object sender, KeyEventArgs e)
     {
+        var key = RealKey(e);
         // Escape releases the pointer before anything else looks at the key.
         // Middle-click is the advertised way out, but a mouse without a middle
         // button must not be able to trap you.
-        if (_captured && e.Key == Key.Escape)
+        if (_captured && key == Key.Escape)
         {
             ReleasePointer();
             e.Handled = true;
             return;
         }
+        // Alt-F4 belongs to the host. Every other key is swallowed below, and
+        // a window that cannot be closed from the keyboard is a trap.
+        if (key == Key.F4 &&
+            (Keyboard.Modifiers & ModifierKeys.Alt) != 0)
+            return;
+        // The serial box is a host control, not the guest: while it holds
+        // focus it keeps its own typing.
+        if (Keyboard.FocusedElement == txtInput)
+            return;
         if (_session is not { Running: true } s)
             return;
-        // Return never arrives as text input, so it needs taking here.
-        if (e.Key == Key.Return)
+        var usage = HidKeys.Usage(key);
+        if (usage == 0)
+            return;
+        // A USB keyboard does not auto-repeat — it reports the key once and
+        // the OS decides how to repeat it. Forwarding the host's repeats would
+        // stack a second press on a key the guest already holds.
+        if (!e.IsRepeat)
         {
-            s.SendKeys("\r");
-            e.Handled = true;
+            _held.Add(usage);
+            s.SendKeyEvent(usage, true);
         }
+        // Taken, so WPF does not also read it as menu access or focus
+        // navigation: Alt would open the menu bar and Tab would walk it.
+        e.Handled = true;
     }
 
-    private void OnGuestTextInput(object sender, TextCompositionEventArgs e)
+    private void OnGuestKeyUp(object sender, KeyEventArgs e)
     {
-        if (_session is { Running: true } s && !string.IsNullOrEmpty(e.Text))
-            s.SendKeys(e.Text);
+        if (Keyboard.FocusedElement == txtInput)
+            return;
+        if (_session is not { Running: true } s)
+            return;
+        var usage = HidKeys.Usage(RealKey(e));
+        if (usage == 0)
+            return;
+        _held.Remove(usage);
+        s.SendKeyEvent(usage, false);
+        e.Handled = true;
+    }
+
+    /// <summary>Let go of everything the guest thinks is down. A key-up that
+    /// lands somewhere else — alt-tab, a stopped machine — otherwise leaves it
+    /// held forever.</summary>
+    private void ReleaseHeldKeys()
+    {
+        if (_held.Count == 0)
+            return;
+        if (_session is { Running: true } s)
+            foreach (var usage in _held)
+                s.SendKeyEvent(usage, false);
+        _held.Clear();
     }
 
     // ---- machine control ----
@@ -285,6 +340,7 @@ public partial class MainWindow : Window
 
     private void OnSessionEnded(MachineSession session, string reason)
     {
+        ReleaseHeldKeys();
         // The worker's last messages may still be queued — render them.
         while (session.ConsoleQ.TryDequeue(out var chunk))
             _term.Feed(chunk);

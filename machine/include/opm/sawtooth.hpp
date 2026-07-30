@@ -507,7 +507,10 @@ private:
     // wrap aliasing begins). Slots whose SPD probe answered nothing are
     // never probed at all — absence is decided at the SPD stage.
     static constexpr u32 kSizeWin = 0x78000000u;
-    static constexpr u32 kDimmBytes = 64u << 20;
+    // The window aliases modulo the MODULE size, which dimms() derives from the
+    // allocation. A fixed constant here could disagree with what the SPD
+    // advertises, and a ROM that does probe would then find a different size
+    // from the one it was told.
     std::vector<RegWr> szLog_; // sizing-window probe traffic (val=data)
     std::vector<RegWr> i2cLog_; // one entry per launched transaction
 
@@ -635,7 +638,7 @@ private:
                        len);
         if (pa - kSizeWin < 0x20000000u) {
             const u32 v =
-                get(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), len);
+                get(ram_.data() + ((pa - kSizeWin) & ((dimms().mb << 20) - 1)), len);
             if (szLog_.size() < 4000)
                 szLog_.push_back({stamp ? *stamp : 0, pa | 1u, v,
                                   pcRef ? *pcRef : 0});
@@ -830,7 +833,7 @@ private:
             return;
         }
         if (pa - kSizeWin < 0x20000000u) {
-            put(ram_.data() + ((pa - kSizeWin) & (kDimmBytes - 1)), v, len);
+            put(ram_.data() + ((pa - kSizeWin) & ((dimms().mb << 20) - 1)), v, len);
             if (szLog_.size() < 4000)
                 szLog_.push_back({stamp ? *stamp : 0, pa, v,
                                   pcRef ? *pcRef : 0});
@@ -1151,8 +1154,14 @@ private:
         if (n != 0)
             return false; // mac-io cell: nothing on the bus yet
         const u8 a = i2c_[0].addr & 0xFEu;
-        return a == 0xA0u                       // one DIMM, slot 1
-            || (a == 0xACu && cpuModuleRom);    // the cache descriptor
+        // Slots 0..2 answer at 0xA0/0xA2/0xA4, as many as the installed memory
+        // needs (see dimms()). Slot 3 is never populated: a fourth module would
+        // take the machine to 2 GB, and RAM would then run into the 0x78000000
+        // sizing window and the device region above it.
+        if (a == 0xACu)
+            return cpuModuleRom;                // the cache descriptor
+        const u32 slot = (a - 0xA0u) >> 1;
+        return a >= 0xA0u && a <= 0xA6u && slot < dimms().count;
     }
     u8 slaveByte(u32 n) const
     {
@@ -1160,6 +1169,13 @@ private:
             return 0xFFu;
         return (i2c_[0].addr & 0xFEu) == 0xACu ? cacheRomByte() : spdByte();
     }
+    // The installed modules, derived from the allocation — see dimms() in
+    // sawtooth.cpp for why this is not a constant.
+    struct Dimms {
+        u32 count, mb;
+        u8 rows, cols, ranks, density;
+    };
+    Dimms dimms() const;
     u8 spdByte() const;
     u8 cacheRomByte() const;
 

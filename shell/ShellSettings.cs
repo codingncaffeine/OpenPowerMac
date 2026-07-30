@@ -20,7 +20,10 @@ public sealed class ShellSettings
     // node, so the OS has nothing to bind a driver to.
     public string AtiRomPath { get; set; } = "";
 
-    public uint RamMb { get; set; } = 256;
+    // 1536 MB: three 512 MB DIMMs, the most a Sawtooth takes and the most Mac
+    // OS 9 can use. The guest sizes this from the SPD, so the figure here only
+    // has to MATCH what the DIMMs advertise — it does not set it.
+    public uint RamMb { get; set; } = 64;
 
     // 60 was the practiced value for reaching the firmware, but it runs guest
     // time about seven times fast and drives the OS era into a decrementer

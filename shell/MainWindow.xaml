@@ -62,6 +62,19 @@
                                    Foreground="{StaticResource TextSecondary}"
                                    Text="Machine ▸ Start boots the Sawtooth ROM.&#10;The firmware talks on the serial console below until the display comes up." />
                     </StackPanel>
+                    <!-- A machine that can swallow the pointer has to say so,
+                         and has to say how to get it back. -->
+                    <Border x:Name="brdCapture" VerticalAlignment="Bottom"
+                            HorizontalAlignment="Center" Margin="0,0,0,10"
+                            Padding="10,4" CornerRadius="3" Opacity="0.82"
+                            Background="{StaticResource Surface}"
+                            BorderThickness="1"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            Visibility="Collapsed">
+                        <TextBlock x:Name="txtCapture" FontSize="12"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   Text="Click the screen to capture the pointer" />
+                    </Border>
                 </Grid>
             </Border>
 

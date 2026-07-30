@@ -48,4 +48,17 @@ internal static class Native
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_pc(IntPtr m);
+
+    // ---- pointer capture (Win32) ----
+    //
+    // A USB mouse is a RELATIVE device, so the guest's cursor and the host's
+    // are two independent pointers. They drift apart the moment the guest
+    // applies its own acceleration or pins at a screen edge, and then aiming
+    // the host pointer at the Apple menu leaves the guest's somewhere else.
+    // The cure is to stop having two of them: hide the host pointer, warp it
+    // back to the centre after every move, and feed the guest the raw travel.
+    // The guest's cursor becomes the only one on screen.
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetCursorPos(int x, int y);
 }

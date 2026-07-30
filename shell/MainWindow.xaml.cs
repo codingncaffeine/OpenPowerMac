@@ -40,24 +40,154 @@ public partial class MainWindow : Window
         imgScreen.MouseUp += OnScreenMouseButton;
         PreviewKeyDown += OnGuestKeyDown;
         PreviewTextInput += OnGuestTextInput;
+        // Alt-tabbing away with the pointer swallowed would leave the host
+        // cursor hidden and pinned with no window to click in.
+        Deactivated += (_, _) => ReleasePointer();
     }
 
     // ---- guest input ----
 
     private Point? _lastMouse;
+    private bool _captured;
+    // The warp we perform ourselves raises its own MouseMove; treat the report
+    // that lands back on the anchor as our own echo, not as travel.
+    private Point _anchorScreen;
 
     private static uint ButtonMask(MouseEventArgs e) =>
         (e.LeftButton == MouseButtonState.Pressed ? 1u : 0u) |
-        (e.RightButton == MouseButtonState.Pressed ? 2u : 0u) |
-        (e.MiddleButton == MouseButtonState.Pressed ? 4u : 0u);
+        (e.RightButton == MouseButtonState.Pressed ? 2u : 0u);
 
-    // The image is letterboxed and scaled, so a window pixel is not a guest
-    // pixel; scale the delta by guest resolution over rendered size, or a
-    // fast flick moves the guest cursor a fraction of the distance.
-    private void OnScreenMouseMove(object sender, MouseEventArgs e)
+    /// <summary>Take the pointer: hide the host cursor and route raw travel to
+    /// the guest. Middle-click gives it back.</summary>
+    private void CapturePointer()
+    {
+        if (_captured || _session is not { Running: true })
+            return;
+        _captured = true;
+        Mouse.Capture(imgScreen);
+        imgScreen.Cursor = Cursors.None;
+        RecentrePointer();
+        UpdateCaptureHint();
+    }
+
+    private void ReleasePointer()
+    {
+        if (!_captured)
+            return;
+        _captured = false;
+        Mouse.Capture(null);
+        imgScreen.Cursor = Cursors.Arrow;
+        UpdateCaptureHint();
+    }
+
+    private void RecentrePointer()
+    {
+        if (imgScreen.ActualWidth <= 0 || imgScreen.ActualHeight <= 0)
+            return;
+        Point mid = imgScreen.PointToScreen(
+            new Point(imgScreen.ActualWidth / 2, imgScreen.ActualHeight / 2));
+        _anchorScreen = mid;
+        Native.SetCursorPos((int)mid.X, (int)mid.Y);
+    }
+
+    // Only touched when something actually changes: this is called from the
+    // 33 ms UI tick as well as the capture edges, and reassigning Text every
+    // frame would invalidate the visual tree thirty times a second for nothing.
+    private bool _hintCaptured, _hintVisible;
+
+    private void UpdateCaptureHint()
+    {
+        bool visible = _session is { Running: true };
+        if (visible != _hintVisible)
+        {
+            _hintVisible = visible;
+            brdCapture.Visibility =
+                visible ? Visibility.Visible : Visibility.Collapsed;
+        }
+        if (_captured != _hintCaptured)
+        {
+            _hintCaptured = _captured;
+            txtCapture.Text = _captured
+                ? "Pointer captured — middle-click (or Esc) to release"
+                : "Click the screen to capture the pointer";
+        }
+    }
+
+    // Travel, not position. While captured the host pointer is pinned to the
+    // centre and every move is measured from there, so the guest gets
+    // unbounded relative motion and the two cursors cannot drift apart.
+    //
+    // Travel is METERED rather than handed over as it arrives, and the reason
+    // is specific. The Cursor Device Manager applies an acceleration curve to
+    // whatever has accumulated by the time its vertical-blank task drains it,
+    // and that curve is steep — measured 1.20x gain at 17 units per drain
+    // against 1.71x at 35. Simply splitting a delta into small reports does
+    // NOTHING, because the USB cell re-accumulates them (there are thousands
+    // of polls between drains) and the guest still sees one lump. What has to
+    // be bounded is travel PER DRAIN, so the meter has to work in time: hold
+    // the travel here and release at most kUnitsPerTick of it on each 33 ms
+    // tick. Nothing is discarded — a fast flick glides over several frames
+    // instead of teleporting, and total distance is preserved exactly.
+    private double _pendX, _pendY;
+    private uint _pendButtons;
+
+    // Sensitivity. The host pointer moves in screen pixels and the guest is a
+    // 640-wide desktop, so 1:1 is far too fast once the CDM's gain is applied.
+    private const double kSensitivity = 0.55;
+    // Ceiling on units released per tick. Ticks run at 30 Hz and the guest
+    // drains ~47 times a host second, so this bounds per-drain travel to well
+    // inside the linear part of the acceleration curve.
+    private const int kUnitsPerTick = 10;
+
+    private void SendTravel(double dx, double dy, uint buttons)
+    {
+        _pendX += dx * kSensitivity;
+        _pendY += dy * kSensitivity;
+        _pendButtons = buttons;
+    }
+
+    /// <summary>Release a bounded slice of the held travel. Called from the UI
+    /// tick so the guest receives a steady stream rather than one lump.</summary>
+    private void PumpMouse()
     {
         if (_session is not { Running: true } s)
             return;
+        if (Math.Abs(_pendX) < 1 && Math.Abs(_pendY) < 1)
+            return;
+
+        // Scale both axes by the same factor so the direction of travel is
+        // preserved; clamping them independently would bend a diagonal flick.
+        double mag = Math.Max(Math.Abs(_pendX), Math.Abs(_pendY));
+        double take = Math.Min(1.0, kUnitsPerTick / mag);
+        int dx = (int)Math.Truncate(_pendX * take);
+        int dy = (int)Math.Truncate(_pendY * take);
+        if (dx == 0 && dy == 0)
+            return;
+        _pendX -= dx;
+        _pendY -= dy;
+        s.SendMouse(dx, dy, _pendButtons);
+    }
+
+    private void OnScreenMouseMove(object sender, MouseEventArgs e)
+    {
+        if (_session is not { Running: true })
+            return;
+
+        if (_captured)
+        {
+            Point now = imgScreen.PointToScreen(e.GetPosition(imgScreen));
+            int dx = (int)Math.Round(now.X - _anchorScreen.X);
+            int dy = (int)Math.Round(now.Y - _anchorScreen.Y);
+            if (dx == 0 && dy == 0)
+                return; // our own re-centring echo
+            SendTravel(dx, dy, ButtonMask(e));
+            RecentrePointer();
+            return;
+        }
+
+        // Uncaptured: still track, so the guest follows the pointer before the
+        // user commits to capturing. The image is letterboxed and scaled, so a
+        // window pixel is not a guest pixel.
         Point p = e.GetPosition(imgScreen);
         if (_lastMouse is { } prev && imgScreen.ActualWidth > 0 &&
             imgScreen.ActualHeight > 0 && _bmp != null)
@@ -67,7 +197,7 @@ public partial class MainWindow : Window
             int dx = (int)Math.Round((p.X - prev.X) * sx);
             int dy = (int)Math.Round((p.Y - prev.Y) * sy);
             if (dx != 0 || dy != 0)
-                s.SendMouse(dx, dy, ButtonMask(e));
+                SendTravel(dx, dy, ButtonMask(e));
         }
         _lastMouse = p;
     }
@@ -77,6 +207,23 @@ public partial class MainWindow : Window
         if (_session is not { Running: true } s)
             return;
         imgScreen.Focus();
+
+        // The middle button is the capture toggle and never reaches the guest:
+        // Mac OS 9 is a one-button world, and a machine that can swallow your
+        // pointer has to offer an unmistakable way out.
+        if (e.ChangedButton == MouseButton.Middle)
+        {
+            if (e.ButtonState == MouseButtonState.Pressed)
+            {
+                if (_captured) ReleasePointer(); else CapturePointer();
+            }
+            e.Handled = true;
+            return;
+        }
+
+        if (!_captured && e.ButtonState == MouseButtonState.Pressed)
+            CapturePointer();
+
         // Zero motion, current buttons: press and release are each a report
         // of their own, which is what the guest edge-detects on.
         s.SendMouse(0, 0, ButtonMask(e));
@@ -84,6 +231,15 @@ public partial class MainWindow : Window
 
     private void OnGuestKeyDown(object sender, KeyEventArgs e)
     {
+        // Escape releases the pointer before anything else looks at the key.
+        // Middle-click is the advertised way out, but a mouse without a middle
+        // button must not be able to trap you.
+        if (_captured && e.Key == Key.Escape)
+        {
+            ReleasePointer();
+            e.Handled = true;
+            return;
+        }
         if (_session is not { Running: true } s)
             return;
         // Return never arrives as text input, so it needs taking here.
@@ -181,6 +337,11 @@ public partial class MainWindow : Window
             txtConsole.Text = _term.Render();
             txtConsole.ScrollToEnd();
         }
+
+        UpdateCaptureHint();
+        PumpMouse();
+        if (_captured && s is not { Running: true })
+            ReleasePointer(); // the machine stopped under us
 
         if (s == null)
             return;

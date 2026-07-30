@@ -325,7 +325,7 @@ int main(int argc, char** argv)
     u64 atiHideFrom = 0, atiHideTo = 0; // --ati-hide FROM TO
     std::vector<std::string> nvramSet; // --nvram-set NAME=VALUE
     u64 maxInsns = 50000000ull;
-    size_t ramMb = 256;
+    size_t ramMb = 64; // the size validated to the desktop; see dimms()
     bool trace = false;
     u64 faultFrom = 0;                 // --fault-from N: skip firmware faults
     int excShow = 16;

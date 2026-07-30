@@ -3997,11 +3997,23 @@ int main(int argc, char** argv)
             return " <" + it->second + "+" + std::to_string(va - it->first) +
                    ">";
         };
-        for (const Cpu::WpHit& h : cpu.wpLog)
-            printf("   pa %08x <- %0*x  by pc=%08x lr=%08x%s tb=%llu\n", h.pa,
-                   static_cast<int>(h.len * 2), h.val, h.pc, h.lr,
-                   ofOwner(h.lr).c_str(),
-                   static_cast<unsigned long long>(h.tb));
+        // dtb is the gap since the previous store to this range. "Who wrote
+        // it" is only half the question for a periodic global; the other half
+        // is HOW OFTEN, and reading a rate off a column of absolute timebases
+        // by hand is how a 44x error in the guest's tick chain stayed a vague
+        // impression for three sessions. r68 is r24, the 68K pc — see
+        // Cpu::WpHit for why a pc of 0x68xxxxxx names nothing on its own.
+        u64 prevTb = 0;
+        for (const Cpu::WpHit& h : cpu.wpLog) {
+            printf("   pa %08x <- %0*x  by pc=%08x lr=%08x%s r68=%08x "
+                   "tb=%llu dtb=%llu\n",
+                   h.pa, static_cast<int>(h.len * 2), h.val, h.pc, h.lr,
+                   ofOwner(h.lr).c_str(), h.r24,
+                   static_cast<unsigned long long>(h.tb),
+                   static_cast<unsigned long long>(
+                       prevTb && h.tb > prevTb ? h.tb - prevTb : 0));
+            prevTb = h.tb;
+        }
     }
     // The MMU as the guest left it. A DSI names an address but not WHY it
     // failed, and "the BAR is routed on the bus" and "the guest can reach
@@ -4092,6 +4104,35 @@ int main(int argc, char** argv)
                    "= %.2f Hz at 25 MHz\n",
                    static_cast<unsigned long long>(cpu.decMinPeriod),
                    25000000.0 / static_cast<double>(cpu.decMinPeriod));
+        // WHO programs the decrementer, and with WHAT. The guest's 60 Hz
+        // chain is timebase-paced and runs ~43x slow, so a routine somewhere
+        // is computing a period in timebase units and getting it wrong. A
+        // total says that happened and names nobody; this names the sites,
+        // busiest first, with the last value each one wrote.
+        if (!cpu.decByPc.empty()) {
+            std::vector<std::pair<u64, u32>> ds;
+            for (const auto& [pc, s] : cpu.decByPc)
+                ds.push_back({s.hits, pc});
+            std::sort(ds.begin(), ds.end(),
+                      [](const std::pair<u64, u32>& a,
+                         const std::pair<u64, u32>& b) {
+                          return a.first > b.first;
+                      });
+            printf("--   who writes DEC (%zu sites; value in TB ticks, "
+                   "416666 = 60 Hz at 25 MHz):\n",
+                   cpu.decByPc.size());
+            for (size_t k = 0; k < ds.size() && k < 12; ++k) {
+                const Cpu::DecSite& s = cpu.decByPc[ds[k].second];
+                const char* nm = sym(ds[k].second);
+                printf("     %08x x%-9llu last=%-10u (%.2f Hz) lr=%08x "
+                       "r68=%08x%s%s\n",
+                       ds[k].second, static_cast<unsigned long long>(s.hits),
+                       s.lastVal,
+                       s.lastVal ? 25000000.0 / static_cast<double>(s.lastVal)
+                                 : 0.0,
+                       s.lastLr, s.lastR24, nm ? "  " : "", nm ? nm : "");
+            }
+        }
     }
     printf("-- gates: arm-at-park=%u (park seen %u times, %s) "
            "arm-on-pc=%08x watch-from=%llu (%s) events=%s\n",

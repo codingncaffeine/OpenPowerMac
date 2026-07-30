@@ -128,6 +128,18 @@ struct Cpu {
     u32 decLastWrite = 0;      // last value written
     u64 decLastWriteTb = 0;    // TB at that write
     u64 decMinPeriod = ~0ull;  // smallest reload seen (TB ticks)
+    // ...and WHO programs it, with what. The guest's 60 Hz chain is
+    // timebase-paced and runs 43x slow, so some routine is computing a period
+    // in timebase units and getting it wrong; a total says that happened and
+    // names nobody. Keyed by the writing pc — bounded by code sites rather
+    // than by traffic — with the last value each site wrote, because the VALUE
+    // is the whole question. r24 comes along because a write from the
+    // NanoKernel's 68K emulator reports a pc that names nothing.
+    struct DecSite {
+        u64 hits = 0;
+        u32 lastVal = 0, lastLr = 0, lastR24 = 0;
+    };
+    std::map<u32, DecSite> decByPc;
 
     // Derived from cyclesPerTbTick and refreshed whenever it changes (it is a
     // public field and the snapshot restores it). Kept on Cpu, never in
@@ -283,6 +295,13 @@ struct Cpu {
     struct WpHit {
         u32 pc, pa, val, len, lr;
         u64 tb;
+        // r24 is the 68K program counter inside the NanoKernel's emulator.
+        // A store made by emulated 68K code reports a pc in 0x68xxxxxx --
+        // the emulator's own dispatch, which names nothing and is the same
+        // handful of addresses for every 68K store in the system. The 68K
+        // routine that actually made it is only in r24, and low-memory
+        // globals like Ticks are written almost exclusively from there.
+        u32 r24;
     };
     std::vector<WpHit> wpLog;
     u32 wpMax = 64;

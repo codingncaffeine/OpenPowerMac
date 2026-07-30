@@ -1018,6 +1018,13 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         c.decLastWriteTb = c.st.tb;
         if (v && !(v & 0x80000000u) && v < c.decMinPeriod)
             c.decMinPeriod = v;
+        if (c.decByPc.size() < 256 || c.decByPc.count(c.st.pc - 4u)) {
+            Cpu::DecSite& s = c.decByPc[c.st.pc - 4u];
+            ++s.hits;
+            s.lastVal = v;
+            s.lastLr = c.st.lr;
+            s.lastR24 = c.st.gpr[24];
+        }
         if (!(old & 0x80000000u) && (v & 0x80000000u))
             c.decPending = true;
         return;

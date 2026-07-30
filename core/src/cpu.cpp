@@ -7,6 +7,7 @@
 
 #include "opm/cpu.hpp"
 #include "opm/bits.hpp"
+#include "opm/prof.hpp"
 #include <cstring>
 #include <vector>
 
@@ -17,6 +18,43 @@ namespace {
 std::vector<Handler>& slots()
 {
     static std::vector<Handler> v(kIsaCount, nullptr);
+    return v;
+}
+
+// Everything step() has to check about an ISA row BEFORE it can dispatch,
+// precomputed once per row.
+//
+// These are properties of the row and never change, but they used to be
+// recomputed for every emulated instruction: isFpInsn and isVecInsn are each a
+// switch over the operand pattern, so two switches ran on the hot path forever
+// to answer a question the table already knew. The profiler charged 15.1% of
+// the machine to "decode" — twice what the instruction handlers themselves
+// cost. Zero, the overwhelmingly common value, means "dispatch, no checks".
+enum : u8 {
+    kPreIll = 1u,  // architected but not implemented on the 7400
+    kPrePriv = 2u, // supervisor-only
+    kPreFp = 4u,   // needs MSR[FP]
+    kPreVec = 8u,  // needs MSR[VEC]
+};
+
+std::vector<u8>& preGates()
+{
+    static std::vector<u8> v = [] {
+        std::vector<u8> g(kIsaCount, 0u);
+        for (size_t i = 0; i < kIsaCount; ++i) {
+            u8 b = 0;
+            if (kIsa[i].flags & FL_ILL7400)
+                b |= kPreIll;
+            if (kIsa[i].flags & FL_PRIV)
+                b |= kPrePriv;
+            if (isFpInsn(kIsa[i]))
+                b |= kPreFp;
+            if (isVecInsn(kIsa[i]))
+                b |= kPreVec;
+            g[i] = b;
+        }
+        return g;
+    }();
     return v;
 }
 
@@ -40,6 +78,12 @@ void setHandler(const char* mnem, Handler fn)
 Cpu::Cpu()
 {
     bindHandlers();
+    // Cache the dispatch tables on the object. They are function-local
+    // statics, so every use costs a thread-safe-initialization guard check,
+    // and step() used them twice per instruction. Neither vector is resized
+    // after binding, so the pointers stay valid for the life of the process.
+    dispFn = slots().data();
+    dispPre = preGates().data();
 }
 
 void Cpu::step()
@@ -95,41 +139,48 @@ void Cpu::step()
         return;
     }
 
-    u32 insn;
-    if (!fetch32(cia, insn)) { // ISI raised by translate()
+    u32 insn, row;
+    OPM_PH(Fetch);
+    if (!fetchDecoded(cia, insn, row)) { // ISI raised by translate()
         tick(1);
         return;
     }
+    OPM_PH(Decode);
     curInsn = insn;
-    const InsnDesc* d = decode(insn);
-    if (!d) {
+    if (row == kNoRow) {
         ++unknownWords[insn];
         raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
         tick(1);
         return;
     }
-    if (d->flags & FL_ILL7400) {
-        raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-        tick(1);
-        return;
-    }
-    if ((d->flags & FL_PRIV) && userMode()) {
-        raiseExc(Exc::Program, cia, kSrr1ProgPrivileged);
-        tick(1);
-        return;
-    }
-    if (isFpInsn(*d) && !(st.msr & msr::FP)) {
-        raiseExc(Exc::FpUnavailable, cia, 0);
-        tick(1);
-        return;
-    }
-    if (isVecInsn(*d) && !(st.msr & msr::VEC)) {
-        raiseExc(Exc::VecUnavailable, cia, 0);
-        tick(1);
-        return;
+    const InsnDesc* d = kIsa + row;
+    // The pre-dispatch gates, in the architecture's priority order, read out
+    // of the table instead of recomputed. Almost every instruction gates on
+    // nothing, so the common path is one load and one branch.
+    if (const u8 gate = dispPre[row]) {
+        if (gate & kPreIll) {
+            raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
+            tick(1);
+            return;
+        }
+        if ((gate & kPrePriv) && userMode()) {
+            raiseExc(Exc::Program, cia, kSrr1ProgPrivileged);
+            tick(1);
+            return;
+        }
+        if ((gate & kPreFp) && !(st.msr & msr::FP)) {
+            raiseExc(Exc::FpUnavailable, cia, 0);
+            tick(1);
+            return;
+        }
+        if ((gate & kPreVec) && !(st.msr & msr::VEC)) {
+            raiseExc(Exc::VecUnavailable, cia, 0);
+            tick(1);
+            return;
+        }
     }
 
-    const Handler fn = handlerFor(d);
+    const Handler fn = dispFn[row];
     if (!fn) {
         ++unimplemented[d->mnem];
         halt(std::string("unimplemented: ") + d->mnem);
@@ -138,14 +189,21 @@ void Cpu::step()
 
     st.pc += 4;
     const u32 fallThrough = st.pc;
+    OPM_PH(Exec);
     fn(*this, insn, *d);
+    OPM_PH(Tick);
     tick(1);
 
     // Performance monitor, minimal-honest: PMC1/PMC2 count cycles (event 1,
     // one per instruction at the provisional 1 cycle/insn rate) or completed
     // instructions (event 2) unless globally frozen; a counter's MSB going
     // 0->1 with PMC1CE/PMCnCE and PMXE requests the (EE-gated) interrupt.
-    if (!(st.mmcr0 & 0x80000000u)) { // FC
+    // MMCR0 == 0 is the state this machine spends its whole life in: no event
+    // is selected, so both counter arms below are dead code, and the shifts
+    // and compares that prove it ran on every emulated instruction. Testing
+    // the register against zero first is exactly equivalent — selector 0 is
+    // "count nothing" — and it is one compare instead of eight instructions.
+    if (st.mmcr0 && !(st.mmcr0 & 0x80000000u)) { // FC
         const u32 sel1 = (st.mmcr0 >> 6) & 0x7Fu;
         const u32 sel2 = st.mmcr0 & 0x3Fu;
         const u32 pmxe = st.mmcr0 & 0x04000000u;

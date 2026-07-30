@@ -14,6 +14,7 @@
 // our purposes: lookups happen after translation).
 
 #include "opm/cpu.hpp"
+#include "opm/prof.hpp"
 
 namespace opm {
 
@@ -26,6 +27,9 @@ inline constexpr u32 kWimgI = 4u;
 
 static void busWriteLine(Cpu& c, u32 base, const u8* b)
 {
+    // The block the fetch buffer may be holding is about to be rewritten in
+    // memory; see Cpu::fetchBase.
+    c.fetchDropAt(base);
     c.bus->writeLine32(base, b); // burst write: chipset caches may allocate
 }
 
@@ -118,7 +122,7 @@ Cpu::L2Line* Cpu::l2Find(u32 pa)
 {
     if (!l2On() || l2Sets == 0 || l2Inert)
         return nullptr;
-    const u32 set = (pa >> 5) % l2Sets;
+    const u32 set = l2SetOf(pa);
     const u32 tag = pa >> 5;
     for (u32 w = 0; w < 2; ++w) {
         L2Line& e = l2[size_t(set) * 2 + w];
@@ -134,6 +138,12 @@ void Cpu::l2Install(u32 pa, const u8* bytes, bool dirty)
 {
     if (!l2On())
         return;
+    // Only a MODIFIED install can change what this block reads as; a clean
+    // reload is a copy of what memory already says, so the fetch buffer keeps
+    // its block — and keeping it matters, because a clean install happens on
+    // every L1 data miss.
+    if (dirty)
+        fetchDropAt(pa);
     if (l2Inert) { // diagnostic: the array holds nothing, so a modified block
         if (dirty)  // has nowhere to live but memory
             busWriteLine(*this, pa, bytes);
@@ -141,7 +151,7 @@ void Cpu::l2Install(u32 pa, const u8* bytes, bool dirty)
     }
     if (l2Sets == 0)
         l2Resize();
-    const u32 set = (pa >> 5) % l2Sets;
+    const u32 set = l2SetOf(pa);
     const u32 tag = pa >> 5;
     L2Line* dst = nullptr;
     for (u32 w = 0; w < 2; ++w) {
@@ -179,9 +189,10 @@ bool Cpu::l2ReadLine(u32 pa, u8* out)
 
 void Cpu::l2Invalidate(u32 pa)
 {
+    fetchDropAt(pa);
     if (l2Sets == 0)
         return;
-    const u32 set = (pa >> 5) % l2Sets;
+    const u32 set = l2SetOf(pa);
     const u32 tag = pa >> 5;
     for (u32 w = 0; w < 2; ++w) {
         L2Line& e = l2[size_t(set) * 2 + w];
@@ -192,6 +203,7 @@ void Cpu::l2Invalidate(u32 pa)
 
 void Cpu::l2WipeAll()
 {
+    fetchDrop();
     for (auto& e : l2)
         e = L2Line{};
 }
@@ -209,6 +221,7 @@ bool Cpu::l2Peek32(u32 pa, u32& w)
 
 void Cpu::l2FlushAll(bool writeback)
 {
+    fetchDrop();
     for (auto& e : l2) {
         if (e.v && e.d && writeback)
             busWriteLine(*this, e.tag << 5, e.b);
@@ -228,7 +241,7 @@ void Cpu::noteL2Skew(u32 pa, bool write)
     if (!l2On() || l2Sets == 0 || l2Inert)
         return;
     const u32 base = pa & ~31u;
-    const u32 set = (base >> 5) % l2Sets, tag = base >> 5;
+    const u32 set = l2SetOf(base), tag = base >> 5;
     bool held = false;
     for (u32 w = 0; w < 2 && !held; ++w) {
         const L2Line& e = l2[size_t(set) * 2 + w];
@@ -250,6 +263,7 @@ void Cpu::noteL2Skew(u32 pa, bool write)
 
 u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
 {
+    OPM_MARK(Read);
     // READ watchpoint, as a census keyed by the READING instruction. Every
     // other watch in this project catches stores, which cannot answer "does
     // anything CONSUME this?" -- and that is the whole question for a device
@@ -301,6 +315,12 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
 
 void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
 {
+    OPM_MARK(Write);
+    // Self-modifying code, a ROM shadow being expanded, a page being paged
+    // in: if this store lands in the block the fetch buffer holds, that block
+    // is no longer what the buffer says. Checked here rather than in the
+    // callers so no store path can miss it.
+    fetchDropRange(pa, len);
     if (wpEnd && pa <= wpEnd && pa + len > wpPa &&
         (!wpFrom || !wpStamp || *wpStamp >= wpFrom)) {
         if (wpLog.size() < wpMax)
@@ -347,6 +367,27 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
     e->d = true;
 }
 
+// Whole-block variant of l1dPeek32, for the instruction fetch buffer. Same
+// precedence and the same dceOn() gate; it deliberately does NOT touch the
+// line's age, exactly as the single-word peek does not — an instruction fetch
+// that reordered the data cache's replacement policy would be an instrument
+// changing the thing it measures.
+bool Cpu::l1dReadLine(u32 pa, u8* out)
+{
+    if (!dceOn())
+        return false;
+    const u32 set = setOf(pa), tag = tagOf(pa);
+    for (u32 k = 0; k < 8; ++k) {
+        const DLine& e = l1d[set][k];
+        if (e.v && e.tag == tag) {
+            for (u32 i = 0; i < 32; ++i)
+                out[i] = e.b[i];
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Cpu::l1dPeek32(u32 pa, u32& w)
 {
     if (!dceOn())
@@ -366,6 +407,7 @@ bool Cpu::l1dPeek32(u32 pa, u32& w)
 
 void Cpu::dcbzLine(u32 pa)
 {
+    fetchDropAt(pa);
     DLine* e = lineFind(*this, pa);
     if (!e) {
         DLine& n = lineVictim(*this, pa);
@@ -381,6 +423,7 @@ void Cpu::dcbzLine(u32 pa)
 
 void Cpu::dcbClean(u32 pa, bool invalidate)
 {
+    fetchDropAt(pa);
     DLine* e = lineFind(*this, pa);
     if (!e)
         return;
@@ -392,6 +435,7 @@ void Cpu::dcbClean(u32 pa, bool invalidate)
 
 void Cpu::dcbKill(u32 pa)
 {
+    fetchDropAt(pa);
     DLine* e = lineFind(*this, pa);
     if (e)
         e->v = false; // discarded, never written back
@@ -408,6 +452,7 @@ void Cpu::dcbKill(u32 pa)
 // is about to change underneath the processor.
 void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
 {
+    fetchDrop(); // a bus master is rewriting memory under us
     if (!len)
         return;
     const u32 first = pa & ~31u;
@@ -468,6 +513,7 @@ void CpuSnoop::snoopWrite(u32 pa, u32 len)
 // another, and neither told the truth about the machine.
 void Cpu::l1dFlushAll(bool writeback)
 {
+    fetchDrop();
     for (u32 s = 0; s < 128; ++s)
         for (u32 w = 0; w < 8; ++w) {
             DLine& e = l1d[s][w];

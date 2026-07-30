@@ -129,23 +129,67 @@ struct Cpu {
     u64 decLastWriteTb = 0;    // TB at that write
     u64 decMinPeriod = ~0ull;  // smallest reload seen (TB ticks)
 
+    // Derived from cyclesPerTbTick and refreshed whenever it changes (it is a
+    // public field and the snapshot restores it). Kept on Cpu, never in
+    // CpuState: the snapshot's layout digest hashes sizeof(CpuState), so
+    // caches live out here and cost no snapshot.
+    u32 tbDivSeen = 0, tbShift = 0;
+
+    // Advance the timebase by `cycles` processor cycles.
+    //
+    // ⚠ THIS IS ON THE HOTTEST PATH IN THE PROGRAM and it used to be a LOOP.
+    // The harness calls it twice per instruction — tick(1) from step(), then
+    // tick(--fast-tb) from the machine loop, 60 by default — so with the
+    // architectural bus/4 divisor it ran about sixteen iterations per emulated
+    // instruction, each one a subtract, a compare and a branch. The profiler
+    // put 16.1% of the whole machine's host time in here, more than the
+    // instruction handlers themselves at 7.2%. Closed form gives the identical
+    // sequence of TB and DEC values at every instruction boundary.
     void tick(u32 cycles)
     {
         cycleAccum += cycles;
-        while (cycleAccum >= cyclesPerTbTick) {
-            cycleAccum -= cyclesPerTbTick;
-            st.tb += 1;
-            const u32 old = st.dec;
-            st.dec -= 1;
-            if (!(old & 0x80000000u) && (st.dec & 0x80000000u))
-                decPending = true;
+        if (cycleAccum < cyclesPerTbTick)
+            return;
+        if (tbDivSeen != cyclesPerTbTick) {
+            tbDivSeen = cyclesPerTbTick;
+            tbShift = 32; // 32 = "not a power of two", use the divide
+            for (u32 k = 0; k < 32; ++k)
+                if (cyclesPerTbTick == (1u << k)) {
+                    tbShift = k;
+                    break;
+                }
         }
+        u32 n;
+        if (tbShift < 32) {
+            n = cycleAccum >> tbShift;
+            cycleAccum &= cyclesPerTbTick - 1u;
+        } else {
+            n = cyclesPerTbTick ? cycleAccum / cyclesPerTbTick : 0u;
+            cycleAccum -= n * cyclesPerTbTick;
+        }
+        st.tb += n;
+        const u32 old = st.dec;
+        st.dec = old - n;
+        // The decrementer asks for an interrupt on the step where its MSB goes
+        // 0 -> 1. Over n decrements from `old` that is exactly the step where
+        // the count passes below zero, so it happens iff the count started
+        // non-negative and n > old. From a negative start it would have to
+        // fall through 2^31 first and then wrap, which needs n >= 2^31 — a
+        // number of cycles no caller passes.
+        if (!(old & 0x80000000u) && n > old)
+            decPending = true;
     }
 
     // Set when execution cannot continue (pre-P2 stand-in for the exception
     // model: traps, sc, illegal ops halt with a reason instead of vectoring).
     bool halted = false;
     std::string haltReason;
+
+    // Dispatch tables, cached at construction (see the constructor). Not in
+    // CpuState: instrument- and performance-only state lives on Cpu so that
+    // no snapshot layout depends on it.
+    const Handler* dispFn = nullptr; // handler per ISA row
+    const u8* dispPre = nullptr;     // pre-dispatch gate bits per ISA row
 
     Cpu();
     void attach(Bus& b) { bus = &b; }
@@ -157,6 +201,7 @@ struct Cpu {
         extIrqLine = smiPending = decPending = pmPending = false;
         napping = false;
         cycleAccum = 0;
+        fetchDrop();
         tlbFlushAll();
     }
     void halt(std::string reason)
@@ -266,7 +311,91 @@ struct Cpu {
     // the USB shim. Anything it makes work is evidence, never a fix.
     u32 wpForce = 0;
     bool wpForceSet = false;
+    // ---- instruction fetch block buffer ----------------------------------
+    //
+    // Instructions are read in sequence: eight of every eight fetches land in
+    // the same 32-byte block. Serving them one word at a time meant an
+    // eight-way L1 tag sweep, an L2 probe and a bus read PER INSTRUCTION, and
+    // the profiler charged 20% of the machine to that. This is the I-cache the
+    // model never had, one block deep.
+    //
+    // ⚠ IT IS KEYED ON THE PHYSICAL ADDRESS AND IT MUST NEVER OUTLIVE ITS
+    // DATA. The project's fetch rule is that a fetch sees a superset of what
+    // real split caches would show — never less — so every path that can
+    // change what memory or the caches hold for a block drops it: stores,
+    // dcbz/dcbf/dcbi, castouts and pushes, L2 installs of modified data, L2
+    // invalidates, the flush-alls, bus-master snoops, reset and snapshot
+    // restore. A block is only ever filled from the L1, from the L2, or from
+    // storage the bus agrees is memory (Bus::memoryAt).
+    //
+    // Lives on Cpu, never in CpuState: the snapshot's layout digest hashes
+    // sizeof(CpuState), so caches out here cost no snapshot compatibility.
+    // ⚠ ONE BLOCK IS NOT ENOUGH, MEASURED. A single buffer hit only 66.9% of
+    // fetches against the 87.5% straight-line execution implies: a call and
+    // its return alternate between two blocks and evict each other every time,
+    // and Open Firmware's Forth is subroutine-threaded, so it does almost
+    // nothing else. Sixty-four blocks direct-mapped covers 2 KB of code for
+    // 2.3 KB of storage and costs exactly the same one tag compare.
+    static constexpr u32 kFetchLines = 64;
+    static constexpr u16 kNoRow = 0xFFFFu; // decodes to nothing: illegal
+    struct FetchLine {
+        u32 base = 1; // block base, or 1 — which no 32-byte base can be
+        // The DECODE of each of the eight words, as an index into kIsa. Decode
+        // is a pure function of the word, so it belongs with the word: it was
+        // being recomputed on every execution of every instruction, and the
+        // profiler charged 22% of the machine to it. Filled with the block and
+        // dropped with the block, so it can never outlive the bytes it
+        // describes.
+        u16 row[8] = {kNoRow, kNoRow, kNoRow, kNoRow,
+                      kNoRow, kNoRow, kNoRow, kNoRow};
+        u8 b[32] = {};
+    };
+    FetchLine fetchLine[kFetchLines];
+
+    // ---- instruction translation cache -----------------------------------
+    //
+    // One page. Straight-line execution stays inside a 4 KB page for a
+    // thousand instructions, and re-deriving the answer meant a four-entry BAT
+    // sweep and a TLB probe every time.
+    //
+    // Validity is checked against the inputs themselves wherever that is
+    // cheap — MSR's translation and privilege bits, and the segment register
+    // for this address — and against a GENERATION for the two that are not:
+    // the BATs and SDR1 (bumped in mtspr) and tlbie/tlbia (bumped in the TLB
+    // invalidators). Deliberately used only on the fetch path, so an
+    // instrument running with mmuProbe never sees it.
+    u64 mmuGen = 0, xlGen = ~0ull;
+    u32 xlPage = 0, xlPa = 0, xlMsr = 0, xlSr = 0;
+    void xlDrop() { xlGen = ~0ull; }
+    // DIAGNOSTIC (--no-icache): bypass the fetch block cache, the cached
+    // decode and this translation cache all at once, restoring the fetch path
+    // byte for byte as it was before they existed. See Cpu::fetchDecoded.
+    bool fetchCacheOff = false;
+    // Census, counted only in the profiling build. A cache is a bet on
+    // locality and a bet has to be settled with a number.
+    u64 fetchHits = 0, fetchFillsL1 = 0, fetchFillsL2 = 0, fetchFillsMem = 0,
+        fetchUncached = 0;
+    static u32 fetchSlot(u32 pa) { return (pa >> 5) & (kFetchLines - 1u); }
+    void fetchDrop()
+    {
+        for (FetchLine& e : fetchLine)
+            e.base = 1;
+    }
+    void fetchDropAt(u32 pa)
+    {
+        FetchLine& e = fetchLine[fetchSlot(pa)];
+        if (e.base == (pa & ~31u))
+            e.base = 1;
+    }
+    void fetchDropRange(u32 pa, u32 len)
+    {
+        fetchDropAt(pa);
+        if (((pa ^ (pa + len - 1u)) & ~31u) != 0)
+            fetchDropAt(pa + len - 1u);
+    }
+
     bool l1dPeek32(u32 pa, u32& w); // fetch path coherence peek
+    bool l1dReadLine(u32 pa, u8* out); // whole-block variant, same precedence
     void dcbzLine(u32 pa);          // allocate + zero, no fill
     void dcbClean(u32 pa, bool invalidate); // dcbst / dcbf
     void dcbKill(u32 pa);                   // dcbi
@@ -290,6 +419,24 @@ struct Cpu {
     };
     std::vector<L2Line> l2;
     u32 l2Sets = 0, l2Clock = 0;
+    // Set index without a division. Every L2CR size the 7400 offers gives a
+    // power-of-two set count (256K..2M over 32-byte lines, 2 ways), and this
+    // index is computed on every instruction FETCH — a runtime `%` there is a
+    // hardware divide on the hottest path in the program. Cached rather than
+    // computed in l2Resize() so that a snapshot which restores l2Sets
+    // directly cannot leave a stale mask behind; a non-power-of-two count
+    // simply falls back to the divide.
+    u32 l2SetsSeen = 0, l2SetMask = 0;
+    u32 l2SetOf(u32 pa)
+    {
+        if (l2SetsSeen != l2Sets) {
+            l2SetsSeen = l2Sets;
+            l2SetMask = (l2Sets && (l2Sets & (l2Sets - 1u)) == 0) ? l2Sets - 1u
+                                                                  : 0u;
+        }
+        const u32 line = pa >> 5;
+        return l2SetMask ? (line & l2SetMask) : (line % l2Sets);
+    }
     bool l2On() const { return (st.l2cr & 0x80000000u) != 0; }
     void l2Resize();                 // per L2CR[L2SIZ]
     L2Line* l2Find(u32 pa);
@@ -333,6 +480,9 @@ struct Cpu {
     bool readV(u32 ea, u32 len, u64& out);
     bool writeV(u32 ea, u32 len, u64 v);
     bool fetch32(u32 ea, u32& insn);
+    // Fetch AND decode in one step, through the caches above. `row` comes back
+    // as an index into kIsa, or kNoRow when the word decodes to nothing.
+    bool fetchDecoded(u32 ea, u32& insn, u32& row);
     bool leAlignCheck(u32 ea, u32 len); // LE mode: misaligned -> alignment exc
 
     bool readV8(u32 ea, u32& v)  { u64 t; if (!readV(ea, 1, t)) return false; v = static_cast<u32>(t); return true; }

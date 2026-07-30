@@ -26,6 +26,7 @@
 
 #include "opm/cpu.hpp"
 #include "opm/bits.hpp"
+#include "opm/prof.hpp"
 
 namespace opm {
 
@@ -86,6 +87,7 @@ bool ppAllows(u32 pp, bool key, bool write)
 
 bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
 {
+    OPM_MARK(Xlate);
     const bool on = (st.msr & (fetch ? msr::IR : msr::DR)) != 0;
     if (!on) {
         pa = ea;
@@ -260,6 +262,7 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
 // both TLBs (UM 5.4.4: one class of each side per tlbie).
 void Cpu::tlbInvalidateClass(u32 ea)
 {
+    ++mmuGen; // retires the one-page instruction translation cache
     const u32 set = (ea >> 12) & 63u;
     for (u32 way = 0; way < 2; ++way) {
         itlb[set][way].v = false;
@@ -269,6 +272,7 @@ void Cpu::tlbInvalidateClass(u32 ea)
 
 void Cpu::tlbFlushAll()
 {
+    ++mmuGen;
     for (u32 s = 0; s < 64; ++s) {
         for (u32 w = 0; w < 2; ++w) {
             itlb[s][w] = TlbEntry{};
@@ -398,19 +402,101 @@ bool Cpu::writeV(u32 ea, u32 len, u64 v)
 
 bool Cpu::fetch32(u32 ea, u32& insn)
 {
+    u32 row;
+    return fetchDecoded(ea, insn, row);
+}
+
+bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
+{
     u32 pa;
     if (st.msr & msr::LE)
         ea ^= 4u; // instruction fetches munge like word data (PEM 3.1.4.4)
-    if (!translate(ea, false, true, pa))
-        return false;
+    // DIAGNOSTIC (--no-icache): the fetch path exactly as it was before any of
+    // the caches below existed — translate every fetch, peek one word at the
+    // L1 then the L2 then the bus, decode it. Three caches now stand between
+    // the guest and its own instructions, and each is a claim that something
+    // cannot have changed; a claim like that is settled by a control run, not
+    // by reading the code. Anything that behaves differently with this set is
+    // the caches' fault and nothing else's.
+    if (fetchCacheOff) {
+        if (!translate(ea, false, true, pa))
+            return false;
+        if (!l1dPeek32(pa, insn) && !l2Peek32(pa, insn))
+            insn = bus->read32(pa);
+        const InsnDesc* d = decode(insn);
+        row = d ? static_cast<u32>(d - kIsa) : kNoRow;
+        return true;
+    }
+    // Translation, from the one-page cache when its inputs are unchanged.
+    // MSR and the segment register are compared directly; the BATs, SDR1 and
+    // the page table are covered by mmuGen. See Cpu::xlPage.
+    const u32 page = ea >> 12;
+    const u32 msrKey = st.msr & (msr::IR | msr::PR | msr::LE);
+    const u32 srKey = st.sr[ea >> 28];
+    if (xlGen == mmuGen && xlPage == page && xlMsr == msrKey && xlSr == srKey) {
+        pa = xlPa | (ea & 0xFFFu);
+    } else {
+        if (!translate(ea, false, true, pa))
+            return false;
+        xlGen = mmuGen;
+        xlPage = page;
+        xlMsr = msrKey;
+        xlSr = srKey;
+        xlPa = pa & ~0xFFFu;
+    }
+    // The block buffer, if it still holds this block. See Cpu::fetchBase for
+    // the invalidation contract — every writer of memory or of a cache drops
+    // it, so a hit here is the same word the long path below would produce.
+    const u32 base = pa & ~31u;
+    const u32 o = pa & 28u;
+    FetchLine& fl = fetchLine[fetchSlot(pa)];
+    if (fl.base == base) {
+        OPM_COUNT(fetchHits);
+        insn = (u32(fl.b[o]) << 24) | (u32(fl.b[o + 1]) << 16) |
+               (u32(fl.b[o + 2]) << 8) | u32(fl.b[o + 3]);
+        row = fl.row[o >> 2];
+        return true;
+    }
     // Fetch coherence: serve from a hitting D-cache or L2 line first.
     // Stronger than real hardware's split caches (which demand dcbst+icbi
     // sweeps), never weaker — deterministic superset, RECEIPT.
-    if (l1dPeek32(pa, insn))
+    bool filled = false;
+    if (l1dReadLine(base, fl.b)) {
+        OPM_COUNT(fetchFillsL1);
+        filled = true;
+    } else if (l2ReadLine(base, fl.b)) {
+        OPM_COUNT(fetchFillsL2);
+        filled = true;
+    } else if (bus->memoryAt(base, 32)) {
+        OPM_COUNT(fetchFillsMem);
+        bus->readLine32(base, fl.b);
+        filled = true;
+    }
+    if (filled) {
+        fl.base = base;
+        // Decode the whole block while it is here. Eighteen instructions are
+        // executed per fill on average, so the seven words that were not asked
+        // for are paid off many times over — and decode has no side effects,
+        // so decoding a word that is never executed costs nothing but this.
+        for (u32 k = 0; k < 8; ++k) {
+            const u32 w = (u32(fl.b[k * 4]) << 24) |
+                          (u32(fl.b[k * 4 + 1]) << 16) |
+                          (u32(fl.b[k * 4 + 2]) << 8) | u32(fl.b[k * 4 + 3]);
+            const InsnDesc* d = decode(w);
+            fl.row[k] = d ? static_cast<u16>(d - kIsa) : kNoRow;
+        }
+        insn = (u32(fl.b[o]) << 24) | (u32(fl.b[o + 1]) << 16) |
+               (u32(fl.b[o + 2]) << 8) | u32(fl.b[o + 3]);
+        row = fl.row[o >> 2];
         return true;
-    if (l2Peek32(pa, insn))
-        return true;
+    }
+    fl.base = 1; // a partial fill must not be left looking valid
+    // Not memory: a device window, or nothing at all. Read exactly the word
+    // that was asked for and cache nothing — see Bus::memoryAt.
+    OPM_COUNT(fetchUncached);
     insn = bus->read32(pa);
+    const InsnDesc* d = decode(insn);
+    row = d ? static_cast<u32>(d - kIsa) : kNoRow;
     return true;
 }
 

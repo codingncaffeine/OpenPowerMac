@@ -58,6 +58,17 @@ public:
     virtual void write32(u32 pa, u32 v) = 0;
     virtual void write64(u32 pa, u64 v) = 0;
 
+    // Is [pa, pa+len) plain storage — RAM or ROM — rather than a device?
+    //
+    // Instruction fetch uses this to decide whether it may read a whole
+    // 32-byte block at once. Reading eight words where the guest asked for one
+    // is free on memory and is NOT free on a device: a FIFO would be drained,
+    // and in this machine an unmapped fetch would file eight entries in the
+    // unclaimed-access log instead of one, quietly corrupting an instrument.
+    // The default is "no", so a bus that has not thought about the question
+    // keeps the exact single-word behaviour.
+    virtual bool memoryAt(u32 /*pa*/, u32 /*len*/) const { return false; }
+
     // Burst (cache-line) transactions, the 60x TBST-asserted class. Chipset
     // caches allocate on these but not on the single-beat accessors above
     // (MPC106 UM Table 5-2). pa is 32-byte aligned; the default falls back

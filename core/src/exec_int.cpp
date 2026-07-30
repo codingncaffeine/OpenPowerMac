@@ -1032,6 +1032,12 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
             c.l1dFlushAll(false); // DCFI 0->1: flash invalidate, no wb
         return;
     }
+    // The instruction-translation cache holds one page's answer and validates
+    // it against MSR and the segment register directly; the BATs and the page
+    // table base are what it cannot see, so writing one has to retire it.
+    // SDR1 (25) and the eight BAT pairs (528-543) are the whole set.
+    if (spr == 25 || (spr >= 528 && spr <= 543))
+        ++c.mmuGen;
     *sprPtr(c, spr) = v;
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)
@@ -1268,7 +1274,12 @@ void bindHandlers()
     setHandler("dcbtst", h_nop);
     setHandler("dcba", h_nop);
     setHandler("dcbi", h_dcbi);
-    setHandler("icbi", h_nop);
+    // icbi has no instruction cache to invalidate here — the fetch path reads
+    // through the D-cache and the L2 — but it must drop the one-block fetch
+    // buffer, which is the only thing in this model that can hold a stale
+    // instruction. Software issues icbi exactly after writing code.
+    setHandler("icbi",
+               [](Cpu& c, u32, const InsnDesc&) { c.fetchDrop(); });
     setHandler("dcbz", h_dcbz);
     setHandler("dst", h_nop);
     setHandler("dstst", h_nop);

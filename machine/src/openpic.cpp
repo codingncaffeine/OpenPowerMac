@@ -1,6 +1,7 @@
 #include "opm/openpic.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace opm {
 
@@ -100,17 +101,36 @@ void OpenPic::setLine(u32 src, bool level)
         pending_[src] = false; // level-sensitive follows the line down
 }
 
+// ⚠ THE MACHINE LOOP ASKS THIS QUESTION ONCE PER EMULATED INSTRUCTION, through
+// cpuLine(). Written as a plain 64-source sweep it was the single largest item
+// in the profile — "irq sync" 26.2% of the whole emulator, more than three
+// times the instruction handlers — and the answer is "nothing is pending"
+// almost every time it is asked.
+//
+// So look at the pending flags eight at a time. They are 64 contiguous bools,
+// an all-zero octet answers for eight sources at once, and the result is
+// identical to the sweep. memcpy, not a cast: reading a bool array through a
+// u64* is an aliasing violation, and every compiler here turns this into the
+// single load it looks like.
 int OpenPic::highestPending() const
 {
+    static_assert(sizeof(bool) == 1, "the octet scan assumes 1-byte bools");
+    static_assert(kSources % 8 == 0, "the octet scan assumes a multiple of 8");
     int best = -1;
     u32 bestPri = taskPri_;
-    for (u32 s = 0; s < kSources; ++s) {
-        if (!pending_[s] || (vp_[s] & 0x80000000u))
+    for (u32 base = 0; base < kSources; base += 8) {
+        u64 oct;
+        std::memcpy(&oct, pending_ + base, sizeof oct);
+        if (!oct)
             continue;
-        const u32 pri = (vp_[s] >> 16) & 0xFu;
-        if (pri > bestPri) {
-            bestPri = pri;
-            best = static_cast<int>(s);
+        for (u32 s = base; s < base + 8; ++s) {
+            if (!pending_[s] || (vp_[s] & 0x80000000u))
+                continue;
+            const u32 pri = (vp_[s] >> 16) & 0xFu;
+            if (pri > bestPri) {
+                bestPri = pri;
+                best = static_cast<int>(s);
+            }
         }
     }
     return best;

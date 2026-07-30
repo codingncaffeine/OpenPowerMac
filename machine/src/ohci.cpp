@@ -3,10 +3,9 @@
 
 namespace opm {
 
-// One USB frame per millisecond of guest time; the timebase runs at
-// bus/4 ≈ 24.94 MHz, so 25000 ticks is a frame within the tolerance any
-// driver measures against.
-static constexpr u64 kTbPerFrame = 25000;
+// The frame period moved onto the class: the machine loop needs it to know
+// when the next frame falls due (OhciCell::nextTickTb).
+static constexpr u64 kTbPerFrame = OhciCell::kTbPerFrame;
 
 u32 OhciCell::regRead(u32 idx)
 {

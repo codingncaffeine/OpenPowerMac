@@ -62,6 +62,9 @@ public:
     // instructions, and it must not change meaning when the harness
     // compresses guest time.
     bool tick(); // true when a deferred command ran: wake the DMA list
+    // The instruction count at which tick() could next do something, so the
+    // machine loop need not ask on every one. ~0 when nothing is deferred.
+    u64 pendingAt() const { return pending_ ? pendAt_ : ~0ull; }
     u64 cmdDelay_ = 4000;
     // Set by the bus from the channel.s RUN bit. On this hardware DMA is
     // selected by the mac-io cell and its DBDMA channel, NOT by the ATA

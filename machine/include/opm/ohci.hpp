@@ -28,6 +28,11 @@ struct SnapReader;
 // tested (it sad-macs through a null procPtr in USBShim).
 class OhciCell {
 public:
+    // One USB frame per millisecond of guest time; the timebase runs at
+    // bus/4 ≈ 24.94 MHz, so 25000 ticks is a frame within the tolerance any
+    // driver measures against.
+    static constexpr u64 kTbPerFrame = 25000;
+
     // Register file offsets (dword index = off >> 2).
     u32 read(u32 off, u32 len);
     void write(u32 off, u32 v, u32 len);
@@ -36,6 +41,11 @@ public:
     // (24.94 MHz ≈ 25000 ticks). Advances HcFmNumber, mirrors it into
     // the HCCA, raises SF while in the operational state.
     void tick(u64 tb);
+    // The earliest timebase at which tick() could do anything. The machine
+    // loop uses it to stop asking 1,600 times per frame; see
+    // SawtoothBus::serviceDevices. Must never be later than the real due
+    // time — a deadline that is too early only costs a wasted call.
+    u64 nextTickTb() const { return lastFrameTb_ + kTbPerFrame; }
 
     bool irqLine() const
     {

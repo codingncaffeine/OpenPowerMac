@@ -95,35 +95,47 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         cpu.step();
         if (m->fastTb)
             cpu.tick(m->fastTb);
-        bus.ohciTick(cpu.st.tb);
-        bus.syncIrqs();
-        cpu.setExternalIrq(bus.pic().cpuLine());
+        // One call, and it does nothing at all unless a device could have
+        // moved — see SawtoothBus::serviceDevices. Ticking every device and
+        // recomputing seven interrupt lines on every emulated instruction was
+        // a quarter of the whole emulator's host time.
+        cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb, m->executed));
         ++m->executed;
     }
     return m->executed;
 }
 
+// ⚠ Every entry point that pokes a device from OUTSIDE the run loop has to
+// say so, or the loop's device-service gate will keep answering from its
+// cache. Input arrives this way — a keystroke the machine never notices is
+// exactly the class of bug this note exists to prevent.
 OPM_API void opm_serial(OpmMachine* m, const char* text)
 {
-    if (text && *text)
+    if (text && *text) {
         m->bus->injectSerial(text);
+        m->bus->deviceStateChanged();
+    }
 }
 
 OPM_API void opm_key(OpmMachine* m, const char* text)
 {
-    if (text && *text)
+    if (text && *text) {
         m->bus->ohci(0).typeAscii(text);
+        m->bus->deviceStateChanged();
+    }
 }
 
 OPM_API void opm_key_event(OpmMachine* m, uint32_t usage, uint32_t down)
 {
     m->bus->ohci(0).keyEvent(static_cast<uint8_t>(usage), down != 0u);
+    m->bus->deviceStateChanged();
 }
 
 OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
                        uint32_t buttons)
 {
     m->bus->ohci(1).moveMouse(dx, dy, static_cast<uint8_t>(buttons));
+    m->bus->deviceStateChanged();
 }
 
 OPM_API uint32_t opm_console(OpmMachine* m, char* buf, uint32_t cap)

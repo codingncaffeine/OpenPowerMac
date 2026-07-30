@@ -363,6 +363,26 @@ u64 R128Cell::vblPeriod() const
     return gVblTbPeriod ? gVblTbPeriod : kTbPerVblank;
 }
 
+// The earliest timebase at which tick() could change anything: the blank
+// itself, or the point at which an unacknowledged one expires. Deliberately
+// mirrors tick()'s own two conditions including the status-bit test — leaving
+// the test out would return a deadline already in the past forever once a
+// blank had expired, and the machine loop would stop gating at all.
+u64 R128Cell::nextTickTb() const
+{
+    if (!vblEnabled || !vblNextTb_)
+        return ~0ull;
+    const u64 per = vblPeriod();
+    u64 due = vblNextTb_;
+    const auto st = regs_.find(kGenIntStatus);
+    if (st != regs_.end() && (st->second & kCrtcVblankInt) && vblNextTb_ >= per) {
+        const u64 expiry = (vblNextTb_ - per) + per / 4u + 1u; // tick tests >
+        if (expiry < due)
+            due = expiry;
+    }
+    return due;
+}
+
 void R128Cell::tick(u64 tb)
 {
     tbNow_ = tb;

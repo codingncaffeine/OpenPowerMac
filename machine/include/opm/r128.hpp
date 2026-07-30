@@ -110,6 +110,12 @@ public:
     // GEN_INT_STATUS latches it and is WRITE-1-TO-CLEAR, and the pin is a
     // LEVEL asserted while an enabled source stands latched.
     void tick(u64 tb);
+    // The earliest timebase at which tick() could matter, so the machine loop
+    // can stop calling it once per instruction; and a way to keep the cell's
+    // notion of "now" exact in between, because the driver ARMS the blank from
+    // inside a register write, before any tick can run.
+    u64 nextTickTb() const;
+    void noteTb(u64 tb) { tbNow_ = tb; }
     bool irqLine() const;
     // Census. "A blank fired" and "a blank reached the CPU" are different
     // claims: the OS programs this source's vector and priority and can still

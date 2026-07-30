@@ -196,6 +196,20 @@ public:
     // framebuffer terminal that never paints. Hiding the card across the
     // choice keeps the node and leaves the console on serial.
     u64 atiHideFrom = 0, atiHideTo = 0;
+    // Device-service gate; see serviceDevices(). Not machine state — a
+    // cache of "when could this answer change" — but it is snapshotted all
+    // the same, because a resume that starts with a stale deadline would
+    // withhold an interrupt until the next guest register access.
+    u64 devGen_ = 0, devGenSeen_ = ~0ull;
+    u64 devDueTb_ = 0, devDueStamp_ = 0;
+    bool cpuIrq_ = false;
+    // DIAGNOSTIC (--no-dev-gate): service every device on every instruction,
+    // the way the machine did before the gate existed. A gate is a claim —
+    // "nothing can have changed" — and a claim about timing needs a control
+    // run to be settled rather than argued. Anything that behaves differently
+    // with this set is the gate's fault, and nothing else's.
+    bool devGateOff = false;
+
     // Memory write-watch bounds (inclusive); see write().
     u32 watchPa = 0;
     u32 watchPaEnd = 0;
@@ -383,6 +397,53 @@ public:
         ohci_[1].snoop = s;
     }
 
+    // ⚠ THE MACHINE LOOP CALLED ohciTick + syncIrqs + cpuLine ONCE PER
+    // EMULATED INSTRUCTION, and the profiler charged 26% of the entire
+    // emulator to it — more than three times the instruction handlers. Almost
+    // every one of those calls could not possibly find anything: a USB frame
+    // is due about every 1,600 instructions, a vertical blank far less often,
+    // and nothing else in the machine moves at all unless the GUEST touches a
+    // device register.
+    //
+    // So say when the answer can change, and answer from the cache until then:
+    //  - devGen_ counts guest accesses that were not plain RAM (read() and
+    //    write() bump it), which covers every register write, every EOI, every
+    //    IACK and every DMA arm;
+    //  - devDueTb_ is the earliest timebase at which a timed device could do
+    //    something — the nearer USB frame, and the display's blank or its
+    //    expiry;
+    //  - devDueStamp_ is the same for the ATA cells, whose deferred commands
+    //    are keyed on the instruction count rather than the clock.
+    // Miss any of those and an interrupt arrives late, so each deadline is a
+    // conservative LOWER bound and the generation is bumped generously.
+    bool serviceDevices(u64 tb, u64 insnCount)
+    {
+        // The display's notion of "now" is used when the driver ARMS the
+        // blank, which happens inside a register write and therefore before
+        // the gate below can open. One store keeps it exact.
+        ati_.noteTb(tb);
+        if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_ &&
+            insnCount < devDueStamp_)
+            return cpuIrq_;
+        devGenSeen_ = devGen_;
+        ohciTick(tb);
+        syncIrqs();
+        cpuIrq_ = pic_.cpuLine();
+        devDueTb_ = ohci_[0].nextTickTb();
+        const u64 d1 = ohci_[1].nextTickTb(), d2 = ati_.nextTickTb();
+        if (d1 < devDueTb_)
+            devDueTb_ = d1;
+        if (d2 < devDueTb_)
+            devDueTb_ = d2;
+        devDueStamp_ = cd_.pendingAt();
+        if (hd_.pendingAt() < devDueStamp_)
+            devDueStamp_ = hd_.pendingAt();
+        return cpuIrq_;
+    }
+    // A machine whose devices were poked from outside the run loop (the shell
+    // attaching media, a test rig) must not be answered from the cache.
+    void deviceStateChanged() { ++devGen_; }
+
     OhciCell& ohci(u32 i) { return ohci_[i & 1u]; }
     void ohciTick(u64 tb)
     {
@@ -538,8 +599,36 @@ private:
         return 0xFFFFFFFFu;
     }
 
+    // Plain RAM, answered before the device decode is walked at all. It is
+    // the overwhelmingly common access, it is provably not a device (every
+    // window below lives at 0x80000000 or above, and the machine tops out at
+    // 1536 MB), and reaching it used to mean falling through a dozen range
+    // tests. The bump on the other path is the machine's DEVICE GENERATION:
+    // see serviceDevices().
+    static constexpr u32 kDeviceWindowBase = 0x80000000u;
+    bool ramFast(u32 pa, u32 len) const
+    {
+        return pa < kDeviceWindowBase &&
+               static_cast<size_t>(pa) + len <= ram_.size();
+    }
+
+    // Plain storage: RAM, or the boot ROM while it answers as an array rather
+    // than as a flash state machine. Everything else here is a device or an
+    // unmapped hole, and both dislike being read speculatively — see
+    // Bus::memoryAt.
+    bool memoryAt(u32 pa, u32 len) const override
+    {
+        if (ramFast(pa, len))
+            return true;
+        return flashMode_ == kFlashArray && pa >= kRomBase &&
+               static_cast<size_t>(pa - kRomBase) + len <= rom_.size();
+    }
+
     u32 read(u32 pa, u32 len)
     {
+        if (ramFast(pa, len))
+            return get(ram_.data() + pa, len);
+        ++devGen_;
         const u32 off = macioOff(pa);
         if (off != 0xFFFFFFFFu) {
             if (off >= 0x16000u && off < 0x18000u) {
@@ -701,6 +790,11 @@ private:
                 fflush(stdout);
             }
         }
+        if (ramFast(pa, len)) {
+            put(ram_.data() + pa, v, len);
+            return;
+        }
+        ++devGen_;
         if (const u32 moff = macioOff(pa); moff != 0xFFFFFFFFu) {
             const u32 off = moff;
             if (off >= 0x16000u && off < 0x18000u) {

@@ -28,7 +28,11 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 9; // 9: the keyboard's held keys
+// 10 carries no new fields: the machine grew a device-service gate, which
+// changes sizeof(SawtoothBus) and so is refused by the layout digest anyway.
+// The number is bumped so the refusal reads as a deliberate change rather
+// than as a mystery.
+constexpr u32 kSnapVersion = 10; // 10: the device-service gate
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -299,6 +303,12 @@ void saveCpu(SnapWriter& w, const Cpu& c)
 
 void loadCpu(SnapReader& r, Cpu& c)
 {
+    // Caches on Cpu are outside the stream by design (they cost no snapshot
+    // compatibility), so they hold the PREVIOUS machine's data and must be
+    // dropped rather than carried across. The fetch buffer in particular
+    // would serve instructions from a machine that no longer exists.
+    c.fetchDrop();
+    c.xlDrop();
     const u8* e = r.beginSection("CPU ");
     loadCpuState(r, c.st);
     c.extIrqLine = r.b();
@@ -1038,6 +1048,15 @@ void SawtoothBus::snapLoad(SnapReader& r)
     ataDma_.ata = &cd_;
     hdDma_.dmaBus = this;
     hdDma_.ata = &hd_;
+    // The device-service gate is a CACHE of "when could an interrupt line next
+    // change", and every device it summarises has just been replaced. Say
+    // "unknown" rather than carry a deadline computed for a different machine:
+    // a stale one would withhold an interrupt until the guest happened to
+    // touch a register. Nothing here needs to be in the stream — this restores
+    // the invariant instead of the value.
+    devGenSeen_ = ~0ull;
+    devDueTb_ = 0;
+    devDueStamp_ = 0;
 }
 
 // --- whole machine --------------------------------------------------------

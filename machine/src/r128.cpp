@@ -66,10 +66,23 @@ static constexpr u32 kCrtcVblankInt = 0x00000001u;
 // later Radeon parts use a wider one, and treating every bit as writable lets
 // an acknowledge clear latches the hardware would have held.
 static constexpr u32 kGenIntAckMask = 0x000F040Fu;
-// One blank per 1/60 s of guest time. The timebase runs at bus/4 ≈ 24.94 MHz
-// and the OHCI cell already calls 25000 ticks a millisecond, so the same
-// nominal rate keeps the two devices' notions of time consistent.
-static constexpr u64 kTbPerVblank = 25000000ull / 60ull;
+// One blank per frame of GUEST-PERCEIVED time, which is NOT the nominal 60 Hz
+// at 25 MHz (that would be 416,666).
+//
+// The timebase runs at bus/4 ≈ 24.94 MHz and the OHCI cell calls 25000 ticks a
+// millisecond, so nominally a frame is 416,666 ticks. But --fast-tb advances the
+// timebase far faster than instructions retire: a boot to the desktop logs
+// tb = 173,964,736,438, which is 6,958 s at 25 MHz, while the OS's own Ticks
+// reaches 9358, which is 156 s. Guest time is compressed about 44.6x, so the
+// nominal period would hand the guest ~2,550 blanks per second of its own time.
+// Polling devices survive that because nothing gates on their rate; an interrupt
+// does not.
+//
+// 225,000,000 is one blank per frame as the guest experiences it, cross-checked
+// two ways: it yields 14 blanks over a 200 M-instruction window whose Ticks
+// advance ~170, and it matches the OS's own decrementer reload of 1,118,587 tb
+// times the ~15.9 reloads it takes per tick. --ati-vbl-tb overrides it.
+static constexpr u64 kTbPerVblank = 225000000ull;
 // Harness knobs, not machine state — see the notes in the header.
 static u64 gVblTbPeriod = 0;
 static int gVblTrace = 0;
@@ -340,6 +353,10 @@ void R128Cell::setVblTbPeriod(u64 n) { gVblTbPeriod = n; }
 u64 R128Cell::vblTbPeriod() { return gVblTbPeriod; }
 void R128Cell::setVblTrace(int n) { gVblTrace = n; }
 u64 R128Cell::vblDropped() { return gVblDropped; }
+u64 R128Cell::vblPeriodEffective()
+{
+    return gVblTbPeriod ? gVblTbPeriod : kTbPerVblank;
+}
 
 u64 R128Cell::vblPeriod() const
 {

@@ -117,18 +117,17 @@ public:
     u64 vblanks = 0;        // blanks generated
     u64 vblIrqs = 0;        // blanks that found CRTC_VBLANK_INT enabled
     u64 vblAcks = 0; // acknowledges the driver wrote
-    // --ati-vbl: model the vertical blank as an INTERRUPT. OPT-IN, and it has
-    // to stay opt-in until the wedge below is fixed.
+    // Model the vertical blank as an INTERRUPT. ON by default, because it is
+    // the only model in which the mouse pointer moves at all; `--no-ati-vbl`
+    // restores the poll-only cell bit for bit.
     //
     // ⚠⚠ THIS DEFAULT IS LOAD-BEARING FOR THE SHIPPING APP. The capi never
     // touches these fields, so the shell takes the CONSTRUCTOR defaults —
-    // exactly how the ganged-power bug reached the app once already. With the
-    // interrupt on, the machine services about two blanks and then livelocks in
-    // the 68K autovector dispatch (the OS stops issuing EOI, so `inService`
-    // sticks and every other source starves), which would turn a working
-    // desktop into a dead one. Off, the cell behaves bit for bit as the
-    // known-good baseline: 292 hd commands, 1,261,505 paint bytes.
-    bool vblEnabled = false;
+    // exactly how the ganged-power bug reached the app once already. Anything
+    // changed here has to be traced into the shell, and the PERIOD matters as
+    // much as the switch: with the nominal 60 Hz the guest is flooded and
+    // livelocks (see kTbPerVblank).
+    bool vblEnabled = true;
     // --ati-vbl-tb N: timebase ticks between blanks, 0 = nominal 60 Hz at
     // 25 MHz. A STATIC, deliberately: it is a harness knob rather than machine
     // state, and keeping it out of the object leaves sizeof(R128Cell) — and so
@@ -152,6 +151,10 @@ public:
     // no snapshot is invalidated.
     static void setVblTrace(int n);
     static u64 vblDropped();
+    // The period actually in force. Reported rather than recomputed at the
+    // print site: that duplicate kept its own stale fallback and announced
+    // 416,666 while the cell was using 225,000,000.
+    static u64 vblPeriodEffective();
 
     // Snapshot: register store, PLL file, DAC palette, and the 32 MB
     // framebuffer — the display work after the mount reads all of it.

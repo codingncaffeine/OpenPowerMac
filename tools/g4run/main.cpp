@@ -407,11 +407,11 @@ int main(int argc, char** argv)
     u64 heartbeat = 0;                 // --heartbeat N: periodic digest
     u32 findVal = 0;                   // --find VALUE: scan RAM for a word
     bool em294Rts = false;             // --em294-rts: reseed the USB shim cell
-    // --ati-vbl: model the display's vertical blank as an INTERRUPT. It is what
-    // moves the mouse pointer — and it also livelocks the machine after about
-    // two blanks, so it is OPT-IN and the shipping default is OFF. See the note
-    // on R128Cell::vblEnabled: the capi takes the constructor defaults.
-    bool atiVbl = false;
+    // The display's vertical blank as an INTERRUPT: what moves the mouse
+    // pointer, and so on by default. --no-ati-vbl backs out to the poll-only
+    // cell. See the note on R128Cell::vblEnabled — the capi takes the
+    // constructor defaults, so this switch and the cell's must agree.
+    bool atiVbl = true;
     // --ati-vbl-tb N: timebase ticks between vertical blanks (0 = nominal
     // 60 Hz at 25 MHz). See the note in r128.hpp — under --fast-tb the guest's
     // own clock runs ~45x slower than the nominal timebase, so the nominal
@@ -4630,9 +4630,7 @@ int main(int argc, char** argv)
                "GEN_INT_STATUS=%08x "
                "blanks=%llu enabled=%llu acks=%llu expired=%llu line=%d\n",
                bus.ati().vblEnabled ? "modelled" : "OFF (--no-ati-vbl)",
-               static_cast<unsigned long long>(
-                   R128Cell::vblTbPeriod() ? R128Cell::vblTbPeriod()
-                                           : 25000000ull / 60ull),
+               static_cast<unsigned long long>(R128Cell::vblPeriodEffective()),
                bus.ati().peek(0x0040), bus.ati().peek(0x0044),
                static_cast<unsigned long long>(bus.ati().vblanks),
                static_cast<unsigned long long>(bus.ati().vblIrqs),

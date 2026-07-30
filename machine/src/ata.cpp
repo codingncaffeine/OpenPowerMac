@@ -236,7 +236,11 @@ void AtaCell::diskCommand(u8 cmd)
         wrLeft_ = nsect_ ? nsect_ : 256u;
         data_.assign(512, 0);
         dataAt_ = 0;
-        status_ = kDrq | (kDrdy | kDsc); // host may deliver the first sector
+        // DRQ means "host, write the data register" and is a PIO handshake.
+        // A DMA write takes its bytes over DMARQ from the channel instead,
+        // and the host is waiting for the transfer to END: BSY clear, DRQ
+        // clear. Same asymmetry the read path documents, opposite direction.
+        status_ = static_cast<u8>((dmaArmed_ ? 0u : kDrq) | (kDrdy | kDsc));
         break;
     case 0xC6: // SET MULTIPLE MODE: nsect is the agreed block size
         multiple_ = nsect_;
@@ -318,6 +322,64 @@ void AtaCell::diskCommand(u8 cmd)
         irq_ = true;
         break;
     }
+}
+
+// One sector's worth of host data has landed in data_: put it on the image
+// and advance the command. Shared by the data register and the DBDMA write
+// path, because "the host delivered a sector" means the same thing whichever
+// of the two carried the bytes.
+bool AtaCell::commitWriteSector()
+{
+#ifdef _MSC_VER
+    _fseeki64(iso_, static_cast<long long>(wrLba_ * 512), SEEK_SET);
+#else
+    fseeko(iso_, static_cast<off_t>(wrLba_ * 512), SEEK_SET);
+#endif
+    // A host write that does not land is a lost disk write, and silently
+    // dropping one is how a guest filesystem corrupts itself hours later.
+    // Report it the way a drive would.
+    const bool wrote =
+        fwrite(data_.data(), 1, data_.size(), iso_) == data_.size();
+    fflush(iso_);
+    if (!wrote) {
+        error_ = 0x04; // ABRT
+        status_ = kDrdy | kDsc | kErr;
+        wrLeft_ = 0;
+        dataAt_ = 0;
+        data_.clear();
+        irq_ = true;
+        return false;
+    }
+    ++wrLba_;
+    --wrLeft_;
+    dataAt_ = 0;
+    // DRQ only for a PIO handshake — see the command arm. The last sector
+    // ends the data phase, and a full buffer left standing here is
+    // indistinguishable from read data: the DMA engine would happily hand
+    // the host back its own write payload.
+    status_ = static_cast<u8>(
+        ((wrLeft_ && !dmaArmed_) ? kDrq : 0u) | (kDrdy | kDsc));
+    if (!wrLeft_)
+        data_.clear();
+    irq_ = true;
+    return true;
+}
+
+// Memory -> drive. The mirror of dmaTake, and see the header for what its
+// absence cost: OUTPUT descriptors were absorbed and completed, so every
+// byte of a WRITE DMA was thrown away while the transfer reported success.
+u32 AtaCell::dmaGive(const u8* src, u32 n)
+{
+    u32 moved = 0;
+    while (moved < n && wrLeft_ && !data_.empty()) {
+        while (moved < n && dataAt_ < data_.size())
+            data_[dataAt_++] = src[moved++];
+        if (dataAt_ < data_.size())
+            break; // the sector is not full yet: wait for the rest
+        if (!commitWriteSector())
+            break; // the write failed, and the error is already latched
+    }
+    return moved;
 }
 
 u32 AtaCell::dmaTake(u8* dst, u32 n)
@@ -439,40 +501,8 @@ void AtaCell::write(u32 off, u32 v, u32 len)
             for (u32 k = 0; k < len && dataAt_ < data_.size(); ++k)
                 data_[dataAt_++] =
                     static_cast<u8>(v >> (8 * (len - 1 - k)));
-            if (dataAt_ >= data_.size()) { // sector complete: commit it
-#ifdef _MSC_VER
-                _fseeki64(iso_, static_cast<long long>(wrLba_ * 512),
-                          SEEK_SET);
-#else
-                fseeko(iso_, static_cast<off_t>(wrLba_ * 512), SEEK_SET);
-#endif
-                // A host write that does not land is a lost disk write, and
-                // silently dropping one is how a guest filesystem corrupts
-                // itself hours later. Report it the way a drive would.
-                const bool wrote =
-                    fwrite(data_.data(), 1, data_.size(), iso_) ==
-                    data_.size();
-                fflush(iso_);
-                if (!wrote) {
-                    error_ = 0x04; // ABRT
-                    status_ = kDrdy | kDsc | kErr;
-                    wrLeft_ = 0;
-                    irq_ = true;
-                    dataAt_ = 0;
-                    return;
-                }
-                ++wrLba_;
-                --wrLeft_;
-                dataAt_ = 0;
-                status_ = wrLeft_ ? (kDrq | kDrdy | kDsc) : (kDrdy | kDsc);
-                // The last sector ends the data phase. A full buffer left
-                // standing here is indistinguishable from read data, and
-                // the DMA engine would happily hand the host back its own
-                // write payload.
-                if (!wrLeft_)
-                    data_.clear();
-                irq_ = true;
-            }
+            if (dataAt_ >= data_.size()) // sector complete: commit it
+                commitWriteSector();
         }
         break;
     case 0x010: features_ = b; break;

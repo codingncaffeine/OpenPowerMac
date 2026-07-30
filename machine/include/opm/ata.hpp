@@ -77,6 +77,20 @@ public:
         return static_cast<u32>(data_.size() - dataAt_);
     }
     u32 dmaTake(u8* dst, u32 n);
+    // The other direction: memory -> drive, for WRITE DMA. Returns how many
+    // bytes the drive accepted, which falls short only when the command's
+    // data phase ends before the descriptor does.
+    //
+    // Its absence was invisible for as long as the only DMA device was the
+    // CD: an ATAPI packet and its payload go through the task file here, so
+    // OUTPUT descriptors were absorbed and marked complete and nothing was
+    // lost. A hard disk's OUTPUT descriptors ARE the write, and absorbing one
+    // loses a sector the guest believes it wrote — the drive is left holding
+    // a data phase for bytes that never arrive, and the driver waits on a
+    // transfer that can never finish. Initialising a disk stops there.
+    u32 dmaGive(const u8* src, u32 n);
+    // Whether this cell's OUTPUT descriptors carry real data. See dmaGive.
+    bool dmaWriteSink() const { return disk_; }
 
     struct Ev {
         u64 at;
@@ -119,6 +133,10 @@ private:
     u32 intRegRead(u32 lane, u32 len) const;
     void diskCommand(u8 cmd);  // ATA (non-packet) command set
     void diskStartRead();      // present the next sector run through DRQ
+    // Commit the sector now filling data_ and advance. Shared by the data
+    // register and the DBDMA write path: "the host delivered a sector" means
+    // the same thing whichever of the two carried the bytes.
+    bool commitWriteSector();
     // The transfer address out of the task file. Bit 6 of the device
     // register picks the mode, and BOTH are live on a real drive: Open
     // Firmware's driver sets it (dev = 0xE0) and addresses by LBA, while

@@ -19,6 +19,7 @@
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace opm;
@@ -156,8 +157,8 @@ bool makeSectorIso()
     return ok;
 }
 
-// Issue a one-sector read and return the sector the drive actually served.
-u32 sectorRead(AtaCell& hd, u8 dev, u8 cylHi, u8 cylLo, u8 sec)
+// Issue a one-sector read and return its first two bytes.
+std::pair<u32, u32> readHead(AtaCell& hd, u8 dev, u8 cylHi, u8 cylLo, u8 sec)
 {
     hd.write(0x060, dev, 1);
     hd.write(0x020, 0x01, 1); // one sector
@@ -166,7 +167,14 @@ u32 sectorRead(AtaCell& hd, u8 dev, u8 cylHi, u8 cylLo, u8 sec)
     hd.write(0x050, cylHi, 1);
     hd.write(0x070, 0x20, 1); // READ SECTOR(S)
     const u32 first = hd.read(0x000, 1);
-    const u32 second = hd.read(0x000, 1);
+    return {first, hd.read(0x000, 1)};
+}
+
+// The same, for a sector that still carries the image's generated header —
+// which is every sector until something writes one.
+u32 sectorRead(AtaCell& hd, u8 dev, u8 cylHi, u8 cylLo, u8 sec)
+{
+    const auto [first, second] = readHead(hd, dev, cylHi, cylLo, sec);
     CHECK(second == ((~first) & 0xFFu)); // it really is a sector header
     return first;
 }
@@ -211,6 +219,53 @@ TEST_CASE("an ATA disk addresses in CHS when the device register says so")
     CHECK(w[56] == 32u);
     CHECK(w[3] == 16u); // the DEFAULT geometry is untouched
     CHECK(w[6] == 63u);
+
+    remove(kChsIso);
+}
+
+// WRITE DMA has to actually put the bytes on the image.
+//
+// The channel's OUTPUT descriptors used to be absorbed and marked complete
+// without moving anything, which was harmless while the only DMA device was
+// the CD — an ATAPI packet and its payload go through the task file here — and
+// silently destroyed every byte of a disk write once there was a disk. The
+// transfer reported success, the drive kept waiting for data that had already
+// been thrown away, and initialising a disk stopped there.
+TEST_CASE("a DMA write reaches the image, and asserts no PIO handshake")
+{
+    REQUIRE(makeSectorIso());
+    AtaCell hd;
+    REQUIRE(hd.attachDisk(kChsIso));
+    CHECK(hd.dmaWriteSink()); // a disk's OUTPUT descriptors ARE the write
+
+    hd.setDmaArmed(true);
+    hd.write(0x060, 0xE0, 1); // LBA, device 0
+    hd.write(0x020, 0x02, 1); // two sectors
+    hd.write(0x030, 0x05, 1); // at LBA 5
+    hd.write(0x040, 0x00, 1);
+    hd.write(0x050, 0x00, 1);
+    hd.write(0x070, 0xCA, 1); // WRITE DMA
+    // DRQ is a PIO handshake and a DMA write does not use it: a host waiting
+    // for BSY and DRQ to clear would wait forever.
+    CHECK((hd.read(0x160, 1) & 0x08u) == 0);
+
+    std::vector<u8> payload(1024);
+    for (size_t k = 0; k < payload.size(); ++k)
+        payload[k] = static_cast<u8>(0xA0u + (k & 0x1Fu));
+    CHECK(hd.dmaGive(payload.data(), static_cast<u32>(payload.size())) ==
+          payload.size());
+
+    // Read it back through the drive rather than out of the file: what
+    // matters is that the sectors the guest asked for are the ones that
+    // changed. These two no longer carry the image's header pattern, which
+    // is the point.
+    hd.setDmaArmed(false);
+    CHECK(readHead(hd, 0xE0, 0, 0, 5) == std::pair<u32, u32>{0xA0u, 0xA1u});
+    CHECK(readHead(hd, 0xE0, 0, 0, 6) == std::pair<u32, u32>{0xA0u, 0xA1u});
+
+    // And a sector either side is untouched.
+    CHECK(sectorRead(hd, 0xE0, 0, 0, 4) == 4u);
+    CHECK(sectorRead(hd, 0xE0, 0, 0, 7) == 7u);
 
     remove(kChsIso);
 }

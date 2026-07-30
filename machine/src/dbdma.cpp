@@ -158,9 +158,26 @@ void DbdmaChannel::run()
             break;
         }
         case 0:
-        case 1: { // OUTPUT: memory -> device (CDB/data writes)
-            // The ATAPI packet and write data go through the task file
-            // in this machine; absorb and complete.
+        case 1: { // OUTPUT_MORE / OUTPUT_LAST: memory -> device
+            if (ata && ata->dmaWriteSink()) {
+                // The source is a buffer the guest built with ordinary
+                // cached stores, so push whatever the processor still holds
+                // dirty before reading it — the read side of the same
+                // coherency truth the descriptor fetch above depends on.
+                dmaBus->snoopBeforeDmaRead(addr, req);
+                std::vector<u8> tmp(req);
+                for (u32 k = 0; k < req; ++k)
+                    tmp[k] = dmaBus->read8(addr + k);
+                const u32 moved = ata->dmaGive(tmp.data(), req);
+                note(2, addr, moved);
+                if (moved == 0)
+                    return; // no write phase open yet — retry on wake
+                wr32le(cmdPtr_ + 12, (0x8400u << 16) | (req - moved));
+                break;
+            }
+            // An ATAPI device's packet and its payload go through the task
+            // file in this machine, so its OUTPUT descriptors carry nothing
+            // the drive has not already been handed: absorb and complete.
             wr32le(cmdPtr_ + 12, (0x8400u << 16) | 0u);
             break;
         }

@@ -95,7 +95,16 @@ public sealed class MachineSession
             ConsoleQ.Enqueue($"[shell] machine up — {s.RamMb} MB, fast-tb {s.FastTb}" +
                              (string.IsNullOrWhiteSpace(s.HdPath) ? ", NO HD" : ", HD attached") +
                              (string.IsNullOrWhiteSpace(s.CdPath) ? "" : ", CD attached") +
-                             (string.IsNullOrWhiteSpace(s.AtiRomPath) ? "" : $", ATI at {s.AtiAt / 1_000_000}M") + "\n");
+                             // AtiAt is the instruction at which the card
+                             // becomes visible in PCI config space, and
+                             // printing it in millions turned the shipping
+                             // value — 1, meaning visible from reset, which
+                             // is what you want — into "ATI at 0M". That
+                             // reads as a card sitting idle, and it is not
+                             // what the number means.
+                             (string.IsNullOrWhiteSpace(s.AtiRomPath) ? ""
+                              : s.AtiAt <= 1 ? ", ATI from reset"
+                              : $", ATI hidden until {s.AtiAt:N0}") + "\n");
 
             bool scriptPending = s.AutoBoot && !string.IsNullOrWhiteSpace(s.BootScript);
             var conBuf = new byte[65536];

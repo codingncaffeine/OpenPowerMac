@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 6;
+constexpr u32 kSnapVersion = 7; // 7: the display's vertical-blank clock
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -721,6 +721,13 @@ void R128Cell::snapSave(SnapWriter& w) const
     saveMapU32(w, pll_);
     w.u32v(palIdx_);
     w.arr32(pal_, 256);
+    // The vertical-blank clock. A resume that lands inside an armed blank
+    // period has to keep its phase, or the first tick after the load re-bases
+    // and the driver sees one stretched frame. The vblank/irq/ack COUNTERS are
+    // deliberately not saved: a snapshotted census mixed with a live one is how
+    // an OS-era write count came to be read against a whole-boot read count.
+    w.u64v(vblNextTb_);
+    w.u64v(tbNow_);
     w.u64v(log.size());
     for (const Ev& ev : log) {
         w.u64v(ev.at);
@@ -741,6 +748,8 @@ void R128Cell::snapLoad(SnapReader& r)
     loadMapU32(r, pll_);
     palIdx_ = r.u32v();
     r.arr32(pal_, 256);
+    vblNextTb_ = r.u64v();
+    tbNow_ = r.u64v();
     const u64 n = r.u64v();
     log.clear();
     for (u64 k = 0; k < n && r.ok; ++k) {

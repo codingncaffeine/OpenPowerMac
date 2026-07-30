@@ -301,6 +301,8 @@ int main(int argc, char** argv)
     // because a gate the guest re-reads must stay forced.
     u32 pokePa = 0, pokeVal = 0;
     u64 pokeAt = 0, pokeEvery = 0;
+    u32 pokeStride = 0, pokeCount = 1; // force a STRIDED SET: an array of
+                                       // records each gate one field
     bool pokeSet = false;
     u64 clickHoldFor = 200000ull; // --mouse-hold N: instructions to hold it
     u64 mouseEvery = 2000000ull; // --mouse-every N: injection cadence
@@ -405,6 +407,16 @@ int main(int argc, char** argv)
     u64 heartbeat = 0;                 // --heartbeat N: periodic digest
     u32 findVal = 0;                   // --find VALUE: scan RAM for a word
     bool em294Rts = false;             // --em294-rts: reseed the USB shim cell
+    // --ati-vbl: model the display's vertical blank as an INTERRUPT. It is what
+    // moves the mouse pointer — and it also livelocks the machine after about
+    // two blanks, so it is OPT-IN and the shipping default is OFF. See the note
+    // on R128Cell::vblEnabled: the capi takes the constructor defaults.
+    bool atiVbl = false;
+    // --ati-vbl-tb N: timebase ticks between vertical blanks (0 = nominal
+    // 60 Hz at 25 MHz). See the note in r128.hpp — under --fast-tb the guest's
+    // own clock runs ~45x slower than the nominal timebase, so the nominal
+    // period floods it with interrupts.
+    u64 atiVblTb = 0;
     const char* findStr = nullptr;     // --find-str TEXT: search RAM
     int findCode = 0;                  // --find-code N: where is N generated
     // --cpu-cache-rom: answer the processor module's I2C cache descriptor at
@@ -494,6 +506,10 @@ int main(int argc, char** argv)
             pokeVal = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--poke-at"))
             pokeAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--poke-stride"))
+            pokeStride = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--poke-count"))
+            pokeCount = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--poke-every"))
             pokeEvery = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--crsr-drag"))
@@ -679,6 +695,12 @@ int main(int argc, char** argv)
             ataLogFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--ati-log-from"))
             atiLogFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--ati-vbl"))
+            atiVbl = true;
+        else if (!strcmp(a, "--no-ati-vbl"))
+            atiVbl = false;
+        else if (!strcmp(a, "--ati-vbl-tb"))
+            atiVblTb = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
             traceFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-at-pc"))
@@ -926,6 +948,8 @@ int main(int argc, char** argv)
         else
             printf("-- ati rom attach FAILED: %s\n", atiRomPath);
     }
+    bus.ati().vblEnabled = atiVbl;
+    R128Cell::setVblTbPeriod(atiVblTb);
     bus.watchPa = watchMemPa;
     bus.watchPaEnd = watchMemEnd ? watchMemEnd : watchMemPa;
     if (hdPath) {
@@ -3010,8 +3034,11 @@ int main(int argc, char** argv)
              (pokeEvery && (executed - pokeAt) % pokeEvery == 0))) {
             // Through the DMA-write snoop so the processor cannot serve a stale
             // cached copy of the cell we are forcing.
-            bus.snoopBeforeDmaWrite(pokePa, 4);
-            bus.write32(pokePa, pokeVal);
+            for (u32 i = 0; i < pokeCount; ++i) {
+                const u32 pa = pokePa + i * pokeStride;
+                bus.snoopBeforeDmaWrite(pa, 4);
+                bus.write32(pa, pokeVal);
+            }
             static u32 pokeN = 0;
             if (++pokeN <= 3)
                 printf("-- poke: [%08x] := %08x @%llu\n", pokePa, pokeVal,
@@ -4584,6 +4611,26 @@ int main(int argc, char** argv)
                            static_cast<unsigned long long>(n));
             printf("\n");
         }
+        // The vertical blank, end to end in one line. The register traffic log
+        // is a 4096-entry ring printed head-and-tail, so the nineteen
+        // GEN_INT_CNTL writes fall in the trimmed middle every time and
+        // "does the driver arm CRTC_VBLANK_INT" was not answerable from it.
+        // Report the two registers' live values next to the counts, because
+        // blanks generated, blanks the driver had enabled, and acknowledges it
+        // wrote are three separate claims — and a raise on a source the
+        // OpenPIC has MASKED reaches nobody at all (see the openpic state).
+        printf("-- ati vblank: %s period=%llutb GEN_INT_CNTL=%08x "
+               "GEN_INT_STATUS=%08x "
+               "blanks=%llu enabled=%llu acks=%llu line=%d\n",
+               bus.ati().vblEnabled ? "modelled" : "OFF (--no-ati-vbl)",
+               static_cast<unsigned long long>(
+                   R128Cell::vblTbPeriod() ? R128Cell::vblTbPeriod()
+                                           : 25000000ull / 60ull),
+               bus.ati().peek(0x0040), bus.ati().peek(0x0044),
+               static_cast<unsigned long long>(bus.ati().vblanks),
+               static_cast<unsigned long long>(bus.ati().vblIrqs),
+               static_cast<unsigned long long>(bus.ati().vblAcks),
+               bus.ati().irqLine() ? 1 : 0);
         printf("-- ddc: %u starts, %u address matches, %u EDID bytes\n",
                bus.ati().ddcStarts, bus.ati().ddcMatches,
                bus.ati().ddcBytes);

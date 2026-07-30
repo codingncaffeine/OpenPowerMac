@@ -94,6 +94,59 @@ public:
     }
     u32 pal(u32 i) const { return pal_[i & 0xFFu]; }
 
+    // --- Vertical blank as an INTERRUPT, not merely a status bit ----------
+    //
+    // The pointer is moved by the SLOT VBL path and by nothing else: the
+    // display driver's interrupt handler calls the ROM's slot-VBL dispatcher
+    // (68K ffc0bcc0 through $0D28, native ffd94798), which — only for the
+    // queue $0D10 names as the PRIMARY display — calls JCrsrTask ($08EE), and
+    // JCrsrTask is the ONLY code that drains the Cursor Device Manager's delta
+    // accumulators at CursorDevice+112..124 into CursorData.whereX/whereY.
+    // CursorDeviceMove piles the deltas up correctly and returns noErr, so a
+    // poll-only vblank yields a machine where every USB report is delivered,
+    // parsed and accumulated and the cursor still never moves one pixel.
+    //
+    // From the register semantics: GEN_INT_CNTL bit 0 is CRTC_VBLANK_INT,
+    // GEN_INT_STATUS latches it and is WRITE-1-TO-CLEAR, and the pin is a
+    // LEVEL asserted while an enabled source stands latched.
+    void tick(u64 tb);
+    bool irqLine() const;
+    // Census. "A blank fired" and "a blank reached the CPU" are different
+    // claims: the OS programs this source's vector and priority and can still
+    // leave it MASKED in the OpenPIC, in which case every raise goes nowhere.
+    u64 vblanks = 0;        // blanks generated
+    u64 vblIrqs = 0;        // blanks that found CRTC_VBLANK_INT enabled
+    u64 vblAcks = 0; // acknowledges the driver wrote
+    // --ati-vbl: model the vertical blank as an INTERRUPT. OPT-IN, and it has
+    // to stay opt-in until the wedge below is fixed.
+    //
+    // ⚠⚠ THIS DEFAULT IS LOAD-BEARING FOR THE SHIPPING APP. The capi never
+    // touches these fields, so the shell takes the CONSTRUCTOR defaults —
+    // exactly how the ganged-power bug reached the app once already. With the
+    // interrupt on, the machine services about two blanks and then livelocks in
+    // the 68K autovector dispatch (the OS stops issuing EOI, so `inService`
+    // sticks and every other source starves), which would turn a working
+    // desktop into a dead one. Off, the cell behaves bit for bit as the
+    // known-good baseline: 292 hd commands, 1,261,505 paint bytes.
+    bool vblEnabled = false;
+    // --ati-vbl-tb N: timebase ticks between blanks, 0 = nominal 60 Hz at
+    // 25 MHz. A STATIC, deliberately: it is a harness knob rather than machine
+    // state, and keeping it out of the object leaves sizeof(R128Cell) — and so
+    // every snapshot — untouched, the same reason the read watchpoint lives on
+    // Cpu instead of CpuState.
+    //
+    // ⚠ THE NOMINAL RATE IS WRONG UNDER --fast-tb, AND NOT BY A LITTLE. That
+    // switch advances the timebase far faster than instructions retire, so
+    // guest time is COMPRESSED: over a boot to the desktop the machine logged
+    // tb = 173,964,736,438 (6,958 s at 25 MHz) while the OS's own Ticks reached
+    // only 9358 (156 s) — a factor of 44.6. A tb-paced 60 Hz vblank therefore
+    // arrives ~2,550 times per second of the guest's OWN time. Polling devices
+    // survive that (nothing gates on the OHCI frame rate); an INTERRUPT does
+    // not — the machine livelocks in the 68K autovector dispatch and stops
+    // retiring USB reports altogether.
+    static void setVblTbPeriod(u64 n);
+    static u64 vblTbPeriod();
+
     // Snapshot: register store, PLL file, DAC palette, and the 32 MB
     // framebuffer — the display work after the mount reads all of it.
     void snapSave(SnapWriter& w) const;
@@ -115,6 +168,13 @@ private:
     std::map<u32, u32> pll_;  // PLL register file
     u32 palIdx_ = 0;
     u32 pal_[256] = {};
+    // Timebase at which the next blank falls due. Zero means the clock is
+    // parked: it starts when the driver arms CRTC_VBLANK_INT, not at reset,
+    // so a machine whose driver never asks for the interrupt behaves exactly
+    // as it did before.
+    u64 vblNextTb_ = 0;
+    u64 tbNow_ = 0; // last timebase this cell was ticked at
+    u64 vblPeriod() const;
 };
 
 } // namespace opm

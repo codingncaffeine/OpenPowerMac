@@ -59,6 +59,17 @@ static constexpr u32 kSenseIn = 0x00C00000u;
 static constexpr u32 kGenIntCntl = 0x0040;   // bit 0 = CRTC_VBLANK_INT
 static constexpr u32 kGenIntStatus = 0x0044;
 static constexpr u32 kPllTest = 0x0000;
+// GEN_INT_CNTL/GEN_INT_STATUS bit assignments.
+static constexpr u32 kCrtcVblankInt = 0x00000001u;
+// GEN_INT_STATUS is write-1-to-clear, and only the bits a source actually
+// latches are writable. This is the Rage 128 PF ('PF', 1002:5046) mask; the
+// later Radeon parts use a wider one, and treating every bit as writable lets
+// an acknowledge clear latches the hardware would have held.
+static constexpr u32 kGenIntAckMask = 0x000F040Fu;
+// One blank per 1/60 s of guest time. The timebase runs at bus/4 ≈ 24.94 MHz
+// and the OHCI cell already calls 25000 ticks a millisecond, so the same
+// nominal rate keeps the two devices' notions of time consistent.
+static constexpr u64 kTbPerVblank = 25000000ull / 60ull;
 
 u32 R128Cell::regRead(u32 idx)
 {
@@ -102,15 +113,23 @@ u32 R128Cell::regRead(u32 idx)
     case kGenIntStatus: {
         // Vertical blank. A display driver arms CRTC_VBLANK_INT in
         // GEN_INT_CNTL and then waits on this status bit before it will
-        // paint; unimplemented, the wait never ends and the framebuffer
-        // stays untouched however correct the modeset was. Report the
-        // blank as pending whenever it is armed - the panel is retracing
-        // far faster than any polling loop - and let a write acknowledge.
-        auto ic = regs_.find(kGenIntCntl);
-        const bool armed = ic != regs_.end() && (ic->second & 1u);
+        // paint, so with nothing here the wait never ends and the
+        // framebuffer stays untouched however correct the modeset was.
+        //
+        // The latch is now real: tick() sets it once per 1/60 s of guest
+        // time and an acknowledge clears it, which is what lets the pin
+        // fall and rise again. Reporting the blank as permanently pending
+        // was fine for a polling loop and is actively wrong for a handler
+        // — an interrupt service routine that re-reads this register would
+        // see a blank that never goes away.
         auto it = regs_.find(kGenIntStatus);
         const u32 v = it != regs_.end() ? it->second : 0;
-        return armed ? (v | 1u) : v;
+        if (vblEnabled)
+            return v;
+        // --no-ati-vbl: the pre-interrupt machine, bit for bit.
+        auto ic = regs_.find(kGenIntCntl);
+        const bool armed = ic != regs_.end() && (ic->second & kCrtcVblankInt);
+        return armed ? (v | kCrtcVblankInt) : v;
     }
     case kClockCntlIndex:
         return pllAddr_;
@@ -247,6 +266,30 @@ void R128Cell::write(u32 off, u32 v, u32 len)
     } else if (aligned == 0x00B4u) { // PALETTE_DATA, auto-increment
         pal_[palIdx_ & 0xFFu] = native & 0x00FFFFFFu;
         palIdx_ = (palIdx_ + 1u) & 0xFFu;
+    } else if (aligned == kGenIntCntl && vblEnabled) {
+        // Arming CRTC_VBLANK_INT starts the blank clock; disarming parks it.
+        // The first blank is scheduled a WHOLE period out rather than fired
+        // from inside the store: a device event delivered before the driver
+        // has finished the write that asked for it is as broken as one that
+        // never arrives, which is the lesson the root-hub connect taught
+        // three times over.
+        const bool arm = (native & kCrtcVblankInt) != 0;
+        if (arm && !vblNextTb_)
+            vblNextTb_ = tbNow_ + vblPeriod();
+        else if (!arm)
+            vblNextTb_ = 0;
+    } else if (aligned == kGenIntStatus && vblEnabled) {
+        // WRITE-1-TO-CLEAR, and only over the bits this part latches. The
+        // acknowledge is what drops the pin, so it has to reach the stored
+        // register rather than overwrite it: fall through to the plain store
+        // below and the driver's first ack would LATCH every bit it wrote.
+        auto it = regs_.find(kGenIntStatus);
+        const u32 cur = it != regs_.end() ? it->second : 0;
+        const u32 cleared = cur & ~(native & kGenIntAckMask);
+        if (cleared != cur)
+            ++vblAcks;
+        regs_[kGenIntStatus] = cleared;
+        return;
     }
     // Mode changes, called out by name. The register log is a 4096-entry
     // ring and the OS driver bit-bangs DDC through the GPIO registers
@@ -277,6 +320,48 @@ void R128Cell::write(u32 off, u32 v, u32 len)
     (void)kMemCntl;
     (void)kCrtcGenCntl;
     (void)kPllTest;
+}
+
+// Harness knob, not machine state — see the note in the header.
+static u64 gVblTbPeriod = 0;
+
+void R128Cell::setVblTbPeriod(u64 n) { gVblTbPeriod = n; }
+u64 R128Cell::vblTbPeriod() { return gVblTbPeriod; }
+
+u64 R128Cell::vblPeriod() const
+{
+    return gVblTbPeriod ? gVblTbPeriod : kTbPerVblank;
+}
+
+void R128Cell::tick(u64 tb)
+{
+    tbNow_ = tb;
+    if (!vblEnabled || !vblNextTb_ || tb < vblNextTb_)
+        return;
+    // Re-base rather than replay. A resume, or an arm that landed before this
+    // cell had ever been handed the timebase, leaves the due time billions of
+    // ticks in the past; firing one blank per missed period would be a burst
+    // that models nothing and would bury the driver in interrupts.
+    vblNextTb_ = tb + vblPeriod();
+    ++vblanks;
+    auto ic = regs_.find(kGenIntCntl);
+    if (ic == regs_.end() || !(ic->second & kCrtcVblankInt))
+        return; // the panel still retraces; nobody asked to hear about it
+    ++vblIrqs;
+    regs_[kGenIntStatus] |= kCrtcVblankInt;
+}
+
+bool R128Cell::irqLine() const
+{
+    if (!vblEnabled)
+        return false;
+    auto ic = regs_.find(kGenIntCntl);
+    auto is = regs_.find(kGenIntStatus);
+    const u32 en = ic != regs_.end() ? ic->second : 0;
+    const u32 st = is != regs_.end() ? is->second : 0;
+    // A level, held while an ENABLED source stands latched. The driver's
+    // write-1-to-clear acknowledge is what releases it.
+    return (en & st & kGenIntAckMask) != 0;
 }
 
 

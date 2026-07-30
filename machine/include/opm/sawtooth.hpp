@@ -350,6 +350,21 @@ public:
         pic_.setLine(20, cd_.irqLine());
         pic_.setLine(27, ohci_[0].irqLine());
         pic_.setLine(28, ohci_[1].irqLine());
+        // The AGP display's vertical blank — what runs the slot-VBL
+        // dispatcher, which is what moves the mouse pointer.
+        //
+        // ⚠ THE SOURCE NUMBER IS `AAPL,interrupt-vectors`, NOT `AAPL,interrupts`.
+        // Both live on the card's Name Registry node and they are different
+        // numbers; reading the wrong one costs a cold boot. The devices already
+        // wired above settle it: usb carries vectors 0x1b/0x1c and interrupts
+        // 3/4, and it is 27/28 that work; ata-4 carries vectors 0x13/0x0b and
+        // interrupts 11/12, and it is 19/11 that work. The vp VECTOR field is
+        // where `AAPL,interrupts` shows up, which is what makes the two easy to
+        // swap. ATY,Rage128Pd carries vectors 0x30 and interrupts 0x20, so the
+        // display is source 48 — and the OS has 48 unmasked at priority 2,
+        // matching the node's AAPL,interrupt-priorities. Source 32 is the
+        // mac-io TIMER, which nothing uses and which the OS leaves masked.
+        pic_.setLine(48, ati_.irqLine());
     }
 
     // Every bus master in the machine answers to the same snoop responder.
@@ -367,6 +382,8 @@ public:
     {
         ohci_[0].tick(tb);
         ohci_[1].tick(tb);
+        // The display retraces on the same clock as everything else.
+        ati_.tick(tb);
         // DMA on this hardware is selected by the channel, not the opcode:
         // tell each cell whether its DBDMA list is armed before any command
         // can present a data phase.

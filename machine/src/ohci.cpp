@@ -632,15 +632,21 @@ void OhciCell::moveMouse(int dx, int dy, u8 buttons)
     buttons_ = buttons & 0x07u;
 }
 
-void OhciCell::typeAscii(const std::string& s)
+void OhciCell::typeAscii(const std::string& s) { typeChord(0, s); }
+
+// Same, with a modifier held down for every keystroke. Byte 0 of a boot
+// keyboard report is the modifier bitmap, and bit 3 is LeftGUI -- the Command
+// key. That is what makes the Finder drivable without a pointer: type a name to
+// select an icon, then Command-O to open it.
+void OhciCell::typeChord(u8 extraMod, const std::string& s)
 {
     for (char c : s) {
-        u8 usage = 0, mod = 0;
+        u8 usage = 0, mod = extraMod;
         if (c >= 'a' && c <= 'z')
             usage = static_cast<u8>(4 + (c - 'a'));
         else if (c >= 'A' && c <= 'Z') {
             usage = static_cast<u8>(4 + (c - 'A'));
-            mod = 0x02; // left shift
+            mod |= 0x02; // left shift, ON TOP of any held modifier
         } else if (c >= '1' && c <= '9')
             usage = static_cast<u8>(30 + (c - '1'));
         else if (c == '0')
@@ -663,7 +669,7 @@ void OhciCell::typeAscii(const std::string& s)
             usage = 51;
         else if (c == ':') {
             usage = 51;
-            mod = 0x02;
+            mod |= 0x02;
         } else
             continue;
         // Press then release: a host that only ever sees the key down

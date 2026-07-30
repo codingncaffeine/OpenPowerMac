@@ -278,10 +278,29 @@ int main(int argc, char** argv)
     bool coverageAll = false; // --coverage-all
     const char* typeText = nullptr; // --type STR --type-at N: USB keystrokes
     u64 typeAt = 0;
+    // --cmd STR --cmd-at N: the same keystrokes with Command held. The Finder
+    // selects an icon by typed name and opens it with Command-O, so this drives
+    // the machine while the pointer is still dead -- including launching the
+    // installer sitting on the desktop.
+    const char* cmdText = nullptr;
+    u64 cmdAt = 0;
     u64 mouseAt = 0;   // --mouse-at N: inject USB mouse motion from N
     u64 clickAt = 0;   // --mouse-click-at N: one button down/up at N
+    // --crsr-drag N: DIAGNOSTIC, not machine truth (like --em294-rts and
+    // --wp-force). Drives the cursor the way a legacy 68K mouse driver does --
+    // write MTemp/RawMouse/Mouse and then copy CrsrCouple into CrsrNew -- which
+    // Apple's Technote HW01 says still works through a compatibility mode even
+    // with the Cursor Device Manager installed. It answers one question: can
+    // this OS draw a moved cursor at all? If it can, everything downstream of
+    // the mouse module is fine and the whole defect is that nothing supplies
+    // motion; if it cannot, the drawing path is broken too.
+    u64 crsrDrag = 0;
     u64 clickHoldFor = 200000ull; // --mouse-hold N: instructions to hold it
     u64 mouseEvery = 2000000ull; // --mouse-every N: injection cadence
+    // --mouse-dx/--mouse-dy: the injected delta. Making it DISTINCTIVE lets the
+    // report be traced through the OS by searching a RAM dump for its bytes;
+    // 8 and 4 are far too common to find.
+    int mouseDx = 8, mouseDy = 4;
     u64 mouseSent = 0;
     // The button state a real mouse carries in EVERY report. moveMouse()
     // assigns buttons_ outright, so injecting motion with a literal 0 cleared
@@ -314,6 +333,7 @@ int main(int argc, char** argv)
     u32 viaA = 0x00;                   // VIA port A strap levels
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
+    u32 rpPa = 0, rpEnd = 0;  // --rp PA [--rp-end PA]: read census
     u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
                                           // store watchpoint (CPU side)
     u32 wpForce = 0;                      // --wp-force V: DIAGNOSTIC, see
@@ -442,12 +462,20 @@ int main(int argc, char** argv)
             ofHistFrom = strtoull(next(), nullptr, 0);
             ofHistTo = strtoull(next(), nullptr, 0);
         }
+        else if (!strcmp(a, "--cmd")) cmdText = next();
+        else if (!strcmp(a, "--cmd-at")) cmdAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--type")) typeText = next();
         else if (!strcmp(a, "--type-at")) typeAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-at"))
             mouseAt = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-click-at"))
             clickAt = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--crsr-drag"))
+            crsrDrag = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--mouse-dx"))
+            mouseDx = static_cast<int>(strtol(next(), nullptr, 0));
+        else if (!strcmp(a, "--mouse-dy"))
+            mouseDy = static_cast<int>(strtol(next(), nullptr, 0));
         else if (!strcmp(a, "--mouse-hold"))
             clickHoldFor = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--mouse-every")) {
@@ -498,6 +526,12 @@ int main(int argc, char** argv)
             wpPa = static_cast<u32>(strtoul(next(), nullptr, 0));
             if (!wpEnd) wpEnd = wpPa + 3u;
         }
+        else if (!strcmp(a, "--rp")) {
+            rpPa = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!rpEnd) rpEnd = rpPa + 3u;
+        }
+        else if (!strcmp(a, "--rp-end"))
+            rpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--wp-end"))
             wpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--wp-force")) {
@@ -912,6 +946,8 @@ int main(int argc, char** argv)
     cpu.reset(); // pc = 0xFFF00100, MSR[IP]: vectors in ROM — authentic
     cpu.wpPa = wpPa;   // physical store watchpoint, set before any stepping
     cpu.wpEnd = wpEnd;
+    cpu.rpPa = rpPa;   // physical READ watchpoint (census by reading pc)
+    cpu.rpEnd = rpEnd;
     cpu.wpForce = wpForce;
     cpu.wpForceSet = wpForceSet;
     // Always go through the setter on a cold start: it sets the reset port
@@ -1369,6 +1405,8 @@ int main(int argc, char** argv)
             bus.systemReset();
             cpu.wpPa = wpPa;
             cpu.wpEnd = wpEnd;
+            cpu.rpPa = rpPa;
+            cpu.rpEnd = rpEnd;
             cpu.wpForce = wpForce;
             cpu.wpForceSet = wpForceSet;
             continue;
@@ -2914,6 +2952,35 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(executed), typeText);
             fflush(stdout);
         }
+        if (crsrDrag && executed >= crsrDrag &&
+            (executed - crsrDrag) % 1000000ull == 0) {
+            // A Mac Point is {v,h} -- VERTICAL first -- so the word is
+            // (y << 16) | x. Low memory lives at PA = logical + 0x4000.
+            static u32 dragStep = 0;
+            ++dragStep;
+            const u32 x = 15 + dragStep * 12, y = 15 + dragStep * 6;
+            const u32 pt = ((y & 0xFFFFu) << 16) | (x & 0xFFFFu);
+            // Through the DMA-write snoop, so the processor's own cached copy
+            // of low memory is invalidated rather than left stale.
+            for (u32 pa : {0x4828u, 0x482Cu, 0x4830u}) {
+                bus.snoopBeforeDmaWrite(pa, 4);
+                bus.write32(pa, pt);
+            }
+            bus.snoopBeforeDmaWrite(0x48CEu, 1);
+            bus.write8(0x48CEu, bus.read8(0x48CFu)); // CrsrNew = CrsrCouple
+            if (dragStep <= 4 || (dragStep % 25) == 0)
+                printf("-- crsr-drag: Mouse := (%u,%u) step %u @%llu\n", x, y,
+                       dragStep, static_cast<unsigned long long>(executed));
+            fflush(stdout);
+        }
+        if (cmdText && executed == cmdAt) {
+            // Command held for each keystroke -- no trailing Return, because
+            // Command-O IS the action.
+            bus.ohci(0).typeChord(0x08, std::string(cmdText));
+            printf("-- typed with COMMAND on usb @%llu: %s\n",
+                   static_cast<unsigned long long>(executed), cmdText);
+            fflush(stdout);
+        }
         // Mouse motion, headless. "The pointer does not move" has two very
         // different causes -- the shell not delivering events, and the device
         // never being polled -- and only injecting motion with no GUI in the
@@ -2927,7 +2994,7 @@ int main(int argc, char** argv)
         // sustained enough to be believed".
         if (mouseAt && executed >= mouseAt &&
             (executed - mouseAt) % mouseEvery == 0) {
-            bus.ohci(1).moveMouse(8, 4, heldButtons);
+            bus.ohci(1).moveMouse(mouseDx, mouseDy, heldButtons);
             ++mouseSent;
         }
         // A CLICK, which reaches the OS by a different route than motion:
@@ -3683,6 +3750,18 @@ int main(int argc, char** argv)
     // saw nothing, or the watch never started looking. Three instruments
     // this session reported silence of the second kind and it was read as
     // silence of the first.
+    if (cpu.rpEnd) {
+        // Who READS this range. "0 readers" and "read by one site a million
+        // times" are opposite diagnoses for a buffer the machine fills, and no
+        // store watch can tell them apart.
+        printf("-- read watch %08x..%08x: %llu reads by %zu distinct pc%s\n",
+               cpu.rpPa, cpu.rpEnd,
+               static_cast<unsigned long long>(cpu.rpHits), cpu.rpByPc.size(),
+               cpu.rpByPc.size() == 1 ? "" : "s");
+        for (const auto& [at, n] : cpu.rpByPc)
+            printf("   pc=%08x  x%llu\n", at,
+                   static_cast<unsigned long long>(n));
+    }
     if (cpu.wpEnd) {
         printf("-- watchpoint %08x..%08x: %zu store%s%s\n", cpu.wpPa,
                cpu.wpEnd, cpu.wpLog.size(), cpu.wpLog.size() == 1 ? "" : "s",

@@ -120,6 +120,10 @@ public:
     // The port reported nothing attached and no list was ever walked, so
     // the controller had nothing to find and nothing to do.
     void typeAscii(const std::string& s); // queue keystrokes
+    // Keystrokes with a modifier held: bit 0 LeftCtrl, 1 LeftShift, 2 LeftAlt,
+    // 3 LeftGUI (Command). Command-O opens the Finder selection, which is how
+    // the machine is drivable while the pointer is still dead.
+    void typeChord(u8 mod, const std::string& s);
     bool keyboardIdle() const { return pending_.empty() && !reportDue_; }
     u64 setupsSeen = 0, inTds = 0, reportsSent = 0; // census
     // WHEN the guest polled, not just how often. "18,548 polls, 0 reports"

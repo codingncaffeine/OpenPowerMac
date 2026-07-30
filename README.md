@@ -4,14 +4,14 @@
 
 # OpenPowerMac
 
-A from-scratch, clean-room Power Macintosh emulator.
+A from-scratch Power Macintosh emulator.
 
 **It boots Mac OS 9 on an emulated Power Mac G4.** The machine runs Apple's own
 Open Firmware out of a real Boot ROM image, loads the operating system from a hard disk
 over ATA with DMA, brings up the Rage 128 Pro, and hands over to Mac OS — which drives the
 display through its own driver at 640×480×32 and enumerates USB keyboard and mouse.
 
-Design, methodology, and the clean-room provenance ledger live in the
+Design, methodology, and the provenance ledger live in the
 [wiki](https://github.com/codingncaffeine/OpenPowerMac/wiki).
 
 No Apple software is included or distributed. ROMs and operating system media must be
@@ -59,7 +59,7 @@ The CPU core is held to a standard the machine layer is still growing into:
   no `fenv`, so results are identical across compilers by construction.
 
 Every hardware behaviour the machine relies on is recorded in the wiki's
-[Clean-Room-Receipts](https://github.com/codingncaffeine/OpenPowerMac/wiki/Clean-Room-Receipts)
+[Receipts](https://github.com/codingncaffeine/OpenPowerMac/wiki/Clean-Room-Receipts)
 ledger with its source tier and how it was verified.
 
 ## Building

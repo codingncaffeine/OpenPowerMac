@@ -214,6 +214,21 @@ void Cpu::l2FlushAll(bool writeback)
 
 u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
 {
+    // READ watchpoint, as a census keyed by the READING instruction. Every
+    // other watch in this project catches stores, which cannot answer "does
+    // anything CONSUME this?" -- and that is the whole question for a device
+    // buffer the machine fills and the guest is supposed to read. A log would
+    // be useless (reads run to millions), so this counts hits per pc: bounded
+    // by the number of distinct code sites rather than by traffic.
+    if (rpEnd && pa <= rpEnd && pa + len > rpPa) {
+        ++rpHits;
+        const u32 at = st.pc - 4u;
+        auto it = rpByPc.find(at);
+        if (it != rpByPc.end())
+            ++it->second;
+        else if (rpByPc.size() < 512) // never let a runaway exhaust memory
+            rpByPc[at] = 1;
+    }
     if (!dceOn() || (wimg & kWimgI)) {
         switch (len) {
         case 1: return bus->read8(pa);

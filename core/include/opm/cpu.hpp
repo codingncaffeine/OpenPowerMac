@@ -241,6 +241,14 @@ struct Cpu {
     };
     std::vector<WpHit> wpLog;
     u32 wpMax = 64;
+    // READ watchpoint (--rp): a census of which code READS a range, keyed by
+    // the reading pc. Stores answer "who changed this"; only reads answer "does
+    // anything consume it", which is the question a device buffer poses. These
+    // live on Cpu and not in CpuState, so they are instrument state and no
+    // snapshot layout depends on them (layoutDigest hashes sizeof(CpuState)).
+    u32 rpPa = 0, rpEnd = 0; // inclusive byte range; rpEnd 0 disables
+    u64 rpHits = 0;
+    std::map<u32, u64> rpByPc;
     // DIAGNOSTIC, NOT MACHINE TRUTH. Substitute wpForce for the value of any
     // 32-bit store landing exactly on wpPa. This exists to supply a positive
     // control: a chain that is decoded but not yet fixed can be proved end to

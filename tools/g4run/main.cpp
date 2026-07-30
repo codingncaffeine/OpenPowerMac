@@ -378,6 +378,11 @@ int main(int argc, char** argv)
     u32 t68Lo = 0, t68Hi = 0;          // --trace-68k LO HI
     u32 t68Cap = 4000;                 // --trace-68k-lines N
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
+    // --drv-from N: when the .ATALoad / on-disc-driver 68K trace opens.
+    // The ATA Manager's device pass is at 2.4886 B and the old hard-coded
+    // 2.8 B opened AFTER it, so the trace never covered the decision it
+    // exists to explain.
+    u64 drvFrom = 2800000000ull;
     u32 armOnPc = 0;                   // --arm-on-pc ADDR: arm on arrival
     u64 traceOfAt = 0;      // --trace-of AT N: OF word trace
     u32 traceOfLeft = 0;
@@ -633,6 +638,8 @@ int main(int argc, char** argv)
             t68Cap = static_cast<u32>(strtoul(next(), nullptr, 0));
         else if (!strcmp(a, "--watch-from"))
             watchFrom = strtoull(next(), nullptr, 0);
+        else if (!strcmp(a, "--drv-from"))
+            drvFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--bp")) {
             if (bpN < 8)
                 bpPc[bpN++] = static_cast<u32>(strtoul(next(), nullptr, 0));
@@ -2624,8 +2631,16 @@ int main(int argc, char** argv)
                            static_cast<unsigned long long>(executed));
                 }
             }
+            // The .ATALoad trace's own time gate. It was the literal
+            // 2,800,000,000 below, and the ATA Manager's whole device pass
+            // now runs at 2.4886 B — so the trace covered only the repeating
+            // steady state AFTER the decision, and two runs that served
+            // DIFFERENT SECTORS produced byte-identical traces. That reads
+            // exactly like "the data made no difference", which is the most
+            // expensive kind of wrong answer. Same failure the file warns
+            // about three times over; the constant is now a knob.
             if (cur68 != prev68 &&
-                (armAtPark ? parkArmed : executed > 2800000000ull)) {
+                (armAtPark ? parkArmed : executed > drvFrom)) {
                 ++cen[kCen68kGate].hits;
                 const bool body = (cur68 >= 0xFFD9A000u &&
                                    cur68 < 0xFFD9D000u) ||

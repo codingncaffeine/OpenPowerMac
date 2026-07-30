@@ -124,6 +124,97 @@ TEST_CASE("ATA disk IDENTIFY reports a capacity the host can read")
     remove(kIso);
 }
 
+// CHS addressing, which is how Mac OS's ATA disk driver talks to a disk.
+//
+// Bit 6 of the device register picks the mode and BOTH are live: Open
+// Firmware sets it (dev = 0xE0) and addresses by LBA, Mac OS clears it
+// (dev = 0xA0), programs the translation with INITIALIZE DEVICE PARAMETERS
+// and addresses by cylinder/head/sector. Reading the task file as LBA in
+// both cases is an off-by-one at the sector that decides everything: the
+// driver's first read is CHS 0/0/1, which is LBA 0 — the Driver Descriptor
+// Record — and it was served block 1 instead. No 'ER' signature, no driver,
+// no disk, for the whole of the boot.
+namespace {
+
+const char* kChsIso = "opm_ata_chs.iso";
+
+// 256 sectors whose FIRST BYTE is the sector's own LBA. The other test
+// image's pattern repeats every 256 bytes, so every sector of it begins
+// with the same byte and could not tell one sector from another.
+bool makeSectorIso()
+{
+    FILE* f = fopen(kChsIso, "wb");
+    if (!f)
+        return false;
+    std::vector<u8> buf(256u * 512u, 0);
+    for (u32 s = 0; s < 256u; ++s) {
+        buf[s * 512u] = static_cast<u8>(s);
+        buf[s * 512u + 1u] = static_cast<u8>(~s);
+    }
+    const bool ok = fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    fclose(f);
+    return ok;
+}
+
+// Issue a one-sector read and return the sector the drive actually served.
+u32 sectorRead(AtaCell& hd, u8 dev, u8 cylHi, u8 cylLo, u8 sec)
+{
+    hd.write(0x060, dev, 1);
+    hd.write(0x020, 0x01, 1); // one sector
+    hd.write(0x030, sec, 1);
+    hd.write(0x040, cylLo, 1);
+    hd.write(0x050, cylHi, 1);
+    hd.write(0x070, 0x20, 1); // READ SECTOR(S)
+    const u32 first = hd.read(0x000, 1);
+    const u32 second = hd.read(0x000, 1);
+    CHECK(second == ((~first) & 0xFFu)); // it really is a sector header
+    return first;
+}
+
+} // namespace
+
+TEST_CASE("an ATA disk addresses in CHS when the device register says so")
+{
+    REQUIRE(makeSectorIso());
+    AtaCell hd;
+    REQUIRE(hd.attachDisk(kChsIso));
+    // No stamp, so commands run as they are written: the deferred-command
+    // window is a separate property with its own test below.
+
+    // The power-on translation is the one IDENTIFY advertises — 16 heads,
+    // 63 sectors per track — so a driver that reads words 3/6 and programs
+    // exactly that changes nothing.
+    CHECK(sectorRead(hd, 0xA0, 0, 0, 1) == 0u);  // C0/H0/S1 = LBA 0
+    CHECK(sectorRead(hd, 0xA0, 0, 0, 2) == 1u);  // sector numbers are 1-based
+    CHECK(sectorRead(hd, 0xA1, 0, 0, 1) == 63u); // head 1 = one track in
+
+    // LBA mode is unaffected: the same task file means something else.
+    CHECK(sectorRead(hd, 0xE0, 0, 0, 1) == 1u);
+    CHECK(sectorRead(hd, 0xE0, 0, 0, 0) == 0u);
+
+    // INITIALIZE DEVICE PARAMETERS re-programs it. Sector count is sectors
+    // per track; the device register's low nibble is the MAXIMUM head
+    // number, one less than the head count.
+    hd.write(0x020, 32, 1);
+    hd.write(0x060, 0xA3, 1); // 4 heads
+    hd.write(0x070, 0x91, 1);
+    CHECK(sectorRead(hd, 0xA0, 0, 0, 1) == 0u);
+    CHECK(sectorRead(hd, 0xA1, 0, 0, 1) == 32u); // one track is now 32
+    CHECK(sectorRead(hd, 0xA3, 0, 0, 1) == 96u); // the last of four heads
+    CHECK(sectorRead(hd, 0xA0, 0, 1, 1) == 128u); // one cylinder = 4 x 32
+
+    // …and IDENTIFY then reports the translation it agreed to.
+    hd.write(0x060, 0xA0, 1);
+    hd.write(0x070, 0xEC, 1);
+    const std::vector<u16> w = readIdentify(hd);
+    CHECK(w[55] == 4u);
+    CHECK(w[56] == 32u);
+    CHECK(w[3] == 16u); // the DEFAULT geometry is untouched
+    CHECK(w[6] == 63u);
+
+    remove(kChsIso);
+}
+
 // A command must not complete in zero time.
 //
 // Open Firmware's ATA driver writes the command register, then arms its

@@ -119,10 +119,30 @@ private:
     u32 intRegRead(u32 lane, u32 len) const;
     void diskCommand(u8 cmd);  // ATA (non-packet) command set
     void diskStartRead();      // present the next sector run through DRQ
-    u32 diskLba() const        // LBA28 out of the task file
+    // The transfer address out of the task file. Bit 6 of the device
+    // register picks the mode, and BOTH are live on a real drive: Open
+    // Firmware's driver sets it (dev = 0xE0) and addresses by LBA, while
+    // Mac OS's ATA disk driver clears it (dev = 0xA0), programs the
+    // translation with INITIALIZE DEVICE PARAMETERS and addresses by
+    // cylinder/head/sector. Reading the task file as LBA unconditionally
+    // is not an approximation, it is an OFF-BY-ONE at the only sector that
+    // matters: CHS 0/0/1 is LBA 0, the Driver Descriptor Record, and it was
+    // being served block 1 instead — so the OS found no 'ER' signature,
+    // concluded the disk had no driver, and never touched it again. OF read
+    // the same disk perfectly throughout, which is exactly why this looked
+    // like an OS-side or device-tree problem.
+    u32 diskLba() const
     {
-        return (u32(dev_ & 0x0Fu) << 24) | (u32(bcHi_) << 16) |
-               (u32(bcLo_) << 8) | lba0_;
+        if (dev_ & 0x40u) // LBA28
+            return (u32(dev_ & 0x0Fu) << 24) | (u32(bcHi_) << 16) |
+                   (u32(bcLo_) << 8) | lba0_;
+        // CHS: cylinder in the two byte-count registers, head in the low
+        // nibble of the device register, and the sector number is 1-BASED.
+        const u32 cyl = (u32(bcHi_) << 8) | bcLo_;
+        const u32 h = curHeads_ ? curHeads_ : 1u;
+        const u32 s = curSectors_ ? curSectors_ : 1u;
+        return (cyl * h + (dev_ & 0x0Fu)) * s +
+               (lba0_ ? u32(lba0_) - 1u : 0u);
     }
 
     FILE* iso_ = nullptr;
@@ -166,6 +186,11 @@ private:
     // IDENTIFY word 59 and then never recorded, so the drive could not
     // report what it had agreed to.
     u8 multiple_ = 0;
+    // The CURRENT translation, which INITIALIZE DEVICE PARAMETERS sets and
+    // every CHS transfer is measured in. Power-on values are the geometry
+    // IDENTIFY advertises in words 3 and 6, so a driver that programs what
+    // it was told changes nothing.
+    u8 curHeads_ = 16, curSectors_ = 63;
     bool irq_ = false;
     // Latched DMA-complete bit of the +0x300 interrupt register. Set when
     // this cell's DBDMA channel raises its interrupt, cleared only by the

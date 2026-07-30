@@ -28,7 +28,7 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // Bump when the SHAPE of the stream changes (a field added, an order
 // changed). The layout digest below catches struct-size changes on its own;
 // this catches everything else.
-constexpr u32 kSnapVersion = 7; // 7: the display's vertical-blank clock
+constexpr u32 kSnapVersion = 8; // 8: the disk's current CHS translation
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -397,6 +397,12 @@ void AtaCell::snapSave(SnapWriter& w) const
     w.u8v(pendDev_);
     w.u32v(pendPc_);
     w.u8v(multiple_);
+    // The CHS translation INITIALIZE DEVICE PARAMETERS set. A resume that
+    // reverts it addresses different sectors than the guest asked for, and
+    // the guest has no way to notice: it programmed the geometry once, at
+    // boot, and never asks again.
+    w.u8v(curHeads_);
+    w.u8v(curSectors_);
     w.b(irq_);
     w.b(dmaIrqLatch_);
     w.arr32(ctl_, 16);
@@ -461,6 +467,8 @@ void AtaCell::snapLoad(SnapReader& r)
     pendDev_ = r.u8v();
     pendPc_ = r.u32v();
     multiple_ = r.u8v();
+    curHeads_ = r.u8v();
+    curSectors_ = r.u8v();
     irq_ = r.b();
     dmaIrqLatch_ = r.b();
     r.arr32(ctl_, 16);

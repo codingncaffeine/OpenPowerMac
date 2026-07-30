@@ -191,9 +191,13 @@ void AtaCell::diskCommand(u8 cmd)
         // claim a driver acts on and we cannot honour.
         w16(49, 0x0300);                        // LBA + DMA supported
         w16(53, 0x0003);                        // words 54-58 and 64-70 valid
+        // 54-56 are the CURRENT translation, not the default one words 1/3/6
+        // carry: a drive re-identified after INITIALIZE DEVICE PARAMETERS
+        // must report what it was told, which is the promise word 53 bit 0
+        // makes.
         w16(54, 16383);
-        w16(55, 16);
-        w16(56, 63);
+        w16(55, curHeads_);
+        w16(56, curSectors_);
         w16(57, static_cast<u16>(secs));
         w16(58, static_cast<u16>(secs >> 16));
         w16(59, 0x0100 | 16);       // multiple sectors currently set
@@ -239,13 +243,44 @@ void AtaCell::diskCommand(u8 cmd)
         status_ = (kDrdy | kDsc);
         irq_ = true;
         break;
+    case 0x91: // INITIALIZE DEVICE PARAMETERS
+        // The host declares the translation it intends to address the drive
+        // in: sector count = sectors per track, device register bits 3:0 =
+        // the MAXIMUM head number, so one less than the head count. Every
+        // CHS transfer after this is measured in these, and answering the
+        // command while ignoring its arguments is how a drive silently
+        // serves the wrong sector.
+        if (nsect_)
+            curSectors_ = nsect_;
+        curHeads_ = static_cast<u8>((dev_ & 0x0Fu) + 1u);
+        status_ = (kDrdy | kDsc);
+        irq_ = true;
+        break;
     case 0x40:
     case 0x41: // READ VERIFY SECTOR(S)
-    case 0x91: // INITIALIZE DEVICE PARAMETERS
     case 0xE7: // FLUSH CACHE
     case 0xEA: // FLUSH CACHE EXT
     case 0xEF: // SET FEATURES
     case 0x10: // RECALIBRATE
+    // Power management. Mac OS's ATA Manager runs an idle timer and spins
+    // the disk down with STANDBY IMMEDIATE — measured, 29 of them in a
+    // three-billion-instruction boot, and every one was ABORTED because
+    // this arm did not exist. The whole group is one feature: implementing
+    // only the opcode that happened to be measured leaves the same failure
+    // one command away.
+    case 0xE0: // STANDBY IMMEDIATE
+    case 0xE1: // IDLE IMMEDIATE
+    case 0xE2: // STANDBY (sector count = the idle timer)
+    case 0xE3: // IDLE
+    case 0xE6: // SLEEP
+        status_ = (kDrdy | kDsc);
+        irq_ = true;
+        break;
+    case 0xE5: // CHECK POWER MODE
+        // 0xFF = active or idle. There is no spin-up latency here and every
+        // access is served at once, so "always active" is not a
+        // simplification — it is what this drive is.
+        nsect_ = 0xFF;
         status_ = (kDrdy | kDsc);
         irq_ = true;
         break;

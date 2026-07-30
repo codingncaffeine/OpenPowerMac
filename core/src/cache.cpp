@@ -116,7 +116,7 @@ void Cpu::l2Resize()
 
 Cpu::L2Line* Cpu::l2Find(u32 pa)
 {
-    if (!l2On() || l2Sets == 0)
+    if (!l2On() || l2Sets == 0 || l2Inert)
         return nullptr;
     const u32 set = (pa >> 5) % l2Sets;
     const u32 tag = pa >> 5;
@@ -134,6 +134,11 @@ void Cpu::l2Install(u32 pa, const u8* bytes, bool dirty)
 {
     if (!l2On())
         return;
+    if (l2Inert) { // diagnostic: the array holds nothing, so a modified block
+        if (dirty)  // has nowhere to live but memory
+            busWriteLine(*this, pa, bytes);
+        return;
+    }
     if (l2Sets == 0)
         l2Resize();
     const u32 set = (pa >> 5) % l2Sets;
@@ -212,6 +217,25 @@ void Cpu::l2FlushAll(bool writeback)
     }
 }
 
+// An access that goes round the caches while the L2 still holds the block is
+// a place where the two can disagree. Recorded, not repaired, so that "the
+// machine misbehaves once the L2 is on" can be attributed rather than guessed.
+void Cpu::noteL2Skew(u32 pa, bool write)
+{
+    if (!l2On() || !l2Find(pa & ~31u))
+        return;
+    if (write)
+        ++l2SkewW;
+    else
+        ++l2SkewR;
+    const u32 at = st.pc - 4u;
+    auto it = l2SkewByPc.find(at);
+    if (it != l2SkewByPc.end())
+        ++it->second;
+    else if (l2SkewByPc.size() < 512)
+        l2SkewByPc[at] = 1;
+}
+
 u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
 {
     // READ watchpoint, as a census keyed by the READING instruction. Every
@@ -236,6 +260,7 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
             rpByLr[caller] = 1;
     }
     if (!dceOn() || (wimg & kWimgI)) {
+        noteL2Skew(pa, false);
         switch (len) {
         case 1: return bus->read8(pa);
         case 2: return bus->read16(pa);
@@ -272,6 +297,7 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
         if (wpForceSet && len == 4 && pa == wpPa) v = wpForce; // diagnostic
     }
     if (!dceOn() || (wimg & kWimgI)) {
+        noteL2Skew(pa, true);
         switch (len) {
         case 1: bus->write8(pa, static_cast<u8>(v)); return;
         case 2: bus->write16(pa, static_cast<u16>(v)); return;
@@ -286,6 +312,7 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
     }
     DLine* e = lineFind(*this, pa);
     if (wimg & kWimgW) { // write-through: no allocation on a store miss
+        noteL2Skew(pa, true);
         if (e)
             for (u32 i = 0; i < len; ++i)
                 e->b[(pa & 31u) + i] =
@@ -418,13 +445,26 @@ void CpuSnoop::snoopWrite(u32 pa, u32 len)
 
 // Harness/instrument coherence: dirty lines go straight to the bus so the
 // observed memory image is the architectural one.
+//
+// ⚠ THE L1 LINE IS THE NEWER ONE, SO ITS L2 COPY MUST DIE WITH IT. A block
+// can be dirty in BOTH caches at once — cast out of the L1 into the L2, then
+// re-fetched and stored to again — and the L1 holds the later value. Writing
+// the L1 back to memory and then letting l2FlushAll write the L2's older copy
+// over it silently reverts the block. That made an arming flush a corrupting
+// event rather than a neutral one, which is the worst thing an instrument can
+// be: --trace-of at 150 M turned a run that died one way into a run that died
+// another, and neither told the truth about the machine.
 void Cpu::l1dFlushAll(bool writeback)
 {
     for (u32 s = 0; s < 128; ++s)
         for (u32 w = 0; w < 8; ++w) {
             DLine& e = l1d[s][w];
-            if (e.v && e.d && writeback)
-                busWriteLine(*this, (e.tag << 12) | (s << 5), e.b);
+            if (e.v && e.d) {
+                const u32 base = (e.tag << 12) | (s << 5);
+                if (writeback)
+                    busWriteLine(*this, base, e.b);
+                l2Invalidate(base);
+            }
             e.v = false;
             e.d = false;
         }

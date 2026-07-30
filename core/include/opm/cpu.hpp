@@ -300,6 +300,26 @@ struct Cpu {
     bool l2Peek32(u32 pa, u32& w);
     void l2FlushAll(bool writeback); // instrumentation/harness coherence
 
+    // DIAGNOSTIC census: accesses that bypass the caches (cache-inhibited,
+    // write-through, or HID0[DCE] clear) while the L2 holds a line for the
+    // same block. Each one is a place where the L2 and memory can disagree,
+    // and "the L2 is enabled and the machine misbehaves" needs to be told
+    // apart from "the L2 is enabled and something reads round it". Counts by
+    // the accessing pc, so it is bounded by code sites rather than traffic.
+    // Lives on Cpu, not CpuState, so no snapshot is invalidated.
+    u64 l2SkewR = 0, l2SkewW = 0;
+    std::map<u32, u64> l2SkewByPc;
+    void noteL2Skew(u32 pa, bool write);
+
+    // DIAGNOSTIC, NOT MACHINE TRUTH. Keep every architectural effect of the
+    // L2 — L2CR programs, L2E sets, the sizing and the invalidate all happen
+    // and read back — while the array holds nothing: every lookup misses and
+    // every allocation goes straight to memory. It separates "the guest
+    // behaves differently because the L2 is switched on" from "the guest
+    // behaves differently because our L2 serves the wrong bytes", which no
+    // amount of staring at the model can tell apart.
+    bool l2Inert = false;
+
     // Thermal Assist Unit: recompute THRM1/THRM2 TIN+TIV from their thresholds
     // and THRM3[E]. Called on every mtspr to a THRM register, which is what
     // restarts a comparison (um7400 2.1.5.6). Adding a method, not a field, so

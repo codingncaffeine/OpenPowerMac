@@ -115,6 +115,22 @@ struct Cpu {
     u32 curInsn = 0;           // instruction being executed (LE align image)
     u32 cycleAccum = 0;
     u32 cyclesPerTbTick = 4;   // TB = bus clock / 4; provisional 1 cycle/insn
+    // Cycles the HARNESS adds to every instruction on top of the
+    // architectural one (--fast-tb). It used to be a second tick() call from
+    // the machine loop, and two calls per instruction is one more than the
+    // model needs: across an instruction boundary tick(1) then tick(n) and a
+    // single tick(1+n) leave TB, DEC and the pending flag identical, and
+    // nothing observes them in between. The one merged away was the call that
+    // crossed the divisor EVERY time, so it did the full arithmetic; the
+    // architectural one alone crosses it once in four.
+    //
+    // ⚠ EQUIVALENCE IS LOAD-BEARING and it is not just the common path. A
+    // step that delivers an async exception executes no instruction and
+    // returns without the architectural tick — so it must still take
+    // `extraCycles`, or the harness's clock silently stops for the length of
+    // every interrupt and the timeline drifts away from every recorded
+    // baseline.
+    u32 extraCycles = 0;
 
     // Timebase/decrementer accounting. Whether the guest's 60 Hz tick is
     // driven off the decrementer is a question the whole boot hangs on —
@@ -125,6 +141,12 @@ struct Cpu {
     // programmed" from "programmed far too long".
     u64 decWrites = 0;         // mtspr DEC by the guest
     u64 decIrqs = 0;           // 0x900 exceptions actually delivered
+    // 0x500s delivered. A periodic global that moves at a fixed rate is being
+    // driven by SOMETHING periodic, and the two candidates -- the decrementer
+    // and a device line -- are told apart by which counter advanced between
+    // two of its stores. Counting only the total says a wake-up happened and
+    // names no source.
+    u64 extIrqs = 0;
     u32 decLastWrite = 0;      // last value written
     u64 decLastWriteTb = 0;    // TB at that write
     u64 decMinPeriod = ~0ull;  // smallest reload seen (TB ticks)
@@ -302,6 +324,10 @@ struct Cpu {
         // routine that actually made it is only in r24, and low-memory
         // globals like Ticks are written almost exclusively from there.
         u32 r24;
+        // What had woken the machine by the time of this store. The gap
+        // between two stores to a periodic global is a rate; the gap between
+        // these two counters over the same interval is its SOURCE.
+        u64 dec, ext;
     };
     std::vector<WpHit> wpLog;
     u32 wpMax = 64;

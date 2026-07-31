@@ -325,7 +325,7 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
         (!wpFrom || !wpStamp || *wpStamp >= wpFrom)) {
         if (wpLog.size() < wpMax)
             wpLog.push_back({st.pc - 4, pa, static_cast<u32>(v), len, st.lr,
-                             st.tb, st.gpr[24]});
+                             st.tb, st.gpr[24], decIrqs, extIrqs});
         if (wpForceSet && len == 4 && pa == wpPa) v = wpForce; // diagnostic
     }
     if (!dceOn() || (wimg & kWimgI)) {

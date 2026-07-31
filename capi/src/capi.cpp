@@ -91,10 +91,13 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     const uint64_t until = m->executed + insns;
     Cpu& cpu = m->cpu;
     SawtoothBus& bus = *m->bus;
+    // The harness's clock advance rides along with the architectural one
+    // inside step() instead of being a second call per instruction — see
+    // Cpu::extraCycles. Set here rather than at create so that whatever
+    // changes fastTb is honoured on the next entry.
+    cpu.extraCycles = m->fastTb;
     while (m->executed < until && !cpu.halted) {
         cpu.step();
-        if (m->fastTb)
-            cpu.tick(m->fastTb);
         // One call, and it does nothing at all unless a device could have
         // moved — see SawtoothBus::serviceDevices. Ticking every device and
         // recomputing seven interrupt lines on every emulated instruction was

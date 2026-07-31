@@ -97,7 +97,7 @@ void Cpu::step()
         const bool wake = (st.msr & msr::EE) &&
                           (smiPending || extIrqLine || decPending || pmPending);
         if (!wake) {
-            tick(1);
+            tick(1 + extraCycles);
             return;
         }
         napping = false;
@@ -105,25 +105,37 @@ void Cpu::step()
 
     // Async exceptions at the instruction boundary, EE-gated.
     // Priority per UM ch.4: SMI, then external, then decrementer.
+    //
+    // No instruction executes on these paths, so there is no architectural
+    // tick — but the harness's extra cycles are the machine loop's, not the
+    // instruction's, and the loop used to add them after step() returned
+    // whatever it did. Dropping them here would stop the compressed clock for
+    // the length of every interrupt, which on this machine is half a million
+    // of them per boot.
     if (st.msr & msr::EE) {
         if (smiPending) {
             smiPending = false;
             raiseExc(Exc::Smi, st.pc, 0);
+            tick(extraCycles);
             return;
         }
         if (extIrqLine) {
+            ++extIrqs;
             raiseExc(Exc::External, st.pc, 0);
+            tick(extraCycles);
             return;
         }
         if (decPending) {
             decPending = false;
             ++decIrqs;
             raiseExc(Exc::Decrementer, st.pc, 0);
+            tick(extraCycles);
             return;
         }
         if (pmPending) {
             pmPending = false;
             raiseExc(Exc::PerfMon, st.pc, 0);
+            tick(extraCycles);
             return;
         }
     }
@@ -135,14 +147,14 @@ void Cpu::step()
     if ((st.iabr & 2u) && ((cia ^ st.iabr) & 0xFFFFFFFCu) == 0 &&
         ((st.iabr & 1u) != 0) == ((st.msr & msr::IR) != 0)) {
         raiseExc(Exc::Iabr, cia, 0);
-        tick(1);
+        tick(1 + extraCycles);
         return;
     }
 
     u32 insn, row;
     OPM_PH(Fetch);
     if (!fetchDecoded(cia, insn, row)) { // ISI raised by translate()
-        tick(1);
+        tick(1 + extraCycles);
         return;
     }
     OPM_PH(Decode);
@@ -150,7 +162,7 @@ void Cpu::step()
     if (row == kNoRow) {
         ++unknownWords[insn];
         raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-        tick(1);
+        tick(1 + extraCycles);
         return;
     }
     const InsnDesc* d = kIsa + row;
@@ -160,22 +172,22 @@ void Cpu::step()
     if (const u8 gate = dispPre[row]) {
         if (gate & kPreIll) {
             raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-            tick(1);
+            tick(1 + extraCycles);
             return;
         }
         if ((gate & kPrePriv) && userMode()) {
             raiseExc(Exc::Program, cia, kSrr1ProgPrivileged);
-            tick(1);
+            tick(1 + extraCycles);
             return;
         }
         if ((gate & kPreFp) && !(st.msr & msr::FP)) {
             raiseExc(Exc::FpUnavailable, cia, 0);
-            tick(1);
+            tick(1 + extraCycles);
             return;
         }
         if ((gate & kPreVec) && !(st.msr & msr::VEC)) {
             raiseExc(Exc::VecUnavailable, cia, 0);
-            tick(1);
+            tick(1 + extraCycles);
             return;
         }
     }
@@ -192,7 +204,7 @@ void Cpu::step()
     OPM_PH(Exec);
     fn(*this, insn, *d);
     OPM_PH(Tick);
-    tick(1);
+    tick(1 + extraCycles);
 
     // Performance monitor, minimal-honest: PMC1/PMC2 count cycles (event 1,
     // one per instruction at the provisional 1 cycle/insn rate) or completed

@@ -627,14 +627,42 @@ public partial class MainWindow : Window
         }
         try
         {
-            // ⭐ SetLength DOES NOT WRITE THE BYTES. On NTFS it moves the
-            // file's valid-data mark; the unwritten region reads back as
-            // zeros, which is exactly what a factory-fresh drive looks like.
-            // So a 2 GB image is instant and costs only the space actually
-            // used, where a loop writing zeros would have made creating the
-            // disk the slow step this menu exists to remove.
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-            fs.SetLength(mb * 1024L * 1024L);
+            // SetLength does not write the bytes: on NTFS it allocates the
+            // clusters and moves the file's length, but leaves the VALID DATA
+            // LENGTH at zero, and the unwritten region reads back as zeros —
+            // which is exactly what a factory-fresh drive looks like.
+            //
+            // ⛔⛔ AND THAT IS A TRAP, SO THE LAST BYTE IS WRITTEN HERE ON
+            // PURPOSE. The first write PAST the valid-data mark makes NTFS
+            // zero-fill everything before it, synchronously. Drive Setup puts
+            // HFS+'s alternate volume header at the very END of the disk, so
+            // the guest's first initialise stalls the whole machine for the
+            // time it takes to zero the entire image — measured 352 ms for
+            // 2 GB on an NVMe here, inside ONE emulated instruction, and
+            // seconds on a slower disk. That is long enough to blow a driver
+            // timeout, and it surfaces to the user as "the disk has errors"
+            // rather than as anything to do with the host filesystem.
+            //
+            // ⭐ So pay it once, HERE, where a pause is expected and harmless,
+            // and the emulated machine never sees it. Deliberately NOT solved
+            // by marking the file sparse: sparse would be faster still and
+            // cost only the space in use, but then the image can fail to write
+            // mid-install because the HOST volume filled up — and a disk that
+            // dies halfway through an OS install is a far worse failure than a
+            // slow New Disk Image.
+            // Zeroing a large image is not instant on every disk, and an
+            // unresponsive window with no cursor change reads as a hang.
+            Mouse.OverrideCursor = Cursors.Wait;
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+                long bytes = mb * 1024L * 1024L;
+                fs.SetLength(bytes);
+                fs.Seek(bytes - 1, SeekOrigin.Begin);
+                fs.WriteByte(0);
+                fs.Flush();
+            }
+            finally { Mouse.OverrideCursor = null; }
         }
         catch (Exception ex)
         {

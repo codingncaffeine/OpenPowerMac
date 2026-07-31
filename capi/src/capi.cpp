@@ -323,10 +323,11 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // guest is asleep-and-idle or awake-and-stuck. They look the same from a
     // progress bar that stopped moving.
     snprintf(b, sizeof b,
-             "-- pacing: realtime=%d slips=%llu idleWaits=%llu idleMs=%llu "
-             "skipped=%llu askCostUs=%llu\n",
+             "-- pacing: realtime=%d slips=%llu rebases=%llu idleWaits=%llu "
+             "idleMs=%llu skipped=%llu askCostUs=%llu\n",
              m->realtime ? 1 : 0,
              static_cast<unsigned long long>(m->pace.slips),
+             static_cast<unsigned long long>(m->pace.rebases),
              static_cast<unsigned long long>(m->idle.waits),
              static_cast<unsigned long long>(m->idle.waitedNs / 1000000ull),
              static_cast<unsigned long long>(m->idle.skipped),

@@ -112,6 +112,29 @@ struct HostPacer {
     std::chrono::steady_clock::time_point base{};
     u64 tbBase = 0;
     u64 slips = 0;
+    // ⛔⛔ WHAT THIS PACER LAST LEFT THE TIMEBASE AT, and it is load-bearing.
+    //
+    // Pacing against a fixed origin is right — rebasing on every sample
+    // integrates the pacer's own error, and rebasing on a slip was measured at
+    // 0.39x real and reverted. But it assumes this is the ONLY thing that
+    // moves the clock, and that assumption became false the moment the
+    // architectural advance was switched off: `mtspr TBL/TBU` writes st.tb
+    // directly (exec_int.cpp, SPR 284/285) and Mac OS uses it.
+    //
+    // When the guest writes a value AHEAD of the host-derived target, `want <=
+    // st.tb` below is true — and stays true forever. The clock stops. Nothing
+    // else advances it, so any guest code waiting on the timebase spins for
+    // ever, and with EE clear inside a handler that is the whole machine dead:
+    // no ticks, no cursor, no interrupts. **Measured: 4,000,000 instructions
+    // between two samples with the timebase identical to the tick, the guest
+    // spinning in a 64-bit mftb delay loop at 00f227a8 that could never
+    // expire.** It killed the Mac OS 9 install at the same point every run.
+    //
+    // ⭐ So notice when the value is not the one we left, and pace from where
+    // it ACTUALLY is. That is not "rebase on a slip" — it is refusing to own a
+    // number somebody else has taken over.
+    u64 lastTb = 0;
+    u64 rebases = 0; // times the guest moved the clock out from under us
 
     // 25 MHz = bus/4: one timebase tick every 40 ns.
     static constexpr u64 kNsPerTick = 40;
@@ -153,6 +176,7 @@ struct HostPacer {
     {
         base = std::chrono::steady_clock::now();
         tbBase = cpu.st.tb;
+        lastTb = cpu.st.tb;
     }
 
     // Move the guest's clock to where the host says it should be. Returns the
@@ -168,6 +192,19 @@ struct HostPacer {
     u64 sync(Cpu& cpu)
     {
         const auto now = std::chrono::steady_clock::now();
+        // ⛔ THE CLOCK IS NOT WHERE WE LEFT IT: the guest wrote TBL/TBU, or it
+        // was reset, or a snapshot was restored. Whatever the reason, the
+        // number is now somebody else's, and pacing an old origin against it
+        // either freezes the clock (if the new value is ahead) or fires the
+        // catch-up cap repeatedly (if it is behind). Take the new value as the
+        // origin and carry on from there — see the note on lastTb.
+        if (cpu.st.tb != lastTb) {
+            base = now;
+            tbBase = cpu.st.tb;
+            lastTb = cpu.st.tb;
+            ++rebases;
+            return 0; // no elapsed host time against the new origin yet
+        }
         const u64 ns = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - base)
                 .count());
@@ -182,6 +219,9 @@ struct HostPacer {
             ++slips;
         }
         cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));
+        // Remember what we produced, so the next call can tell our own advance
+        // apart from somebody else's write.
+        lastTb = cpu.st.tb;
         return delta;
     }
 };

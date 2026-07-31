@@ -1,4 +1,5 @@
 #pragma once
+#include "opm/dbdma.hpp"
 #include "opm/types.hpp"
 
 #include <cstdio>
@@ -19,7 +20,11 @@ struct SnapReader;
 //   hi (lba2) · +0x60 device · +0x70 status/command · +0x160
 //   alt-status/devctl · +0x200 timing (inert store)
 // ATAPI signature after reset/diagnostic: 01 01 14 EB.
-class AtaCell {
+//
+// It is a DmaDevice: the DBDMA engine's device end, alongside the sound
+// codec. A drive is the NON-streaming kind — a short transfer means its data
+// phase ended, not that it will want the rest later.
+class AtaCell : public DmaDevice {
 public:
     // The image is held open for the life of the cell; nothing else owns it.
     ~AtaCell()
@@ -94,7 +99,7 @@ public:
     {
         return static_cast<u32>(data_.size() - dataAt_);
     }
-    u32 dmaTake(u8* dst, u32 n);
+    u32 dmaTake(u8* dst, u32 n) override;
     // The other direction: memory -> drive, for WRITE DMA. Returns how many
     // bytes the drive accepted, which falls short only when the command's
     // data phase ends before the descriptor does.
@@ -106,9 +111,9 @@ public:
     // loses a sector the guest believes it wrote — the drive is left holding
     // a data phase for bytes that never arrive, and the driver waits on a
     // transfer that can never finish. Initialising a disk stops there.
-    u32 dmaGive(const u8* src, u32 n);
+    u32 dmaGive(const u8* src, u32 n) override;
     // Whether this cell's OUTPUT descriptors carry real data. See dmaGive.
-    bool dmaWriteSink() const { return disk_; }
+    bool dmaWriteSink() const override { return disk_; }
 
     struct Ev {
         u64 at;

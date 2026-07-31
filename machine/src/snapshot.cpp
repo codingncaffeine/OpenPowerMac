@@ -39,7 +39,10 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // would have refused a version-11 file — it would have loaded, and a snapshot
 // taken inside a BSY window would have resumed with a deadline billions of
 // ticks away and a drive that never answered. A unit change is a stream change.
-constexpr u32 kSnapVersion = 12; // 12: ATA command delay in timebase
+// 13 adds the sound codec and the two audio DBDMA channels, and a
+// mid-descriptor transfer cursor to every channel. It also changes
+// sizeof(SawtoothBus), so old files are refused by the digest either way.
+constexpr u32 kSnapVersion = 13; // 13: AWACS codec + audio DBDMA channels
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -61,7 +64,7 @@ u64 layoutDigest()
         sizeof(Cpu::L2Line),     sizeof(AtaCell),       sizeof(OpenPic),
         sizeof(OhciCell),        sizeof(DbdmaChannel),  sizeof(PmuVia),
         sizeof(R128Cell),        sizeof(SawtoothBus),   sizeof(V128),
-        sizeof(HarnessState),    kSnapVersion,
+        sizeof(HarnessState),    sizeof(AwacsCell),     kSnapVersion,
     };
     return fnv1a(sizes, sizeof sizes);
 }
@@ -646,6 +649,7 @@ void DbdmaChannel::snapSave(SnapWriter& w) const
     w.u32v(intSel_);
     w.u32v(brSel_);
     w.u32v(waitSel_);
+    w.u32v(xferDone_);
     w.b(irq_);
     w.u64v(log.size());
     for (const Ev& ev : log) {
@@ -663,6 +667,7 @@ void DbdmaChannel::snapLoad(SnapReader& r)
     intSel_ = r.u32v();
     brSel_ = r.u32v();
     waitSel_ = r.u32v();
+    xferDone_ = r.u32v();
     irq_ = r.b();
     const u64 n = r.u64v();
     log.clear();
@@ -674,6 +679,47 @@ void DbdmaChannel::snapLoad(SnapReader& r)
         ev.b = r.u32v();
         log.push_back(ev);
     }
+}
+
+// The codec. The PCM ring is part of it: nothing the guest can read, but a
+// resume that kept a stale queue would play the old machine's audio, and the
+// whole-machine fingerprint would call two different machines the same.
+void AwacsCell::snapSave(SnapWriter& w) const
+{
+    w.u32v(soundCtl_);
+    w.u32v(codecCtl_);
+    w.u32v(clipCount_);
+    w.u32v(byteSwap_);
+    for (u32 r : codecRegs_)
+        w.u32v(r);
+    w.u64v(playTb_);
+    w.u64v(recTb_);
+    w.u64v(frameTb_);
+    w.u64v(frameVal_);
+    w.u64v(nowTb_);
+    w.u64v(played_);
+    w.u64v(recorded_);
+    w.u64v(underruns_);
+    w.bytes(ring_);
+}
+
+void AwacsCell::snapLoad(SnapReader& r)
+{
+    soundCtl_ = r.u32v();
+    codecCtl_ = r.u32v();
+    clipCount_ = r.u32v();
+    byteSwap_ = r.u32v();
+    for (u32& v : codecRegs_)
+        v = r.u32v();
+    playTb_ = r.u64v();
+    recTb_ = r.u64v();
+    frameTb_ = r.u64v();
+    frameVal_ = r.u64v();
+    nowTb_ = r.u64v();
+    played_ = r.u64v();
+    recorded_ = r.u64v();
+    underruns_ = r.u64v();
+    r.bytes(ring_);
 }
 
 void PmuVia::snapSave(SnapWriter& w) const
@@ -937,6 +983,15 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     sec = w.begin("DBD2");
     hdDma_.snapSave(w);
     w.end(sec);
+    sec = w.begin("SND ");
+    snd_.snapSave(w);
+    w.end(sec);
+    sec = w.begin("SDMO");
+    sndOut_.snapSave(w);
+    w.end(sec);
+    sec = w.begin("SDMI");
+    sndIn_.snapSave(w);
+    w.end(sec);
     sec = w.begin("PMU ");
     pmu_.snapSave(w);
     w.end(sec);
@@ -1045,6 +1100,15 @@ void SawtoothBus::snapLoad(SnapReader& r)
     e = r.beginSection("DBD2");
     hdDma_.snapLoad(r);
     r.endSection("DBD2", e);
+    e = r.beginSection("SND ");
+    snd_.snapLoad(r);
+    r.endSection("SND ", e);
+    e = r.beginSection("SDMO");
+    sndOut_.snapLoad(r);
+    r.endSection("SDMO", e);
+    e = r.beginSection("SDMI");
+    sndIn_.snapLoad(r);
+    r.endSection("SDMI", e);
     e = r.beginSection("PMU ");
     pmu_.snapLoad(r);
     r.endSection("PMU ", e);
@@ -1059,9 +1123,11 @@ void SawtoothBus::snapLoad(SnapReader& r)
         ohci_[f].ramSize = static_cast<u32>(ram_.size());
     }
     ataDma_.dmaBus = this;
-    ataDma_.ata = &cd_;
+    ataDma_.dev = &cd_;
     hdDma_.dmaBus = this;
-    hdDma_.ata = &hd_;
+    hdDma_.dev = &hd_;
+    sndOut_.dmaBus = sndIn_.dmaBus = this;
+    sndOut_.dev = sndIn_.dev = &snd_;
     // The device-service gate is a CACHE of "when could an interrupt line next
     // change", and every device it summarises has just been replaced. Say
     // "unknown" rather than carry a deadline computed for a different machine:

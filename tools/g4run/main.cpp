@@ -469,6 +469,18 @@ int main(int argc, char** argv)
     // because the capi takes constructor defaults. --no-kl-timer restores the
     // 43x-slow clock every pre-session-27 baseline was recorded under.
     bool klTimer = true;
+    // --no-sound: take the AWACS codec and the two audio DBDMA channels back
+    // out, so the mac-io window falls through to KeyLargo storage the way it
+    // did before 2026-07-31. It is the control for a machine-behaviour
+    // change, not a preference: with the channels there the boot ROM waits
+    // for its own startup chime to finish, because it spins on the output
+    // channel's ACTIVE bit (fff868ec). See SawtoothBus::soundOn.
+    bool soundOn = true;
+    // --wav-out FILE: every byte the codec accepts, written out as a WAV at
+    // the rate Sound Control selects. The boot ROM's chime arrives at about
+    // 8.3 M instructions, so the whole output path is graded by a cold boot
+    // rather than by a desktop that has to be persuaded to play something.
+    const char* wavOut = nullptr;
     // --ati-vbl-tb N: timebase ticks between vertical blanks (0 = nominal
     // 60 Hz at 25 MHz). See the note in r128.hpp — under --fast-tb the guest's
     // own clock runs ~45x slower than the nominal timebase, so the nominal
@@ -549,6 +561,14 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--no-nap-skip")) { napSkipOn = false; continue; }
         if (!strcmp(a, "--no-batch")) { batchOn = false; continue; }
         if (!strcmp(a, "--no-line-exec")) { lineExecOff = true; continue; }
+        // Up here for the same reason as the speed flags: the else-if ladder
+        // below is already at MSVC's nesting limit (C1061).
+        if (!strcmp(a, "--sound")) { soundOn = true; continue; }
+        if (!strcmp(a, "--no-sound")) { soundOn = false; continue; }
+        if (!strcmp(a, "--wav-out") && i + 1 < argc) {
+            wavOut = argv[++i];
+            continue;
+        }
         if (!strcmp(a, "--fingerprint-every") && i + 1 < argc) {
             fpEvery = strtoull(argv[++i], nullptr, 0);
             continue;
@@ -1050,6 +1070,12 @@ int main(int argc, char** argv)
     }
     bus.ati().vblEnabled = atiVbl;
     bus.klTimerOn = klTimer;
+    bus.soundOn = soundOn;
+    // A second tap on the codec, independent of the ring the application
+    // drains, so a capture cannot be stolen by a consumer that is not there.
+    std::vector<u8> wavPcm;
+    if (wavOut)
+        bus.sound().capture = &wavPcm;
     R128Cell::setVblTbPeriod(atiVblTb);
     R128Cell::setVblTrace(vblTrace);
     OpenPic::setTrace(vblTrace * 4); // iack+eoi pairs outnumber latch+ack
@@ -5006,6 +5032,105 @@ int main(int argc, char** argv)
                  k < dl.size(); ++k)
                 printf("   %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
                        dl[k].b, static_cast<unsigned long long>(dl[k].at));
+        }
+    }
+    {
+        // The codec and its two channels. `played` is the only number that
+        // says the output path works end to end: the guest built a
+        // descriptor list, the engine walked it, and the codec accepted
+        // bytes at its own sample rate.
+        const AwacsCell& sc = bus.sound();
+        printf("-- sound: %s  ctl=%08x (rate %u Hz, in sf %u, out sf %u)  "
+               "codec=%08x  byteswap=%08x  frames=%llu\n",
+               bus.soundOn ? "on" : "OFF (--no-sound)", sc.soundCtl(),
+               sc.rateHz(), sc.soundCtl() & 0xFu, (sc.soundCtl() >> 4) & 0xFu,
+               sc.codecCtl(), sc.byteSwap(),
+               static_cast<unsigned long long>(sc.frameCount()));
+        printf("--   played %llu bytes, captured %llu, underruns %llu, "
+               "queued %zu\n",
+               static_cast<unsigned long long>(sc.bytesPlayed()),
+               static_cast<unsigned long long>(sc.bytesCaptured()),
+               static_cast<unsigned long long>(sc.underruns()), sc.queued());
+        for (u32 c = 0; c < 2; ++c) {
+            const auto& dl = c ? bus.sndIn().log : bus.sndOut().log;
+            printf("--   %s dbdma events (%zu; 0=ctl 1=desc 2=data 3=stop "
+                   "4=dead 5=storequad 7=branch):\n",
+                   c ? "audio-in" : "audio-out", dl.size());
+            for (size_t k = 0; k < dl.size() && k < 24; ++k)
+                printf("     %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
+                       dl[k].b, static_cast<unsigned long long>(dl[k].at));
+        }
+    }
+    if (wavOut) {
+        // ⭐ THE BYTE ORDER IS DECIDED BY MEASUREMENT, NOT BY THE REGISTER.
+        // Byte Swapping at +0x40 is the one sound register the ROM writes
+        // with a plain store rather than a byte-reversed one, so reading a
+        // sample order out of it would be a guess. Audio is smooth and noise
+        // is not: the mean absolute difference between neighbouring samples
+        // is tiny for the right interpretation and near full scale for the
+        // wrong one, and the two numbers are printed so the claim is
+        // checkable rather than asserted.
+        auto rough = [&](bool be) {
+            if (wavPcm.size() < 8)
+                return 0.0;
+            double sum = 0;
+            size_t n = 0;
+            int prev = 0;
+            for (size_t k = 0; k + 1 < wavPcm.size(); k += 2) {
+                const int v = static_cast<i16>(
+                    be ? (wavPcm[k] << 8) | wavPcm[k + 1]
+                       : (wavPcm[k + 1] << 8) | wavPcm[k]);
+                if (n)
+                    sum += std::abs(v - prev);
+                prev = v;
+                ++n;
+            }
+            return n > 1 ? sum / double(n - 1) : 0.0;
+        };
+        const double rBe = rough(true), rLe = rough(false);
+        const bool srcBe = rBe <= rLe;
+        const u32 rate = bus.sound().rateHz();
+        const u32 frames = static_cast<u32>(wavPcm.size() / 4);
+        int peak = 0;
+        for (size_t k = 0; k + 1 < wavPcm.size(); k += 2) {
+            const int v = static_cast<i16>(srcBe
+                                               ? (wavPcm[k] << 8) | wavPcm[k + 1]
+                                               : (wavPcm[k + 1] << 8) | wavPcm[k]);
+            if (std::abs(v) > peak)
+                peak = std::abs(v);
+        }
+        printf("-- wav: %zu bytes, roughness BE %.0f / LE %.0f -> samples "
+               "read as %s-endian, peak %d\n",
+               wavPcm.size(), rBe, rLe, srcBe ? "BIG" : "little", peak);
+        FILE* f = fopen(wavOut, "wb");
+        if (!f) {
+            printf("-- wav: cannot write %s\n", wavOut);
+        } else {
+            const u32 dataBytes = frames * 4u;
+            auto w32 = [&](u32 v) { fwrite(&v, 4, 1, f); };
+            auto w16 = [&](u16 v) { fwrite(&v, 2, 1, f); };
+            fwrite("RIFF", 1, 4, f);
+            w32(36u + dataBytes);
+            fwrite("WAVEfmt ", 1, 8, f);
+            w32(16);
+            w16(1);              // PCM
+            w16(2);              // stereo
+            w32(rate);
+            w32(rate * 4u);      // byte rate
+            w16(4);              // block align
+            w16(16);             // bits
+            fwrite("data", 1, 4, f);
+            w32(dataBytes);
+            // A WAV holds little-endian samples whichever way the guest
+            // wrote them.
+            for (u32 k = 0; k < dataBytes; k += 2) {
+                const u8 a = wavPcm[k], b = wavPcm[k + 1];
+                const u8 out[2] = {srcBe ? b : a, srcBe ? a : b};
+                fwrite(out, 1, 2, f);
+            }
+            fclose(f);
+            printf("-- wav written: %s (%u frames, %.2f s at %u Hz)\n", wavOut,
+                   frames, rate ? double(frames) / double(rate) : 0.0, rate);
         }
     }
     // The serial console census sat INSIDE the ATI report, so hiding the

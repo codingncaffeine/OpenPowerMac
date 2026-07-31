@@ -1,7 +1,8 @@
 #include "opm/dbdma.hpp"
 
-#include "opm/ata.hpp"
 #include "opm/bus.hpp"
+
+#include <vector>
 
 namespace opm {
 
@@ -58,6 +59,16 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
         const u32 wasRun = status_ & kRun;
         status_ = (status_ & ~mask) | (val & mask);
         note(0, native, status_);
+        // The interrupt is a LEVEL, and until this line existed nothing ever
+        // lowered it. On the hardware the condition lives in channelStatus
+        // and the driver clears it by writing channelControl, which is what
+        // every DBDMA interrupt handler does before it looks at anything
+        // else. A level nothing lowers is an interrupt storm the moment a
+        // driver enables the source — which is exactly what a sound driver
+        // does, and why this could stay wrong for as long as ATA was the
+        // only user (its driver reads the condition from the cell's +0x300
+        // latch instead).
+        irq_ = false;
         if (status_ & kFlush) {
             // flush completes immediately: drop the standing list state
             status_ &= ~kFlush;
@@ -70,10 +81,13 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
         if ((status_ & kRun) && !wasRun) {
             status_ &= ~kDead;
             status_ |= kActive;
+            xferDone_ = 0; // a fresh list starts at the head of a descriptor
             run();
         }
-        if (!(status_ & kRun))
+        if (!(status_ & kRun)) {
             status_ &= ~kActive;
+            xferDone_ = 0;
+        }
         break;
     }
     case 3:
@@ -109,6 +123,12 @@ void DbdmaChannel::run()
         return swap32(be);
     };
     auto wr32le = [&](u32 pa, u32 x) { dmaBus->write32(pa, swap32(x)); };
+    // A descriptor list that BRANCHES is a ring, and an audio driver's output
+    // list is one: without a bound, a ring whose device has no room would be
+    // walked forever inside a single guest instruction. Any descriptor that
+    // moves a byte resets the count, so an ATA list — which never branches at
+    // all — cannot reach it.
+    u32 idle = 0;
     for (u32 steps = 0; steps < 65536; ++steps) {
         if (!(status_ & kRun))
             return;
@@ -125,33 +145,46 @@ void DbdmaChannel::run()
         const u32 req = w0 & 0xFFFFu;
         const u32 addr = rd32le(cmdPtr_ + 4);
         note(1, cmdPtr_, w0);
+        // Park on this descriptor and wait for a wake: a streaming device
+        // took part of it and still owes the rest.
+        bool stall = false;
+        u32 movedNow = 0;
         switch (op) {
         case 7: // STOP
             status_ &= ~kActive;
+            xferDone_ = 0;
             note(3, cmdPtr_, 0);
             return;
         case 2:
         case 3: { // INPUT_MORE / INPUT_LAST: device -> memory
             u32 moved = 0;
-            if (ata) {
-                std::vector<u8> tmp(req);
-                moved = ata->dmaTake(tmp.data(), req);
+            const u32 want = req - xferDone_;
+            const u32 at = addr + xferDone_;
+            if (dev) {
+                std::vector<u8> tmp(want);
+                moved = dev->dmaTake(tmp.data(), want);
                 // The processor's copy of the destination is about to be
                 // wrong. Without this the bytes land in RAM underneath a
                 // live cache line and the driver reads back whatever it
                 // had before the transfer — a DMA that "worked" and
                 // delivered nothing.
-                dmaBus->snoopBeforeDmaWrite(addr, moved);
+                dmaBus->snoopBeforeDmaWrite(at, moved);
                 for (u32 k = 0; k < moved; ++k)
-                    dmaBus->write8(addr + k, tmp[k]);
+                    dmaBus->write8(at + k, tmp[k]);
             }
-            note(2, addr, moved);
-            if (moved < req) {
+            note(2, at, moved);
+            movedNow = moved;
+            xferDone_ += moved;
+            if (xferDone_ < req) {
                 // Device has no more data right now: report what moved,
                 // stay on this descriptor and wait for a wake.
-                if (moved == 0)
+                if (xferDone_ == 0)
                     return; // nothing yet — retry on wake
-                wr32le(cmdPtr_ + 12, (0x8400u << 16) | (req - moved));
+                if (dev && dev->dmaStreams()) {
+                    stall = true;
+                    break;
+                }
+                wr32le(cmdPtr_ + 12, (0x8400u << 16) | (req - xferDone_));
             } else {
                 wr32le(cmdPtr_ + 12, (0x8400u << 16) | 0u);
             }
@@ -159,20 +192,28 @@ void DbdmaChannel::run()
         }
         case 0:
         case 1: { // OUTPUT_MORE / OUTPUT_LAST: memory -> device
-            if (ata && ata->dmaWriteSink()) {
+            if (dev && dev->dmaWriteSink()) {
+                const u32 want = req - xferDone_;
+                const u32 at = addr + xferDone_;
                 // The source is a buffer the guest built with ordinary
                 // cached stores, so push whatever the processor still holds
                 // dirty before reading it — the read side of the same
                 // coherency truth the descriptor fetch above depends on.
-                dmaBus->snoopBeforeDmaRead(addr, req);
-                std::vector<u8> tmp(req);
-                for (u32 k = 0; k < req; ++k)
-                    tmp[k] = dmaBus->read8(addr + k);
-                const u32 moved = ata->dmaGive(tmp.data(), req);
-                note(2, addr, moved);
-                if (moved == 0)
+                dmaBus->snoopBeforeDmaRead(at, want);
+                std::vector<u8> tmp(want);
+                for (u32 k = 0; k < want; ++k)
+                    tmp[k] = dmaBus->read8(at + k);
+                const u32 moved = dev->dmaGive(tmp.data(), want);
+                note(2, at, moved);
+                movedNow = moved;
+                xferDone_ += moved;
+                if (xferDone_ == 0)
                     return; // no write phase open yet — retry on wake
-                wr32le(cmdPtr_ + 12, (0x8400u << 16) | (req - moved));
+                if (xferDone_ < req && dev->dmaStreams()) {
+                    stall = true;
+                    break;
+                }
+                wr32le(cmdPtr_ + 12, (0x8400u << 16) | (req - xferDone_));
                 break;
             }
             // An ATAPI device's packet and its payload go through the task
@@ -206,6 +247,15 @@ void DbdmaChannel::run()
             note(4, cmdPtr_, w0);
             return;
         }
+        if (stall) {
+            // The device took part of this descriptor and still owes the
+            // rest. Stay here; a wake resumes at addr + xferDone_. The
+            // status word is deliberately NOT written — the descriptor is
+            // not finished, and a driver that read a residual here would be
+            // told a transfer ended that has not.
+            return;
+        }
+        xferDone_ = 0;
         // Interrupt control. The descriptor is a LITTLE-ENDIAN struct —
         //   u16 reqCount · u8 cmdBits · u8 cmdKey · u32 address · …
         // so in the assembled word cmdKey is 31:24 (cmd = key>>4) and
@@ -218,7 +268,32 @@ void DbdmaChannel::run()
         // no list in this machine uses them, so they read as "always".)
         if (((w0 >> 20) & 3u) != 0)
             irq_ = true;
-        cmdPtr_ += 16;
+        // Branch, at word bits 19:18 by the same arithmetic. It is what
+        // turns a list into a RING, which is what a continuous audio stream
+        // needs and what no ATA list has ever used — the branch target is
+        // cmdDep, word2, the same word STORE_QUAD/LOAD_QUAD use as their
+        // literal, so those two are excluded rather than trusted.
+        const u32 br = (op == 4 || op == 5) ? 0u : ((w0 >> 18) & 3u);
+        bool take = br == 3u; // 11 = always
+        if (br == 1u || br == 2u) {
+            // 01 branch if the channel's s0-s7 match branchSelect, 10 if
+            // they do not. Both halves of the select register are used:
+            // mask in 23:16, value in 7:0.
+            const u32 mask = (brSel_ >> 16) & 0xFFu, val = brSel_ & 0xFFu;
+            const bool cond = ((status_ & 0xFFu) & mask) == (val & mask);
+            take = br == 1u ? cond : !cond;
+        }
+        if (take) {
+            const u32 target = rd32le(cmdPtr_ + 8) & ~15u;
+            note(7, cmdPtr_, target);
+            cmdPtr_ = target;
+        } else {
+            cmdPtr_ += 16;
+        }
+        if (movedNow)
+            idle = 0;
+        else if (++idle > 512)
+            return; // a ring going round without moving a byte: park
     }
 }
 

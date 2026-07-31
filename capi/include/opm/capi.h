@@ -84,6 +84,24 @@ OPM_API void opm_key_event(OpmMachine* m, uint32_t usage, uint32_t down);
 OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
                        uint32_t buttons);
 
+// ---- audio ----
+// Drain PCM the guest has handed to the sound codec: 16-bit signed stereo
+// samples, BIG-ENDIAN, interleaved left then right — the byte order Mac OS
+// writes and the DBDMA channel carries unaltered. Returns bytes written
+// (<= cap, always a multiple of 4). Poll it regularly: the codec queues about
+// six seconds and then drops the oldest, so a front end that never drains
+// hears the machine skip.
+//
+// The rate is not fixed — the Sound Control register selects it and the guest
+// may change it — so ask opm_audio_rate() alongside, and re-open the host
+// device when it changes. The boot ROM's startup chime comes out of this path
+// at about 8.3 M instructions, which is the cheapest end-to-end test there is.
+OPM_API uint32_t opm_audio(OpmMachine* m, uint8_t* out, uint32_t cap);
+OPM_API uint32_t opm_audio_rate(const OpmMachine* m);
+// Total bytes the codec has accepted since power-on. A status line can
+// divide it by (rate*4) for the guest's own idea of how long it has played.
+OPM_API uint64_t opm_audio_played(const OpmMachine* m);
+
 // Snapshot the display. Returns 1 and fills w/h if the CRTC is live and
 // the caller's buffer (BGRA, w*h*4 bytes, cap in bytes) was big enough;
 // returns 0 with w/h set when only the size query succeeded; returns -1

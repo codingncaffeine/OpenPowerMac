@@ -253,6 +253,25 @@ OPM_API uint32_t opm_console(OpmMachine* m, char* buf, uint32_t cap)
     return n;
 }
 
+OPM_API uint32_t opm_audio(OpmMachine* m, uint8_t* out, uint32_t cap)
+{
+    if (!m || !out || cap < 4u)
+        return 0;
+    // Whole frames only: a caller handed three bytes would have the two
+    // channels out of step for the rest of the stream.
+    return static_cast<uint32_t>(m->bus->sound().drain(out, cap & ~3u));
+}
+
+OPM_API uint32_t opm_audio_rate(const OpmMachine* m)
+{
+    return m ? m->bus->sound().rateHz() : 0u;
+}
+
+OPM_API uint64_t opm_audio_played(const OpmMachine* m)
+{
+    return m ? m->bus->sound().bytesPlayed() : 0ull;
+}
+
 OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
                            uint32_t* w, uint32_t* h)
 {

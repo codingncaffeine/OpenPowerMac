@@ -1,5 +1,6 @@
 set(OPM_MACHINE_SRC
   src/ati.cpp
+  src/awacs.cpp
   src/gossamer.cpp
   src/macio.cpp
   src/cuda.cpp

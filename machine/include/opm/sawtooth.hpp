@@ -1,5 +1,6 @@
 #pragma once
 #include "opm/ata.hpp"
+#include "opm/awacs.hpp"
 #include "opm/dbdma.hpp"
 #include "opm/bus.hpp"
 #include "opm/ohci.hpp"
@@ -160,9 +161,14 @@ public:
             if (r != 0x08)
                 cfgSeed(0, 0x00010000u | r, 0);
         ataDma_.dmaBus = this;
-        ataDma_.ata = &cd_;
+        ataDma_.dev = &cd_;
         hdDma_.dmaBus = this;
-        hdDma_.ata = &hd_;
+        hdDma_.dev = &hd_;
+        // The two audio channels share the engine the ATA channels proved,
+        // and both ends of the codec are the same cell: +0x8800 hands it
+        // samples, +0x8900 asks it for them.
+        sndOut_.dmaBus = sndIn_.dmaBus = this;
+        sndOut_.dev = sndIn_.dev = &snd_;
         // The machine's clock, handed to the cells that model a DURATION.
         // Wired here rather than by the consumer for the reason setStamp
         // exists: a per-consumer wiring list is how the app ended up with a
@@ -446,6 +452,32 @@ public:
         pic_.setLine(11, hdDma_.irqLine()); // ata-4's DBDMA (reg 8a00)
         pic_.setLine(19, hd_.irqLine()); // ata-4@1f000, interrupts 0x13
         pic_.setLine(20, cd_.irqLine());
+        // The audio DBDMA channels. A mac-io channel at +0x8000 + N*0x100
+        // raises source N+1 — the two ATA channels are the recorded pairs
+        // (0x8A00 = channel 10 = source 11, 0x8B00 = channel 11 = source
+        // 12), so audio out is channel 8 = SOURCE 9 and audio in is channel
+        // 9 = SOURCE 10. Session 25's census of sources the OS enables and
+        // this machine never asserts named 9, 10, 12, 22, 24, 25 and 29:
+        // 9 and 10 are these two, and 12 is the CD's, which reaches the
+        // driver through the cell's +0x300 register instead.
+        //
+        // ⭐⭐ IT IS A PULSE, NOT A LEVEL, AND THE DIFFERENCE WEDGED THE
+        // MACHINE. Mac OS's sound driver arms a self-sustaining ring —
+        // INPUT_MORE, STORE_QUAD (interrupt always, writing its own
+        // ready-flag word), INPUT_MORE, STORE_QUAD, NOP branching back — and
+        // it never touches the channel again. There is nothing for a handler
+        // to clear, and the OS reads the flag word the STORE_QUAD wrote, not
+        // the channel. Held as a level, the first interrupt was taken and
+        // never EOI'd: the run ended `inService=10 cpuLine=0`, every device
+        // interrupt in the machine blocked behind it, the OS had defensively
+        // MASKED source 9, and the guest's 60 Hz chain was running at 7.3 Hz
+        // (Ticks 4,890 against the control's 39,731). Both OpenPIC sources
+        // are edge-sensitive here — `vp=00040007`, sense bit 22 clear — so
+        // raising and lowering in the same breath is the honest shape.
+        if (soundOn) {
+            pulse(9, sndOut_);
+            pulse(10, sndIn_);
+        }
         pic_.setLine(27, ohci_[0].irqLine());
         pic_.setLine(28, ohci_[1].irqLine());
         // The AGP display's vertical blank — what runs the slot-VBL
@@ -463,6 +495,19 @@ public:
         // matching the node's AAPL,interrupt-priorities. Source 32 is the
         // mac-io TIMER, which nothing uses and which the OS leaves masked.
         pic_.setLine(48, ati_.irqLine());
+    }
+    // One edge, then the line goes back down and the channel's condition is
+    // consumed. ⚠ The ATA channels deliberately do NOT go through here: their
+    // interrupt reaches the driver through the cell's +0x300 latch, source 11
+    // has never raised once in a whole boot, and their behaviour is the one
+    // every recorded baseline was measured against.
+    void pulse(u32 src, DbdmaChannel& ch)
+    {
+        if (!ch.irqLine())
+            return;
+        pic_.setLine(src, true);
+        pic_.setLine(src, false);
+        ch.clearIrq();
     }
 
     // Every bus master in the machine answers to the same snoop responder.
@@ -505,6 +550,7 @@ public:
         // the gate below can open. One store keeps it exact — see nowTb_.
         nowTb_ = tb;
         ati_.noteTb(tb);
+        snd_.noteTb(tb);
         if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_)
             return cpuIrq_;
         ++devServices_;
@@ -513,8 +559,8 @@ public:
         syncIrqs();
         cpuIrq_ = pic_.cpuLine();
         devDueTb_ = ohci_[0].nextTickTb();
-        const u64 due[4] = {ohci_[1].nextTickTb(), ati_.nextTickTb(),
-                            cd_.pendingTb(), hd_.pendingTb()};
+        const u64 due[5] = {ohci_[1].nextTickTb(), ati_.nextTickTb(),
+                            cd_.pendingTb(), hd_.pendingTb(), soundDueTb()};
         for (const u64 d : due)
             if (d < devDueTb_)
                 devDueTb_ = d;
@@ -538,6 +584,10 @@ public:
         const u64 t = deviceNow(nowTb_);
         nowTb_ = t;
         ati_.noteTb(t);
+        // The codec has the same problem the display has, from the other
+        // side: the guest ARMS a DBDMA list from inside a register write,
+        // and the engine asks the codec for room in that same breath.
+        snd_.noteTb(t);
     }
     // A machine whose devices were poked from outside the run loop (the shell
     // attaching media, a test rig) must not be answered from the cache.
@@ -586,6 +636,36 @@ public:
             ataDma_.wake();
         if (hd_.tick())
             hdDma_.wake();
+        // The codec is the one device that parks a channel on ITSELF: a
+        // stream drains at its sample rate, so an output list is left
+        // mid-descriptor until the FIFO has room again. Nothing the guest
+        // does wakes it — the passage of time does.
+        if (soundOn) {
+            snd_.noteTb(tb);
+            if (sndOut_.parked() && tb >= snd_.outDueTb())
+                sndOut_.wake();
+            if (sndIn_.parked() && tb >= snd_.inDueTb())
+                sndIn_.wake();
+        }
+    }
+    // The codec's contribution to the device gate's deadline. It is asked of
+    // the CHANNELS, not of the codec: only a channel knows it is parked
+    // mid-descriptor, and a descriptor larger than the FIFO — which every
+    // audio buffer is — parks on a call where the codec accepted bytes and
+    // had no reason to think anything was waiting.
+    u64 soundDueTb() const
+    {
+        if (!soundOn)
+            return ~0ull;
+        u64 d = ~0ull;
+        if (sndOut_.parked())
+            d = snd_.outDueTb();
+        if (sndIn_.parked()) {
+            const u64 i = snd_.inDueTb();
+            if (i < d)
+                d = i;
+        }
+        return d;
     }
 
     // DBDMA channels, one per ATA cell, at the mac-io offsets the ROM's
@@ -601,6 +681,24 @@ public:
     // missing volume.
     DbdmaChannel& ataDma() { return ataDma_; }
     DbdmaChannel& hdDma() { return hdDma_; }
+
+    // The sound codec and its two DBDMA channels, at the KeyLargo offsets
+    // the same map gives: 0x8800 audio out, 0x8900 audio in.
+    //
+    // ⚠⚠ CONSTRUCTOR DEFAULT, WHICH IS WHAT THE CAPI AND THEREFORE THE APP
+    // GET. Turning this on is a MACHINE-BEHAVIOUR change, not an addition:
+    // the boot ROM arms the output channel for the startup chime and then
+    // SPINS ON ITS ACTIVE BIT (fff868ec..fff868fc). With nothing behind the
+    // window the status register read zero, the spin fell straight through
+    // and the chime cost nothing; with a channel there the ROM waits for the
+    // chime to finish, which is what the hardware does and what the sound is
+    // for. `--no-sound` is the control, and it restores the old machine
+    // exactly — the register window falls back to KeyLargo storage.
+    bool soundOn = true;
+    AwacsCell& sound() { return snd_; }
+    const AwacsCell& sound() const { return snd_; }
+    DbdmaChannel& sndOut() { return sndOut_; }
+    DbdmaChannel& sndIn() { return sndIn_; }
 
     // ATA cells (OF's tree: ata-4@1f000, ata-3@20000, ata-3@21000, each
     // with a /disk node). The CD lives on ata-3@20000 device 0 when an
@@ -688,6 +786,7 @@ public:
         ohci_[0].stamp = ohci_[1].stamp = s;
         ati_.stamp = s;
         ataDma_.stamp = hdDma_.stamp = s;
+        sndOut_.stamp = sndIn_.stamp = s;
     }
     void setPcRef(const u32* p)
     {
@@ -696,6 +795,7 @@ public:
         ohci_[0].pcRef = ohci_[1].pcRef = p;
         ati_.pcRef = p;
         ataDma_.pcRef = hdDma_.pcRef = p;
+        sndOut_.pcRef = sndIn_.pcRef = p;
     }
 
     size_t ramBytes() const { return ram_.size(); }
@@ -796,6 +896,14 @@ private:
                 return ataDma_.read(off - 0x8B00u, len);
             if (off - 0x8A00u < 0x100u)
                 return hdDma_.read(off - 0x8A00u, len);
+            if (soundOn) {
+                if (off - 0x8800u < 0x100u)
+                    return sndOut_.read(off - 0x8800u, len);
+                if (off - 0x8900u < 0x100u)
+                    return sndIn_.read(off - 0x8900u, len);
+                if (off - AwacsCell::kRegBase < AwacsCell::kRegSize)
+                    return snd_.read(off - AwacsCell::kRegBase, len);
+            }
             if (off - 0x1F000u < 0x3000u) {
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
@@ -976,6 +1084,20 @@ private:
             if (off - 0x8A00u < 0x100u) {
                 hdDma_.write(off - 0x8A00u, v, len);
                 return;
+            }
+            if (soundOn) {
+                if (off - 0x8800u < 0x100u) {
+                    sndOut_.write(off - 0x8800u, v, len);
+                    return;
+                }
+                if (off - 0x8900u < 0x100u) {
+                    sndIn_.write(off - 0x8900u, v, len);
+                    return;
+                }
+                if (off - AwacsCell::kRegBase < AwacsCell::kRegSize) {
+                    snd_.write(off - AwacsCell::kRegBase, v, len);
+                    return;
+                }
             }
             if (off - 0x1F000u < 0x3000u) {
                 if ((off & 0xFF0u) != 0 &&
@@ -1608,6 +1730,8 @@ private:
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
     R128Cell ati_;
     DbdmaChannel ataDma_, hdDma_;
+    AwacsCell snd_;
+    DbdmaChannel sndOut_, sndIn_;
     std::vector<u8> atiRom_;
     u64 romBase_ = 0; // FNV-1a of the boot flash as loaded (see the ctor)
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;

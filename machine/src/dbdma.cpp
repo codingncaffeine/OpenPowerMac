@@ -70,8 +70,36 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
         // latch instead).
         irq_ = false;
         if (status_ & kFlush) {
-            // flush completes immediately: drop the standing list state
             status_ &= ~kFlush;
+            // ⭐⭐ AND ACTUALLY FLUSH, WHICH THIS NEVER DID. Clearing the bit
+            // was the whole of it, while the comment claimed it "drops the
+            // standing list state" — it left that state exactly where it was,
+            // so a channel parked mid-descriptor stayed RUN|ACTIVE on the same
+            // descriptor for ever.
+            //
+            // ⛔ That hung the Mac OS 9 boot during extension loading. A serial
+            // driver programs SCC receive B (+0x8700) with an INPUT_MORE for
+            // 768 bytes, gets nothing because no device is attached to that
+            // channel, and aborts the pending receive the way DBDMA says to:
+            // set FLUSH and wait for the channel to let go. Measured at the
+            // hang: 2,467 writes of 0x20002000 to ChannelControl, one every
+            // ~26 instructions, against a channel answering RUN|ACTIVE every
+            // single time.
+            //
+            // A flush means "give up what you are holding", so the descriptor
+            // in progress ends here — its status word takes the residual it
+            // did NOT transfer, and the channel stops being busy on it.
+            // Anything else tells a driver its transfer is still coming when
+            // nothing is ever going to arrive.
+            if ((status_ & kActive) && cmdPtr_ && dmaBus) {
+                const u32 req = swap32(dmaBus->read32(cmdPtr_)) & 0xFFFFu;
+                dmaBus->write32(cmdPtr_ + 12,
+                                swap32((0x8400u << 16) |
+                                       ((req - xferDone_) & 0xFFFFu)));
+                xferDone_ = 0;
+                status_ &= ~kActive;
+                note(3, cmdPtr_, status_);
+            }
         }
         if (status_ & kWake) {
             status_ &= ~kWake;

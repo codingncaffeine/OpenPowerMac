@@ -488,6 +488,151 @@ public partial class MainWindow : Window
         UpdateTitle();
     }
 
+    // ---- hard disks ----
+    //
+    // ⚠ THE MACHINE OPENS ITS DISK AT opm_create, so everything here decides
+    // what the NEXT start will boot. Changing the disk under a running machine
+    // is the one case that needs saying out loud, because it otherwise looks
+    // like the menu did nothing.
+
+    // The history entries currently inserted into the submenu. Held so they
+    // can be removed before the next rebuild — the alternative is recognising
+    // them by their content, which breaks the first time a disk is called
+    // "Detach".
+    private readonly List<MenuItem> _hdRecentItems = new();
+
+    private static string DescribeMb(long mb) =>
+        mb >= 1024 && mb % 1024 == 0 ? $"{mb / 1024} GB" : $"{mb} MB";
+
+    private static string DescribeBytes(long bytes) =>
+        bytes >= 1L << 30 ? $"{bytes / (double)(1L << 30):0.#} GB"
+                          : $"{bytes / (double)(1L << 20):0.#} MB";
+
+    // What a disk is, said in one line: its name and how big it is. A missing
+    // file says so rather than being hidden — a disk on a drive that is not
+    // plugged in right now is still the disk you meant.
+    private static string DescribeDisk(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            return fi.Exists ? $"{fi.Name}  ({DescribeBytes(fi.Length)})"
+                             : $"{Path.GetFileName(path)}  (missing)";
+        }
+        catch { return Path.GetFileName(path); }
+    }
+
+    private void OnHardDiskOpened(object sender, RoutedEventArgs e)
+    {
+        foreach (var mi in _hdRecentItems)
+            miHd.Items.Remove(mi);
+        _hdRecentItems.Clear();
+
+        int at = miHd.Items.IndexOf(miHdSep) + 1;
+        foreach (string path in _settings.RecentHds)
+        {
+            string p = path;
+            var mi = new MenuItem
+            {
+                Header = DescribeDisk(p),
+                IsCheckable = true,
+                IsChecked = string.Equals(p, _settings.HdPath,
+                                          StringComparison.OrdinalIgnoreCase),
+                ToolTip = p,
+            };
+            mi.Click += (_, _) => AttachHd(p, "attached");
+            miHd.Items.Insert(at++, mi);
+            _hdRecentItems.Add(mi);
+        }
+        miHdSep.Visibility = _settings.RecentHds.Count > 0
+                                 ? Visibility.Visible : Visibility.Collapsed;
+        miHdDetach.IsEnabled = !string.IsNullOrWhiteSpace(_settings.HdPath);
+    }
+
+    private void OnNewHd(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem mi || mi.Tag is not string tag ||
+            !long.TryParse(tag, out long mb))
+            return;
+        var dlg = new SaveFileDialog
+        {
+            Title = $"New {DescribeMb(mb)} hard disk image",
+            Filter = "Disk images (*.img)|*.img|All files (*.*)|*.*",
+            FileName = $"macos9_{(mb >= 1024 && mb % 1024 == 0 ? $"{mb / 1024}gb" : $"{mb}mb")}.img",
+            DefaultExt = ".img",
+            AddExtension = true,
+            // Ours below, because Windows' own prompt does not say how big the
+            // thing it is about to destroy is — and the point of this menu is
+            // that several disks are in play at once.
+            OverwritePrompt = false,
+        };
+        if (dlg.ShowDialog(this) != true)
+            return;
+        string path = dlg.FileName;
+        if (File.Exists(path))
+        {
+            long existing;
+            try { existing = new FileInfo(path).Length; } catch { existing = 0; }
+            if (MessageBox.Show(
+                    this,
+                    $"{Path.GetFileName(path)} already exists ({DescribeBytes(existing)}).\n\n" +
+                    $"Replace it with a blank {DescribeMb(mb)} disk? Anything " +
+                    "installed on it is lost.",
+                    "Replace disk image?", MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning,
+                    MessageBoxResult.No) != MessageBoxResult.Yes)
+                return;
+        }
+        try
+        {
+            // ⭐ SetLength DOES NOT WRITE THE BYTES. On NTFS it moves the
+            // file's valid-data mark; the unwritten region reads back as
+            // zeros, which is exactly what a factory-fresh drive looks like.
+            // So a 2 GB image is instant and costs only the space actually
+            // used, where a loop writing zeros would have made creating the
+            // disk the slow step this menu exists to remove.
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            fs.SetLength(mb * 1024L * 1024L);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Could not create the disk image:\n\n{ex.Message}",
+                            "New disk image", MessageBoxButton.OK,
+                            MessageBoxImage.Error);
+            return;
+        }
+        AttachHd(path, $"created a blank {DescribeMb(mb)} disk and attached");
+    }
+
+    private void OnChooseHd(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog
+        {
+            Title = "Choose a hard disk image",
+            Filter = "Disk images (*.img;*.dsk;*.hfv)|*.img;*.dsk;*.hfv|All files (*.*)|*.*",
+        };
+        if (dlg.ShowDialog(this) != true)
+            return;
+        AttachHd(dlg.FileName, "attached");
+    }
+
+    private void OnDetachHd(object sender, RoutedEventArgs e) =>
+        AttachHd("", "detached the hard disk");
+
+    private void AttachHd(string path, string what)
+    {
+        _settings.AttachHd(path);
+        _settings.Save();
+        UpdateTitle();
+        if (_session is { Running: true })
+            MessageBox.Show(
+                this,
+                $"Shell {what}.\n\nThe machine is running, and it opened its "
+                + "disk when it started — this takes effect the next time you "
+                + "start it.",
+                "Hard disk", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
     private void OnAutoBootToggled(object sender, RoutedEventArgs e)
     {
         _settings.AutoBoot = miAutoBoot.IsChecked;
@@ -513,6 +658,13 @@ public partial class MainWindow : Window
             t += " — " + Path.GetFileNameWithoutExtension(_settings.RomPath);
         if (!string.IsNullOrWhiteSpace(_settings.CdPath))
             t += " + " + Path.GetFileName(_settings.CdPath);
+        // Which disk this machine will boot. With several test disks in play
+        // at once — a blank one, last attempt's half-installed one, the good
+        // one — "which am I about to start?" is a question the title should
+        // answer without opening a menu.
+        t += string.IsNullOrWhiteSpace(_settings.HdPath)
+                 ? "  [no HD]"
+                 : "  [" + Path.GetFileName(_settings.HdPath) + "]";
         Title = t;
     }
 

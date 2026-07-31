@@ -16,6 +16,34 @@ public sealed class ShellSettings
     // the hard disk. Without one the machine only reaches the firmware.
     public string HdPath { get; set; } = "";
 
+    // Disks used before, most-recent-first. Testing an OS install means
+    // keeping several around — a blank one to initialise, the half-installed
+    // one from the last attempt, the good one — and switching between them by
+    // hand through a file picker every time is how the wrong disk gets
+    // overwritten. Capped when written; entries whose file has gone are
+    // dropped as the menu is built, not here, so a disk on a disconnected
+    // drive survives being unplugged once.
+    public List<string> RecentHds { get; set; } = new();
+
+    // How many to keep. Enough for a working set of test disks, few enough
+    // that the menu stays readable.
+    public const int MaxRecentHds = 8;
+
+    /// <summary>Make <paramref name="path"/> the attached disk and move it to
+    /// the front of the history. Passing an empty path detaches without
+    /// disturbing the history — "no disk" is a state, not a disk.</summary>
+    public void AttachHd(string path)
+    {
+        HdPath = path ?? "";
+        if (string.IsNullOrWhiteSpace(path))
+            return;
+        RecentHds.RemoveAll(p => string.Equals(p, path,
+                                               StringComparison.OrdinalIgnoreCase));
+        RecentHds.Insert(0, path);
+        if (RecentHds.Count > MaxRecentHds)
+            RecentHds.RemoveRange(MaxRecentHds, RecentHds.Count - MaxRecentHds);
+    }
+
     // Required for any picture. Without the card's FCode there is no display
     // node, so the OS has nothing to bind a driver to.
     public string AtiRomPath { get; set; } = "";
@@ -94,6 +122,14 @@ public sealed class ShellSettings
                 // install that already saved one — hence the clamp here.
                 if (s.FastTb > 30)
                     s.FastTb = 4;
+                // The disk this file already names belongs in the history —
+                // every settings file written before the disk menu existed has
+                // an HdPath and no history at all, and a history that opens
+                // without the disk you are actually booting in it reads as
+                // broken.
+                if (!string.IsNullOrWhiteSpace(s.HdPath) &&
+                    !s.RecentHds.Contains(s.HdPath, StringComparer.OrdinalIgnoreCase))
+                    s.RecentHds.Insert(0, s.HdPath);
                 return s;
             }
         }

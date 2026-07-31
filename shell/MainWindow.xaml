@@ -14,6 +14,22 @@
                 <MenuItem x:Name="miCd" Header="Choose CD Image…" Click="OnChooseCd" />
                 <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
                 <Separator />
+                <!-- The disks. Built on open (OnHardDiskOpened) because the
+                     history and the size of each image are facts about the
+                     filesystem, not about the last time this window was
+                     constructed. -->
+                <MenuItem x:Name="miHd" Header="_Hard Disk" SubmenuOpened="OnHardDiskOpened">
+                    <MenuItem x:Name="miHdNew" Header="_New Disk Image">
+                        <MenuItem Header="_250 MB" Tag="250" Click="OnNewHd" />
+                        <MenuItem Header="_500 MB" Tag="500" Click="OnNewHd" />
+                        <MenuItem Header="_1 GB" Tag="1024" Click="OnNewHd" />
+                        <MenuItem Header="_2 GB" Tag="2048" Click="OnNewHd" />
+                    </MenuItem>
+                    <MenuItem x:Name="miHdChoose" Header="_Choose Disk Image…" Click="OnChooseHd" />
+                    <Separator x:Name="miHdSep" />
+                    <MenuItem x:Name="miHdDetach" Header="_Detach (no hard disk)" Click="OnDetachHd" />
+                </MenuItem>
+                <Separator />
                 <MenuItem Header="E_xit" Click="OnExit" />
             </MenuItem>
             <MenuItem Header="_Machine">

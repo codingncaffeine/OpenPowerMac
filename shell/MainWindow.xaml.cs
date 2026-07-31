@@ -543,6 +543,16 @@ public partial class MainWindow : Window
     // "Detach".
     private readonly List<MenuItem> _hdRecentItems = new();
 
+    // FSCTL_SET_SPARSE. See OnNewHd for why a disk image wants to be sparse
+    // and what it costs.
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        Microsoft.Win32.SafeHandles.SafeFileHandle handle, uint code,
+        IntPtr inBuf, uint inSize, IntPtr outBuf, uint outSize,
+        out uint returned, IntPtr overlapped);
+
+    private const uint FSCTL_SET_SPARSE = 0x000900C4;
+
     private static string DescribeMb(long mb) =>
         mb >= 1024 && mb % 1024 == 0 ? $"{mb / 1024} GB" : $"{mb} MB";
 
@@ -627,42 +637,56 @@ public partial class MainWindow : Window
         }
         try
         {
-            // SetLength does not write the bytes: on NTFS it allocates the
-            // clusters and moves the file's length, but leaves the VALID DATA
-            // LENGTH at zero, and the unwritten region reads back as zeros —
-            // which is exactly what a factory-fresh drive looks like.
+            // ⭐ SPARSE, AND THAT IS THE WHOLE DESIGN OF THIS FUNCTION.
             //
-            // ⛔⛔ AND THAT IS A TRAP, SO THE LAST BYTE IS WRITTEN HERE ON
-            // PURPOSE. The first write PAST the valid-data mark makes NTFS
-            // zero-fill everything before it, synchronously. Drive Setup puts
-            // HFS+'s alternate volume header at the very END of the disk, so
-            // the guest's first initialise stalls the whole machine for the
-            // time it takes to zero the entire image — measured 352 ms for
-            // 2 GB on an NVMe here, inside ONE emulated instruction, and
-            // seconds on a slower disk. That is long enough to blow a driver
-            // timeout, and it surfaces to the user as "the disk has errors"
-            // rather than as anything to do with the host filesystem.
+            // SetLength alone does not write the bytes: NTFS moves the file's
+            // length and leaves the VALID DATA LENGTH at zero, so the image
+            // reads back as zeros — exactly what a factory-fresh drive looks
+            // like. The trap is what happens on the first write PAST that
+            // mark: NTFS zero-fills everything before it, synchronously,
+            // inside one emulated instruction. Drive Setup puts HFS+'s
+            // alternate volume header at the very END of the disk, so the
+            // guest's first initialise stalls the whole machine for as long as
+            // it takes to zero the image. Measured here: 352 ms for a 2 GB
+            // image on an NVMe, and seconds on a slower disk — long enough to
+            // blow a driver timeout and reach the user as "the disk has
+            // errors" rather than as anything about the host filesystem.
             //
-            // ⭐ So pay it once, HERE, where a pause is expected and harmless,
-            // and the emulated machine never sees it. Deliberately NOT solved
-            // by marking the file sparse: sparse would be faster still and
-            // cost only the space in use, but then the image can fail to write
-            // mid-install because the HOST volume filled up — and a disk that
-            // dies halfway through an OS install is a far worse failure than a
-            // slow New Disk Image.
-            // Zeroing a large image is not instant on every disk, and an
-            // unresponsive window with no cursor change reads as a hang.
-            Mouse.OverrideCursor = Cursors.Wait;
-            try
+            // Writing the last byte at creation fixes that by paying it up
+            // front, and it was the right answer while these images were
+            // hundreds of megabytes. It is the wrong answer at 120 GB: it
+            // would consume 120 GB of real disk for a guest that will use one,
+            // and take a minute doing it.
+            //
+            // A sparse file fixes BOTH, measured on this host:
+            //     create 120 GB          11 ms
+            //     write at the very end   4 ms   (vs 352 ms non-sparse @ 2 GB)
+            // because a write into a hole allocates that region alone and has
+            // nothing to zero before it.
+            //
+            // ⚠ The trade is real and it is the reason this once went the other
+            // way: a sparse image can fail to write mid-install if the HOST
+            // volume fills up. At these sizes that is the better risk — asking
+            // for 120 GB of real space up front fails EVERY time on a disk
+            // that cannot spare it, instead of only when the guest actually
+            // uses it. The free-space check below is what makes it visible.
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            uint unused;
+            if (!DeviceIoControl(fs.SafeFileHandle, FSCTL_SET_SPARSE, IntPtr.Zero,
+                                 0, IntPtr.Zero, 0, out unused, IntPtr.Zero))
             {
-                using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-                long bytes = mb * 1024L * 1024L;
-                fs.SetLength(bytes);
-                fs.Seek(bytes - 1, SeekOrigin.Begin);
-                fs.WriteByte(0);
-                fs.Flush();
+                // Not fatal: a non-sparse image still works, it just costs the
+                // space and the zero-fill. Say so rather than silently
+                // producing a very different thing from what was asked for.
+                MessageBox.Show(
+                    this,
+                    "This volume would not take a sparse file, so the image "
+                    + "will use its full size on disk and the guest's first "
+                    + "initialise may pause while Windows zeroes it.",
+                    "New disk image", MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
             }
-            finally { Mouse.OverrideCursor = null; }
+            fs.SetLength(mb * 1024L * 1024L);
         }
         catch (Exception ex)
         {
@@ -671,6 +695,29 @@ public partial class MainWindow : Window
                             MessageBoxImage.Error);
             return;
         }
+        // ⚠ A sparse image is a promise the host may not be able to keep. The
+        // guest sees a 120 GB disk whatever is behind it, and if the volume
+        // runs out while Mac OS is writing, that surfaces as disk corruption
+        // rather than as "you are out of space". Say it once, here, where it
+        // is cheap — not blocking, because a 120 GB image on a disk with 40 GB
+        // free is perfectly reasonable for a guest that will use two.
+        try
+        {
+            var drive = new DriveInfo(Path.GetPathRoot(path)!);
+            long want = mb * 1024L * 1024L;
+            if (drive.AvailableFreeSpace < want)
+                MessageBox.Show(
+                    this,
+                    $"The disk is {DescribeMb(mb)} but {drive.Name} has only "
+                    + $"{DescribeBytes(drive.AvailableFreeSpace)} free.\n\n"
+                    + "The image is sparse, so it only uses what the guest "
+                    + "actually writes — this is fine unless the guest fills "
+                    + "it. If this volume runs out while Mac OS is writing, "
+                    + "the guest sees it as a damaged disk.",
+                    "New disk image", MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+        }
+        catch { /* the warning is a courtesy; failing to give it is not fatal */ }
         AttachHd(path, $"created a blank {DescribeMb(mb)} disk and attached");
     }
 

@@ -24,11 +24,15 @@
                      filesystem, not about the last time this window was
                      constructed. -->
                 <MenuItem x:Name="miHd" Header="_Hard Disk" SubmenuOpened="OnHardDiskOpened">
+                    <!-- Sparse images, so the size is what Mac OS sees rather
+                         than what the host gives up. 120 GB is the ceiling the
+                         drive itself advertises: LBA28 tops out at 0x0FFFFFFF
+                         sectors, which is 128 GB. -->
                     <MenuItem x:Name="miHdNew" Header="_New Disk Image">
-                        <MenuItem Header="_250 MB" Tag="250" Click="OnNewHd" />
-                        <MenuItem Header="_500 MB" Tag="500" Click="OnNewHd" />
-                        <MenuItem Header="_1 GB" Tag="1024" Click="OnNewHd" />
-                        <MenuItem Header="_2 GB" Tag="2048" Click="OnNewHd" />
+                        <MenuItem Header="_20 GB" Tag="20480" Click="OnNewHd" />
+                        <MenuItem Header="_40 GB" Tag="40960" Click="OnNewHd" />
+                        <MenuItem Header="_80 GB" Tag="81920" Click="OnNewHd" />
+                        <MenuItem Header="1_20 GB" Tag="122880" Click="OnNewHd" />
                     </MenuItem>
                     <MenuItem x:Name="miHdChoose" Header="_Choose Disk Image…" Click="OnChooseHd" />
                     <Separator x:Name="miHdSep" />

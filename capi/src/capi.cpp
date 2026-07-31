@@ -277,6 +277,48 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
              cpu.extIrqLine ? 1 : 0, cpu.decPending ? 1 : 0,
              cpu.smiPending ? 1 : 0, cpu.pmPending ? 1 : 0);
     s += b;
+    // ⭐⭐ WHAT THE MACHINE FAULTED ON. A guest that stops with EE and the two
+    // translation bits clear has not hung waiting for a device — it is sitting
+    // in an exception handler, in exactly the state the hardware enters one:
+    // EE=0, PR=0, IR=0, DR=0, RI=0, ME preserved. That reads from outside as a
+    // frozen machine (no interrupts means no cursor and no ticks) and it is a
+    // CRASH, which is a completely different investigation.
+    //
+    // ⚠ RI=0 is what makes these registers trustworthy: it says the handler
+    // has not re-armed for a nested exception, so srr0 is still the faulting
+    // instruction and srr1 still the MSR it faulted under.
+    snprintf(b, sizeof b,
+             "-- exception context: srr0=%08x srr1=%08x dar=%08x dsisr=%08x\n"
+             "--   lr=%08x ctr=%08x sprg=%08x %08x %08x %08x\n",
+             cpu.st.srr0, cpu.st.srr1, cpu.st.dar, cpu.st.dsisr, cpu.st.lr,
+             cpu.st.ctr, cpu.st.sprg[0], cpu.st.sprg[1], cpu.st.sprg[2],
+             cpu.st.sprg[3]);
+    s += b;
+    {
+        const u32 msrv = cpu.st.msr, r = cpu.st.srr1;
+        snprintf(b, sizeof b,
+                 "--   msr: EE=%d PR=%d IR=%d DR=%d RI=%d ME=%d FP=%d%s\n",
+                 (msrv & 0x8000u) ? 1 : 0, (msrv & 0x4000u) ? 1 : 0,
+                 (msrv & 0x0020u) ? 1 : 0, (msrv & 0x0010u) ? 1 : 0,
+                 (msrv & 0x0002u) ? 1 : 0, (msrv & 0x1000u) ? 1 : 0,
+                 (msrv & 0x2000u) ? 1 : 0,
+                 (!(msrv & 0x8000u) && !(msrv & 0x0020u) && !(msrv & 0x0010u))
+                     ? "   <-- EXCEPTION CONTEXT, not a device wait"
+                     : "");
+        s += b;
+        // Only the Program-exception bits are self-describing; a DSI is named
+        // by DSISR and the address it faulted on, which is why DAR is above.
+        snprintf(b, sizeof b, "--   srr1 flags:%s%s%s%s%s\n",
+                 (r & kSrr1ProgIllegal) ? " ILLEGAL" : "",
+                 (r & kSrr1ProgPrivileged) ? " PRIVILEGED" : "",
+                 (r & kSrr1ProgTrap) ? " TRAP" : "",
+                 (r & kSrr1ProgFpEnabled) ? " FP-ENABLED" : "",
+                 (r & (kSrr1ProgIllegal | kSrr1ProgPrivileged |
+                       kSrr1ProgTrap | kSrr1ProgFpEnabled))
+                     ? ""
+                     : " (none set: not a Program exception)");
+        s += b;
+    }
     // ⏳ Whether this process is waiting or spinning, which says whether the
     // guest is asleep-and-idle or awake-and-stuck. They look the same from a
     // progress bar that stopped moving.

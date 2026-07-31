@@ -364,29 +364,33 @@ public:
     // 25,000,000 timebase ticks is 2304/3125 exactly.
     static constexpr u32 kKlTimerLo = 0x15038u; // +0x3c holds the high word
     static constexpr u64 kKlTimerNum = 2304ull, kKlTimerDen = 3125ull;
-    // ⚠⚠ OFF BY DEFAULT, AND THE DEFAULT IS LOAD-BEARING. This is the
-    // CONSTRUCTOR default, which is what the capi — and therefore the app —
-    // gets, so g4run's switch has to agree with it.
+    // ⚠⚠ ON BY DEFAULT, AND THE DEFAULT IS LOAD-BEARING — IT IS PAIRED WITH
+    // THE PACING. This is the CONSTRUCTOR default, which is what the capi and
+    // therefore the app get, so g4run's switch has to agree with it.
     //
-    // Answering the timer is CORRECT and it fixes the guest's clock. It also
-    // breaks the boot, and both halves are measured. With it on, a 12.95 B
-    // cold boot reaches `hd command log 287` and a framebuffer that is
-    // essentially flat — a 2 KB PNG, 29 distinct rows. The recorded baseline
-    // is 292, `ati paint 1261505`, and a 111 KB PNG with 462 distinct rows of
-    // 480. The user saw it before any counter did: no welcome screen, no
-    // desktop, a grey screen at 9.25 B.
+    // Answering the timer is correct and it fixes the guest's clock. It was
+    // shipped OFF for one session because a 12.95 B cold boot with it on
+    // stopped dead at 2.5 G instructions — one distinct scanline of 480, no
+    // welcome screen, 287 disk commands against a baseline 292 — and the
+    // cause was read as a device timeout expiring. It is not.
     //
-    // The mechanism is not the timer, it is what a correct clock EXPOSES. The
-    // guest's Duration conversions used to be 43x long, so a driver's "wait
-    // 100 ms" bought about 7 M instructions of headroom and now buys 164 k.
-    // Our devices answer on an instruction budget, and at --fast-tb 60 guest
-    // time runs ~6x real, so every device latency is that much longer in guest
-    // microseconds than the model intends. Timeouts that never expired now do.
+    // ⭐ THE CAUSE IS AN INTERRUPT LIVELOCK, AND IT IS ARITHMETIC. Mac OS
+    // spends about 32,000 EMULATED INSTRUCTIONS on each 60 Hz tick: the 68K
+    // VBL chain, the Time Manager, CrsrTask. --fast-tb n hands it
+    // 416,666 x 4/(1+n) instructions per tick to do that in. At n = 60 that
+    // is 27,300 — LESS THAN THE WORK COSTS — so the machine services ticks
+    // back to back at 2.2% behind nominal, and the boot never advances again.
+    // Measured, one variable, cold boots scored on distinct scanlines:
+    // n = 60 stops at 2.5 G with 1 scanline; n = 30, 15, 8, 4 and 1 all reach
+    // the desktop with 462 of 480, 292 disk commands and ati paint 1,261,505
+    // — the recorded baseline, item for item. At n = 4 the timebase runs at
+    // 26.57 MHz, 1.06x real, and the guest's clock reads 62.7 Ticks per HOST
+    // second against a real 60.
     //
-    // So it stays off until the pacing work lands (SESSION27_PLAN §1-2), and
-    // goes on together with a --fast-tb that makes guest time mean something.
-    // Turning it on without that ships a machine that does not boot.
-    bool klTimerOn = false;
+    // So the timer goes on together with a --fast-tb that leaves room for the
+    // guest's own periodic work — or, better, with opm_set_realtime, which
+    // sizes the interval from the host clock and does not have to guess.
+    bool klTimerOn = true;
     // KeyLargo GPIO block: 0x30 bytes at mac-io +0x50 (QEMU hw/misc/macio).
     static constexpr u32 kGpioBase = 0x50u;
     static constexpr u32 kGpioSize = 0x30u;
@@ -614,6 +618,33 @@ public:
     // attribution here — and the ATA traffic log was quoting the pc.
     const u32* lrRef = nullptr;
     const u64* stamp = nullptr;
+
+    // ⚠⚠ ONE CALL, EVERY CELL — AND THE STAMP IS NOT A DEBUG AID. The
+    // instruction counter used to be wired cell by cell by each consumer, and
+    // the capi's list was missing hd() and hdDma(): AtaCell::tick() returns
+    // false when stamp is null, so the app's hard disk raised BSY on its first
+    // command and held it for the rest of the machine's life, while g4run —
+    // whose list was complete — booted from the same image. It also pinned
+    // serviceDevices' devDueStamp_ at cmdDelay_ forever, so the device gate
+    // never closed. A per-consumer wiring list is a defect waiting for its
+    // next reader; call these instead of assigning the fields.
+    void setStamp(const u64* s)
+    {
+        stamp = s;
+        cd_.stamp = hd_.stamp = s;
+        pic_.stamp = s;
+        ohci_[0].stamp = ohci_[1].stamp = s;
+        ati_.stamp = s;
+        ataDma_.stamp = hdDma_.stamp = s;
+    }
+    void setPcRef(const u32* p)
+    {
+        pcRef = p;
+        cd_.pcRef = hd_.pcRef = p;
+        ohci_[0].pcRef = ohci_[1].pcRef = p;
+        ati_.pcRef = p;
+        ataDma_.pcRef = hdDma_.pcRef = p;
+    }
 
     size_t ramBytes() const { return ram_.size(); }
     const std::vector<u8>& ram() const { return ram_; }

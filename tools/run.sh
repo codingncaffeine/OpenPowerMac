@@ -23,9 +23,15 @@ cd "$(dirname "$0")/.." || exit 1
 
 DEFAULT_SERIAL='" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 probe-pci-device;unselect-dev;dev /pci@f0000000/pci1002,5046@10;" ATY,Rage128Pd" device-name;" display" device-type;" ATY,Rage128Pd" encode-string " compatible" property;" /pci@f2000000" select-dev;3000000 to pci-probe-request;unselect-dev;probe-pci;dev /pci@f2000000/pci106b,19@18;" usb" device-name;" usb" device-type;dev /pci@f2000000/pci106b,19@19;" usb" device-name;" usb" device-type;mac-boot'
 
+# ⚠ --fast-tb WAS 60 UNTIL 2026-07-30 AND IS NOW 4. With the KeyLargo timer
+# answered the guest's clock is correct, and 60 leaves Mac OS only ~27,300
+# emulated instructions to do ~32,000 instructions of 60 Hz work in: the
+# machine services ticks back to back and the boot dies at 2.5 G with a blank
+# screen. 4 gives it 333,000 and lands the timebase at 1.06x real. See the
+# note on SawtoothBus::klTimerOn.
 exec "${OPM_BIN:-./build/tools/g4run/Release/g4run.exe}" \
  --rom "../scratch/openpowermac/roms/newworld/sawtooth_4.2.8f1_stock.rom" \
- --exc 0 --fast-tb 60 \
+ --exc 0 --fast-tb "${OPM_FAST_TB:-4}" \
  --cd "/c/Users/gamer/Downloads/PowerMacG4.iso" \
  --hd "${OPM_HD:-../scratch/openpowermac/hd.img}" \
  --ati-rom "../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom" \

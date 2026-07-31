@@ -79,13 +79,19 @@ static constexpr u32 kGenIntAckMask = 0x000F040Fu;
 //
 // A constant chosen to cancel a bug outlives the bug and reads like a model.
 //
-// ⚠ BUT IT GOES BACK WHEN THE TIMER DOES. SawtoothBus::klTimerOn is off by
-// default — a correct clock stops this machine booting until the pacing work
-// lands — so the 44.6x compression is still there, and the nominal period
-// would hand the guest ~2,550 blanks per second of its own time. The cell's
-// vblEnabled is a CONSTRUCTOR default of true, so this is live in the app.
-// Move the two together, or not at all. --ati-vbl-tb still overrides it.
-static constexpr u64 kTbPerVblank = 225000000ull;
+// ⚠ IT MOVED WITH THE TIMER, WHICH IS THE ONLY WAY IT COULD MOVE.
+// SawtoothBus::klTimerOn is now on by default, so the compression is gone and
+// the nominal period is simply the right one. Measured before flipping it,
+// cold boot, one variable (--ati-vbl-tb 416666 against the same run without):
+// 462 distinct scanlines either way, 292 disk commands, ati paint 1,261,505,
+// 62.2 against 62.7 guest Ticks per host second, 23.5 against 23.7 MIPS. The
+// blank census goes from 72 raised / 1 acknowledged to 38,901 / 11 — the OS
+// services a few and lets the rest expire, and SESSION27_PLAN §6's "wedges
+// after two blanks" does NOT reproduce with a correct clock.
+//
+// The cell's vblEnabled is a CONSTRUCTOR default of true, so this is live in
+// the app. --ati-vbl-tb still overrides it.
+static constexpr u64 kTbPerVblank = 416666ull;
 // Harness knobs, not machine state — see the notes in the header.
 static u64 gVblTbPeriod = 0;
 static int gVblTrace = 0;

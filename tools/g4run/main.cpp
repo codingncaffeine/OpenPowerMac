@@ -434,10 +434,12 @@ int main(int argc, char** argv)
     // constructor defaults, so this switch and the cell's must agree.
     bool atiVbl = true;
     // --kl-timer: answer the KeyLargo timer HWInit calibrates the timebase
-    // against. It makes the guest's clock correct and it stops the boot
-    // reaching the desktop — see the note on SawtoothBus::klTimerOn, whose
-    // default this MUST match, because the capi takes constructor defaults.
-    bool klTimer = false;
+    // against. It makes the guest's clock correct, and it is only survivable
+    // with a --fast-tb that leaves room for the guest's own 60 Hz work — see
+    // the note on SawtoothBus::klTimerOn, whose default this MUST match,
+    // because the capi takes constructor defaults. --no-kl-timer restores the
+    // 43x-slow clock every pre-session-27 baseline was recorded under.
+    bool klTimer = true;
     // --ati-vbl-tb N: timebase ticks between vertical blanks (0 = nominal
     // 60 Hz at 25 MHz). See the note in r128.hpp — under --fast-tb the guest's
     // own clock runs ~45x slower than the nominal timebase, so the nominal
@@ -1105,14 +1107,12 @@ int main(int argc, char** argv)
         kCenAddbus, kCenAtafn, kCenAtares, kCenLk, kCenScmp,
         kCenQsel, kCenCtl, kCenDrv, kCenPoke, kCen68kGate
     };
-    bus.pcRef = &cpu.st.pc;
+    // One call each, so this list and the capi's cannot drift apart again —
+    // the capi's was missing the hard disk and its DMA channel, and a cell
+    // with no stamp never runs a deferred command. See SawtoothBus::setStamp.
+    bus.setPcRef(&cpu.st.pc);
+    bus.setStamp(&executed);
     bus.lrRef = &cpu.st.lr;
-    bus.stamp = &executed;
-    bus.cd().stamp = &executed;
-    bus.cd().pcRef = &cpu.st.pc;
-    bus.hd().pcRef = &cpu.st.pc;
-    bus.hd().stamp = &executed;
-    bus.pic().stamp = &executed;
     bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
     bus.pmu().portAIn = static_cast<u8>(viaA);
     cpu.l2Inert = l2Inert;
@@ -1127,22 +1127,9 @@ int main(int argc, char** argv)
     else
         printf("-- --no-cpu-cache-rom: the processor module is silent, so the "
                "machine reports NO L2 and Mac OS puts up the cache alert\n");
-    for (u32 f = 0; f < 2; ++f) {
-        bus.ohci(f).stamp = &executed;
-        bus.ohci(f).pcRef = &cpu.st.pc;
-    }
-    bus.ati().stamp = &executed;
-    bus.ati().pcRef = &cpu.st.pc;
     bus.atiVisibleAt = atiAt;
     bus.atiHideFrom = atiHideFrom;
     bus.atiHideTo = atiHideTo;
-    bus.ataDma().stamp = &executed;
-    bus.ataDma().pcRef = &cpu.st.pc;
-    // The hard disk has its own DBDMA channel and it was never stamped nor
-    // reported: "ata dbdma events (0)" was the CD channel, idle by
-    // definition, while every disk transfer went unobserved.
-    bus.hdDma().stamp = &executed;
-    bus.hdDma().pcRef = &cpu.st.pc;
 
     // One-shot diagnostic pokes. These are the only instruments that write
     // guest memory, so unlike every other counter here they are snapshot

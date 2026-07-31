@@ -29,8 +29,14 @@ SCRIPT='" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 probe-pci-d
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 echo "-- running the flagship recipe to $MAX ..."
-"$G4" --rom "$ROM" --max "$MAX" --exc 0 --fast-tb 60 --cd "$CD" \
-  --ati-rom "$ATI" --ati-at 236000000 --serial-input "$SCRIPT" \
+# ⚠ --fast-tb 60 does not reach the OS any more: the KeyLargo timer is now
+# answered, so the guest's clock is correct and 60 leaves Mac OS less time per
+# 60 Hz tick than its own tick work costs. 4 is the measured value. ⚠ --ati-at
+# 236000000 is likewise stale — the reveal has to land before Open Firmware's
+# PCI probe and the boot timeline moved past that count, which produces a
+# machine with a working boot and no picture at all.
+"$G4" --rom "$ROM" --max "$MAX" --exc 0 --fast-tb 4 --cd "$CD" \
+  --ati-rom "$ATI" --ati-at 1 --serial-input "$SCRIPT" \
   --arm-at-park 200 --dump-structs > "$LOG" 2>&1 || true
 
 fail=0

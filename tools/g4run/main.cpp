@@ -386,6 +386,9 @@ int main(int argc, char** argv)
     // --no-icache: bypass the fetch block cache, the cached decode and the
     // instruction translation cache (the control for all three).
     bool icache = true;
+    // --no-nap-skip: step an asleep processor one instruction at a time (the
+    // control for machine/include/opm/pace.hpp).
+    bool napSkipOn = true;
     unsigned profHz = 0;               // --profile HZ (g4prof only)
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
     bool fastTbSet = false;            // CLI wins over a resumed value
@@ -515,6 +518,10 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--bench")) { bench = true; continue; }
         if (!strcmp(a, "--no-dev-gate")) { devGate = false; continue; }
         if (!strcmp(a, "--no-icache")) { icache = false; continue; }
+        // The control for the nap skip. Every other cache and gate in here
+        // ships with the switch that turns it off, because that is the only
+        // way a claim about one gets settled.
+        if (!strcmp(a, "--no-nap-skip")) { napSkipOn = false; continue; }
         if (!strcmp(a, "--profile")) {
             profHz = static_cast<unsigned>(strtoul(next(), nullptr, 0));
             continue;
@@ -1569,8 +1576,9 @@ int main(int argc, char** argv)
             // clock twice. capi's real-time path is excluded for the same
             // reason, and for the same reason it is only a stopgap there.
             if (const u64 n =
-                    realtime ? 0
-                             : napSkip(cpu, bus, executed, maxInsns - executed)) {
+                    (realtime || !napSkipOn)
+                        ? 0
+                        : napSkip(cpu, bus, executed, maxInsns - executed)) {
                 executed += n;
                 tickPeripherals();
                 continue;

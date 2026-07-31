@@ -32,6 +32,23 @@
 
 namespace opm {
 
+// The slow half must stay OUT of the caller, or the compiler folds it back in
+// and the per-instruction question is expensive again. Measured in the
+// firmware era, where the core never sleeps and the answer is always no:
+// 59.0 MIPS with the whole thing written as one function MSVC declined to
+// inline, 61.4 split like this, 63.7 with --no-nap-skip.
+//
+// ⚠ SO THE QUESTION IS NOT FREE: about 4% where nothing ever sleeps, against
+// 3.1 s -> 2.3 s for the same window where things do. That trade is worth
+// taking — the firmware era is fifteen seconds of a boot and the desktop is
+// where the machine actually lives — but it is a trade, and --no-nap-skip is
+// how the next reader checks it rather than trusting this comment.
+#if defined(_MSC_VER)
+#define OPM_PACE_COLD __declspec(noinline)
+#else
+#define OPM_PACE_COLD __attribute__((noinline))
+#endif
+
 // ⚠ INSTRUCTION-PACED LOOPS ONLY. This advances the timebase itself, so a
 // caller whose timebase already comes from the host clock (--realtime,
 // opm_set_realtime) must not use it — the clock would advance twice. An idle
@@ -45,9 +62,16 @@ namespace opm {
 // room to skip — in which case the caller just steps normally.
 //
 // `budget` is how many steps the caller still wants to run at all.
-inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 executed, u64 budget)
+// ⚠ SPLIT, AND THE SPLIT IS MEASURED. As one function this is too big for
+// MSVC to inline, so the machine paid a call with two pointer arguments on
+// every instruction — 61.9 -> 59.0 MIPS in the firmware era, where the core
+// never sleeps at all and the answer is always "no". The question asked per
+// instruction has to be one load and one branch; everything else belongs
+// behind it.
+OPM_PACE_COLD inline u64 napSkipSlow(Cpu& cpu, const SawtoothBus& bus,
+                                       u64 executed, u64 budget)
 {
-    if (!cpu.napping || budget < 2)
+    if (budget < 2)
         return 0;
     // An enabled interrupt already waiting: step() must run and take it.
     if ((cpu.st.msr & msr::EE) &&
@@ -83,6 +107,13 @@ inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 executed, u64 budget)
     cpu.clockAdvance(n, cyclesPerStep);
     cpu.napSkipped += n;
     return n;
+}
+
+inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 executed, u64 budget)
+{
+    if (!cpu.napping)
+        return 0;
+    return napSkipSlow(cpu, bus, executed, budget);
 }
 
 } // namespace opm

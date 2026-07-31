@@ -97,6 +97,7 @@ void Cpu::step()
         const bool wake = (st.msr & msr::EE) &&
                           (smiPending || extIrqLine || decPending || pmPending);
         if (!wake) {
+            OPM_COUNT(napSteps);
             tick(1 + extraCycles);
             return;
         }

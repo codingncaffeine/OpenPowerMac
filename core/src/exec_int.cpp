@@ -7,6 +7,7 @@
 
 #include "opm/cpu.hpp"
 #include "opm/bits.hpp"
+#include "opm/prof.hpp"
 #include "softfp.hpp"
 #include <bit>
 #include <string>
@@ -1285,8 +1286,10 @@ void bindHandlers()
     // through the D-cache and the L2 — but it must drop the one-block fetch
     // buffer, which is the only thing in this model that can hold a stale
     // instruction. Software issues icbi exactly after writing code.
-    setHandler("icbi",
-               [](Cpu& c, u32, const InsnDesc&) { c.fetchDrop(); });
+    setHandler("icbi", [](Cpu& c, u32, const InsnDesc&) {
+        OPM_COUNT(c.fetchDropIcbi);
+        c.fetchDrop();
+    });
     setHandler("dcbz", h_dcbz);
     setHandler("dst", h_nop);
     setHandler("dstst", h_nop);

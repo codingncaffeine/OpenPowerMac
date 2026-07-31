@@ -6,11 +6,17 @@
 // LE <- ILE, ME/IP/ILE preserved. Machine check additionally clears ME.
 
 #include "opm/cpu.hpp"
+#include "opm/prof.hpp"
 
 namespace opm {
 
 void Cpu::raiseExc(Exc v, u32 srr0, u32 extra)
 {
+    // Scoped, because this is reached from an async check at the top of step()
+    // — before the fetch marker, so its cost used to land in whatever phase
+    // the machine loop left set — and from inside a handler, where the
+    // enclosing phase has to come back. See the note on prof::Ph::Exc.
+    OPM_MARK(Exc);
     raisedThisStep = true;
     st.srr0 = srr0;
     st.srr1 = (st.msr & 0x87C0FFFFu) | (extra & 0x783F0000u);

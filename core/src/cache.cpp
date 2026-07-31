@@ -203,6 +203,7 @@ void Cpu::l2Invalidate(u32 pa)
 
 void Cpu::l2WipeAll()
 {
+    OPM_COUNT(fetchDropFlush);
     fetchDrop();
     for (auto& e : l2)
         e = L2Line{};
@@ -221,6 +222,7 @@ bool Cpu::l2Peek32(u32 pa, u32& w)
 
 void Cpu::l2FlushAll(bool writeback)
 {
+    OPM_COUNT(fetchDropFlush);
     fetchDrop();
     for (auto& e : l2) {
         if (e.v && e.d && writeback)
@@ -452,12 +454,25 @@ void Cpu::dcbKill(u32 pa)
 // is about to change underneath the processor.
 void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
 {
-    fetchDrop(); // a bus master is rewriting memory under us
+    // ⚠⚠ THIS USED TO THROW AWAY THE WHOLE FETCH BLOCK CACHE ON EVERY SNOOP,
+    // READ OR WRITE. A master READ cannot change memory, so it cannot make a
+    // fetched block stale; a master WRITE can, but only the block it lands
+    // on. Measured at the Finder desktop, 300 M instructions: 2,043,750 full
+    // drops — one wipe of all 64 lines every 147 instructions, almost all of
+    // them the USB controller's per-frame descriptor walk — which held the
+    // block cache at 84.5% hit with 16.6 M fills coming straight off the bus,
+    // against 97.2% in the firmware era. Dropping per line inside the loop
+    // below is exact, and it is the same claim the old code made, only
+    // narrower.
     if (!len)
         return;
+    if (invalidate)
+        OPM_COUNT(fetchDropSnoop);
     const u32 first = pa & ~31u;
     const u32 last = (pa + len - 1u) & ~31u;
     for (u32 a = first;; a += 32u) {
+        if (invalidate)
+            fetchDropAt(a);
         if (dceOn()) {
             const u32 set = setOf(a), tag = tagOf(a);
             for (u32 w = 0; w < 8; ++w) {
@@ -513,6 +528,7 @@ void CpuSnoop::snoopWrite(u32 pa, u32 len)
 // another, and neither told the truth about the machine.
 void Cpu::l1dFlushAll(bool writeback)
 {
+    OPM_COUNT(fetchDropFlush);
     fetchDrop();
     for (u32 s = 0; s < 128; ++s)
         for (u32 w = 0; w < 8; ++w) {

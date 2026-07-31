@@ -46,6 +46,13 @@ enum class Ph : unsigned char {
     DevTick,   // the machine's per-instruction device advance
     Irq,       // interrupt-line recomputation and delivery to the CPU
     Instr,     // the harness's own per-step instrumentation
+    // ⚠ ADDED 2026-07-30 BECAUSE "other" READ 23.9% AT THE DESKTOP. An async
+    // exception returns out of Cpu::step BEFORE the fetch marker, so the whole
+    // of exception delivery — and at the desktop that is a decrementer every
+    // few thousand instructions — was being billed to whatever phase the
+    // machine loop had left set. Unattributed time is not a small bucket you
+    // can ignore; it is the bucket the next optimisation should have gone to.
+    Exc,       // Cpu::raiseExc: vectoring, MSR/SRR transition, handler entry
     N
 };
 

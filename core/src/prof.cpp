@@ -94,6 +94,7 @@ const char* name(Ph p)
     case Ph::DevTick: return "device tick";
     case Ph::Irq: return "irq sync";
     case Ph::Instr: return "instrumentation";
+    case Ph::Exc: return "exception";
     default: return "?";
     }
 }

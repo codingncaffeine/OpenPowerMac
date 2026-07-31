@@ -381,7 +381,25 @@ struct Cpu {
     // and Open Firmware's Forth is subroutine-threaded, so it does almost
     // nothing else. Sixty-four blocks direct-mapped covers 2 KB of code for
     // 2.3 KB of storage and costs exactly the same one tag compare.
-    static constexpr u32 kFetchLines = 64;
+    //
+    // ⚠⚠ AND SIXTY-FOUR WAS NOT ENOUGH EITHER — MEASURED AT THE DESKTOP,
+    // WHICH IS A DIFFERENT MACHINE FROM THE FIRMWARE. Open Firmware runs
+    // tight threaded loops and hit 97.2% on 64 lines; Mac OS at the Finder
+    // has a working set that 2 KB cannot hold, and the same 64 lines hit
+    // 84.5% with 16.5 M fills coming straight off the bus. Sweep, resumed
+    // from the desktop, 300 M instructions each:
+    //
+    //     lines   coverage   hit     fills from memory   MIPS
+    //        64       2 KB   84.6%          16,523,991   55.2
+    //       256       8 KB   90.5%          10,196,535   62.5
+    //      1024      32 KB   96.3%           3,958,051   72.0
+    //     4096     128 KB   99.0%           1,080,691   80.2
+    //
+    // 4096 costs 208 KB and is where the curve flattens. ⚠ 16384 does NOT
+    // run: Cpu is ~1 MB then and the process cannot start, so the next step
+    // up needs Cpu off the stack first. The firmware era gains little from
+    // this (it was already at 97%) and loses nothing: 63.4 -> 66.2 MIPS.
+    static constexpr u32 kFetchLines = 4096;
     static constexpr u16 kNoRow = 0xFFFFu; // decodes to nothing: illegal
     struct FetchLine {
         u32 base = 1; // block base, or 1 — which no 32-byte base can be
@@ -425,6 +443,20 @@ struct Cpu {
     // locality and a bet has to be settled with a number.
     u64 fetchHits = 0, fetchFillsL1 = 0, fetchFillsL2 = 0, fetchFillsMem = 0,
         fetchUncached = 0;
+    // ⚠ WHY A MISS HAPPENED, WHICH IS A DIFFERENT QUESTION FROM HOW MANY.
+    // A block cache can miss because it is too small for the working set, or
+    // because something threw the whole thing away. Those have opposite fixes:
+    // the first wants more lines, the second wants a narrower invalidation —
+    // and enlarging a cache that is being wiped just makes the wipe cost more.
+    // icbi drops EVERY line here although the architecture gives it an
+    // address, and every DMA snoop does the same.
+    u64 fetchDropIcbi = 0, fetchDropSnoop = 0, fetchDropFlush = 0;
+    // Steps that executed NO instruction because the core was in nap/doze:
+    // the clock advances, the fetch path is never entered, and the step still
+    // counts. Without this, a machine that is asleep and a machine that is
+    // working are the same MIPS number, and the fetch hit rate is computed
+    // over a denominator that has nothing to do with the step count.
+    u64 napSteps = 0;
     static u32 fetchSlot(u32 pa) { return (pa >> 5) & (kFetchLines - 1u); }
     void fetchDrop()
     {

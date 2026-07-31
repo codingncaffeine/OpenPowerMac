@@ -4279,6 +4279,23 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(cpu.fetchFillsL2),
                    static_cast<unsigned long long>(cpu.fetchFillsMem),
                    static_cast<unsigned long long>(cpu.fetchUncached));
+        // WHY it missed, not just how often. A capacity miss wants more lines;
+        // a whole-cache drop wants a narrower invalidation, and enlarging the
+        // cache would only make each drop cost more.
+        if (cpu.napSteps)
+            printf("--   nap steps: %llu of %llu executed (%.1f%%) — the core "
+                   "was asleep and fetched nothing\n",
+                   static_cast<unsigned long long>(cpu.napSteps),
+                   static_cast<unsigned long long>(executed),
+                   100.0 * static_cast<double>(cpu.napSteps) /
+                       static_cast<double>(executed ? executed : 1));
+        if (ftot)
+            printf("--   fetch drops: icbi=%llu snoop=%llu flush=%llu "
+                   "(each throws away all %u lines)\n",
+                   static_cast<unsigned long long>(cpu.fetchDropIcbi),
+                   static_cast<unsigned long long>(cpu.fetchDropSnoop),
+                   static_cast<unsigned long long>(cpu.fetchDropFlush),
+                   Cpu::kFetchLines);
         u32 hotPc[24];
         u64 hotN[24];
         const size_t np = prof::topPcs(hotPc, hotN, 24);

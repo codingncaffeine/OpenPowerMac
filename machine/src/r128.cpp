@@ -99,6 +99,31 @@ static int gVblTrace = 0;
 // deliberately not snapshotted, and because it keeps sizeof(R128Cell) fixed.
 static u64 gVblDropped = 0;
 
+// 📊 THE READS WE NEVER ACTUALLY ANSWER.
+//
+// `readCount` already says which registers the guest touches and how often.
+// What it cannot say is whether this model ANSWERED any of them, and that is
+// the difference that matters: ⚠ a register this model does not implement is
+// NOT silent. The card claims its whole register aperture, so a read of an
+// unmodelled offset never reaches the unclaimed-access log — it falls through
+// to `default:` and reads back the last value written there, or zero. A guest
+// driver polling such a register for a change waits for ever, and the only
+// trace it leaves is a machine that stopped making progress. Session 30 wrote
+// this down for mac-io as *claiming an address and implementing it are
+// different things*; it is the same trap on the other device, and it cost a
+// second session.
+//
+// So count separately the reads that fell to the default with NOTHING ever
+// written there. A register read four million times that has only ever
+// returned zero is an unimplemented register being spun on — which reads
+// nothing like a register that is merely busy.
+//
+// File-static for the same reason as the censuses above: it keeps
+// sizeof(R128Cell) fixed, so an instrument cannot invalidate a snapshot.
+static std::map<u32, u64> gRegReadsUnbacked;
+
+const std::map<u32, u64>& r128RegReadsUnbacked() { return gRegReadsUnbacked; }
+
 u32 R128Cell::regRead(u32 idx)
 {
     const u32 off = idx << 2;
@@ -202,7 +227,14 @@ u32 R128Cell::regRead(u32 idx)
     }
     default: {
         auto it = regs_.find(off);
-        return it != regs_.end() ? it->second : 0;
+        if (it == regs_.end()) {
+            // Never written, not modelled: this read is answering 0 and will
+            // keep answering 0 for ever. If a count here is large, the guest
+            // is waiting on something this card does not have.
+            ++gRegReadsUnbacked[off];
+            return 0;
+        }
+        return it->second;
     }
     }
 }

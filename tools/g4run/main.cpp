@@ -28,6 +28,27 @@ using namespace opm;
 
 namespace {
 
+// Cpu::excByVec is indexed by (vector >> 8) & 15, so the index alone reads as
+// a magic number. Name it where it is printed.
+const char* excVecName(u32 vi)
+{
+    switch (vi) {
+    case 1: return "RESET";
+    case 2: return "MACHINE-CHECK";
+    case 3: return "DSI";
+    case 4: return "ISI";
+    case 5: return "EXTERNAL";
+    case 6: return "ALIGNMENT";
+    case 7: return "PROGRAM";
+    case 8: return "FP-UNAVAIL";
+    case 9: return "DECREMENTER";
+    case 12: return "SYSCALL";
+    case 13: return "TRACE";
+    case 15: return "PERFMON";
+    default: return "?";
+    }
+}
+
 std::vector<u8> readFile(const char* path)
 {
     FILE* f = fopen(path, "rb");
@@ -1914,7 +1935,12 @@ int main(int argc, char** argv)
         // next run the same count lands somewhere unrelated, which is exactly
         // how a 44-line window aimed at a shim landed in the idle loop. Code
         // addresses are stable across resumes of one snapshot; counts are not.
-        if (traceAtPc && !traceArmed && pc == traceAtPc) {
+        // ⚠ --bp-from GATES THIS TOO. Arming on the FIRST arrival is wrong
+        // whenever the interesting visit is not the first one: a routine that
+        // runs healthily at boot and pathologically at the desktop arms during
+        // the boot and shows the healthy pass. --bp-from already means "ignore
+        // hits before N" for breakpoints; it means the same here.
+        if (traceAtPc && !traceArmed && pc == traceAtPc && executed >= bpFrom) {
             traceArmed = true;
             traceFrom = executed;
             printf("-- trace armed at pc=%08x @%llu\n", traceAtPc,
@@ -1935,8 +1961,15 @@ int main(int argc, char** argv)
                        cpu.st.gpr[27] & 0xFFFFu, cpu.st.gpr[8],
                        cpu.st.gpr[16], cpu.st.gpr[3], cpu.st.gpr[4]);
             else
-                printf(" | r3=%08x r4=%08x lr=%08x\n", cpu.st.gpr[3],
-                       cpu.st.gpr[4], cpu.st.lr);
+                // r0 and CR0 are here because of `sc`: the selector a system
+                // call asks for lives in r0, and the answer a NanoKernel stub
+                // reads back is CR0[EQ] -- `li r0,-1 ; sc ; li r3,1 ; beqlr`.
+                // A trace through a syscall that prints neither shows the
+                // dispatcher running and cannot say what was asked or what
+                // came back.
+                printf(" | r0=%08x r3=%08x r4=%08x lr=%08x cr0=%x\n",
+                       cpu.st.gpr[0], cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.lr,
+                       (cpu.st.cr >> 28) & 15u);
             if (executed + 1 == traceFrom + traceLines)
                 printf("-- trace window done (%llu lines)\n",
                        static_cast<unsigned long long>(traceLines));
@@ -1985,12 +2018,39 @@ int main(int argc, char** argv)
         // shows neither.
         if (heartbeat && executed && (executed % heartbeat) == 0) {
             static size_t lastRegions = 0, lastCd = 0, lastHd = 0;
+            // ⚠ These logs are CAPPED and can shrink, so an unsigned
+            // subtraction against the previous beat printed
+            // `cd 2069 (+18446744073709549937)` — a delta that reads as
+            // enormous device activity at exactly the moment there was none.
+            // An instrument that lies gets believed; clamp it.
+            auto grew = [](size_t now, size_t before) {
+                return now > before ? now - before : size_t(0);
+            };
             printf("-- beat @%llu: regions %zu (+%zu) cd %zu (+%zu) "
                    "hd %zu (+%zu) pc=%08x%s\n",
                    static_cast<unsigned long long>(executed), seen.size(),
-                   seen.size() - lastRegions, bus.cd().log.size(),
-                   bus.cd().log.size() - lastCd, bus.hd().log.size(),
-                   bus.hd().log.size() - lastHd, cpu.st.pc, sym(cpu.st.pc));
+                   grew(seen.size(), lastRegions), bus.cd().log.size(),
+                   grew(bus.cd().log.size(), lastCd), bus.hd().log.size(),
+                   grew(bus.hd().log.size(), lastHd), cpu.st.pc, sym(cpu.st.pc));
+            // 📊 EXCEPTIONS PER BEAT, BY VECTOR. A running total cannot say
+            // whether a storm is happening NOW or happened once during boot,
+            // and those read identically in a final report. The DELTA over a
+            // fixed window is a rate, and a rate is what distinguishes "this
+            // machine has always done this" from "this machine started doing
+            // this". Printed as instructions-per-exception, because that is
+            // the unit the diagnostic's own histogram reports in.
+            static u64 lastVec[16] = {};
+            printf("--   exc/beat:");
+            for (u32 vi = 0; vi < 16; ++vi) {
+                const u64 d = cpu.excByVec[vi] - lastVec[vi];
+                lastVec[vi] = cpu.excByVec[vi];
+                if (!d)
+                    continue;
+                printf(" %s=%llu(1/%llu)", excVecName(vi),
+                       static_cast<unsigned long long>(d),
+                       static_cast<unsigned long long>(heartbeat / d));
+            }
+            printf("\n");
             fflush(stdout);
             lastRegions = seen.size();
             lastCd = bus.cd().log.size();
@@ -5243,6 +5303,27 @@ int main(int argc, char** argv)
                    "%llu framebuffer writes\n",
                    static_cast<unsigned long long>(engine),
                    static_cast<unsigned long long>(ac.fbWrites));
+            // ⭐ THE REGISTERS THE GUEST READS THAT WE NEVER ANSWER. The card
+            // claims its whole aperture, so these can never appear in the
+            // unclaimed-access log — they read back zero for ever. A big count
+            // here is a driver spinning on hardware this model does not have,
+            // which is precisely how the session-31 desktop hang looked from
+            // the inside: `ARMQSTimeStampElapsed` in the ATI Graphics
+            // Accelerator polling a 64-bit engine timestamp at +0x15e0/+0x15e4.
+            // Printed unconditionally, header included, so "nothing to report"
+            // and "this section was filtered away" cannot be confused.
+            {
+                std::vector<std::pair<u64, u32>> ub;
+                for (const auto& [o, n] : r128RegReadsUnbacked())
+                    ub.push_back({n, o});
+                std::sort(ub.rbegin(), ub.rend());
+                printf("-- ati registers READ but never answered (always 0), "
+                       "busiest first: %zu offset(s)\n",
+                       ub.size());
+                for (size_t i = 0; i < ub.size() && i < 12; ++i)
+                    printf("--   %04x  %llu reads\n", ub[i].second,
+                           static_cast<unsigned long long>(ub[i].first));
+            }
         }
         // The vertical blank, end to end in one line. The register traffic log
         // is a 4096-entry ring printed head-and-tail, so the nineteen

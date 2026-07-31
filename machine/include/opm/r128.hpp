@@ -192,4 +192,9 @@ private:
     u64 vblPeriod() const;
 };
 
+// Reads that fell through to the register model's default with nothing ever
+// written at that offset — reads this card answered with zero and always will.
+// See the census in r128.cpp for why this is separate from readCount.
+const std::map<u32, u64>& r128RegReadsUnbacked();
+
 } // namespace opm

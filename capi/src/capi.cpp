@@ -459,8 +459,14 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // when IR was clear, on the reasoning that the pc is then physical and
     // there is nothing to get wrong — which meant the case that matters most,
     // a guest spinning in ORDINARY user-mode code, printed nothing at all.
-    for (int which = 0; which < 2; ++which) {
-        const u32 ea = which ? cpu.st.srr0 : cpu.st.pc;
+    // pc, srr0 AND lr. The link register is the one that names the DRIVER: OF
+    // and the OS reach device registers through a handful of shared accessor
+    // primitives, so a pc inside one names the primitive and never the caller.
+    // The bus keeps LR for device attribution for exactly this reason.
+    for (int which = 0; which < 3; ++which) {
+        const u32 ea = which == 0   ? cpu.st.pc
+                       : which == 1 ? cpu.st.srr0
+                                    : cpu.st.lr;
         if (which && (ea == 0 || ea == cpu.st.pc))
             continue;
         u32 base = ea;
@@ -470,16 +476,20 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             ok = diagXlate(cpu, *m->bus, ea, true, base);
         if (!ok) {
             snprintf(b, sizeof b, "-- code at %s %08x: NOT MAPPED\n",
-                     which ? "srr0" : "pc  ", ea);
+                     which == 0 ? "pc  " : which == 1 ? "srr0" : "lr  ", ea);
             s += b;
             continue;
         }
         // Walk back four instructions so the top of a short loop is visible.
         const u32 from = base - 16u;
         snprintf(b, sizeof b, "-- code at %s %08x (%s %08x):\n",
-                 which ? "srr0" : "pc  ", ea, ir ? "pa" : "physical", from);
+                 which == 0 ? "pc  " : which == 1 ? "srr0" : "lr  ", ea,
+                 ir ? "pa" : "physical", from);
         s += b;
-        for (u32 row = 0; row < 6; ++row) {
+        // Twelve rows rather than six: a polling routine and the loop that
+        // calls it do not fit in six, and the second half of the answer being
+        // one row past the end costs another ten-minute boot to find out.
+        for (u32 row = 0; row < 12; ++row) {
             snprintf(b, sizeof b, "--   %08x:", ea - 16u + row * 16u);
             s += b;
             for (u32 w = 0; w < 4; ++w) {
@@ -635,6 +645,71 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         one("audio-in", 0x8900, m->bus->sndIn());
         one("ata-hd", 0x8A00, m->bus->hdDma());
         one("ata-cd", 0x8B00, m->bus->ataDma());
+
+        // ⭐ WHAT THE CHANNEL WAS ASKED TO DO, and what it has been doing.
+        // A status word says a channel is stuck; only the descriptor list says
+        // what it is stuck ON, and only the event log says how it got there.
+        // Both are dumped for any channel that has been programmed at all, so
+        // whichever way the status reads, the answer is in the same capture.
+        //
+        // ⚠ Descriptors are LITTLE-ENDIAN in memory — that is why the guest
+        // reaches these registers with lwbrx/stwbrx — so every word is swapped
+        // on the way out here.
+        auto swap32 = [](u32 v) {
+            return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) |
+                   (v << 24);
+        };
+        static const char* kCmd[8] = {"OUTPUT_MORE", "OUTPUT_LAST",
+                                      "INPUT_MORE",  "INPUT_LAST",
+                                      "STORE_QUAD",  "LOAD_QUAD",
+                                      "NOP",         "STOP"};
+        static const char* kEvKind[8] = {"ctl",  "desc", "data",     "stop",
+                                         "dead", "sq",   "ptr-live", "branch"};
+        auto detail = [&](const char* nm, u32 off, DbdmaChannel& ch) {
+            if (!ch.cmdPtr() && ch.log.empty())
+                return; // never programmed: nothing to say
+            // ⚠ START BEFORE cmdPtr, not at it. cmdPtr is where the engine has
+            // got TO, so a dump that begins there shows the descriptors not
+            // yet run and, past the end of a short list, whatever RAM follows
+            // it — which reads as garbage and hides the ones that matter. Two
+            // back puts the recently executed entries in view.
+            const u32 first =
+                ch.cmdPtr() > 32u ? ch.cmdPtr() - 32u : ch.cmdPtr();
+            snprintf(b, sizeof b,
+                     "--   +%04x %s: descriptors from %08x (cmdPtr=%08x)\n",
+                     off, nm, first, ch.cmdPtr());
+            s += b;
+            for (u32 d = 0; d < 6 && ch.cmdPtr(); ++d) {
+                const u32 a = first + d * 16u;
+                const u32 w0 = swap32(m->bus->read32(a));
+                const u32 w1 = swap32(m->bus->read32(a + 4));
+                const u32 w2 = swap32(m->bus->read32(a + 8));
+                const u32 w3 = swap32(m->bus->read32(a + 12));
+                snprintf(b, sizeof b,
+                         "--     %08x %-11s req=%-5u addr=%08x dep=%08x "
+                         "xferStatus=%04x res=%u%s\n",
+                         a, kCmd[(w0 >> 28) & 7u], w0 & 0xFFFFu, w1, w2,
+                         w3 >> 16, w3 & 0xFFFFu,
+                         a == ch.cmdPtr() ? "   <== cmdPtr" : "");
+                s += b;
+            }
+            const size_t n = ch.log.size() > 16 ? 16 : ch.log.size();
+            snprintf(b, sizeof b, "--     last %zu of %zu channel events:\n", n,
+                     ch.log.size());
+            s += b;
+            for (size_t k = ch.log.size() - n; k < ch.log.size(); ++k) {
+                const DbdmaChannel::Ev& e = ch.log[k];
+                snprintf(b, sizeof b, "--       %-8s a=%08x b=%08x @%llu\n",
+                         kEvKind[e.kind & 7u], e.a, e.b,
+                         static_cast<unsigned long long>(e.at));
+                s += b;
+            }
+        };
+        for (u32 i = 0; i < 8; ++i)
+            detail(kChanName[i], 0x8000u + i * 0x100u, m->bus->genDma(i));
+        detail("audio-out", 0x8800, m->bus->sndOut());
+        detail("ata-hd", 0x8A00, m->bus->hdDma());
+        detail("ata-cd", 0x8B00, m->bus->ataDma());
     }
     s += m->bus->hd().describe("hd");
     s += m->bus->cd().describe("cd");

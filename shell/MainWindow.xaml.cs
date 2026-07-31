@@ -430,11 +430,13 @@ public partial class MainWindow : Window
         // Dropped frames are shown because a stutter and a silent machine are
         // otherwise the same observation.
         long dropped = Interlocked.Read(ref s.StatAudioDropped);
+        long starved = Interlocked.Read(ref s.StatAudioStarved);
+        string audioNote = starved > 0 ? $" ({starved:N0} starved)"
+                         : dropped > 0 ? $" ({dropped:N0} dropped)"
+                         : "";
         txtAudio.Text = s.StatAudioRate == 0
             ? ""
-            : dropped > 0
-                ? $"audio {s.StatAudioRate / 1000.0:F1} kHz ({dropped:N0} dropped)"
-                : $"audio {s.StatAudioRate / 1000.0:F1} kHz";
+            : $"audio {s.StatAudioRate / 1000.0:F1} kHz{audioNote}";
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentQueue<string> StaticEmptyQ = new();

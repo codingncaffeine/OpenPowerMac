@@ -28,6 +28,22 @@ internal sealed class WaveOutSink : IDisposable
     private int _bufBytes;
     private int _next;
 
+    // Silence queued ahead of a sound that starts from an idle device.
+    //
+    // ⭐ THIS IS WHY THE CHIME POPPED, AND IT IS NOT A HOST PROBLEM.
+    // The codec never lets the guest run more than its 8 KB hardware FIFO —
+    // 46 ms — ahead of the play cursor, because that bound is what stops a
+    // descriptor RING being swallowed whole. So the device can only ever be
+    // 46 ms deep however large this ring is, and the app's real-time pacing
+    // slips (26 measured in 25 s, whenever the emulator hits synchronous host
+    // I/O) are longer than that. The device then runs dry mid-chime, stops,
+    // and restarts on the next write — which is the pop.
+    //
+    // A cushion has to be built ONCE, at the start of a sound, where there is
+    // no waveform to damage. Inserting it into a stream that is already
+    // playing is the mistake that turned the chime to static.
+    private const int PrimeBuffers = 4; // 100 ms
+
     /// <summary>Sample rate the device is currently open at (0 = closed).</summary>
     public int Rate { get; private set; }
     /// <summary>Frames dropped because every buffer was still playing. A
@@ -35,6 +51,11 @@ internal sealed class WaveOutSink : IDisposable
     /// a burst larger than the ring — it is the number that tells a stutter
     /// apart from a machine that simply made no sound.</summary>
     public long DroppedFrames { get; private set; }
+    /// <summary>Times the device was found completely idle with more audio
+    /// still to come — i.e. it ran dry mid-sound. THIS is the number that
+    /// separates a pop caused by starvation from a pop in the samples
+    /// themselves, and there was no way to tell them apart before.</summary>
+    public long Starvations { get; private set; }
 
     public bool IsOpen => _hwo != IntPtr.Zero;
 
@@ -51,6 +72,10 @@ internal sealed class WaveOutSink : IDisposable
         {
             if (_hwo == IntPtr.Zero)
                 return 0;
+            // Idle: Write will spend PrimeBuffers on the cushion first, so
+            // that room is not the caller's to fill.
+            if (AllIdle)
+                return (Buffers - PrimeBuffers) * _bufBytes;
             // Buffers are consumed in rotation, so only the run starting at
             // _next is usable without playing them out of order.
             int free = 0;
@@ -112,6 +137,7 @@ internal sealed class WaveOutSink : IDisposable
         }
         Rate = rate;
         _next = 0;
+        _playing = false;
         return true;
     }
 
@@ -140,6 +166,7 @@ internal sealed class WaveOutSink : IDisposable
         waveOutClose(_hwo);
         _hwo = IntPtr.Zero;
         Rate = 0;
+        _playing = false;
     }
 
     /// <summary>Queue PCM for playback. <paramref name="pcm"/> holds
@@ -151,6 +178,18 @@ internal sealed class WaveOutSink : IDisposable
     {
         if (_hwo == IntPtr.Zero || count < 4)
             return;
+        // Starting from an idle device: build the cushion first. `_playing`
+        // distinguishes "the very first sound" from "we ran dry in the middle
+        // of one", and both want the same treatment — but only the second is
+        // a fault, so only the second is counted.
+        if (AllIdle)
+        {
+            if (_playing)
+                Starvations++;
+            for (int k = 0; k < PrimeBuffers; k++)
+                QueueSilence();
+        }
+        _playing = true;
         int at = 0;
         while (at < count)
         {
@@ -188,6 +227,32 @@ internal sealed class WaveOutSink : IDisposable
     }
 
     public void Dispose() => Close();
+
+    private bool _playing;
+
+    /// <summary>Nothing is queued: every buffer has come back.</summary>
+    private bool AllIdle
+    {
+        get
+        {
+            for (int k = 0; k < Buffers; k++)
+                if ((GetFlags(_hdr[k]) & WHDR_DONE) == 0)
+                    return false;
+            return true;
+        }
+    }
+
+    private void QueueSilence()
+    {
+        int idx = _next;
+        if ((GetFlags(_hdr[idx]) & WHDR_DONE) == 0)
+            return;
+        for (int k = 0; k < _bufBytes; k += 4)
+            Marshal.WriteInt32(_data[idx], k, 0);
+        SetLengthAndArm(_hdr[idx], (uint)_bufBytes);
+        waveOutWrite(_hwo, _hdr[idx], (uint)Marshal.SizeOf<WAVEHDR>());
+        _next = (_next + 1) % Buffers;
+    }
 
     private byte[] _swap = [];
 

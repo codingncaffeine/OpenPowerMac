@@ -13,6 +13,9 @@ public sealed class MachineSession
     private volatile bool _stop;
     // Owned and touched only by the worker, like every other capi resource.
     private readonly WaveOutSink _wave = new();
+    // OPM_AUDIO_WAV=path: record what the APP played, which is a different
+    // timeline from what g4run's --wav-out records. See AudioCapture.
+    private AudioCapture? _capture;
     private readonly ConcurrentQueue<string> _serialQ = new();
     private readonly ConcurrentQueue<string> _keyQ = new();
     private readonly ConcurrentQueue<(uint usage, uint down)> _keyEvQ = new();
@@ -39,6 +42,10 @@ public sealed class MachineSession
     /// the user can hear, which is otherwise indistinguishable from a guest
     /// that simply stopped playing.</summary>
     public long StatAudioDropped;
+    /// <summary>Times the speaker ran dry in the middle of a sound. This is
+    /// the number that says a pop came from starvation rather than from the
+    /// samples, and nothing could tell them apart before it existed.</summary>
+    public long StatAudioStarved;
 
     /// <summary>Raised on the worker when the session ends (reason text).</summary>
     public event Action<string>? Ended;
@@ -130,6 +137,7 @@ public sealed class MachineSession
             // codec can have produced between two chunks — the drain is never
             // the thing that falls behind.
             var pcm = new byte[44100 * 4 / 4];
+            _capture = AudioCapture.FromEnvironment();
             ulong chunk = 1_000_000;
             var sw = Stopwatch.StartNew();
             long lastShotMs = 0, lastStatMs = 0, lastStatInsns = 0;
@@ -203,11 +211,13 @@ public sealed class MachineSession
                         if (got == 0)
                             break;
                         _wave.Write(pcm, (int)got, bigEndian: true);
+                        _capture?.Write(pcm, (int)got, rate, bigEndian: true);
                         room -= (int)got;
                     }
                 }
                 StatAudioRate = _wave.IsOpen ? _wave.Rate : 0;
                 Interlocked.Exchange(ref StatAudioDropped, _wave.DroppedFrames);
+                Interlocked.Exchange(ref StatAudioStarved, _wave.Starvations);
 
                 uint n;
                 while ((n = Native.opm_console(m, conBuf, (uint)conBuf.Length)) > 0)
@@ -249,6 +259,8 @@ public sealed class MachineSession
         finally
         {
             _wave.Close();
+            _capture?.Dispose();
+            _capture = null;
             if (m != IntPtr.Zero)
                 Native.opm_destroy(m);
             Running = false;

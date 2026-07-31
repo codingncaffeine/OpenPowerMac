@@ -58,11 +58,6 @@ public:
     // driver's descriptor list is — from being swallowed whole inside a
     // single guest instruction.
     static constexpr u32 kFifoBytes = 0x2000;
-    // How long a gap in the guest's output still counts as an UNDERRUN — a
-    // hitch inside one sound, to be filled with silence so the host device
-    // never stops mid-waveform — rather than as the start of a new sound.
-    // 250 ms of timebase.
-    static constexpr u64 kMaxGapTb = kTbHz / 4;
 
     u32 read(u32 off, u32 len) const;
     void write(u32 off, u32 v, u32 len);
@@ -133,11 +128,6 @@ private:
     // room for, given a cursor that says when everything queued so far will
     // have been consumed.
     u32 credit(u64& cursorTb);
-    // Close a short gap with silence rather than by splicing. See the note on
-    // the definition — this is what stops the host's device restarting
-    // mid-waveform, which is heard as a pop.
-    void fillUnderrun(u64& cursorTb);
-    void pushSilence(u32 n);
     u64 dueTb(u64 cursorTb) const
     {
         const u64 halfTb = tbForBytes(kFifoBytes / 2);

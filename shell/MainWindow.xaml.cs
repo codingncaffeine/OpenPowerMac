@@ -124,50 +124,61 @@ public partial class MainWindow : Window
     // centre and every move is measured from there, so the guest gets
     // unbounded relative motion and the two cursors cannot drift apart.
     //
-    // Travel is METERED rather than handed over as it arrives, and the reason
-    // is specific. The Cursor Device Manager applies an acceleration curve to
-    // whatever has accumulated by the time its vertical-blank task drains it,
-    // and that curve is steep — measured 1.20x gain at 17 units per drain
-    // against 1.71x at 35. Simply splitting a delta into small reports does
-    // NOTHING, because the USB cell re-accumulates them (there are thousands
-    // of polls between drains) and the guest still sees one lump. What has to
-    // be bounded is travel PER DRAIN, so the meter has to work in time: hold
-    // the travel here and release at most kUnitsPerTick of it on each 33 ms
-    // tick. Nothing is discarded — a fast flick glides over several frames
-    // instead of teleporting, and total distance is preserved exactly.
+    // ⛔⛔ TRAVEL IS NOT METERED, AND THE METER THAT USED TO BE HERE IS WHY THE
+    // POINTER WAS SLOW.
+    //
+    // It held the motion and released at most 10 units on each 33 ms tick,
+    // which is a hard ceiling of about **303 units per second whatever the
+    // hand does** — a 400 CPI mouse moved at a leisurely five inches a second
+    // delivers 2,000. Everything above the ceiling was not dropped but
+    // deferred, so a flick kept gliding after the hand stopped: the pointer
+    // was smooth and sluggish for the same reason, and no amount of extra
+    // physical movement could beat the cap.
+    //
+    // ⭐ The meter's own justification is what gives it away. It existed to
+    // keep travel PER DRAIN "well inside the linear part of the acceleration
+    // curve" — that is, to deliberately suppress the Cursor Device Manager's
+    // acceleration. But that curve is the thing that makes a mouse feel right:
+    // move fast, hand the CDM a large delta for that drain, get high gain and
+    // a pointer that crosses the screen. Bounding the delta pins the curve at
+    // its low end forever, which is precisely "needs far more physical
+    // movement than it should".
+    //
+    // ⚠ It was also tuned against a machine whose clock ran 1.93x fast (the
+    // comment quoted "the guest drains ~47 times a host second"). The clock is
+    // real time now and the guest drains at 60 Hz, so the premise is gone as
+    // well as the reasoning. A real USB mouse hands its host whatever it
+    // accumulated between polls and lets the OS curve decide; so do we. The
+    // USB cell already accumulates between the guest's own polls, which is the
+    // only re-accumulation that models anything.
+    //
+    // What is left is a sub-unit remainder, because sensitivity may be
+    // fractional and a HID report carries whole counts. Nothing is discarded.
     private double _pendX, _pendY;
     private uint _pendButtons;
 
-    // Sensitivity. The host pointer moves in screen pixels and the guest is a
-    // 640-wide desktop, so 1:1 is far too fast once the CDM's gain is applied.
-    private const double kSensitivity = 0.55;
-    // Ceiling on units released per tick. Ticks run at 30 Hz and the guest
-    // drains ~47 times a host second, so this bounds per-drain travel to well
-    // inside the linear part of the acceleration curve.
-    private const int kUnitsPerTick = 10;
+    // 1:1 with the host pointer. The guest has a Mouse control panel and that
+    // is the right place to set tracking speed — a constant here would be this
+    // host's feel baked into the machine.
+    private const double kSensitivity = 1.0;
 
     private void SendTravel(double dx, double dy, uint buttons)
     {
         _pendX += dx * kSensitivity;
         _pendY += dy * kSensitivity;
         _pendButtons = buttons;
+        FlushMouse();
     }
 
-    /// <summary>Release a bounded slice of the held travel. Called from the UI
-    /// tick so the guest receives a steady stream rather than one lump.</summary>
-    private void PumpMouse()
+    /// <summary>Hand over whole counts as they arrive, keeping the sub-unit
+    /// remainder. Also called from the UI tick, so a fraction left by the last
+    /// movement is not stranded when the hand stops.</summary>
+    private void FlushMouse()
     {
         if (_session is not { Running: true } s)
             return;
-        if (Math.Abs(_pendX) < 1 && Math.Abs(_pendY) < 1)
-            return;
-
-        // Scale both axes by the same factor so the direction of travel is
-        // preserved; clamping them independently would bend a diagonal flick.
-        double mag = Math.Max(Math.Abs(_pendX), Math.Abs(_pendY));
-        double take = Math.Min(1.0, kUnitsPerTick / mag);
-        int dx = (int)Math.Truncate(_pendX * take);
-        int dy = (int)Math.Truncate(_pendY * take);
+        int dx = (int)Math.Truncate(_pendX);
+        int dy = (int)Math.Truncate(_pendY);
         if (dx == 0 && dy == 0)
             return;
         _pendX -= dx;
@@ -396,7 +407,7 @@ public partial class MainWindow : Window
         }
 
         UpdateCaptureHint();
-        PumpMouse();
+        FlushMouse();
         if (_captured && s is not { Running: true })
             ReleasePointer(); // the machine stopped under us
 

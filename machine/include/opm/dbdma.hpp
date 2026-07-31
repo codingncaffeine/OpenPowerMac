@@ -64,6 +64,11 @@ public:
     // Parked mid-descriptor waiting on a streaming device (see
     // DmaDevice::dmaStreams) — the state a periodic wake exists to clear.
     bool parked() const { return (status_ & 0x8000u) && (status_ & 0x0400u); }
+    // The raw registers, for a report. run/parked/irq answer three questions,
+    // and a stalled driver always turns on a fourth: WHICH bit it is waiting
+    // for. Accessors only — sizeof is unchanged, so snapshots are untouched.
+    u32 status() const { return status_; }
+    u32 cmdPtr() const { return cmdPtr_; }
 
     Bus* dmaBus = nullptr;
     DmaDevice* dev = nullptr;

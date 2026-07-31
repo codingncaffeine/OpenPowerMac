@@ -697,6 +697,9 @@ public:
     // missing volume.
     DbdmaChannel& ataDma() { return ataDma_; }
     DbdmaChannel& hdDma() { return hdDma_; }
+    // Channels 0-7, the deviceless ones. Exposed so a report can say what a
+    // driver polling one of them is actually looking at.
+    DbdmaChannel& genDma(u32 i) { return dmaGen_[i & 7u]; }
 
     // The sound codec and its two DBDMA channels, at the KeyLargo offsets
     // the same map gives: 0x8800 audio out, 0x8900 audio in.

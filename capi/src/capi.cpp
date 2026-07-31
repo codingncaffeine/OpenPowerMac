@@ -607,16 +607,35 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // transfer that will never finish, which from outside is a frozen machine.
     // RUN set with the interrupt line high and nobody lowering it is the other
     // shape, and it is how the session-29 wedge presented.
-    snprintf(b, sizeof b,
-             "-- dbdma hd: run=%d parked=%d irq=%d | ata(cd): run=%d "
-             "parked=%d irq=%d\n",
-             m->bus->hdDma().running() ? 1 : 0,
-             m->bus->hdDma().parked() ? 1 : 0,
-             m->bus->hdDma().irqLine() ? 1 : 0,
-             m->bus->ataDma().running() ? 1 : 0,
-             m->bus->ataDma().parked() ? 1 : 0,
-             m->bus->ataDma().irqLine() ? 1 : 0);
-    s += b;
+    // ⭐ EVERY CHANNEL, WITH THE BITS SPELLED OUT. A driver stalled on a DBDMA
+    // channel is waiting for one specific bit, and "run/parked/irq" answers
+    // three questions that are usually not the one being asked. The CHRP names
+    // are here too, because +0x8700 meaning "SCC receive B" is the step that
+    // turned an address into a diagnosis.
+    {
+        static const char* kChanName[8] = {
+            "scsi0", "floppy", "ether-tx", "ether-rx",
+            "scc-a-tx", "scc-a-rx", "scc-b-tx", "scc-b-rx"};
+        s += "-- dbdma channels (status bits: RUN 8000 PAUSE 4000 FLUSH 2000 "
+             "WAKE 1000 DEAD 800 ACTIVE 400 BRANCH 100):\n";
+        auto one = [&](const char* nm, u32 off, DbdmaChannel& ch) {
+            const u32 st = ch.status();
+            snprintf(b, sizeof b,
+                     "--   +%04x %-9s status=%08x cmdPtr=%08x irq=%d %s%s%s%s%s%s\n",
+                     off, nm, st, ch.cmdPtr(), ch.irqLine() ? 1 : 0,
+                     (st & 0x8000u) ? "RUN " : "", (st & 0x4000u) ? "PAUSE " : "",
+                     (st & 0x2000u) ? "FLUSH " : "", (st & 0x1000u) ? "WAKE " : "",
+                     (st & 0x0800u) ? "DEAD " : "",
+                     (st & 0x0400u) ? "ACTIVE" : "");
+            s += b;
+        };
+        for (u32 i = 0; i < 8; ++i)
+            one(kChanName[i], 0x8000u + i * 0x100u, m->bus->genDma(i));
+        one("audio-out", 0x8800, m->bus->sndOut());
+        one("audio-in", 0x8900, m->bus->sndIn());
+        one("ata-hd", 0x8A00, m->bus->hdDma());
+        one("ata-cd", 0x8B00, m->bus->ataDma());
+    }
     s += m->bus->hd().describe("hd");
     s += m->bus->cd().describe("cd");
     s += "===== end =====\n";

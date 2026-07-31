@@ -341,6 +341,68 @@ static bool diagXlate(const Cpu& cpu, SawtoothBus& bus, u32 ea, bool fetch,
     return false;
 }
 
+// 🧭 THE PAGE-TABLE WALK FOR ONE ADDRESS, SPELLED OUT.
+//
+// Factored out because it was only ever pointed at DAR, and the address that
+// most needed it was the pc: "code at pc 3e894d70: NOT MAPPED" is where a
+// capture stopped being useful, when the machine was demonstrably EXECUTING
+// there. An address the CPU is running from that the page table does not
+// describe is either a stale translation or a walk that disagrees with the
+// hardware's, and both are findings — but only if the walk shows its working.
+static void dumpMmu(std::string& s, const Cpu& cpu, SawtoothBus& bus, u32 ea,
+                    const char* what)
+{
+    char b[512];
+    const u32 sr = cpu.st.sr[ea >> 28];
+    const u32 vsid = sr & 0x00FFFFFFu;
+    const u32 pi = (ea >> 12) & 0xFFFFu;
+    const u32 api = pi >> 10;
+    const u32 htaborg = cpu.st.sdr1 & 0xFFFF0000u;
+    const u32 htabmask = cpu.st.sdr1 & 0x1FFu;
+    snprintf(b, sizeof b,
+             "-- mmu for %s=%08x: sr[%u]=%08x vsid=%06x pi=%04x api=%02x "
+             "sdr1=%08x (org=%08x mask=%03x)\n",
+             what, ea, ea >> 28, sr, vsid, pi, api, cpu.st.sdr1, htaborg,
+             htabmask);
+    s += b;
+    // A BAT covering this address would have answered before the table was
+    // consulted, so their absence is part of the evidence. Both sets: an
+    // INSTRUCTION address is answered by the IBATs, and printing only the
+    // DBATs beside a pc invites the wrong conclusion.
+    for (u32 i = 0; i < 4; ++i) {
+        snprintf(b, sizeof b, "--   bat%u: i u=%08x l=%08x   d u=%08x l=%08x\n",
+                 i, cpu.st.ibatu[i], cpu.st.ibatl[i], cpu.st.dbatu[i],
+                 cpu.st.dbatl[i]);
+        s += b;
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        const u32 hash = pass == 0 ? ((vsid & 0x7FFFFu) ^ pi)
+                                   : (~((vsid & 0x7FFFFu) ^ pi) & 0x7FFFFu);
+        const u32 pteg = htaborg | ((((hash >> 10) & 0x1FFu) & htabmask) << 16) |
+                         ((hash & 0x3FFu) << 6);
+        snprintf(b, sizeof b, "--   %s pteg @%08x (hash=%05x):\n",
+                 pass ? "secondary" : "primary  ", pteg, hash);
+        s += b;
+        for (u32 slot = 0; slot < 8; ++slot) {
+            const u32 a = pteg + slot * 8u;
+            const u32 w0 = bus.read32(a);
+            const u32 w1 = bus.read32(a + 4);
+            const bool v = (w0 & 0x80000000u) != 0;
+            const u32 eVsid = (w0 >> 7) & 0xFFFFFFu;
+            const u32 eH = (w0 >> 6) & 1u;
+            const u32 eApi = w0 & 0x3Fu;
+            const bool match =
+                v && eVsid == vsid && eH == static_cast<u32>(pass) && eApi == api;
+            snprintf(b, sizeof b,
+                     "--     %u %08x %08x  v=%d vsid=%06x h=%u api=%02x "
+                     "rpn=%05x pp=%u%s\n",
+                     slot, w0, w1, v ? 1 : 0, eVsid, eH, eApi, w1 >> 12,
+                     w1 & 3u, match ? "   <== MATCHES" : "");
+            s += b;
+        }
+    }
+}
+
 OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
 {
     if (!buf || !cap)
@@ -454,16 +516,121 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             if (excSetsDar(r.vec))
                 snprintf(b, sizeof b,
                          "--   %03x %-12s srr0=%08x srr1=%08x dar=%08x "
-                         "dsisr=%08x @%llu\n",
+                         "dsisr=%08x lr=%08x @%llu\n",
                          r.vec, excName(r.vec), r.srr0, r.srr1, r.dar, r.dsisr,
+                         r.lr, static_cast<unsigned long long>(r.tb));
+            else if (r.vec == 0xC00)
+                // 📞 A SYSCALL IS A QUESTION, SO PRINT THE QUESTION. r0 is the
+                // NanoKernel selector and lr is who asked; srr0 is only ever
+                // the instruction after `sc`, which is the least informative
+                // field of the three and was the only one printed.
+                snprintf(b, sizeof b,
+                         "--   %03x %-12s srr0=%08x sel=r0:%-10d lr=%08x @%llu\n",
+                         r.vec, excName(r.vec), r.srr0,
+                         static_cast<int>(r.r0), r.lr,
                          static_cast<unsigned long long>(r.tb));
             else
                 snprintf(b, sizeof b,
-                         "--   %03x %-12s srr0=%08x srr1=%08x %-28s @%llu\n",
+                         "--   %03x %-12s srr0=%08x srr1=%08x %-16s lr=%08x @%llu\n",
                          r.vec, excName(r.vec), r.srr0, r.srr1,
-                         "(dar/dsisr not set by this)",
+                         "(no dar/dsisr)", r.lr,
                          static_cast<unsigned long long>(r.tb));
             s += b;
+        }
+    }
+    // 🧠 THE NANOKERNEL BLOCK THE `sc -1` FAST PATH READS.
+    //
+    // Mac OS's syscall vector at physical 0xC00 saves r1/lr into SPRG1/SPRG2
+    // and jumps through a table of handlers at [SPRG3 + vector>>8*4]; entry 12
+    // (0xC00) is the dispatcher, and it fast-paths exactly three selectors
+    // before the general save-everything path:
+    //
+    //     cmpwi r0,-1 ; mfspr r1,272 (SPRG0)
+    //     lwz    r0,-16(r1)          <- a per-CPU flags word below SPRG0
+    //     rlwinm. r0,r0,0,10,10      <- keeps ONE bit, 0x00200000, sets CR0
+    //     rfi
+    //
+    // and the ROM stub that calls it is `li r0,-1 ; sc ; li r3,1 ; beqlr ;
+    // li r3,0` — so it returns TRUE exactly when that bit is CLEAR. Measured on
+    // a healthy desktop the word is 0x00280006, bit SET, stub answers 0, and
+    // the ROM predicate that consults it takes its good path. Print the word
+    // and the answer, because "the guest keeps asking the same question" is
+    // only half a finding until the machine's answer is beside it.
+    //
+    // ⚠ SPRG0 is a PHYSICAL address: the dispatcher reads it with DR clear, so
+    // this reads the bus directly rather than translating — one less thing to
+    // get wrong, and it works when the page tables do not.
+    {
+        const u32 sprg0 = cpu.st.sprg[0];
+        s += "-- nanokernel per-cpu block (physical; sc -1 reads [SPRG0-16]):\n";
+        if (sprg0 >= 32 && u64(sprg0) + 4 <= m->bus->ramBytes()) {
+            snprintf(b, sizeof b, "--   SPRG0=%08x ", sprg0);
+            s += b;
+            for (int off = -32; off <= -4; off += 4) {
+                snprintf(b, sizeof b, "[%d]=%08x ", off,
+                         m->bus->read32(static_cast<u32>(sprg0 + off)));
+                s += b;
+            }
+            s += "\n";
+            const u32 flags = m->bus->read32(sprg0 - 16u);
+            const bool bit10 = (flags & 0x00200000u) != 0;
+            snprintf(b, sizeof b,
+                     "--   flags=[SPRG0-16]=%08x  bit10(0x00200000)=%s  =>  "
+                     "`sc -1` answers %d %s\n",
+                     flags, bit10 ? "SET" : "CLEAR", bit10 ? 0 : 1,
+                     bit10 ? "(healthy: the caller's good path)"
+                           : "<== NOT the healthy value (healthy = SET)");
+            s += b;
+        } else {
+            snprintf(b, sizeof b,
+                     "--   SPRG0=%08x is not a readable RAM address\n", sprg0);
+            s += b;
+        }
+    }
+    // 📇 …AND THE OTHER INPUTS TO THE SAME PREDICATE. The ROM routine that
+    // calls the stub also consults ExpandMem (low-memory long at 0x2B6): it
+    // reads emSize at +2, and only if that exceeds 0x31C does it test the field
+    // at +0x31C. Four branches decide one answer, so print all four inputs at
+    // once — chasing them one capture at a time is how a ten-minute
+    // reproduction turns into a session.
+    {
+        s += "-- lowmem ExpandMem (the same predicate's other inputs):\n";
+        u32 pa = 0;
+        if (diagXlate(cpu, *m->bus, 0x2B6u, false, pa)) {
+            const u32 em = m->bus->read32(pa);
+            u32 empa = 0;
+            if (em && diagXlate(cpu, *m->bus, em, false, empa)) {
+                // emSize is a longword at +2 — deliberately unaligned, which is
+                // why it is read a halfword at a time here.
+                const u32 emSize = (u32(m->bus->read16(empa + 2)) << 16) |
+                                   m->bus->read16(empa + 4);
+                snprintf(b, sizeof b, "--   ExpandMem=%08x (pa %08x) emSize=%08x\n",
+                         em, empa, emSize);
+                s += b;
+                u32 fpa = 0;
+                if (emSize > 0x31Cu && diagXlate(cpu, *m->bus, em + 0x31Cu, false, fpa)) {
+                    snprintf(b, sizeof b,
+                             "--   [ExpandMem+0x31C]=%08x %s\n", m->bus->read32(fpa),
+                             m->bus->read32(fpa) ? "<== NON-ZERO: predicate returns 6"
+                                             : "(zero: predicate's good path)");
+                    s += b;
+                } else {
+                    snprintf(b, sizeof b,
+                             "--   emSize <= 0x31C, so +0x31C is not consulted\n");
+                    s += b;
+                }
+            } else {
+                // ⚠ Zero and unmapped are DIFFERENT facts and must not print
+                // the same way: before Mac OS is up this pointer is simply not
+                // set yet, which is normal, while a non-zero pointer that will
+                // not translate is a broken one.
+                snprintf(b, sizeof b, "--   ExpandMem=%08x %s\n", em,
+                         em ? "(non-zero but NOT translatable)"
+                            : "(not set up yet: normal before Mac OS boots)");
+                s += b;
+            }
+        } else {
+            s += "--   low memory 0x2B6 is not mapped in this context\n";
         }
     }
     // 🔬 THE HANDLER'S OWN INSTRUCTIONS. With IR clear the program counter IS
@@ -490,9 +657,49 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         if (ir)
             ok = diagXlate(cpu, *m->bus, ea, true, base);
         if (!ok) {
-            snprintf(b, sizeof b, "-- code at %s %08x: NOT MAPPED\n",
-                     which == 0 ? "pc  " : which == 1 ? "srr0" : "lr  ", ea);
+            const char* nm =
+                which == 0 ? "pc  " : which == 1 ? "srr0" : "lr  ";
+            snprintf(b, sizeof b,
+                     "-- code at %s %08x: no PTE and no BAT covers it\n", nm,
+                     ea);
             s += b;
+            // ⭐ ASK THE CPU'S OWN FETCH TRANSLATION TOO. This walk reads the
+            // page table out of RAM; the machine fetches through a cached
+            // translation guarded by a generation counter. If the pc will not
+            // translate here but the CPU has a live cached mapping for that
+            // very page, the two readers of one mapping disagree — and this
+            // project has been here before: that disagreement IS the finding,
+            // not a detail. If they agree that nothing maps it, then the guest
+            // is genuinely about to take an ISI and the walk below says why.
+            if (which == 0) {
+                const bool live =
+                    cpu.xlGen == cpu.mmuGen && cpu.xlPage == (ea >> 12) &&
+                    cpu.xlMsr == (cpu.st.msr & (msr::IR | msr::PR | msr::LE)) &&
+                    cpu.xlSr == cpu.st.sr[ea >> 28];
+                if (live) {
+                    const u32 pa = cpu.xlPa | (ea & 0xFFFu);
+                    snprintf(b, sizeof b,
+                             "--   !! but the CPU's OWN fetch translation maps "
+                             "this page: pa=%08x (xlPage=%05x xlPa=%08x) - the "
+                             "walk and the fetch path DISAGREE\n",
+                             pa, cpu.xlPage, cpu.xlPa);
+                    s += b;
+                    for (u32 row = 0; row < 8; ++row) {
+                        snprintf(b, sizeof b, "--   %08x:", ea - 16u + row * 16u);
+                        s += b;
+                        for (u32 w = 0; w < 4; ++w) {
+                            snprintf(b, sizeof b, " %08x",
+                                     m->bus->read32(pa - 16u + row * 16u + w * 4u));
+                            s += b;
+                        }
+                        s += "\n";
+                    }
+                } else {
+                    s += "--   the CPU has no live cached fetch translation for "
+                         "this page either (they agree)\n";
+                }
+            }
+            dumpMmu(s, cpu, *m->bus, ea, nm);
             continue;
         }
         // Walk back four instructions so the top of a short loop is visible.
@@ -528,56 +735,8 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // just written and not yet flushed would be visible to the walk and NOT
     // here. So "no match below" means "no match in RAM", and a disagreement
     // between this and the fault is itself the finding.
-    if (cpu.st.dsisr || cpu.st.dar) {
-        const u32 ea = cpu.st.dar;
-        const u32 sr = cpu.st.sr[ea >> 28];
-        const u32 vsid = sr & 0x00FFFFFFu;
-        const u32 pi = (ea >> 12) & 0xFFFFu;
-        const u32 api = pi >> 10;
-        const u32 htaborg = cpu.st.sdr1 & 0xFFFF0000u;
-        const u32 htabmask = cpu.st.sdr1 & 0x1FFu;
-        snprintf(b, sizeof b,
-                 "-- mmu for dar=%08x: sr[%u]=%08x vsid=%06x pi=%04x api=%02x "
-                 "sdr1=%08x (org=%08x mask=%03x)\n",
-                 ea, ea >> 28, sr, vsid, pi, api, cpu.st.sdr1, htaborg,
-                 htabmask);
-        s += b;
-        // A DBAT covering this address would have answered before the table
-        // was ever consulted, so their absence is part of the evidence.
-        for (u32 i = 0; i < 4; ++i) {
-            snprintf(b, sizeof b, "--   dbat%u: u=%08x l=%08x\n", i,
-                     cpu.st.dbatu[i], cpu.st.dbatl[i]);
-            s += b;
-        }
-        for (int pass = 0; pass < 2; ++pass) {
-            const u32 hash = pass == 0
-                                 ? ((vsid & 0x7FFFFu) ^ pi)
-                                 : (~((vsid & 0x7FFFFu) ^ pi) & 0x7FFFFu);
-            const u32 pteg = htaborg |
-                             ((((hash >> 10) & 0x1FFu) & htabmask) << 16) |
-                             ((hash & 0x3FFu) << 6);
-            snprintf(b, sizeof b, "--   %s pteg @%08x (hash=%05x):\n",
-                     pass ? "secondary" : "primary  ", pteg, hash);
-            s += b;
-            for (u32 slot = 0; slot < 8; ++slot) {
-                const u32 a = pteg + slot * 8u;
-                const u32 w0 = m->bus->read32(a);
-                const u32 w1 = m->bus->read32(a + 4);
-                const bool v = (w0 & 0x80000000u) != 0;
-                const u32 eVsid = (w0 >> 7) & 0xFFFFFFu;
-                const u32 eH = (w0 >> 6) & 1u;
-                const u32 eApi = w0 & 0x3Fu;
-                const bool match = v && eVsid == vsid &&
-                                   eH == static_cast<u32>(pass) && eApi == api;
-                snprintf(b, sizeof b,
-                         "--     %u %08x %08x  v=%d vsid=%06x h=%u api=%02x "
-                         "rpn=%05x pp=%u%s\n",
-                         slot, w0, w1, v ? 1 : 0, eVsid, eH, eApi, w1 >> 12,
-                         w1 & 3u, match ? "   <== MATCHES the faulting EA" : "");
-                s += b;
-            }
-        }
-    }
+    if (cpu.st.dsisr || cpu.st.dar)
+        dumpMmu(s, cpu, *m->bus, cpu.st.dar, "dar");
     // 📋 THE REGISTERS. A guest polling a device holds the base address it is
     // polling in a register — this capture showed a loop calling a little-
     // endian accessor (lwbrx/stwbrx + eieio at DBDMA offsets 0x04/0x0C) with

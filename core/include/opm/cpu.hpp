@@ -472,8 +472,15 @@ struct Cpu {
     // ⚠ Deliberately on Cpu and NOT in CpuState: the snapshot layout digest
     // hashes sizeof(CpuState), so putting it there would invalidate every
     // snapshot in the project to gain an instrument. Same rule the caches obey.
+    //
+    // 📞 r0 AND lr ARE HERE FOR `sc`. A system call's SELECTOR is in r0 and its
+    // caller is in lr, and without them a ring of thirty-two SYSCALLs reads as
+    // one repeated address with nothing to say about what was being ASKED —
+    // which is exactly where session 30's desktop hang stalled. They cost two
+    // stores on a path that already writes six fields, and for every other
+    // vector they are free context about who was running.
     struct ExcRec {
-        u32 vec, srr0, srr1, dar, dsisr;
+        u32 vec, srr0, srr1, dar, dsisr, r0, lr;
         u64 tb;
     };
     static constexpr u32 kExcRing = 32; // power of two: the index masks

@@ -41,7 +41,8 @@ void Cpu::raiseExc(Exc v, u32 srr0, u32 extra)
     // CpuState's size, so putting it there would kill every existing snapshot
     // to gain an instrument.
     ExcRec& r = excRing[excRingAt & (kExcRing - 1u)];
-    r = {static_cast<u32>(v), srr0, st.srr1, st.dar, st.dsisr, st.tb};
+    r = {static_cast<u32>(v), srr0,     st.srr1, st.dar,
+         st.dsisr,            st.gpr[0], st.lr,   st.tb};
     ++excRingAt;
     ++excByVec[(static_cast<u32>(v) >> 8) & 15u];
 }

@@ -133,6 +133,34 @@ struct Cpu {
     // baseline.
     u32 extraCycles = 0;
 
+    // ⏱⏱ THE ARCHITECTURAL CYCLE ITSELF — one per instruction, and ZERO when
+    // the HOST CLOCK owns the timebase.
+    //
+    // A processor cycle per instruction is what makes the guest's clock a
+    // function of how many instructions this emulator got through, and that is
+    // a rate: tb advances `insnCycles / cyclesPerTbTick` per instruction, so
+    // the emulator's own throughput is a FLOOR under the guest's clock. At the
+    // architectural 1 and the bus divisor of 4 that floor is MIPS/4 — 25 MHz
+    // at 100 MIPS, which is exactly the rate a Sawtooth's timebase runs at.
+    //
+    // That was invisible while the machine was slow. It is not now. Measured
+    // at the Finder desktop on 2026-07-31: 203.6 MIPS, timebase 50.90 MHz,
+    // 2.04x real, and 203.6/4 = 50.9 to three digits — the architectural
+    // advance was the WHOLE clock and the host-paced top-up in the run loops
+    // never fired once. The guest's 60 Hz chain ran at 122.5 Hz.
+    //
+    // ⭐ So under real-time pacing this is zero, and the host clock is the
+    // only thing that advances the timebase. Then the guest's clock is right
+    // at ANY speed — and stays right the next time this emulator gets faster,
+    // which is the property the fix has to have. It also stops being a lie in
+    // the other direction: a machine retiring 200 M instructions per guest
+    // second now REPORTS 200 M instead of pretending to be a 100 M machine
+    // whose seconds are half as long.
+    //
+    // ⚠ Instruction pacing — every measurement, every A/B run, every snapshot
+    // proof — keeps the architectural 1 and is untouched.
+    u32 insnCycles = 1;
+
     // Timebase/decrementer accounting. Whether the guest's 60 Hz tick is
     // driven off the decrementer is a question the whole boot hangs on —
     // Ticks ($016A) advanced once in 1.45 billion instructions — and it is
@@ -224,6 +252,22 @@ struct Cpu {
     // rather than approximate: the skip stops on the step where tick() would
     // have raised the interrupt, so the state afterwards is the state the
     // one-at-a-time loop would have produced, tick for tick.
+    // The same deadline in the machine's own units. ~0 when the decrementer
+    // has already gone negative, because it will not ask again until the guest
+    // reloads it — and a sleeping core cannot. tick() requests the interrupt on
+    // the tick where the count passes below zero, which is one past the count
+    // it holds now.
+    //
+    // This is the one a HOST-PACED loop needs: there is no instruction rate to
+    // convert through when the clock comes from outside, so "when could this
+    // machine next need me" has to be answerable in timebase alone.
+    u64 tbUntilDec() const
+    {
+        if (st.dec & 0x80000000u)
+            return ~0ull;
+        return u64(st.dec) + 1;
+    }
+
     u64 stepsUntilDec(u32 cyclesPerStep) const
     {
         if ((st.dec & 0x80000000u) || !cyclesPerStep || !cyclesPerTbTick)
@@ -408,7 +452,7 @@ struct Cpu {
         OPM_PH(Exec);
         fn(*this, insn, kIsa[row]);
         OPM_PH(Tick);
-        charge(1 + extraCycles);
+        charge(insnCycles + extraCycles);
         OPM_PH(Loop);
         return true;
     }

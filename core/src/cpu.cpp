@@ -98,7 +98,7 @@ void Cpu::step()
                           (smiPending || extIrqLine || decPending || pmPending);
         if (!wake) {
             OPM_COUNT(napSteps);
-            charge(1 + extraCycles);
+            charge(insnCycles + extraCycles);
             return;
         }
         napping = false;
@@ -148,14 +148,14 @@ void Cpu::step()
     if ((st.iabr & 2u) && ((cia ^ st.iabr) & 0xFFFFFFFCu) == 0 &&
         ((st.iabr & 1u) != 0) == ((st.msr & msr::IR) != 0)) {
         raiseExc(Exc::Iabr, cia, 0);
-        charge(1 + extraCycles);
+        charge(insnCycles + extraCycles);
         return;
     }
 
     u32 insn, row;
     OPM_PH(Fetch);
     if (!fetchDecoded(cia, insn, row)) { // ISI raised by translate()
-        charge(1 + extraCycles);
+        charge(insnCycles + extraCycles);
         return;
     }
     execRow(insn, row);
@@ -174,7 +174,7 @@ void Cpu::execRow(u32 insn, u32 row)
     if (row == kNoRow) {
         ++unknownWords[insn];
         raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-        charge(1 + extraCycles);
+        charge(insnCycles + extraCycles);
         return;
     }
     const InsnDesc* d = kIsa + row;
@@ -184,22 +184,22 @@ void Cpu::execRow(u32 insn, u32 row)
     if (const u8 gate = dispPre[row]) {
         if (gate & kPreIll) {
             raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-            charge(1 + extraCycles);
+            charge(insnCycles + extraCycles);
             return;
         }
         if ((gate & kPrePriv) && userMode()) {
             raiseExc(Exc::Program, cia, kSrr1ProgPrivileged);
-            charge(1 + extraCycles);
+            charge(insnCycles + extraCycles);
             return;
         }
         if ((gate & kPreFp) && !(st.msr & msr::FP)) {
             raiseExc(Exc::FpUnavailable, cia, 0);
-            charge(1 + extraCycles);
+            charge(insnCycles + extraCycles);
             return;
         }
         if ((gate & kPreVec) && !(st.msr & msr::VEC)) {
             raiseExc(Exc::VecUnavailable, cia, 0);
-            charge(1 + extraCycles);
+            charge(insnCycles + extraCycles);
             return;
         }
     }
@@ -216,7 +216,7 @@ void Cpu::execRow(u32 insn, u32 row)
     OPM_PH(Exec);
     fn(*this, insn, *d);
     OPM_PH(Tick);
-    charge(1 + extraCycles);
+    charge(insnCycles + extraCycles);
 
     // Performance monitor, minimal-honest: PMC1/PMC2 count cycles (event 1,
     // one per instruction at the provisional 1 cycle/insn rate) or completed

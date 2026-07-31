@@ -150,7 +150,15 @@ public sealed class MachineSession
                 executed = Native.opm_run(m, chunk);
                 long dt = sw.ElapsedMilliseconds - t0;
 
-                if (executed == before)
+                // ⛔ ASK THE MACHINE, DO NOT INFER IT. This used to read
+                // `executed == before`, and that stopped being a halt the
+                // moment the run loop learned to wait: an idle guest at the
+                // Finder legitimately executes NOTHING for a whole call,
+                // because opm_run spends the time off the processor waiting
+                // for the guest's next deadline. Inferring from the
+                // instruction count would have stopped the machine the first
+                // time the user left it sitting at the desktop.
+                if (Native.opm_halted(m) != 0)
                 {
                     ConsoleQ.Enqueue($"\n[shell] machine halted @{executed:N0}\n");
                     reason = "halted";
@@ -158,7 +166,11 @@ public sealed class MachineSession
                 }
 
                 // Aim each chunk at ~15 ms so serial input and stop stay snappy.
-                if (dt < 8) chunk = Math.Min(chunk * 2, 40_000_000);
+                // ⚠ Only grow it on a call that actually RAN. An idle call
+                // returns after its own wait bound having executed nothing, and
+                // treating that as "there was time to spare" would ratchet the
+                // chunk to its ceiling for a machine doing no work at all.
+                if (dt < 8 && executed != before) chunk = Math.Min(chunk * 2, 40_000_000);
                 else if (dt > 30) chunk = Math.Max(chunk / 2, 100_000);
 
                 while (_serialQ.TryDequeue(out var text))

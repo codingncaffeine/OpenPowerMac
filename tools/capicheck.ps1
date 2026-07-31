@@ -48,6 +48,8 @@ public static class Opm {
     [DllImport("$($tmp.Replace('\','\\'))", CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_rt_slips(IntPtr m);
     [DllImport("$($tmp.Replace('\','\\'))", CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong opm_idle_ns(IntPtr m);
+    [DllImport("$($tmp.Replace('\','\\'))", CallingConvention = CallingConvention.Cdecl)]
     public static extern int opm_screen(IntPtr m, byte[] bgra, uint cap, out uint w, out uint h);
     [DllImport("$($tmp.Replace('\','\\'))", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);
@@ -74,15 +76,23 @@ $next = 5
 # cumulative average carries that lost stretch forever and reads as pacing
 # that never recovers — a run whose instantaneous rate is exactly 25 MHz
 # showed 0.84x. Same lesson as g4run's timing line.
-$pTime = 0.0; $pTb = 0UL
+# ⏳ AND HOW MUCH OF EACH INTERVAL THE MACHINE SPENT OFF THE PROCESSOR. A
+# correct clock says nothing about whether an idle guest is waiting or
+# spinning — both produce exactly 25 MHz — and the difference is a whole host
+# core. Per-interval for the same reason the rate is: the firmware era never
+# idles, so any run-long average is dominated by the phase that cannot idle
+# and would read as "the wait does not work".
+$pTime = 0.0; $pTb = 0UL; $pIdle = 0UL
 while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
     $exec = [Opm]::opm_run($m, 20000000)
     if ($sw.Elapsed.TotalSeconds -ge $next) {
         $next += 5
         $s = $sw.Elapsed.TotalSeconds
         $tb = [Opm]::opm_tb($m) - $tb0
+        $idle = [Opm]::opm_idle_ns($m)
         $dS = $s - $pTime; $dTb = $tb - $pTb
-        $pTime = $s; $pTb = $tb
+        $dIdle = ($idle - $pIdle) / 1e9 / $dS
+        $pTime = $s; $pTb = $tb; $pIdle = $idle
         # The guest resets its own timebase (Open Firmware's mid-boot PMU
         # reset), so a delta can be negative. Say that, rather than printing a
         # negative frequency and inviting someone to explain it as pacing.
@@ -90,8 +100,8 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
             Write-Host ("   t={0,5:N1}s  {1,12:N0} insns  {2,6:N1} MIPS  tb went BACKWARDS (the guest reset its timebase)" -f `
                 $s, $exec, ($exec / $s / 1e6))
         } else {
-            Write-Host ("   t={0,5:N1}s  {1,12:N0} insns  {2,6:N1} MIPS  tb now {3,6:N2} MHz ({4:N2}x real)" -f `
-                $s, $exec, ($exec / $s / 1e6), ($dTb / $dS / 1e6), ($dTb / $dS / 25e6))
+            Write-Host ("   t={0,5:N1}s  {1,12:N0} insns  {2,6:N1} MIPS  tb now {3,6:N2} MHz ({4:N2}x real)  idle {5,3:N0}%" -f `
+                $s, $exec, ($exec / $s / 1e6), ($dTb / $dS / 1e6), ($dTb / $dS / 25e6), (100 * $dIdle))
         }
     }
 }

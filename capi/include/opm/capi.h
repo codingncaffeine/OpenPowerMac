@@ -62,6 +62,23 @@ OPM_API uint64_t opm_rt_slips(const OpmMachine* m);
 // host seconds it says whether the machine is actually running at real time.
 OPM_API uint64_t opm_tb(const OpmMachine* m);
 
+// ⛔ WHETHER THE MACHINE STOPPED, ASKED DIRECTLY. A caller cannot infer this
+// from opm_run returning the same instruction count it was given before:
+// under real-time pacing an IDLE machine legitimately executes nothing for a
+// whole call, because the run loop spends the time waiting for the guest's
+// next deadline instead of spinning. Those two states need telling apart —
+// one is a Mac sitting at the Finder with nothing to do, the other is a dead
+// machine — and only this can tell them apart.
+OPM_API int32_t opm_halted(const OpmMachine* m);
+
+// ⏳ HOW LONG THIS MACHINE HAS SPENT OFF THE HOST PROCESSOR, in nanoseconds,
+// since it was created. Over elapsed host time it is the share of a core the
+// emulator is NOT burning, which is the only way to tell an idle machine that
+// waits from one that spins — they look identical from outside, and the
+// difference is a whole core. Meaningful only under real-time pacing;
+// instruction-paced runs never wait, by design.
+OPM_API uint64_t opm_idle_ns(const OpmMachine* m);
+
 // Queue text for the serial console (CRs included by the caller).
 OPM_API void opm_serial(OpmMachine* m, const char* text);
 

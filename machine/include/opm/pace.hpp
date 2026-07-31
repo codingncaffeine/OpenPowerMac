@@ -28,6 +28,7 @@
 // boot passed. One definition, called from both.
 
 #include "opm/cpu.hpp"
+#include "opm/hostclock.hpp"
 #include "opm/prof.hpp"
 #include "opm/sawtooth.hpp"
 
@@ -81,7 +82,16 @@ OPM_PACE_COLD inline u64 napSkipSlow(Cpu& cpu, const SawtoothBus& bus,
     if ((cpu.st.msr & msr::EE) &&
         (cpu.smiPending || cpu.extIrqLine || cpu.decPending || cpu.pmPending))
         return 0;
-    const u32 cyclesPerStep = 1u + cpu.extraCycles;
+    const u32 cyclesPerStep = cpu.insnCycles + cpu.extraCycles;
+    // Zero is the host clock owning the timebase, and this function ADVANCES
+    // the timebase — the two cannot both be true. The callers know that and
+    // exclude it, but the header refuses as well: a skip that charged asleep
+    // steps to a host-paced clock would advance it twice, and it would read as
+    // a pacing bug rather than as a wiring one. hostIdleWait is the equivalent
+    // over there — it waits instead of skipping, because there IS nothing to
+    // skip when time comes from outside.
+    if (!cyclesPerStep)
+        return 0;
     u64 n = budget;
     const u64 dec = cpu.stepsUntilDec(cyclesPerStep);
     if (dec < n)
@@ -112,6 +122,70 @@ inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 budget)
     return napSkipSlow(cpu, bus, budget);
 }
 
+// ---- the same question, for a machine whose clock comes from outside -------
+//
+// The nap skip's answer is "charge those steps and move on", because there the
+// timebase is made of steps: skipping them IS letting time pass. Under
+// host-clock pacing time passes whether or not this process does anything, so
+// the answer is the opposite one — WAIT, and let the host's clock carry the
+// guest's forward while this thread is off the processor.
+//
+// ⚠ THIS IS THE THIRD FACE OF THE PACING BUG, and it is the one nobody was
+// looking at: the app burned a whole core while the guest sat idle at the
+// Finder, because nothing in this file ever yielded. It reads as a D7 shell
+// problem and it is not; it is this loop.
+//
+// ⛔ IT IS NOT "SLEEP WHEN AHEAD", WHICH WAS TRIED AND REVERTED. That threw
+// away time the guest had already earned, fought the pacer's own catch-up, and
+// measured 0.39x real with 13,320 slips. This waits only when the machine has
+// NOTHING TO DO — the core is asleep and no enabled interrupt is waiting — and
+// only up to the first moment something could happen. The guest cannot tell
+// the difference between this and a processor that was simply idle, which is
+// what it is modelling.
+//
+// Returns the nanoseconds waited (0 when the machine had work, or when the
+// deadline was too near to be worth a system call).
+OPM_PACE_COLD inline u64 hostIdleWaitSlow(const Cpu& cpu,
+                                          const SawtoothBus& bus,
+                                          HostWait& w)
+{
+    OPM_MARK(Loop);
+    // An enabled interrupt is already waiting: the machine has work this
+    // instant, whatever its core is doing.
+    if ((cpu.st.msr & msr::EE) &&
+        (cpu.smiPending || cpu.extIrqLine || cpu.decPending || cpu.pmPending))
+        return 0;
+    // The two deadlines, in the one unit that survives the clock coming from
+    // outside. Nothing else can wake a sleeping core — see the note at the top
+    // of this file, which enumerates the four sources and disposes of the
+    // other two.
+    u64 dueTb = bus.deviceDueTb();
+    const u64 dec = cpu.tbUntilDec();
+    if (dec != ~0ull && cpu.st.tb + dec < dueTb)
+        dueTb = cpu.st.tb + dec;
+    if (dueTb <= cpu.st.tb)
+        return 0; // already due: service it, do not wait on it
+    // ⚠ CLAMPED, FOR TWO UNRELATED REASONS THAT MEET AT THE SAME LINE. A
+    // machine with nothing due at all leaves dueTb at ~0, and the multiply
+    // would overflow into a wait measured in centuries; and this runs INSIDE
+    // opm_run, which the shell needs back every few milliseconds to pump the
+    // keyboard, the mouse and the audio drain. The clamp costs nothing when it
+    // does not bind — waking early is free, because the caller is a loop and
+    // simply asks again — so it is compared in TIMEBASE, before the multiply
+    // that would have overflowed.
+    const u64 tbLeft = dueTb - cpu.st.tb;
+    return w.wait(tbLeft > HostWait::kMaxAskNs / HostPacer::kNsPerTick
+                      ? HostWait::kMaxAskNs
+                      : tbLeft * HostPacer::kNsPerTick);
+}
+
+inline u64 hostIdleWait(const Cpu& cpu, const SawtoothBus& bus, HostWait& w)
+{
+    if (!cpu.napping)
+        return 0;
+    return hostIdleWaitSlow(cpu, bus, w);
+}
+
 // ---- the batch ------------------------------------------------------------
 //
 // The same reasoning as the nap skip, for a processor that is AWAKE. There the
@@ -133,7 +207,15 @@ inline u64 batchSteps(const Cpu& cpu, const SawtoothBus& bus, u64 budget)
 {
     if (budget < 2)
         return budget;
-    const u32 cyclesPerStep = 1u + cpu.extraCycles;
+    const u32 cyclesPerStep = cpu.insnCycles + cpu.extraCycles;
+    // ⏱ THE HOST CLOCK OWNS THE TIMEBASE, so executing instructions does not
+    // advance it and neither deadline below can be reached by running. Nothing
+    // bounds the batch except the caller's budget and the things that end it
+    // from the inside — a device access, a write to DEC or the timebase, the
+    // core going to sleep. The caller's budget is what carries the clock
+    // sample, and it is the caller that sizes it. See Cpu::insnCycles.
+    if (!cyclesPerStep)
+        return budget;
     u64 n = budget;
     // The decrementer's own deadline: run to the step where tick() would have
     // asked for the interrupt, and no further. Exact, not approximate — this

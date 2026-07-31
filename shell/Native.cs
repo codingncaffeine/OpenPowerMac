@@ -34,6 +34,18 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_rt_slips(IntPtr m);
 
+    // Whether the machine STOPPED — which is not the same question as whether
+    // it executed anything. An idle guest legitimately runs no instructions
+    // for a whole opm_run call, because the machine spends the time waiting
+    // for its next deadline instead of spinning.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_halted(IntPtr m);
+
+    // Nanoseconds spent off the host processor since the machine was created.
+    // Over elapsed time it is the share of a core the emulator is NOT burning.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong opm_idle_ns(IntPtr m);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);
 

@@ -1,6 +1,7 @@
 #include "opm/capi.h"
 
 #include "opm/cpu.hpp"
+#include "opm/hostclock.hpp"
 #include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
 
@@ -33,10 +34,13 @@ struct OpmMachine {
     // Instruction pacing cannot promise either: it fixes a tb-per-instruction
     // ratio, so a faster host runs guest time faster, and past some speed the
     // 60 Hz work no longer fits in the interval it is given. See the note on
-    // SawtoothBus::klTimerOn.
+    // SawtoothBus::klTimerOn, and opm/hostclock.hpp for who owns the clock.
     bool realtime = false;
-    std::chrono::steady_clock::time_point rtBase{};
-    uint64_t rtTbBase = 0, rtSlips = 0;
+    HostPacer pace;
+    // The other half of owning the clock: what this thread does when the guest
+    // has nothing for it. It carries a timer handle and the learned cost of
+    // asking for a wait, so it belongs to the machine rather than to one call.
+    HostWait idle;
 
     ~OpmMachine() { delete bus; }
 };
@@ -105,65 +109,72 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     // Cpu::extraCycles. Set here rather than at create so that whatever
     // changes fastTb is honoured on the next entry.
     cpu.extraCycles = m->realtime ? 0u : m->fastTb;
+    // ⏱⏱ AND THE ARCHITECTURAL CYCLE TOO. Real-time pacing means the HOST
+    // CLOCK owns the timebase; leaving the per-instruction cycle in place left
+    // the emulator's own throughput as a FLOOR under the guest's clock — see
+    // Cpu::insnCycles for the measurement that named it — so the clock the
+    // guest reads is now a function of nothing but elapsed host time.
+    cpu.insnCycles = m->realtime ? 0u : 1u;
     if (m->realtime) {
-        // 25 MHz = bus/4, one timebase tick every 40 ns, sampled every 1024
-        // instructions; at most 1 ms of debt is ever injected at once, because
-        // handing the guest a whole host stall as one delta fires a burst of
-        // decrementer interrupts that models nothing. Same constants as
-        // g4run's --realtime, deliberately: the two have to say the same thing
-        // about the same machine.
-        constexpr uint64_t kNsPerTick = 40, kCatchup = 25000;
-        // ⚠⚠⚠ THIS PACES IN ONE DIRECTION ONLY, AND SINCE THE EMULATOR GOT
-        // FAST THAT IS NO LONGER ENOUGH. The top-up below can only ADD time.
-        // The guest's timebase also advances architecturally — one cycle per
-        // instruction over the bus divisor, a quarter of a tick each — so once
-        // the machine retires more than 100 M instructions per host second the
-        // architectural rate alone EXCEEDS 25 MHz and the top-up never fires
-        // again. Measured through this DLL at the Finder desktop: 192 MIPS,
-        // timebase 48.4 MHz, 1.93x real. THE GUEST'S CLOCK GAINS AN HOUR EVERY
-        // HOUR, and the faster this emulator gets the worse it will be.
+        // How long this call may spend WAITING before it hands control back to
+        // its caller, whether or not the guest woke up.
         //
-        // ⛔ DO NOT "just sleep when ahead" — it was tried, measured and
-        // reverted on 2026-07-31. Sleeping the excess whenever the lead passed
-        // 2 ms drove the machine to 0.39x real with 13,320 slips over a 300 s
-        // boot, because the sleep and the slip REBASE below form a limit
-        // cycle: oversleep (a host sleep quantum is milliseconds, the lead is
-        // microseconds) -> fall behind -> the catch-up cap fires -> rtTbBase
-        // is rebased to now -> instantly "ahead" again -> sleep. A correct
-        // throttle has to pace against a fixed origin with hysteresis, or not
-        // rebase on the slip, and it needs its own measurement pass.
+        // ⚠ It is not a pacing constant and nothing about the clock depends on
+        // it. It bounds LATENCY: the caller is a UI thread's partner and needs
+        // this back promptly to pump the keyboard, the mouse, the screen and
+        // the audio drain, and a guest can idle for a long time. It also stops
+        // a core that naps with interrupts disabled — a machine that would be
+        // hung on real hardware too — from hanging the app's run thread with
+        // it, which would look like the app crashing rather than like the
+        // machine stopping.
         //
-        // The right shape is the one pace.hpp already describes: an idle
-        // machine should SLEEP TO THE EARLIEST DEVICE DEADLINE, which is now
-        // expressible because every deadline is in timebase.
+        // ⭐ AND THEN IT RETURNS, RATHER THAN RUNNING OUT THE REST OF THE
+        // BUDGET. Draining the remaining chunk through an asleep core is a
+        // spin at full speed — it was measured at 79% of a host core with the
+        // guest idle at the Finder — and it buys nothing: those steps execute
+        // no instruction and, now that the host clock owns the timebase, do
+        // not advance it either. They are pure heat. Returning early means a
+        // call can legitimately end with the instruction count UNMOVED, which
+        // is why opm_halted exists: the shell used to infer "halted" from
+        // exactly that and would have stopped an idle machine.
+        constexpr uint64_t kMaxIdleNsPerCall = 15000000; // 15 ms
+        uint64_t idleNs = 0;
         while (m->executed < until && !cpu.halted) {
-            // Batched to the next clock sample, so the host-paced top-up below
-            // still lands every 1024 instructions. Anything shorter ends the
-            // batch by itself — a device access, a write to DEC, the core
-            // going to sleep. See machine/include/opm/pace.hpp.
-            const uint64_t toSample = 1024u - (m->executed & 1023u);
+            // 1. THE CLOCK, FROM OUTSIDE. Nothing else moves it now.
+            m->pace.sync(cpu);
+            // 2. The devices, in the same breath, because the clock just
+            //    crossed whatever deadlines it crossed and an interrupt that
+            //    is due should reach the processor before more instructions
+            //    run, not after them.
+            cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
+            // 3. ⏳ NOTHING TO DO — so give the host processor back until the
+            //    first moment something could happen, instead of spinning
+            //    through millions of asleep steps to discover the same thing.
+            //    This is the third face of the pacing bug and the one that
+            //    reads as a shell problem: the app burned a whole core while
+            //    the guest sat idle at the Finder. Going round again rather
+            //    than running: the clock has moved by the length of the wait,
+            //    so the devices have to be looked at before anything else.
+            if (const uint64_t waited = hostIdleWait(cpu, bus, m->idle)) {
+                idleNs += waited;
+                if (idleNs >= kMaxIdleNsPerCall)
+                    break; // idle, and the caller has been kept long enough
+                continue;
+            }
+            // 4. A run of instructions. Nothing in the machine can happen
+            //    inside it — executing does not advance the clock any more, so
+            //    neither the decrementer nor a timed device can come due — and
+            //    the things that end it early end it from the inside: a device
+            //    access, a write to DEC or the timebase, the core going to
+            //    sleep. See machine/include/opm/pace.hpp.
+            //
+            //    ⚠ SO THE CAP IS ABOUT THE CLOCK'S GRAIN, NOT ABOUT
+            //    CORRECTNESS — see HostPacer::kBatchInsns, which g4run's
+            //    --realtime loop uses too.
             const uint64_t left = until - m->executed;
             runBatch(cpu, bus, m->executed,
-                     toSample < left ? toSample : left);
-            if ((m->executed & 0x3FFu) == 0) {
-                const auto now = std::chrono::steady_clock::now();
-                const uint64_t ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        now - m->rtBase)
-                        .count());
-                const uint64_t want = m->rtTbBase + ns / kNsPerTick;
-                if (want > cpu.st.tb) {
-                    uint64_t delta = want - cpu.st.tb;
-                    if (delta > kCatchup) {
-                        delta = kCatchup;
-                        m->rtBase = now;
-                        m->rtTbBase = cpu.st.tb + delta;
-                        ++m->rtSlips;
-                    }
-                    cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));
-                }
-            }
-            cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
+                     left < HostPacer::kBatchInsns ? left
+                                                   : HostPacer::kBatchInsns);
         }
         return m->executed;
     }
@@ -189,18 +200,23 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     return m->executed;
 }
 
-// ⚠ The anchor is the timebase the machine is ACTUALLY at, not zero: a
-// resumed or already-running machine is billions of ticks in, and pacing
-// "0 + elapsed" against it leaves the target behind the timebase forever, so
-// the clock never advances at all. g4run learned this the same way.
 OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
 {
     m->realtime = on != 0;
-    m->rtBase = std::chrono::steady_clock::now();
-    m->rtTbBase = m->cpu.st.tb;
+    m->pace.anchor(m->cpu);
 }
 
-OPM_API uint64_t opm_rt_slips(const OpmMachine* m) { return m->rtSlips; }
+OPM_API uint64_t opm_rt_slips(const OpmMachine* m) { return m->pace.slips; }
+
+// ⛔ Asked directly, because it can no longer be inferred. opm_run returns the
+// same instruction count it started with whenever the guest spent the call
+// idle, which under real-time pacing is most calls at the Finder desktop.
+OPM_API int32_t opm_halted(const OpmMachine* m) { return m->cpu.halted ? 1 : 0; }
+
+// ⏳ Time this machine spent OFF the host processor. HostWait counts it at the
+// one place it can be counted honestly — around the system call itself — so
+// this is measured, not modelled.
+OPM_API uint64_t opm_idle_ns(const OpmMachine* m) { return m->idle.waitedNs; }
 
 // The guest's own clock. Divided by 25,000,000 it is the machine's uptime in
 // its own seconds, and divided by host seconds it says whether this machine

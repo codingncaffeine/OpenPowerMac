@@ -6,6 +6,7 @@
 // the exceptions it takes, and the last instructions before the stop.
 
 #include "opm/cpu.hpp"
+#include "opm/hostclock.hpp"
 #include "opm/insn.hpp"
 #include "opm/prof.hpp"
 #include "opm/pace.hpp"
@@ -1295,12 +1296,24 @@ int main(int argc, char** argv)
     // construction. Real time is for using the machine; instruction time is
     // for reasoning about it.
     const auto hostStart = std::chrono::steady_clock::now();
-    auto rtBase = hostStart;
-    // Where the wall clock is anchored. It has to be the timebase the machine
-    // is ACTUALLY at, not zero: a resumed machine starts billions of ticks in,
-    // and pacing "0 + elapsed" against it means the target is behind the
-    // timebase forever and the clock simply stops.
-    u64 rtTbBase = cpu.st.tb, rtSlips = 0;
+    // Who owns the guest's clock, and the anchor it is paced against — shared
+    // with the capi so the app and this tool cannot drift apart about it. See
+    // machine/include/opm/hostclock.hpp.
+    HostPacer pacer;
+    pacer.anchor(cpu);
+    // …and what this thread does when the guest has nothing for it. ⚠ IT IS
+    // HERE BECAUSE THE APP HAS IT. --bench claims to run exactly the loop the
+    // app runs, and a claim like that decays the moment one of them grows a
+    // step the other has not: the last two times run-loop wiring existed in
+    // two copies, one was missing the hard disk for weeks and the other
+    // diagnosed a real-time-only audio defect from an instruction-paced
+    // capture. See machine/include/opm/pace.hpp.
+    HostWait idleWait;
+    // The livelock guard the bench loop's wait is bounded by, and the
+    // instruction count it watches to decide the machine is making progress.
+    constexpr u64 kMaxIdleNs = 1000000000ull; // 1 s of waiting with the
+                                              // instruction count unmoved
+    u64 idleNs = 0, idleAt = 0;
     // Where the run STARTS. A resumed machine carries the whole history of
     // the boot that made the snapshot, so every rate divided by THIS run's
     // host seconds is a different question from the one being asked: a
@@ -1319,8 +1332,13 @@ int main(int argc, char** argv)
     cpu.l1dFlushAll(true);
     cpu.l2FlushAll(true);
     const u32 ticksAtStart = bus.read32(0x0000416Au);
-    constexpr u64 kRtNsPerTick = 40;   // 25 MHz = bus/4
-    constexpr u64 kRtCatchup = 25000;  // at most 1 ms of debt per sample
+    // ⏱⏱ UNDER --realtime THE HOST CLOCK OWNS THE TIMEBASE OUTRIGHT: executing
+    // an instruction stops advancing it, so the emulator's own throughput is
+    // no longer a floor under the guest's clock. See Cpu::insnCycles for the
+    // measurement that made this necessary — 2.04x real at the desktop, and
+    // the top-up that was supposed to prevent it firing zero times.
+    if (realtime)
+        cpu.insnCycles = 0;
     // One rate for the whole run and no wall clock: then the extra cycles are
     // a constant per instruction and step() can carry them, which is one
     // tick() call per instruction instead of two (Cpu::extraCycles). The
@@ -1342,35 +1360,11 @@ int main(int argc, char** argv)
         if (mergedTick) {
             // step() already advanced the clock by 1 + extraCycles.
         } else if (realtime) {
-            if ((executed & 0x3FFu) == 0) {
-                const auto now = std::chrono::steady_clock::now();
-                const u64 ns =
-                    static_cast<u64>(std::chrono::duration_cast<
-                                         std::chrono::nanoseconds>(
-                                         now - rtBase)
-                                         .count());
-                const u64 want = rtTbBase + ns / kRtNsPerTick;
-                if (want > cpu.st.tb) {
-                    u64 delta = want - cpu.st.tb;
-                    if (delta > kRtCatchup) {
-                        // A host stall, or simply a stretch we could not
-                        // keep up with. Take the cap and forgive the rest:
-                        // injecting the whole debt would fire a burst of
-                        // decrementer interrupts that models nothing.
-                        delta = kRtCatchup;
-                        rtBase = now;
-                        rtTbBase = cpu.st.tb + delta;
-                        ++rtSlips;
-                    }
-                    cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));
-                }
-                // ⚠ NOTHING PACES THE OTHER DIRECTION, and since the emulator
-                // got fast that is a real error rather than a theoretical one:
-                // past about 100 MIPS the architectural clock alone outruns
-                // 25 MHz, this branch stops firing, and the guest's timebase
-                // reads 1.93x real. ⛔ Sleeping the excess was tried, measured
-                // and reverted — see the note in capi's opm_run.
-            }
+            // The whole clock, and nothing paces the other direction because
+            // there is no other direction: instructions no longer advance the
+            // timebase, so the guest can only be behind the host, never ahead
+            // of it. What used to be a correction is now the source.
+            pacer.sync(cpu);
         } else if (fastTb && executed < fastTbUntil) {
             cpu.tick(fastTb);
         } else if (fastTbAfter) {
@@ -1439,11 +1433,8 @@ int main(int argc, char** argv)
         if (!batchOn || (!mergedTick && !realtime))
             return 1;
         u64 want = maxInsns - done;
-        if (realtime) {
-            const u64 toSample = 1024u - (done & 1023u);
-            if (toSample < want)
-                want = toSample;
-        }
+        if (realtime && want > HostPacer::kBatchInsns)
+            want = HostPacer::kBatchInsns; // the clock's grain — see there
         return fpClamp(done, want);
     };
 
@@ -1692,6 +1683,32 @@ int main(int argc, char** argv)
     // number that includes the measurement is a number about g4run.
     if (bench)
         while (executed < maxInsns && !cpu.halted) {
+            // ⏳ NOTHING TO DO, AND THE CLOCK COMES FROM OUTSIDE — so wait for
+            // the guest's next deadline instead of spinning through asleep
+            // steps to discover the same thing. The previous trip round the
+            // loop ended in tickPeripherals(), so the clock and the interrupt
+            // lines are already as fresh as they get; going round again rather
+            // than running, because the wait moved the clock and the devices
+            // have to be looked at before any instruction is.
+            //
+            // ⚠ THE BOUND IS A LIVELOCK GUARD, NOT A PACING CONSTANT. Every
+            // wait ends at a real deadline — deviceDueTb is the USB frame
+            // clock, a millisecond out at most — so the guest normally wakes
+            // and this never binds. What it catches is a core that naps with
+            // interrupts disabled, which is a machine that would be hung on
+            // real hardware too: without it an unattended measuring run would
+            // hang instead of reaching --max and reporting the stop.
+            if (realtime && idleNs < kMaxIdleNs) {
+                if (executed != idleAt) { // it moved: this is not a livelock
+                    idleAt = executed;
+                    idleNs = 0;
+                }
+                if (const u64 w = hostIdleWait(cpu, bus, idleWait)) {
+                    idleNs += w;
+                    tickPeripherals();
+                    continue;
+                }
+            }
             // Same call, same header, same order as capi's opm_run — see
             // machine/include/opm/pace.hpp. If this loop and the app's stop
             // agreeing, the number this tool reports is about this tool.
@@ -4372,10 +4389,24 @@ int main(int argc, char** argv)
         // number the pacing work moves.
         const u64 ranInsns = executed - executedAtStart;
         const u64 ranTb = cpu.st.tb - tbAtStart;
-        char rtText[64] = "";
+        // ⏳ SAY WHETHER THE IDLE MACHINE WAITED OR SPUN. A wait that never
+        // happens and a wait that never ends look identical from outside the
+        // loop — both are just a host second going by — and the difference is
+        // a whole processor core. `idle` is the share of this run's host time
+        // spent off the processor; on an idle Finder desktop it should be most
+        // of it, and a run that reports 0 waits is spinning however good its
+        // clock looks. `skipped` is the deadlines that were too near to be
+        // worth a system call, which is a healthy number, not a fault.
+        char rtText[160] = "";
         if (realtime)
-            snprintf(rtText, sizeof rtText, " [realtime, %llu slips]",
-                     static_cast<unsigned long long>(rtSlips));
+            snprintf(rtText, sizeof rtText,
+                     " [realtime, %llu slips, %llu waits (%.0f%% idle, %llu "
+                     "skipped), ask cost %.2f ms]",
+                     static_cast<unsigned long long>(pacer.slips),
+                     static_cast<unsigned long long>(idleWait.waits),
+                     host > 0 ? 100.0 * (idleWait.waitedNs / 1e9) / host : 0.0,
+                     static_cast<unsigned long long>(idleWait.skipped),
+                     idleWait.overshootNs / 1e6);
         printf("-- timing: %.1f s host, %.1f MIPS, tb +%llu (%.2f MHz = "
                "%.2fx real), %s%s\n",
                host, host > 0 ? ranInsns / host / 1e6 : 0.0,

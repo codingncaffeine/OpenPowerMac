@@ -1,0 +1,5 @@
+add_executable(ppcdis main.cpp)
+target_link_libraries(ppcdis PRIVATE opmcore)
+if(MSVC)
+  target_compile_definitions(ppcdis PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

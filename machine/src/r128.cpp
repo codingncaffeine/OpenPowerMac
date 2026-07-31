@@ -78,8 +78,14 @@ static constexpr u32 kGenIntAckMask = 0x000F040Fu;
 // Ticks tracks the timebase at 60 Hz and the nominal period is simply correct.
 //
 // A constant chosen to cancel a bug outlives the bug and reads like a model.
-// --ati-vbl-tb still overrides it.
-static constexpr u64 kTbPerVblank = 416666ull;
+//
+// ⚠ BUT IT GOES BACK WHEN THE TIMER DOES. SawtoothBus::klTimerOn is off by
+// default — a correct clock stops this machine booting until the pacing work
+// lands — so the 44.6x compression is still there, and the nominal period
+// would hand the guest ~2,550 blanks per second of its own time. The cell's
+// vblEnabled is a CONSTRUCTOR default of true, so this is live in the app.
+// Move the two together, or not at all. --ati-vbl-tb still overrides it.
+static constexpr u64 kTbPerVblank = 225000000ull;
 // Harness knobs, not machine state — see the notes in the header.
 static u64 gVblTbPeriod = 0;
 static int gVblTrace = 0;

@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -432,6 +433,11 @@ int main(int argc, char** argv)
     // cell. See the note on R128Cell::vblEnabled — the capi takes the
     // constructor defaults, so this switch and the cell's must agree.
     bool atiVbl = true;
+    // --kl-timer: answer the KeyLargo timer HWInit calibrates the timebase
+    // against. It makes the guest's clock correct and it stops the boot
+    // reaching the desktop — see the note on SawtoothBus::klTimerOn, whose
+    // default this MUST match, because the capi takes constructor defaults.
+    bool klTimer = false;
     // --ati-vbl-tb N: timebase ticks between vertical blanks (0 = nominal
     // 60 Hz at 25 MHz). See the note in r128.hpp — under --fast-tb the guest's
     // own clock runs ~45x slower than the nominal timebase, so the nominal
@@ -743,6 +749,10 @@ int main(int argc, char** argv)
             atiVbl = true;
         else if (!strcmp(a, "--no-ati-vbl"))
             atiVbl = false;
+        else if (!strcmp(a, "--kl-timer"))
+            klTimer = true;
+        else if (!strcmp(a, "--no-kl-timer"))
+            klTimer = false;
         else if (!strcmp(a, "--vbl-trace")) vblTrace = atoi(next());
         else if (!strcmp(a, "--ati-vbl-tb"))
             atiVblTb = strtoull(next(), nullptr, 0);
@@ -998,6 +1008,7 @@ int main(int argc, char** argv)
             printf("-- ati rom attach FAILED: %s\n", atiRomPath);
     }
     bus.ati().vblEnabled = atiVbl;
+    bus.klTimerOn = klTimer;
     R128Cell::setVblTbPeriod(atiVblTb);
     R128Cell::setVblTrace(vblTrace);
     OpenPic::setTrace(vblTrace * 4); // iack+eoi pairs outnumber latch+ack
@@ -5039,7 +5050,35 @@ int main(int argc, char** argv)
                         fwrite(rgb, 1, 3, pf);
                     }
                 fclose(pf);
-                printf("-- ati screen dumped: ati_screen.ppm\n");
+                // ⚠⚠ WHETHER THE SCREEN HAS ANYTHING ON IT, stated as a
+                // number. `ati paint` counts bytes ever written and SATURATES
+                // once one screenful has been painted: it reads 1,261,501 on
+                // a blank grey screen and 1,261,505 on the Finder desktop —
+                // four bytes apart — and a whole session was called healthy on
+                // the strength of it while the user was looking at nothing.
+                //
+                // Distinct scanlines separate them completely: the recorded
+                // desktop has 462 of 480, a uniform screen has 1. Cheap, and
+                // it cannot be confused by a counter that only goes up.
+                std::set<std::string> rows;
+                for (u32 y = 0; y < h; ++y) {
+                    std::string r;
+                    r.reserve(size_t(w) * bypp);
+                    for (u32 x = 0; x < w; ++x) {
+                        const size_t o = offset + size_t(y) * rowBytes +
+                                         size_t(x) * bypp;
+                        for (u32 b = 0; b < bypp; ++b)
+                            r.push_back(static_cast<char>(
+                                o + b < vr.size() ? vr[o + b] : 0));
+                    }
+                    rows.insert(std::move(r));
+                }
+                printf("-- ati screen dumped: ati_screen.ppm — %zu distinct "
+                       "scanlines of %u (%s)\n",
+                       rows.size(), h,
+                       rows.size() <= 2
+                           ? "UNIFORM: nothing is being displayed"
+                           : "structured");
             }
         }
     }

@@ -364,6 +364,29 @@ public:
     // 25,000,000 timebase ticks is 2304/3125 exactly.
     static constexpr u32 kKlTimerLo = 0x15038u; // +0x3c holds the high word
     static constexpr u64 kKlTimerNum = 2304ull, kKlTimerDen = 3125ull;
+    // ⚠⚠ OFF BY DEFAULT, AND THE DEFAULT IS LOAD-BEARING. This is the
+    // CONSTRUCTOR default, which is what the capi — and therefore the app —
+    // gets, so g4run's switch has to agree with it.
+    //
+    // Answering the timer is CORRECT and it fixes the guest's clock. It also
+    // breaks the boot, and both halves are measured. With it on, a 12.95 B
+    // cold boot reaches `hd command log 287` and a framebuffer that is
+    // essentially flat — a 2 KB PNG, 29 distinct rows. The recorded baseline
+    // is 292, `ati paint 1261505`, and a 111 KB PNG with 462 distinct rows of
+    // 480. The user saw it before any counter did: no welcome screen, no
+    // desktop, a grey screen at 9.25 B.
+    //
+    // The mechanism is not the timer, it is what a correct clock EXPOSES. The
+    // guest's Duration conversions used to be 43x long, so a driver's "wait
+    // 100 ms" bought about 7 M instructions of headroom and now buys 164 k.
+    // Our devices answer on an instruction budget, and at --fast-tb 60 guest
+    // time runs ~6x real, so every device latency is that much longer in guest
+    // microseconds than the model intends. Timeouts that never expired now do.
+    //
+    // So it stays off until the pacing work lands (SESSION27_PLAN §1-2), and
+    // goes on together with a --fast-tb that makes guest time mean something.
+    // Turning it on without that ships a machine that does not boot.
+    bool klTimerOn = false;
     // KeyLargo GPIO block: 0x30 bytes at mac-io +0x50 (QEMU hw/misc/macio).
     static constexpr u32 kGpioBase = 0x50u;
     static constexpr u32 kGpioSize = 0x30u;
@@ -719,7 +742,8 @@ private:
                 }
                 return v;
             }
-            if (off - kKlTimerLo < 8u && off - kKlTimerLo + len <= 8u) {
+            if (klTimerOn && off - kKlTimerLo < 8u &&
+                off - kKlTimerLo + len <= 8u) {
                 u8 img[8];
                 klTimerImage(klTimerCount(), img);
                 klNote(kMacIoBase + off, 0, false);
@@ -889,7 +913,8 @@ private:
                 }
                 return;
             }
-            if (off - kKlTimerLo < 8u && off - kKlTimerLo + len <= 8u) {
+            if (klTimerOn && off - kKlTimerLo < 8u &&
+                off - kKlTimerLo + len <= 8u) {
                 klTimerWrite(off, v, len);
                 klNote(kMacIoBase + off, v, true);
                 return;

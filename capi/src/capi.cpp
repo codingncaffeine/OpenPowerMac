@@ -332,6 +332,110 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
              static_cast<unsigned long long>(m->idle.skipped),
              static_cast<unsigned long long>(m->idle.overshootNs / 1000ull));
     s += b;
+    // 📓 WHAT IT HAS BEEN DOING, not just where it stopped. A handler entered
+    // once and a fault re-taken forever look identical in a single sample.
+    {
+        const u64 n = cpu.excRingAt < Cpu::kExcRing ? cpu.excRingAt
+                                                    : Cpu::kExcRing;
+        snprintf(b, sizeof b,
+                 "-- last %llu of %llu exceptions (oldest first; vec srr0 srr1 "
+                 "dar dsisr @tb):\n",
+                 static_cast<unsigned long long>(n),
+                 static_cast<unsigned long long>(cpu.excRingAt));
+        s += b;
+        for (u64 k = 0; k < n; ++k) {
+            const Cpu::ExcRec& r =
+                cpu.excRing[(cpu.excRingAt - n + k) & (Cpu::kExcRing - 1u)];
+            snprintf(b, sizeof b,
+                     "--   %03x srr0=%08x srr1=%08x dar=%08x dsisr=%08x @%llu\n",
+                     r.vec, r.srr0, r.srr1, r.dar, r.dsisr,
+                     static_cast<unsigned long long>(r.tb));
+            s += b;
+        }
+    }
+    // 🔬 THE HANDLER'S OWN INSTRUCTIONS. With IR clear the program counter IS
+    // a physical address, so the code it is sitting in can be read straight
+    // out of RAM — no translation to get wrong. Sixteen words around pc is
+    // enough to see whether it is a loop and what it is testing.
+    if (!(cpu.st.msr & 0x0020u)) {
+        const u32 at = (cpu.st.pc & ~0x1Fu) - 32u;
+        snprintf(b, sizeof b, "-- code at pc (IR=0, physical) from %08x:\n", at);
+        s += b;
+        for (u32 row = 0; row < 6; ++row) {
+            snprintf(b, sizeof b, "--   %08x:", at + row * 16u);
+            s += b;
+            for (u32 w = 0; w < 4; ++w) {
+                snprintf(b, sizeof b, " %08x",
+                         m->bus->read32(at + row * 16u + w * 4u));
+                s += b;
+            }
+            s += (at + row * 16u == (cpu.st.pc & ~0xFu)) ? "   <== pc row\n"
+                                                         : "\n";
+        }
+    }
+    // 🔎 THE PAGE TABLE, FOR THE ADDRESS THAT FAULTED. A DSI with DSISR bit 1
+    // says "no translation found", and there are two very different reasons
+    // for that: the guest genuinely has not mapped the page (its own business,
+    // and its handler's job to fix), or a PTE IS there and our search failed to
+    // match it (ours). Printing our conclusion cannot tell those apart — only
+    // the raw table can, so this dumps both PTEGs and lets the reader judge.
+    //
+    // ⚠ READ STRAIGHT FROM RAM, and that is a real caveat rather than a
+    // detail: the walk in mmu.cpp reads through the data cache, because a page
+    // table living in dirty cache lines is architectural. A PTE the guest has
+    // just written and not yet flushed would be visible to the walk and NOT
+    // here. So "no match below" means "no match in RAM", and a disagreement
+    // between this and the fault is itself the finding.
+    if (cpu.st.dsisr || cpu.st.dar) {
+        const u32 ea = cpu.st.dar;
+        const u32 sr = cpu.st.sr[ea >> 28];
+        const u32 vsid = sr & 0x00FFFFFFu;
+        const u32 pi = (ea >> 12) & 0xFFFFu;
+        const u32 api = pi >> 10;
+        const u32 htaborg = cpu.st.sdr1 & 0xFFFF0000u;
+        const u32 htabmask = cpu.st.sdr1 & 0x1FFu;
+        snprintf(b, sizeof b,
+                 "-- mmu for dar=%08x: sr[%u]=%08x vsid=%06x pi=%04x api=%02x "
+                 "sdr1=%08x (org=%08x mask=%03x)\n",
+                 ea, ea >> 28, sr, vsid, pi, api, cpu.st.sdr1, htaborg,
+                 htabmask);
+        s += b;
+        // A DBAT covering this address would have answered before the table
+        // was ever consulted, so their absence is part of the evidence.
+        for (u32 i = 0; i < 4; ++i) {
+            snprintf(b, sizeof b, "--   dbat%u: u=%08x l=%08x\n", i,
+                     cpu.st.dbatu[i], cpu.st.dbatl[i]);
+            s += b;
+        }
+        for (int pass = 0; pass < 2; ++pass) {
+            const u32 hash = pass == 0
+                                 ? ((vsid & 0x7FFFFu) ^ pi)
+                                 : (~((vsid & 0x7FFFFu) ^ pi) & 0x7FFFFu);
+            const u32 pteg = htaborg |
+                             ((((hash >> 10) & 0x1FFu) & htabmask) << 16) |
+                             ((hash & 0x3FFu) << 6);
+            snprintf(b, sizeof b, "--   %s pteg @%08x (hash=%05x):\n",
+                     pass ? "secondary" : "primary  ", pteg, hash);
+            s += b;
+            for (u32 slot = 0; slot < 8; ++slot) {
+                const u32 a = pteg + slot * 8u;
+                const u32 w0 = m->bus->read32(a);
+                const u32 w1 = m->bus->read32(a + 4);
+                const bool v = (w0 & 0x80000000u) != 0;
+                const u32 eVsid = (w0 >> 7) & 0xFFFFFFu;
+                const u32 eH = (w0 >> 6) & 1u;
+                const u32 eApi = w0 & 0x3Fu;
+                const bool match = v && eVsid == vsid &&
+                                   eH == static_cast<u32>(pass) && eApi == api;
+                snprintf(b, sizeof b,
+                         "--     %u %08x %08x  v=%d vsid=%06x h=%u api=%02x "
+                         "rpn=%05x pp=%u%s\n",
+                         slot, w0, w1, v ? 1 : 0, eVsid, eH, eApi, w1 >> 12,
+                         w1 & 3u, match ? "   <== MATCHES the faulting EA" : "");
+                s += b;
+            }
+        }
+    }
     s += m->bus->pic().describe();
     // ⚠ PARKED is the one to read first. A channel parked mid-descriptor is
     // waiting for a device to take or supply more bytes, and it is cleared by

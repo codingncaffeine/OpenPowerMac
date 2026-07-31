@@ -90,6 +90,13 @@ public sealed class MachineSession
     // is exactly when racing it would turn a diagnosable stall into a crash.
     // The loop honours it between chunks and the text arrives on ConsoleQ.
     private volatile bool _diagWanted;
+    // Sample A, held while the machine runs one more chunk so B can be
+    // compared against it. See the capture site for why one sample is not
+    // enough.
+    private bool _diagPending;
+    private string _diagA = "";
+    private ulong _diagAInsns;
+    private uint _diagAPc;
     public void RequestDiagnostics() => _diagWanted = true;
 
     private void Run(ShellSettings s)
@@ -184,12 +191,40 @@ public sealed class MachineSession
                 else if (dt > 30) chunk = Math.Max(chunk / 2, 100_000);
 
                 // Between chunks, never during one — see RequestDiagnostics.
+                // ⭐ TWO SAMPLES, ONE CLICK. A single capture cannot say whether
+                // a stopped-looking machine is spinning or truly stopped, and
+                // asking a person to click twice at the right moment is asking
+                // them to remember it during the one run that reproduced the
+                // bug — which each cost about ten minutes. So the first request
+                // takes sample A and arms a second; the next trip round the
+                // loop takes B, and the file carries both plus the delta.
                 if (_diagWanted)
                 {
                     _diagWanted = false;
+                    var ab = new byte[65536];
+                    uint an = Native.opm_diag(m, ab, (uint)ab.Length);
+                    _diagA = System.Text.Encoding.ASCII.GetString(ab, 0, (int)an);
+                    _diagAInsns = Native.opm_executed(m);
+                    _diagAPc = Native.opm_pc(m);
+                    _diagPending = true;
+                }
+                else if (_diagPending)
+                {
+                    _diagPending = false;
                     var db = new byte[65536];
                     uint dn = Native.opm_diag(m, db, (uint)db.Length);
-                    string text = System.Text.Encoding.ASCII.GetString(db, 0, (int)dn);
+                    ulong bInsns = Native.opm_executed(m);
+                    uint bPc = Native.opm_pc(m);
+                    string verdict = bInsns == _diagAInsns
+                        ? "STOPPED DEAD — the instruction count did not move between samples"
+                        : $"RUNNING — {bInsns - _diagAInsns:N0} instructions between samples"
+                          + (bPc == _diagAPc ? ", same pc (a tight loop)" : ", pc moved");
+                    string text =
+                        $"[sample A] pc={_diagAPc:x8} executed={_diagAInsns:N0}\n"
+                        + _diagA
+                        + $"\n[sample B] pc={bPc:x8} executed={bInsns:N0}\n"
+                        + System.Text.Encoding.ASCII.GetString(db, 0, (int)dn)
+                        + $"\n===== VERDICT: {verdict} =====\n";
                     ConsoleQ.Enqueue(text);
                     // ⭐ AND TO A FILE. A wedge is reported by someone reading a
                     // scrolling text pane and retyping what they see, which is

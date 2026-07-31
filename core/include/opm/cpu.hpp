@@ -463,6 +463,23 @@ struct Cpu {
     // srr0 = address to save; extra = exception-specific SRR1 bits (1-4,10-15).
     void raiseExc(Exc v, u32 srr0, u32 extra);
 
+    // 📓 A ring of the exceptions most recently taken. See raiseExc: one look
+    // at a stopped machine cannot distinguish a handler entered ONCE from a
+    // fault being re-taken forever, and that is the whole question when a guest
+    // freezes inside one. The same vector at the same DAR, over and over, is
+    // the second — visibly, without another ten-minute run to find out.
+    //
+    // ⚠ Deliberately on Cpu and NOT in CpuState: the snapshot layout digest
+    // hashes sizeof(CpuState), so putting it there would invalidate every
+    // snapshot in the project to gain an instrument. Same rule the caches obey.
+    struct ExcRec {
+        u32 vec, srr0, srr1, dar, dsisr;
+        u64 tb;
+    };
+    static constexpr u32 kExcRing = 32; // power of two: the index masks
+    ExcRec excRing[kExcRing]{};
+    u64 excRingAt = 0; // total ever raised; & (kExcRing-1) is the next slot
+
     void setExternalIrq(bool level) { extIrqLine = level; }
     void raiseSmi() { smiPending = true; }
 

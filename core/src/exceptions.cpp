@@ -30,6 +30,19 @@ void Cpu::raiseExc(Exc v, u32 srr0, u32 extra)
 
     const u32 base = (st.msr & msr::IP) ? 0xFFF00000u : 0x00000000u;
     st.pc = base | static_cast<u32>(v);
+
+    // 📓 THE LAST FEW EXCEPTIONS, kept so a stopped machine can be asked what
+    // it has been doing rather than only where it ended up. One sample of a
+    // guest sitting in a handler cannot say whether it arrived once and stayed,
+    // or is re-taking the same fault forever — and those are opposite bugs. A
+    // ring of the same vector at the same DAR is the second one, visibly.
+    //
+    // ⚠ On Cpu, never in CpuState: the snapshot layout digest hashes
+    // CpuState's size, so putting it there would kill every existing snapshot
+    // to gain an instrument.
+    ExcRec& r = excRing[excRingAt & (kExcRing - 1u)];
+    r = {static_cast<u32>(v), srr0, st.srr1, st.dar, st.dsisr, st.tb};
+    ++excRingAt;
 }
 
 } // namespace opm

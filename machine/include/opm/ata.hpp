@@ -55,17 +55,32 @@ public:
     // the register trace; only the cell's own counters tell them apart.
     void dumpState(const char* who) const;
 
-    // Run the deferred command, if its BSY window has elapsed. Called once
-    // per instruction from the machine's peripheral tick. The delay is in
-    // INSTRUCTIONS rather than timebase ticks on purpose: it exists to be
-    // wider than a driver's arming sequence, which is a fixed number of
-    // instructions, and it must not change meaning when the harness
-    // compresses guest time.
+    // Run the deferred command, if its BSY window has elapsed. Called from
+    // the machine's peripheral tick.
+    //
+    // ⚠ THE DELAY IS A DURATION, AND A DURATION IS TIMEBASE. It used to be
+    // 4000 INSTRUCTIONS, which is not a duration at all: it means 2.4 ms of
+    // guest time at --fast-tb 60 and 200 µs at --fast-tb 4, and under
+    // real-time pacing — where the clock comes from the host and the guest has
+    // no instruction RATE — it means nothing whatsoever. It also cannot
+    // survive a run loop that charges several instructions at once, because an
+    // instruction-denominated deadline is then overshot by a whole batch.
+    // 200 µs is what the old constant bought at the shipping --fast-tb 4, and
+    // it is what every configuration gets now.
+    //
+    // What the window is FOR is unchanged: it must be wider than the driver's
+    // arming sequence (Open Firmware's ATA driver writes the command, then
+    // stores to the cell's +0x200 control word some hundreds of instructions
+    // later, then waits). 200 µs is ~4000 instructions at --fast-tb 4 and
+    // ~11,000 through the app's real-time loop, against an arming sequence of
+    // about 700 — and a real drive takes milliseconds, so erring wide is
+    // erring towards the hardware.
     bool tick(); // true when a deferred command ran: wake the DMA list
-    // The instruction count at which tick() could next do something, so the
-    // machine loop need not ask on every one. ~0 when nothing is deferred.
-    u64 pendingAt() const { return pending_ ? pendAt_ : ~0ull; }
-    u64 cmdDelay_ = 4000;
+    // The timebase at which tick() could next do something, so the machine
+    // loop need not ask on every instruction. ~0 when nothing is deferred.
+    u64 pendingTb() const { return pending_ ? pendAtTb_ : ~0ull; }
+    static constexpr u64 kTbPerUs = 25; // 25 MHz timebase = bus clock / 4
+    u64 cmdDelayTb_ = 200 * kTbPerUs;
     // Set by the bus from the channel.s RUN bit. On this hardware DMA is
     // selected by the mac-io cell and its DBDMA channel, NOT by the ATA
     // opcode: Open Firmware arms the channel and then issues an ordinary
@@ -109,7 +124,16 @@ public:
         u8 cdb[12] = {};
     };
     std::vector<Ev> log;
+    // ⚠ TWO CLOCKS, AND THEY ANSWER DIFFERENT QUESTIONS. `stamp` is the
+    // emulator's instruction counter and it is a LABEL: every log entry
+    // carries it so a command can be correlated with the rest of a run's
+    // instrumentation, all of which counts instructions. `tbRef` is the
+    // machine's timebase and it is the CLOCK: every duration this cell models
+    // is measured against it. Timing anything against the instruction counter
+    // is what this cell used to do, and it made "how long does a command take"
+    // a question with a different answer for every harness setting.
     const u64* stamp = nullptr;
+    const u64* tbRef = nullptr;
     // Which code issued a command. The command log had timestamps but no
     // issuer, so "who asked for this sector" meant correlating two logs by
     // eye across a trimmed window.
@@ -189,19 +213,19 @@ private:
     u8 sense_ = 0; // last sense key
     u32 pulled_ = 0; // data-register bytes served since the last command
     // Deferred command: the write lands, BSY goes up, and the command runs
-    // cmdDelay_ instructions later. See write() case 0x070.
+    // cmdDelayTb_ timebase ticks later. See write() case 0x070.
     bool pending_ = false;
     u8 pendCmd_ = 0;
-    u64 pendAt_ = 0;
+    u64 pendAtTb_ = 0;
     // Task file as it stood when the command byte landed.
     u32 latchShown_ = 0;
     u8 pendNsect_ = 0, pendLba0_ = 0, pendBcLo_ = 0, pendBcHi_ = 0,
        pendDev_ = 0;
     // The pc that WROTE the command byte. The command log sampled the live
-    // pc inside ataCommand(), which runs from tick() cmdDelay_ instructions
+    // pc inside ataCommand(), which runs from tick() a whole command delay
     // later — so its "issuer" column was whatever code happened to be
-    // executing 4000 instructions afterwards, and it was quoted as the
-    // driver's address.
+    // executing thousands of instructions afterwards, and it was quoted as
+    // the driver's address.
     u32 pendPc_ = 0;
     // Sectors per DRQ block, from SET MULTIPLE MODE. Advertised as 16 in
     // IDENTIFY word 59 and then never recorded, so the drive could not

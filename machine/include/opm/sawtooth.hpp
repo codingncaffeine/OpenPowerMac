@@ -163,6 +163,11 @@ public:
         ataDma_.ata = &cd_;
         hdDma_.dmaBus = this;
         hdDma_.ata = &hd_;
+        // The machine's clock, handed to the cells that model a DURATION.
+        // Wired here rather than by the consumer for the reason setStamp
+        // exists: a per-consumer wiring list is how the app ended up with a
+        // hard disk that never completed a command.
+        cd_.tbRef = hd_.tbRef = &nowTb_;
     }
 
     bool attachAtiRom(const char* path)
@@ -201,12 +206,18 @@ public:
     // the same, because a resume that starts with a stale deadline would
     // withhold an interrupt until the next guest register access.
     u64 devGen_ = 0, devGenSeen_ = ~0ull;
-    u64 devDueTb_ = 0, devDueStamp_ = 0;
+    u64 devDueTb_ = 0, devServices_ = 0;
     bool cpuIrq_ = false;
-    // KeyLargo timer: the timebase at the last reload, the value reloaded,
-    // and the machine's current timebase (kept here because a register read
-    // has no clock of its own). See kKlTimerLo.
-    u64 klTimerTb_ = 0, klTimerVal_ = 0, klTb_ = 0;
+    // KeyLargo timer: the timebase at the last reload and the value reloaded.
+    u64 klTimerTb_ = 0, klTimerVal_ = 0;
+    // ⏱ THE MACHINE'S CURRENT TIMEBASE, and the one clock every device reads.
+    // It lives here because a device register access has no clock of its own:
+    // it happens inside a guest load or store, with the service gate shut, and
+    // whatever it needs to know about "now" it has to find already written
+    // down. The KeyLargo timer is read exactly that way and it is what the
+    // guest calibrates its entire clock against, so this store is
+    // unconditional and stays that way (session 26).
+    u64 nowTb_ = 0;
     // DIAGNOSTIC (--no-dev-gate): service every device on every instruction,
     // the way the machine did before the gate existed. A gate is a claim —
     // "nothing can have changed" — and a claim about timing needs a control
@@ -323,7 +334,7 @@ public:
         // The processor restart takes the timebase back to zero, so the
         // timer's reload point has to come with it or the counter would sit
         // frozen (clamped) until the guest happened to write it.
-        klTimerTb_ = klTimerVal_ = klTb_ = 0;
+        klTimerTb_ = klTimerVal_ = nowTb_ = 0;
     }
 
     struct Acc {
@@ -470,50 +481,59 @@ public:
     //    write() bump it), which covers every register write, every EOI, every
     //    IACK and every DMA arm;
     //  - devDueTb_ is the earliest timebase at which a timed device could do
-    //    something — the nearer USB frame, and the display's blank or its
-    //    expiry;
-    //  - devDueStamp_ is the same for the ATA cells, whose deferred commands
-    //    are keyed on the instruction count rather than the clock.
-    // Miss any of those and an interrupt arrives late, so each deadline is a
+    //    something — the nearer USB frame, the display's blank or its expiry,
+    //    and either ATA cell's deferred command.
+    // Miss any of those and an interrupt arrives late, so the deadline is a
     // conservative LOWER bound and the generation is bumped generously.
-    bool serviceDevices(u64 tb, u64 insnCount)
+    //
+    // ⏱ ONE AXIS, NOT TWO. There used to be a second deadline in INSTRUCTIONS
+    // for the ATA cells, because their command delay was denominated that way.
+    // A machine has one clock; a run loop that has to clamp on two of them
+    // cannot batch, and under real-time pacing the instruction axis is not a
+    // clock at all. See AtaCell::tick.
+    bool serviceDevices(u64 tb)
     {
         // The display's notion of "now" is used when the driver ARMS the
         // blank, which happens inside a register write and therefore before
-        // the gate below can open. One store keeps it exact. The KeyLargo
-        // timer is read the same way — inside a load, with the gate shut —
-        // and it is what the guest calibrates its whole clock against, so it
-        // gets the same unconditional store.
+        // the gate below can open. One store keeps it exact — see nowTb_.
         ati_.noteTb(tb);
-        klTb_ = tb;
-        if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_ &&
-            insnCount < devDueStamp_)
+        nowTb_ = tb;
+        if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_)
             return cpuIrq_;
+        ++devServices_;
         devGenSeen_ = devGen_;
         ohciTick(tb);
         syncIrqs();
         cpuIrq_ = pic_.cpuLine();
         devDueTb_ = ohci_[0].nextTickTb();
-        const u64 d1 = ohci_[1].nextTickTb(), d2 = ati_.nextTickTb();
-        if (d1 < devDueTb_)
-            devDueTb_ = d1;
-        if (d2 < devDueTb_)
-            devDueTb_ = d2;
-        devDueStamp_ = cd_.pendingAt();
-        if (hd_.pendingAt() < devDueStamp_)
-            devDueStamp_ = hd_.pendingAt();
+        const u64 due[4] = {ohci_[1].nextTickTb(), ati_.nextTickTb(),
+                            cd_.pendingTb(), hd_.pendingTb()};
+        for (const u64 d : due)
+            if (d < devDueTb_)
+                devDueTb_ = d;
         return cpuIrq_;
     }
     // A machine whose devices were poked from outside the run loop (the shell
     // attaching media, a test rig) must not be answered from the cache.
     void deviceStateChanged() { ++devGen_; }
 
-    // The two deadlines the gate above is built on, published so a caller can
-    // skip forward to them instead of asking once per instruction. Both are
-    // conservative LOWER bounds on when a device could next do something, so
-    // a caller that stops at the nearer of them cannot miss an event.
+    // The deadline the gate above is built on, published so a caller can skip
+    // forward to it instead of asking once per instruction. A conservative
+    // LOWER bound on when a device could next do something, so a caller that
+    // stops there cannot miss an event.
     u64 deviceDueTb() const { return devDueTb_; }
-    u64 deviceDueStamp() const { return devDueStamp_; }
+
+    // 📏 HOW OFTEN THE MACHINE ACTUALLY HAS TO LOOK AT ITS DEVICES, which is
+    // the question a batched run loop lives or dies on. A loop that charges
+    // several instructions at once has to stop at anything that could change
+    // an interrupt line, and these are those events: devGen counts the guest's
+    // own non-RAM accesses, devServices counts the times the gate opened at
+    // all (an access OR a timed device falling due). Instructions divided by
+    // devServices is the longest batch this machine would allow — measure it
+    // before building a batch, because if the answer is five there is nothing
+    // to win.
+    u64 devGen() const { return devGen_; }
+    u64 deviceServices() const { return devServices_; }
 
     OhciCell& ohci(u32 i) { return ohci_[i & 1u]; }
     void ohciTick(u64 tb)
@@ -626,15 +646,14 @@ public:
     const u32* lrRef = nullptr;
     const u64* stamp = nullptr;
 
-    // ⚠⚠ ONE CALL, EVERY CELL — AND THE STAMP IS NOT A DEBUG AID. The
-    // instruction counter used to be wired cell by cell by each consumer, and
-    // the capi's list was missing hd() and hdDma(): AtaCell::tick() returns
-    // false when stamp is null, so the app's hard disk raised BSY on its first
-    // command and held it for the rest of the machine's life, while g4run —
-    // whose list was complete — booted from the same image. It also pinned
-    // serviceDevices' devDueStamp_ at cmdDelay_ forever, so the device gate
-    // never closed. A per-consumer wiring list is a defect waiting for its
-    // next reader; call these instead of assigning the fields.
+    // ⚠⚠ ONE CALL, EVERY CELL. The instruction counter used to be wired cell
+    // by cell by each consumer, and the capi's list was missing hd() and
+    // hdDma(): the app's hard disk raised BSY on its first command and held it
+    // for the rest of the machine's life, while g4run — whose list was
+    // complete — booted from the same image. A per-consumer wiring list is a
+    // defect waiting for its next reader; call these instead of assigning the
+    // fields. (The cells' CLOCK is wired in the constructor, because it is the
+    // machine's own — see nowTb_.)
     void setStamp(const u64* s)
     {
         stamp = s;
@@ -1484,7 +1503,7 @@ private:
         // snapshot, so "now" can legitimately be earlier than the reload
         // point. An unsigned subtract there would hand the guest a count near
         // 2^64 and a calibrated clock built on it — clamp instead.
-        const u64 dt = klTb_ > klTimerTb_ ? klTb_ - klTimerTb_ : 0ull;
+        const u64 dt = nowTb_ > klTimerTb_ ? nowTb_ - klTimerTb_ : 0ull;
         return klTimerVal_ + dt * kKlTimerNum / kKlTimerDen;
     }
     static void klTimerImage(u64 c, u8 img[8])
@@ -1508,7 +1527,7 @@ private:
         klTimerImage(klTimerCount(), img);
         put(img + (off - kKlTimerLo), v, len);
         klTimerVal_ = klTimerFromImage(img);
-        klTimerTb_ = klTb_;
+        klTimerTb_ = nowTb_;
     }
 
     void note(u32 pa, u32 v, bool wr)

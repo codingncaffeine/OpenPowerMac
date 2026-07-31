@@ -34,7 +34,12 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // than as a mystery.
 // 11 adds the KeyLargo timer's reload point and value. It also changes
 // sizeof(SawtoothBus), so old files are refused by the digest either way.
-constexpr u32 kSnapVersion = 11; // 11: the KeyLargo timer
+// 12 changes the UNIT of the ATA cells' deferred-command deadline from
+// instructions to timebase. ⚠ THE FIELDS ARE THE SAME SIZE, so nothing else
+// would have refused a version-11 file — it would have loaded, and a snapshot
+// taken inside a BSY window would have resumed with a deadline billions of
+// ticks away and a drive that never answered. A unit change is a stream change.
+constexpr u32 kSnapVersion = 12; // 12: ATA command delay in timebase
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -397,8 +402,8 @@ void AtaCell::snapSave(SnapWriter& w) const
     // with the command still owed, or the drive silently drops it.
     w.b(pending_);
     w.u8v(pendCmd_);
-    w.u64v(pendAt_);
-    w.u64v(cmdDelay_);
+    w.u64v(pendAtTb_);
+    w.u64v(cmdDelayTb_);
     // The latched task file travels WITH the pending command. Saving the
     // command without the registers it sampled resumes the drive running a
     // different transfer than the host asked for.
@@ -470,8 +475,8 @@ void AtaCell::snapLoad(SnapReader& r)
     sense_ = r.u8v();
     pending_ = r.b();
     pendCmd_ = r.u8v();
-    pendAt_ = r.u64v();
-    cmdDelay_ = r.u64v();
+    pendAtTb_ = r.u64v();
+    cmdDelayTb_ = r.u64v();
     pendNsect_ = r.u8v();
     pendLba0_ = r.u8v();
     pendBcLo_ = r.u8v();
@@ -866,7 +871,7 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     w.u64v(kl_.size());
     w.raw(kl_.data(), kl_.size());
     // The KeyLargo timer is not in kl_ — it is derived from the timebase, so
-    // what has to travel is where it was last reloaded and to what. klTb_ is
+    // what has to travel is where it was last reloaded and to what. nowTb_ is
     // restored from the CPU's timebase by the machine's own load, not stored.
     w.u64v(klTimerTb_);
     w.u64v(klTimerVal_);
@@ -1065,12 +1070,11 @@ void SawtoothBus::snapLoad(SnapReader& r)
     // the invariant instead of the value.
     devGenSeen_ = ~0ull;
     devDueTb_ = 0;
-    devDueStamp_ = 0;
-    // Likewise the KeyLargo timer's notion of "now", which the run loop
-    // refreshes on the first serviceDevices call. Starting it at the reload
-    // point makes the first read report the reloaded value rather than a
-    // count derived from a timebase this machine has not reached yet.
-    klTb_ = klTimerTb_;
+    // Likewise the machine's notion of "now", which the run loop refreshes on
+    // the first serviceDevices call. Starting it at the KeyLargo timer's
+    // reload point makes the first read report the reloaded value rather than
+    // a count derived from a timebase this machine has not reached yet.
+    nowTb_ = klTimerTb_;
 }
 
 // --- whole machine --------------------------------------------------------

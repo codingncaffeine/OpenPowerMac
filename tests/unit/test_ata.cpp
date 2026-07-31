@@ -186,7 +186,7 @@ TEST_CASE("an ATA disk addresses in CHS when the device register says so")
     REQUIRE(makeSectorIso());
     AtaCell hd;
     REQUIRE(hd.attachDisk(kChsIso));
-    // No stamp, so commands run as they are written: the deferred-command
+    // No clock, so commands run as they are written: the deferred-command
     // window is a separate property with its own test below.
 
     // The power-on translation is the one IDENTIFY advertises — 16 heads,
@@ -284,9 +284,13 @@ TEST_CASE("an ATA command asserts BSY and completes only after its delay")
     AtaCell hd;
     REQUIRE(hd.attachDisk(kIso));
 
+    // The clock is the TIMEBASE, not the instruction count: a command delay
+    // is a duration, and the instruction count is not one — it means a
+    // different number of guest microseconds at every harness setting, and
+    // none at all when the timebase is paced from the host.
     u64 clock = 0;
-    hd.stamp = &clock;
-    hd.cmdDelay_ = 100;
+    hd.tbRef = &clock;
+    hd.cmdDelayTb_ = 100;
 
     hd.write(0x060, 0xE0, 1); // LBA mode, device 0
     hd.write(0x020, 0x01, 1); // one sector

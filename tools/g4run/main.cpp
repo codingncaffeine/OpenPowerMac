@@ -1318,7 +1318,7 @@ int main(int argc, char** argv)
             cpu.tick(fastTbAfter);
         }
         OPM_PH(DevTick);
-        cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb, executed));
+        cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
         OPM_PH(Other);
     };
 
@@ -1578,7 +1578,7 @@ int main(int argc, char** argv)
             if (const u64 n =
                     (realtime || !napSkipOn)
                         ? 0
-                        : napSkip(cpu, bus, executed, maxInsns - executed)) {
+                        : napSkip(cpu, bus, maxInsns - executed)) {
                 executed += n;
                 tickPeripherals();
                 continue;
@@ -4271,6 +4271,23 @@ int main(int argc, char** argv)
                           static_cast<double>(cpu.napSkipped)) /
                              host / 1e6
                        : 0.0);
+        // 📏 HOW LONG A BATCH COULD BE. A run loop that charges several
+        // instructions at once has to stop at anything that could move an
+        // interrupt line: a guest access to a device, a timed device falling
+        // due, and the decrementer — its own deadline and every reload of it.
+        // The mean gap between those is the ceiling on batching, and it is
+        // cheaper to print it than to build a batch and find out.
+        const u64 breaks = bus.deviceServices() + cpu.decWrites + cpu.decIrqs;
+        printf("--   batch ceiling: %llu device services (%llu guest device "
+               "accesses) + %llu dec writes + %llu dec irqs = one break per "
+               "%.0f instructions\n",
+               static_cast<unsigned long long>(bus.deviceServices()),
+               static_cast<unsigned long long>(bus.devGen()),
+               static_cast<unsigned long long>(cpu.decWrites),
+               static_cast<unsigned long long>(cpu.decIrqs),
+               breaks ? static_cast<double>(ranInsns) /
+                            static_cast<double>(breaks)
+                      : 0.0);
     }
     // Where the host time went. Sampled, so it is a distribution and not a
     // ledger: percentages under about 1% are noise at any realistic rate.

@@ -53,10 +53,12 @@ namespace opm {
 // caller whose timebase already comes from the host clock (--realtime,
 // opm_set_realtime) must not use it — the clock would advance twice. An idle
 // machine under real-time pacing wants to SLEEP to the earliest deadline
-// instead, which needs device latency expressed in timebase rather than in
-// instructions first (SESSION27_PLAN §1 step 2).
+// instead. That is now BUILDABLE — every device deadline is in timebase, so
+// "when could anything happen" converts straight to host nanoseconds — and it
+// is not built: nothing in this file yields the host processor.
 //
-// Steps the caller may charge to `executed` WITHOUT calling Cpu::step,
+// Steps the caller may charge to its instruction count WITHOUT calling
+// Cpu::step,
 // because the core is asleep and provably cannot wake inside them. Returns 0
 // when the core is awake, when a wake is already pending, or when there is no
 // room to skip — in which case the caller just steps normally.
@@ -69,7 +71,7 @@ namespace opm {
 // instruction has to be one load and one branch; everything else belongs
 // behind it.
 OPM_PACE_COLD inline u64 napSkipSlow(Cpu& cpu, const SawtoothBus& bus,
-                                       u64 executed, u64 budget)
+                                     u64 budget)
 {
     if (budget < 2)
         return 0;
@@ -82,17 +84,9 @@ OPM_PACE_COLD inline u64 napSkipSlow(Cpu& cpu, const SawtoothBus& bus,
     const u64 dec = cpu.stepsUntilDec(cyclesPerStep);
     if (dec < n)
         n = dec;
-    // The nearer device deadline, in steps. devDueStamp is already an
-    // instruction count; devDueTb is a timebase value and converts through
-    // the same cycles-per-step the clock advances at.
-    const u64 dueStamp = bus.deviceDueStamp();
-    if (dueStamp > executed) {
-        const u64 s = dueStamp - executed;
-        if (s < n)
-            n = s;
-    } else {
-        return 0; // a device is already due: service it first
-    }
+    // The device deadline, in steps. It is a timebase value and converts
+    // through the same cycles-per-step the clock advances at. There used to be
+    // a second one in instructions, for ATA commands; a machine has one clock.
     const u64 dueTb = bus.deviceDueTb();
     if (dueTb > cpu.st.tb) {
         const u64 cycles = (dueTb - cpu.st.tb) * cpu.cyclesPerTbTick;
@@ -109,11 +103,11 @@ OPM_PACE_COLD inline u64 napSkipSlow(Cpu& cpu, const SawtoothBus& bus,
     return n;
 }
 
-inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 executed, u64 budget)
+inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 budget)
 {
     if (!cpu.napping)
         return 0;
-    return napSkipSlow(cpu, bus, executed, budget);
+    return napSkipSlow(cpu, bus, budget);
 }
 
 } // namespace opm

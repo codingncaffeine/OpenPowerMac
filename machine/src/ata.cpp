@@ -91,11 +91,12 @@ void AtaCell::dumpState(const char* who) const
            data_.size(), dataAt_,
            static_cast<unsigned long long>(readLba_), readLeft_, wrLeft_,
            pulled_);
-    printf("--   dmaArmed=%d pending=%d pendCmd=%02x pendAt=%llu "
-           "cmdDelay=%llu multiple=%u\n",
+    printf("--   dmaArmed=%d pending=%d pendCmd=%02x pendAtTb=%llu "
+           "nowTb=%llu cmdDelayTb=%llu multiple=%u\n",
            dmaArmed_ ? 1 : 0, pending_ ? 1 : 0, pendCmd_,
-           static_cast<unsigned long long>(pendAt_),
-           static_cast<unsigned long long>(cmdDelay_), multiple_);
+           static_cast<unsigned long long>(pendAtTb_),
+           static_cast<unsigned long long>(tbRef ? *tbRef : 0),
+           static_cast<unsigned long long>(cmdDelayTb_), multiple_);
     printf("--   cell regs +200..+2f0:");
     for (u32 k = 0; k < 16; ++k)
         printf(" %08x", ctl_[k]);
@@ -526,7 +527,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
             // the boot HD, eight 16 KiB READ MULTIPLEs succeeded and the
             // ninth hung with DRQ asserted and the driver polling forever.
             // Hold the command for a window wider than that arming sequence.
-            if (!stamp) { // no clock to defer against: run it now
+            if (!tbRef) { // no clock to defer against: run it now
                 ataCommand(b);
                 break;
             }
@@ -554,7 +555,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
             pendBcHi_ = bcHi_;
             pendDev_ = dev_;
             pendPc_ = pcRef ? *pcRef : 0;
-            pendAt_ = (stamp ? *stamp : 0) + cmdDelay_;
+            pendAtTb_ = *tbRef + cmdDelayTb_;
             pending_ = true;
             status_ = kBsy;
         }
@@ -594,7 +595,7 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 // about every 390 M instructions.
 bool AtaCell::tick()
 {
-    if (!pending_ || !stamp || *stamp < pendAt_)
+    if (!pending_ || !tbRef || *tbRef < pendAtTb_)
         return false;
     pending_ = false;
     nsect_ = pendNsect_;

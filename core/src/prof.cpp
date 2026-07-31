@@ -95,6 +95,7 @@ const char* name(Ph p)
     case Ph::Irq: return "irq sync";
     case Ph::Instr: return "instrumentation";
     case Ph::Exc: return "exception";
+    case Ph::Loop: return "run loop";
     default: return "?";
     }
 }

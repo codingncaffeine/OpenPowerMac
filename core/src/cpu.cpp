@@ -254,7 +254,7 @@ void Cpu::execRow(u32 insn, u32 row)
     // tests to tick+perfmon and read 36.1% on a machine whose clock advance is
     // now three instructions. Third time this project has been lied to by a
     // marker that outlived the work it named; see the note in prof.hpp.
-    OPM_PH(Other);
+    OPM_PH(Loop);
     if (halted || raisedThisStep)
         return;
 
@@ -371,8 +371,11 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
         const u32 base = fl->base;
         for (;;) {
             const u32 cia = st.pc;
+            const u32 insn = fl->w[word];
+            const u32 row = fl->row[word];
             OPM_COUNT(lineInsns);
-            execRow(fl->w[word], fl->row[word]);
+            if (!execFast(insn, row))
+                execRow(insn, row);
             ++i;
             if (batchBreak || halted)
                 goto done;

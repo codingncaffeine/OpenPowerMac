@@ -2,6 +2,7 @@
 #include "types.hpp"
 #include "bus.hpp"
 #include "insn.hpp"
+#include "prof.hpp" // markers on the inline execution path; compiled away
 #include <map>
 #include <string>
 #include <vector>
@@ -377,6 +378,40 @@ struct Cpu {
     // bug this project has already paid for twice, and the second copy is
     // always the one nobody measures.
     void execRow(u32 insn, u32 row);
+    // The FALL-THROUGH of execRow, inline, for the line executor's inner loop:
+    // an ordinary instruction with no gate, a bound handler, and none of the
+    // hoisted conditions live. Returns false without touching anything if the
+    // instruction is not that, and the caller hands it to execRow.
+    //
+    // ⚠ IT DUPLICATES NO RULE. Every decision — illegal, privileged, FP and
+    // vector availability, the unimplemented halt, the performance monitor,
+    // the trace — stays in execRow and this defers to it. What is inline here
+    // is the part with no decisions in it, because MSVC will not inline a
+    // function the size of execRow and the line loop was paying a call with
+    // two arguments on every emulated instruction.
+    bool execFast(u32 insn, u32 row)
+    {
+        if (row == kNoRow)
+            return false;
+        const Handler fn = dispFn[row];
+        if (dispPre[row] || !fn)
+            return false;
+        raisedThisStep = false;
+        curInsn = insn;
+        st.pc += 4;
+        // ⚠ THE MARKERS ARE NOT OPTIONAL ON THIS PATH. They compile away
+        // entirely in the shipping build, and without them the profiling build
+        // bills the handler — nine tenths of the instructions this machine
+        // executes — to whatever phase the run loop last set. Measured: with
+        // them missing, `execute` read 4.3% and `run loop` read 64.8% on a
+        // machine that had not changed. Fourth marker to lie in this project.
+        OPM_PH(Exec);
+        fn(*this, insn, kIsa[row]);
+        OPM_PH(Tick);
+        charge(1 + extraCycles);
+        OPM_PH(Loop);
+        return true;
+    }
 
     // Vector to an exception per the UM ch.4 model: SRR0/SRR1 composition,
     // MSR transition (clears VEC/POW/EE/PR/FP/FE0/SE/BE/FE1/PM/IR/DR/RI,

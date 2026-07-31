@@ -28,6 +28,7 @@
 // boot passed. One definition, called from both.
 
 #include "opm/cpu.hpp"
+#include "opm/prof.hpp"
 #include "opm/sawtooth.hpp"
 
 namespace opm {
@@ -73,6 +74,7 @@ namespace opm {
 OPM_PACE_COLD inline u64 napSkipSlow(Cpu& cpu, const SawtoothBus& bus,
                                      u64 budget)
 {
+    OPM_MARK(Loop);
     if (budget < 2)
         return 0;
     // An enabled interrupt already waiting: step() must run and take it.
@@ -161,7 +163,12 @@ inline u64 batchSteps(const Cpu& cpu, const SawtoothBus& bus, u64 budget)
 // sit still for the length of a batch.
 inline u64 runBatch(Cpu& cpu, SawtoothBus& bus, u64& executed, u64 budget)
 {
-    return cpu.runSteps(batchSteps(cpu, bus, budget), executed);
+    u64 n;
+    {
+        OPM_MARK(Loop); // the sizing is the loop's cost, not the machine's
+        n = batchSteps(cpu, bus, budget);
+    }
+    return cpu.runSteps(n, executed);
 }
 
 } // namespace opm

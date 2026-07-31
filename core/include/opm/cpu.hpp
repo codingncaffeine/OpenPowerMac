@@ -214,6 +214,40 @@ struct Cpu {
             decPending = true;
     }
 
+    // How many steps of `cyclesPerStep` cycles each can pass before the
+    // decrementer's MSB goes 0 -> 1 and asks for its interrupt. ~0 when it
+    // has already gone negative, because it will not ask again until the
+    // guest reloads it — and the guest cannot, if no instruction is running.
+    //
+    // This is the clamp that makes skipping a run of asleep steps EXACT
+    // rather than approximate: the skip stops on the step where tick() would
+    // have raised the interrupt, so the state afterwards is the state the
+    // one-at-a-time loop would have produced, tick for tick.
+    u64 stepsUntilDec(u32 cyclesPerStep) const
+    {
+        if ((st.dec & 0x80000000u) || !cyclesPerStep || !cyclesPerTbTick)
+            return ~0ull;
+        const u64 need = static_cast<u64>(st.dec) + 1ull; // TB ticks to go
+        const u64 total = need * cyclesPerTbTick;         // cycles for them
+        const u64 cycles = total > cycleAccum ? total - cycleAccum : 0ull;
+        return (cycles + cyclesPerStep - 1ull) / cyclesPerStep;
+    }
+
+    // Advance the clock by `steps` steps' worth of cycles without executing
+    // anything. Chunked because tick() takes a 32-bit cycle count and a nap
+    // can legitimately span millions of steps.
+    void clockAdvance(u64 steps, u32 cyclesPerStep)
+    {
+        u64 cycles = steps * static_cast<u64>(cyclesPerStep);
+        while (cycles) {
+            const u32 c = cycles > 0x3F000000ull
+                              ? 0x3F000000u
+                              : static_cast<u32>(cycles);
+            cycles -= c;
+            tick(c);
+        }
+    }
+
     // Set when execution cannot continue (pre-P2 stand-in for the exception
     // model: traps, sc, illegal ops halt with a reason instead of vectoring).
     bool halted = false;
@@ -457,6 +491,12 @@ struct Cpu {
     // working are the same MIPS number, and the fetch hit rate is computed
     // over a denominator that has nothing to do with the step count.
     u64 napSteps = 0;
+    // Steps charged to the instruction count without calling step(), because
+    // the core was asleep and could not wake inside them. Counted in every
+    // build, not just the profiling one: it is the difference between "this
+    // machine is fast" and "this machine is asleep", and the MIPS figure
+    // cannot tell them apart on its own. See machine/include/opm/pace.hpp.
+    u64 napSkipped = 0;
     static u32 fetchSlot(u32 pa) { return (pa >> 5) & (kFetchLines - 1u); }
     void fetchDrop()
     {

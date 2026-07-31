@@ -8,6 +8,7 @@
 #include "opm/cpu.hpp"
 #include "opm/insn.hpp"
 #include "opm/prof.hpp"
+#include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
 #include "opm/snapshot.hpp"
 
@@ -1559,6 +1560,21 @@ int main(int argc, char** argv)
     // number that includes the measurement is a number about g4run.
     if (bench)
         while (executed < maxInsns && !cpu.halted) {
+            // Same call, same header, same order as capi's opm_run — see
+            // machine/include/opm/pace.hpp. If this loop and the app's stop
+            // agreeing, the number this tool reports is about this tool.
+            //
+            // ⚠ NOT UNDER --realtime, where the timebase comes from the host
+            // clock: charging a run of asleep steps to it would advance the
+            // clock twice. capi's real-time path is excluded for the same
+            // reason, and for the same reason it is only a stopgap there.
+            if (const u64 n =
+                    realtime ? 0
+                             : napSkip(cpu, bus, executed, maxInsns - executed)) {
+                executed += n;
+                tickPeripherals();
+                continue;
+            }
             cpu.step();
             tickPeripherals();
             ++executed;
@@ -4233,6 +4249,20 @@ int main(int argc, char** argv)
         if (bench)
             printf("--   ^ THE APP'S LOOP (--bench): step, tick, sync, "
                    "deliver, and nothing else.\n");
+        // ⚠ MIPS ALONE CANNOT TELL A FAST MACHINE FROM A SLEEPING ONE. Steps
+        // charged without executing anything are still steps; say how many,
+        // or an idle desktop reports a throughput it never achieved.
+        if (cpu.napSkipped)
+            printf("--   of which %llu (%.1f%%) were SKIPPED asleep, not "
+                   "executed: %.1f MIPS of real work\n",
+                   static_cast<unsigned long long>(cpu.napSkipped),
+                   100.0 * static_cast<double>(cpu.napSkipped) /
+                       static_cast<double>(ranInsns ? ranInsns : 1),
+                   host > 0
+                       ? (static_cast<double>(ranInsns) -
+                          static_cast<double>(cpu.napSkipped)) /
+                             host / 1e6
+                       : 0.0);
     }
     // Where the host time went. Sampled, so it is a distribution and not a
     // ledger: percentages under about 1% are noise at any realistic rate.
@@ -4283,12 +4313,9 @@ int main(int argc, char** argv)
         // a whole-cache drop wants a narrower invalidation, and enlarging the
         // cache would only make each drop cost more.
         if (cpu.napSteps)
-            printf("--   nap steps: %llu of %llu executed (%.1f%%) — the core "
-                   "was asleep and fetched nothing\n",
-                   static_cast<unsigned long long>(cpu.napSteps),
-                   static_cast<unsigned long long>(executed),
-                   100.0 * static_cast<double>(cpu.napSteps) /
-                       static_cast<double>(executed ? executed : 1));
+            printf("--   nap steps: %llu stepped one at a time — the core was "
+                   "asleep and fetched nothing\n",
+                   static_cast<unsigned long long>(cpu.napSteps));
         if (ftot)
             printf("--   fetch drops: icbi=%llu snoop=%llu flush=%llu "
                    "(each throws away all %u lines)\n",

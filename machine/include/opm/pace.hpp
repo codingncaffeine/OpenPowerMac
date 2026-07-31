@@ -1,0 +1,88 @@
+#pragma once
+// How the machine advances when the processor has nothing to do.
+//
+// WHY THIS EXISTS. Measured at the Finder desktop, 300 M instructions:
+// 192,528,873 of them — 64% — executed NO instruction at all. Mac OS puts the
+// core to sleep (MSR[POW]) whenever it is idle, and Cpu::step's nap arm ticks
+// the clock and returns. The emulator was spending most of a host core
+// stepping one asleep instruction at a time, and the profiler charged the
+// whole of it to "other", where it sat unexplained for two sessions.
+//
+// WHY IT IS EXACT AND NOT AN APPROXIMATION. Nothing can wake a sleeping core
+// except an enabled interrupt, and there are only four sources:
+//   - the decrementer   — set by Cpu::tick, so Cpu::stepsUntilDec bounds it;
+//   - an external line  — set only when the machine's devices are serviced,
+//                         and SawtoothBus publishes conservative lower bounds
+//                         on when a device could next do anything;
+//   - SMI and the performance monitor — neither can change while no
+//                         instruction is executing.
+// Stopping at the nearest of those bounds leaves the machine in exactly the
+// state the one-at-a-time loop would have produced: same timebase, same
+// decrementer, same pending flags, same instruction count. It is a skip, not
+// a shortcut.
+//
+// ⚠ IT LIVES HERE, IN ONE HEADER, BECAUSE THE APP AND THE MEASURING TOOL ARE
+// TWO DIFFERENT MACHINES ASSEMBLED FROM THE SAME PARTS. The last time a piece
+// of run-loop wiring was written out twice, the copy in the C API was missing
+// the hard disk and the app had no working disk for weeks while every g4run
+// boot passed. One definition, called from both.
+
+#include "opm/cpu.hpp"
+#include "opm/sawtooth.hpp"
+
+namespace opm {
+
+// ⚠ INSTRUCTION-PACED LOOPS ONLY. This advances the timebase itself, so a
+// caller whose timebase already comes from the host clock (--realtime,
+// opm_set_realtime) must not use it — the clock would advance twice. An idle
+// machine under real-time pacing wants to SLEEP to the earliest deadline
+// instead, which needs device latency expressed in timebase rather than in
+// instructions first (SESSION27_PLAN §1 step 2).
+//
+// Steps the caller may charge to `executed` WITHOUT calling Cpu::step,
+// because the core is asleep and provably cannot wake inside them. Returns 0
+// when the core is awake, when a wake is already pending, or when there is no
+// room to skip — in which case the caller just steps normally.
+//
+// `budget` is how many steps the caller still wants to run at all.
+inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 executed, u64 budget)
+{
+    if (!cpu.napping || budget < 2)
+        return 0;
+    // An enabled interrupt already waiting: step() must run and take it.
+    if ((cpu.st.msr & msr::EE) &&
+        (cpu.smiPending || cpu.extIrqLine || cpu.decPending || cpu.pmPending))
+        return 0;
+    const u32 cyclesPerStep = 1u + cpu.extraCycles;
+    u64 n = budget;
+    const u64 dec = cpu.stepsUntilDec(cyclesPerStep);
+    if (dec < n)
+        n = dec;
+    // The nearer device deadline, in steps. devDueStamp is already an
+    // instruction count; devDueTb is a timebase value and converts through
+    // the same cycles-per-step the clock advances at.
+    const u64 dueStamp = bus.deviceDueStamp();
+    if (dueStamp > executed) {
+        const u64 s = dueStamp - executed;
+        if (s < n)
+            n = s;
+    } else {
+        return 0; // a device is already due: service it first
+    }
+    const u64 dueTb = bus.deviceDueTb();
+    if (dueTb > cpu.st.tb) {
+        const u64 cycles = (dueTb - cpu.st.tb) * cpu.cyclesPerTbTick;
+        const u64 s = cycles / cyclesPerStep; // floor: never overshoot
+        if (s < n)
+            n = s;
+    } else {
+        return 0;
+    }
+    if (n < 2)
+        return 0;
+    cpu.clockAdvance(n, cyclesPerStep);
+    cpu.napSkipped += n;
+    return n;
+}
+
+} // namespace opm

@@ -508,6 +508,13 @@ public:
     // attaching media, a test rig) must not be answered from the cache.
     void deviceStateChanged() { ++devGen_; }
 
+    // The two deadlines the gate above is built on, published so a caller can
+    // skip forward to them instead of asking once per instruction. Both are
+    // conservative LOWER bounds on when a device could next do something, so
+    // a caller that stops at the nearer of them cannot miss an event.
+    u64 deviceDueTb() const { return devDueTb_; }
+    u64 deviceDueStamp() const { return devDueStamp_; }
+
     OhciCell& ohci(u32 i) { return ohci_[i & 1u]; }
     void ohciTick(u64 tb)
     {

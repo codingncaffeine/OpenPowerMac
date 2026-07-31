@@ -1,6 +1,7 @@
 #include "opm/capi.h"
 
 #include "opm/cpu.hpp"
+#include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
 
 #include <chrono>
@@ -112,6 +113,14 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         // g4run's --realtime, deliberately: the two have to say the same thing
         // about the same machine.
         constexpr uint64_t kNsPerTick = 40, kCatchup = 25000;
+        // ⚠ NO napSkip ON THIS PATH, DELIBERATELY. Under real-time pacing the
+        // timebase comes from the host clock, so charging a run of asleep
+        // steps to it would advance the clock twice; and skipping without
+        // advancing it would race past an ATA command whose completion is
+        // denominated in INSTRUCTIONS, which is the modelling wart §1 of the
+        // session-27 plan already names. The honest fix for an idle machine
+        // here is to SLEEP until the earliest deadline, once device latency
+        // is expressed in timebase rather than in instructions.
         while (m->executed < until && !cpu.halted) {
             cpu.step();
             if ((m->executed & 0x3FFu) == 0) {
@@ -138,6 +147,15 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         return m->executed;
     }
     while (m->executed < until && !cpu.halted) {
+        // An asleep core executes nothing, and nothing that could wake it can
+        // happen before the deadlines this asks about — so charge the whole
+        // run of sleeping steps at once. At the Finder desktop that is most
+        // of them. See machine/include/opm/pace.hpp.
+        if (const u64 n = napSkip(cpu, bus, m->executed, until - m->executed)) {
+            m->executed += n;
+            cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb, m->executed));
+            continue;
+        }
         cpu.step();
         // One call, and it does nothing at all unless a device could have
         // moved — see SawtoothBus::serviceDevices. Ticking every device and

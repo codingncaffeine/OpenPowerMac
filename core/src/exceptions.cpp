@@ -43,6 +43,7 @@ void Cpu::raiseExc(Exc v, u32 srr0, u32 extra)
     ExcRec& r = excRing[excRingAt & (kExcRing - 1u)];
     r = {static_cast<u32>(v), srr0, st.srr1, st.dar, st.dsisr, st.tb};
     ++excRingAt;
+    ++excByVec[(static_cast<u32>(v) >> 8) & 15u];
 }
 
 } // namespace opm

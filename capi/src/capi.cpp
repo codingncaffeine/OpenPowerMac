@@ -429,6 +429,21 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  static_cast<unsigned long long>(n),
                  static_cast<unsigned long long>(cpu.excRingAt));
         s += b;
+        // The histogram first: which vector dominates, and at what rate. One
+        // exception per few thousand instructions is a working machine; one
+        // per few hundred is something drowning.
+        s += "--   by vector:";
+        for (u32 vi = 0; vi < 16; ++vi) {
+            if (!cpu.excByVec[vi])
+                continue;
+            snprintf(b, sizeof b, " %s=%llu", excName(vi << 8),
+                     static_cast<unsigned long long>(cpu.excByVec[vi]));
+            s += b;
+        }
+        snprintf(b, sizeof b, "\n--   rate: 1 per %llu instructions\n",
+                 static_cast<unsigned long long>(
+                     cpu.excRingAt ? m->executed / cpu.excRingAt : 0));
+        s += b;
         for (u64 k = 0; k < n; ++k) {
             const Cpu::ExcRec& r =
                 cpu.excRing[(cpu.excRingAt - n + k) & (Cpu::kExcRing - 1u)];

@@ -480,6 +480,15 @@ struct Cpu {
     ExcRec excRing[kExcRing]{};
     u64 excRingAt = 0; // total ever raised; & (kExcRing-1) is the next slot
 
+    // 📊 …AND A TALLY PER VECTOR, because thirty-two entries cannot tell a
+    // storm from a coincidence. A ring full of one vector might be the machine
+    // drowning in it or might be the last microsecond of an otherwise healthy
+    // run; only the counts say which, and the rate against the instruction
+    // count says whether it is pathological at all. Indexed by vector >> 8, so
+    // 0x300 is [3] and 0xF20 shares [15] with 0xF00 — close enough for a
+    // histogram, and it keeps the array to sixteen words.
+    u64 excByVec[16]{};
+
     void setExternalIrq(bool level) { extIrqLine = level; }
     void raiseSmi() { smiPending = true; }
 

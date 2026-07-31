@@ -575,6 +575,39 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  row * 4 + 3, cpu.st.gpr[row * 4 + 3]);
         s += (row == 0) ? std::string("-- gprs:\n") + b : std::string(b);
     }
+    // 🔎 WHAT THE POINTER REGISTERS POINT AT, decoded as a DBDMA descriptor as
+    // well as raw. A stalled driver polls a WORD, and knowing which register
+    // holds the address is only half of it — this hang came down to a loop
+    // reading offset +0x0C of something in r28 with lwbrx and testing 0x0400,
+    // which is a descriptor's completion flag, at an address that belongs to
+    // no channel this machine knows about. Only the memory says whose it is.
+    // ⚠ Header printed unconditionally. It used to ride on r0's line, so when
+    // r0 held zero — which is most of the time — the whole section silently
+    // disappeared and read as "nothing to report" rather than "nothing
+    // qualified".
+    s += "-- memory at pointer registers (RAM-looking, word-aligned):\n";
+    for (u32 gi = 0; gi < 32; ++gi) {
+        const u32 ea = cpu.st.gpr[gi];
+        // Anything that could be a pointer into RAM. Device space and small
+        // integers are not worth the lines.
+        if (ea < 0x1000u || ea >= 0x40000000u || (ea & 3u))
+            continue;
+        u32 pa = ea;
+        if ((cpu.st.msr & 0x0010u) && !diagXlate(cpu, *m->bus, ea, false, pa))
+            continue;
+        const u32 w0 = m->bus->read32(pa), w1 = m->bus->read32(pa + 4);
+        const u32 w2 = m->bus->read32(pa + 8), w3 = m->bus->read32(pa + 12);
+        auto sw = [](u32 v) {
+            return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) |
+                   (v << 24);
+        };
+        snprintf(b, sizeof b,
+                 "--   r%-2u -> %08x: %08x %08x %08x %08x | as descriptor: "
+                 "cmd=%u req=%u addr=%08x xferStatus=%04x res=%u\n",
+                 gi, ea, w0, w1, w2, w3, (sw(w0) >> 28) & 7u, sw(w0) & 0xFFFFu,
+                 sw(w1), sw(w3) >> 16, sw(w3) & 0xFFFFu);
+        s += b;
+    }
     // ⭐ WHAT THE MACHINE ASKED FOR AND NOBODY ANSWERED. Every access that no
     // device claims master-aborts (reads all-ones, writes dropped) and lands
     // here, keyed by address. A driver polling a register block this emulator

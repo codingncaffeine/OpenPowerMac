@@ -6,10 +6,15 @@
 
 A from-scratch Power Macintosh emulator.
 
-**It boots Mac OS 9 on an emulated Power Mac G4.** The machine runs Apple's own
-Open Firmware out of a real Boot ROM image, loads the operating system from a hard disk
-over ATA with DMA, brings up the Rage 128 Pro, and hands over to Mac OS — which drives the
-display through its own driver at 640×480×32 and enumerates USB keyboard and mouse.
+**It installs Mac OS 9 onto a disk it creates, and boots that disk to the desktop.** The
+machine runs Apple's own Open Firmware out of a real Boot ROM image, brings up the Rage 128
+Pro, and hands over to Mac OS — which drives the display through its own driver at
+640×480×32, enumerates USB keyboard and mouse, and plays sound through the AWACS codec.
+
+The whole storage path works end to end: create a blank disk in the app, initialise it with
+Drive Setup from the installation CD, run the installer, eject the CD, and boot from it.
+The guest's clock is paced from the host, so a guest second is a real second and the 60 Hz
+tick chain runs at 60 Hz regardless of how fast the emulator itself is.
 
 Design, methodology, and the provenance ledger live in the
 [wiki](https://github.com/codingncaffeine/OpenPowerMac/wiki).
@@ -34,13 +39,17 @@ and two OHCI USB controllers with boot-protocol HID devices.
 | | |
 |---|---|
 | Open Firmware | boots to the prompt and auto-boots from disk |
-| Mac OS 9 | loads, starts, and draws its own interface |
-| Display | the OS binds its driver and sets 640×480×32 |
+| Mac OS 9 | installs from CD onto an emulated disk, and boots from it to the desktop |
+| Storage | ATA/ATAPI with DBDMA and bus-snooped DMA; disks are created in the app |
+| Display | the OS binds its own driver and sets 640×480×32 |
 | Input | USB keyboard and mouse enumerate and reach the guest |
-| Sound, 3D | not yet started |
+| Sound | the startup chime and system audio play through the AWACS codec |
+| Timing | the guest's clock is paced from the host — a guest second is a real second |
+| 3D | not yet started |
 
-Later arcs: sound, a JIT, and register-level 3D on the Rage 128 so the guest's own driver
-does the translation.
+The desktop is reached and usable for a time; keeping it stable indefinitely is the
+current work. Later arcs: a JIT, higher display resolutions, and register-level 3D on the
+Rage 128 so the guest's own driver does the translation.
 
 ## How it is verified
 

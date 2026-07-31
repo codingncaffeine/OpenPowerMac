@@ -1233,9 +1233,35 @@ int main(int argc, char** argv)
     // for reasoning about it.
     const auto hostStart = std::chrono::steady_clock::now();
     auto rtBase = hostStart;
-    u64 rtTbBase = 0, rtSlips = 0;
+    // Where the wall clock is anchored. It has to be the timebase the machine
+    // is ACTUALLY at, not zero: a resumed machine starts billions of ticks in,
+    // and pacing "0 + elapsed" against it means the target is behind the
+    // timebase forever and the clock simply stops.
+    u64 rtTbBase = cpu.st.tb, rtSlips = 0;
+    // Where the run STARTS. A resumed machine carries the whole history of
+    // the boot that made the snapshot, so every rate divided by THIS run's
+    // host seconds is a different question from the one being asked: a
+    // real-time resume reported 8,983 ticks/host-s and 320 MIPS when its real
+    // figures were 26 and 18.6.
+    //
+    // ⚠ Ticks has to be read through a FLUSH. bus.read32 reads RAM, and the
+    // guest's copy of a low-memory global it writes 60 times a second is
+    // normally sitting dirty in the L1 — the unflushed read came back 19,298
+    // on a machine whose Ticks was 404,342.
+    const u64 executedAtStart = executed, tbAtStart = cpu.st.tb;
+    cpu.l1dFlushAll(true);
+    cpu.l2FlushAll(true);
+    const u32 ticksAtStart = bus.read32(0x0000416Au);
     constexpr u64 kRtNsPerTick = 40;   // 25 MHz = bus/4
     constexpr u64 kRtCatchup = 25000;  // at most 1 ms of debt per sample
+    // One rate for the whole run and no wall clock: then the extra cycles are
+    // a constant per instruction and step() can carry them, which is one
+    // tick() call per instruction instead of two (Cpu::extraCycles). The
+    // two-rate and real-time modes vary it, so they keep the explicit call.
+    const bool mergedTick =
+        !realtime && !fastTbAfter && fastTbUntil == ~0ull;
+    if (mergedTick)
+        cpu.extraCycles = fastTb;
     auto tickPeripherals = [&]() {
         // Mark the clock advance as clock work. It used to inherit whatever
         // phase the caller was in, so --fast-tb's tick — a real cost, sixty
@@ -1246,7 +1272,9 @@ int main(int argc, char** argv)
         // depending on who called it is the same failure as a watchpoint that
         // changes the run.
         OPM_PH(Tick);
-        if (realtime) {
+        if (mergedTick) {
+            // step() already advanced the clock by 1 + extraCycles.
+        } else if (realtime) {
             if ((executed & 0x3FFu) == 0) {
                 const auto now = std::chrono::steady_clock::now();
                 const u64 ns =
@@ -4003,16 +4031,20 @@ int main(int argc, char** argv)
         // by hand is how a 44x error in the guest's tick chain stayed a vague
         // impression for three sessions. r68 is r24, the 68K pc — see
         // Cpu::WpHit for why a pc of 0x68xxxxxx names nothing on its own.
-        u64 prevTb = 0;
+        u64 prevTb = 0, prevDec = 0, prevExt = 0;
         for (const Cpu::WpHit& h : cpu.wpLog) {
             printf("   pa %08x <- %0*x  by pc=%08x lr=%08x%s r68=%08x "
-                   "tb=%llu dtb=%llu\n",
+                   "tb=%llu dtb=%llu ddec=%lld dext=%lld\n",
                    h.pa, static_cast<int>(h.len * 2), h.val, h.pc, h.lr,
                    ofOwner(h.lr).c_str(), h.r24,
                    static_cast<unsigned long long>(h.tb),
                    static_cast<unsigned long long>(
-                       prevTb && h.tb > prevTb ? h.tb - prevTb : 0));
+                       prevTb && h.tb > prevTb ? h.tb - prevTb : 0),
+                   static_cast<long long>(prevTb ? h.dec - prevDec : 0),
+                   static_cast<long long>(prevTb ? h.ext - prevExt : 0));
             prevTb = h.tb;
+            prevDec = h.dec;
+            prevExt = h.ext;
         }
     }
     // The MMU as the guest left it. A DSI names an address but not WHY it
@@ -4166,25 +4198,40 @@ int main(int argc, char** argv)
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           hostStart)
                 .count();
+        cpu.l1dFlushAll(true); // see ticksAtStart: RAM is not the guest's copy
+        cpu.l2FlushAll(true);
         const u32 ticks = bus.read32(0x0000416Au);
         // Before the 68K world starts, that cell holds power-on RAM junk.
         // Printing a rate derived from junk is how a measurement becomes a
         // wrong belief, so say so instead: a plausible count is bounded by
         // 60/s against a run that has never been longer than minutes.
         char tickText[96];
+        const bool haveBase =
+            ticksAtStart < 100000000u && ticks >= ticksAtStart;
+        const u32 moved = haveBase ? ticks - ticksAtStart : ticks;
         if (ticks < 100000000u)
             snprintf(tickText, sizeof tickText,
-                     "guest Ticks=%u (%.1f/host-s; real is 60/s)", ticks,
-                     host > 0 ? ticks / host : 0.0);
+                     "guest Ticks=%u (+%u this run, %.1f/host-s; real is "
+                     "60/s)",
+                     ticks, moved, host > 0 ? moved / host : 0.0);
         else
             snprintf(tickText, sizeof tickText,
                      "guest Ticks n/a (68K lowmem not initialised yet)");
-        printf("-- timing: %.1f s host, %.1f MIPS, tb=%llu (%.2f MHz), %s%s\n",
-               host, host > 0 ? executed / host / 1e6 : 0.0,
-               static_cast<unsigned long long>(cpu.st.tb),
-               host > 0 ? cpu.st.tb / host / 1e6 : 0.0, tickText,
-               realtime ? (rtSlips ? " [realtime, slipped]" : " [realtime]")
-                        : "");
+        // Every rate is over what THIS run did, not over the whole history a
+        // snapshot carries. 25.00 MHz is real time; the ratio to it is the
+        // number the pacing work moves.
+        const u64 ranInsns = executed - executedAtStart;
+        const u64 ranTb = cpu.st.tb - tbAtStart;
+        char rtText[64] = "";
+        if (realtime)
+            snprintf(rtText, sizeof rtText, " [realtime, %llu slips]",
+                     static_cast<unsigned long long>(rtSlips));
+        printf("-- timing: %.1f s host, %.1f MIPS, tb +%llu (%.2f MHz = "
+               "%.2fx real), %s%s\n",
+               host, host > 0 ? ranInsns / host / 1e6 : 0.0,
+               static_cast<unsigned long long>(ranTb),
+               host > 0 ? ranTb / host / 1e6 : 0.0,
+               host > 0 ? ranTb / host / 25.0e6 : 0.0, tickText, rtText);
         if (bench)
             printf("--   ^ THE APP'S LOOP (--bench): step, tick, sync, "
                    "deliver, and nothing else.\n");

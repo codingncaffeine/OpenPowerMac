@@ -111,6 +111,31 @@ std::string AtaCell::describe(const char* who) const
         s += b;
     }
     s += "\n";
+    // ⭐ THE LAST COMMANDS, WHICH IS THE HALF THAT NAMES THE CULPRIT. The
+    // register state says a cell is idle or busy; it cannot say WHAT was asked
+    // of it. A machine that wedges at the same point of the same job every
+    // time is being asked something specific, and the command that never
+    // completed is the last one here — with the pc that issued it, so the
+    // guest's own driver can be disassembled at that address.
+    //
+    // `xfer` against the sector count is the tell for a short transfer: a
+    // command whose bytes never all moved is a data phase that stalled, not a
+    // command that was refused.
+    const size_t kTail = 16;
+    const size_t from = log.size() > kTail ? log.size() - kTail : 0;
+    snprintf(b, sizeof b,
+             "--   last %zu of %zu commands (c=ata p=packet e=err; "
+             "@insn cmd lba+count pc xfer):\n",
+             log.size() - from, log.size());
+    s += b;
+    for (size_t k = from; k < log.size(); ++k) {
+        const Ev& e = log[k];
+        snprintf(b, sizeof b,
+                 "     %c %02x lba=%u n=%u pc=%08x xfer=%u @%llu\n", e.kind,
+                 e.val, e.a, e.b, e.pc, e.xfer,
+                 static_cast<unsigned long long>(e.at));
+        s += b;
+    }
     return s;
 }
 

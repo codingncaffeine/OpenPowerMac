@@ -291,6 +291,22 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
              static_cast<unsigned long long>(m->idle.overshootNs / 1000ull));
     s += b;
     s += m->bus->pic().describe();
+    // ⚠ PARKED is the one to read first. A channel parked mid-descriptor is
+    // waiting for a device to take or supply more bytes, and it is cleared by
+    // a periodic wake — so a channel that is parked and STAYS parked is a
+    // transfer that will never finish, which from outside is a frozen machine.
+    // RUN set with the interrupt line high and nobody lowering it is the other
+    // shape, and it is how the session-29 wedge presented.
+    snprintf(b, sizeof b,
+             "-- dbdma hd: run=%d parked=%d irq=%d | ata(cd): run=%d "
+             "parked=%d irq=%d\n",
+             m->bus->hdDma().running() ? 1 : 0,
+             m->bus->hdDma().parked() ? 1 : 0,
+             m->bus->hdDma().irqLine() ? 1 : 0,
+             m->bus->ataDma().running() ? 1 : 0,
+             m->bus->ataDma().parked() ? 1 : 0,
+             m->bus->ataDma().irqLine() ? 1 : 0);
+    s += b;
     s += m->bus->hd().describe("hd");
     s += m->bus->cd().describe("cd");
     s += "===== end =====\n";

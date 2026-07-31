@@ -22,6 +22,9 @@
                 <Separator />
                 <MenuItem x:Name="miAutoBoot" Header="Auto-boot script (display + USB + mac-boot)"
                           IsCheckable="True" Click="OnAutoBootToggled" />
+                <Separator />
+                <MenuItem x:Name="miSound" Header="_Sound" IsCheckable="True"
+                          Click="OnSoundToggled" />
             </MenuItem>
         </Menu>
 
@@ -38,6 +41,9 @@
             </StatusBarItem>
             <StatusBarItem>
                 <TextBlock x:Name="txtPc" Text="" FontFamily="Consolas" Foreground="{StaticResource TextSecondary}" />
+            </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock x:Name="txtAudio" Text="" Foreground="{StaticResource TextSecondary}" />
             </StatusBarItem>
             <StatusBarItem HorizontalAlignment="Right">
                 <TextBlock x:Name="txtVideo" Text="no video" Foreground="{StaticResource TextSecondary}" />

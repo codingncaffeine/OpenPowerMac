@@ -11,6 +11,8 @@ public sealed class MachineSession
 {
     private Thread? _thread;
     private volatile bool _stop;
+    // Owned and touched only by the worker, like every other capi resource.
+    private readonly WaveOutSink _wave = new();
     private readonly ConcurrentQueue<string> _serialQ = new();
     private readonly ConcurrentQueue<string> _keyQ = new();
     private readonly ConcurrentQueue<(uint usage, uint down)> _keyEvQ = new();
@@ -31,6 +33,12 @@ public sealed class MachineSession
     public long StatMipsX10;
     public int StatPc;
     public volatile bool Running;
+    /// <summary>Sample rate the guest's codec is running at (0 = silent).</summary>
+    public int StatAudioRate;
+    /// <summary>Frames the host sink could not take. Non-zero means a stutter
+    /// the user can hear, which is otherwise indistinguishable from a guest
+    /// that simply stopped playing.</summary>
+    public long StatAudioDropped;
 
     /// <summary>Raised on the worker when the session ends (reason text).</summary>
     public event Action<string>? Ended;
@@ -118,6 +126,10 @@ public sealed class MachineSession
             bool scriptPending = s.AutoBoot && !string.IsNullOrWhiteSpace(s.BootScript);
             var conBuf = new byte[65536];
             var shot = new byte[Frame.Length];
+            // A quarter of a second of 44.1 kHz stereo, which is more than the
+            // codec can have produced between two chunks — the drain is never
+            // the thing that falls behind.
+            var pcm = new byte[44100 * 4 / 4];
             ulong chunk = 1_000_000;
             var sw = Stopwatch.StartNew();
             long lastShotMs = 0, lastStatMs = 0, lastStatInsns = 0;
@@ -160,6 +172,43 @@ public sealed class MachineSession
                     ConsoleQ.Enqueue($"\n[shell] boot script injected @{executed:N0}\n");
                 }
 
+                // Audio. Drained EVERY chunk whether or not anything is
+                // listening: the codec's queue is bounded and drops its
+                // oldest, so leaving it alone would make the machine skip
+                // rather than merely stay quiet. The samples are big-endian —
+                // see opm_audio — and the sink swaps them on the way to the
+                // device.
+                if (!s.Sound)
+                {
+                    // Still drained, just not played: the codec's queue is
+                    // bounded and drops its oldest, so leaving it alone makes
+                    // the machine skip rather than merely stay quiet.
+                    while (Native.opm_audio(m, pcm, (uint)pcm.Length) > 0) { }
+                }
+                else if (_wave.IsOpen || _wave.Open((int)Native.opm_audio_rate(m)))
+                {
+                    int rate = (int)Native.opm_audio_rate(m);
+                    if (rate != _wave.Rate)
+                        _wave.Open(rate);
+                    // ⭐ Take only what the device can hold. The overflow's
+                    // right home is the codec's own six-second queue, not the
+                    // floor: draining more than the sink can take and dropping
+                    // the excess punches a hole in the waveform, and a hole is
+                    // heard as a pop.
+                    int room = _wave.FreeBytes;
+                    while (room >= 4)
+                    {
+                        uint want = (uint)Math.Min(room, pcm.Length);
+                        uint got = Native.opm_audio(m, pcm, want);
+                        if (got == 0)
+                            break;
+                        _wave.Write(pcm, (int)got, bigEndian: true);
+                        room -= (int)got;
+                    }
+                }
+                StatAudioRate = _wave.IsOpen ? _wave.Rate : 0;
+                Interlocked.Exchange(ref StatAudioDropped, _wave.DroppedFrames);
+
                 uint n;
                 while ((n = Native.opm_console(m, conBuf, (uint)conBuf.Length)) > 0)
                 {
@@ -199,9 +248,11 @@ public sealed class MachineSession
         }
         finally
         {
+            _wave.Close();
             if (m != IntPtr.Zero)
                 Native.opm_destroy(m);
             Running = false;
+            StatAudioRate = 0;
             _thread = null;
             Ended?.Invoke(reason);
         }

@@ -58,6 +58,13 @@ public sealed class ShellSettings
     // everything downstream works.
     public ulong AtiAt { get; set; } = 1;
 
+    // Play the guest's audio on the host. On by default — a Mac that makes no
+    // sound is a broken Mac, and the very first thing this path carries is
+    // the boot ROM's startup chime. Off leaves the codec running and simply
+    // stops draining it to a speaker, so turning it off cannot change the
+    // machine's behaviour.
+    public bool Sound { get; set; } = true;
+
     public ulong ScriptAt { get; set; } = 240_000_000;
     public bool AutoBoot { get; set; } = true;
 

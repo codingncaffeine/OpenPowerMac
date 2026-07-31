@@ -22,6 +22,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         WindowTheming.ApplyDarkTitleBar(this);
         miAutoBoot.IsChecked = _settings.AutoBoot;
+        miSound.IsChecked = _settings.Sound;
         UpdateTitle();
         _timer = new DispatcherTimer(DispatcherPriority.Render)
         {
@@ -426,6 +427,14 @@ public partial class MainWindow : Window
         long mipsX10 = Interlocked.Read(ref s.StatMipsX10);
         txtMips.Text = mipsX10 > 0 ? $"{mipsX10 / 10.0:F1} MIPS" : "";
         txtPc.Text = $"pc {s.StatPc:X8}";
+        // Dropped frames are shown because a stutter and a silent machine are
+        // otherwise the same observation.
+        long dropped = Interlocked.Read(ref s.StatAudioDropped);
+        txtAudio.Text = s.StatAudioRate == 0
+            ? ""
+            : dropped > 0
+                ? $"audio {s.StatAudioRate / 1000.0:F1} kHz ({dropped:N0} dropped)"
+                : $"audio {s.StatAudioRate / 1000.0:F1} kHz";
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentQueue<string> StaticEmptyQ = new();
@@ -480,6 +489,16 @@ public partial class MainWindow : Window
     private void OnAutoBootToggled(object sender, RoutedEventArgs e)
     {
         _settings.AutoBoot = miAutoBoot.IsChecked;
+        _settings.Save();
+    }
+
+    // Takes effect on the next Start. The guest's codec runs either way — the
+    // samples are drained whether or not anyone is listening, because the
+    // queue is bounded — so this only decides whether they reach a speaker,
+    // and it cannot change how the machine behaves.
+    private void OnSoundToggled(object sender, RoutedEventArgs e)
+    {
+        _settings.Sound = miSound.IsChecked;
         _settings.Save();
     }
 

@@ -55,6 +55,22 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void opm_mouse(IntPtr m, int dx, int dy, uint buttons);
 
+    // Drain PCM the guest handed the sound codec: 16-bit signed stereo,
+    // BIG-ENDIAN, interleaved. Returns bytes (a multiple of 4). The codec
+    // queues about six seconds and then drops its oldest, so this has to be
+    // polled whether or not anything is listening — otherwise the machine
+    // skips rather than merely staying quiet.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_audio(IntPtr m, byte[] outBuf, uint cap);
+
+    // The rate the guest's Sound Control register selects. Not a constant:
+    // the guest may change it, and the host device is re-opened when it does.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_audio_rate(IntPtr m);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong opm_audio_played(IntPtr m);
+
     // 1 = frame filled (BGRA, w*h*4), 0 = size query only, -1 = no picture.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int opm_screen(IntPtr m, byte[]? bgra, uint cap,

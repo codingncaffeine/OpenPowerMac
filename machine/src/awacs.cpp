@@ -114,10 +114,56 @@ u32 AwacsCell::credit(u64& cursorTb)
     return static_cast<u32>(can) & ~(kFrameBytes - 1u);
 }
 
+// ⭐ A SHORT GAP IS AN UNDERRUN AND HAS TO BE HEARD AS SILENCE, NOT CLOSED UP.
+//
+// When the guest is late the play cursor falls behind the clock, and simply
+// restarting it at "now" splices the next samples straight onto the previous
+// ones. The host's device has meanwhile drained its queue and stopped, so it
+// restarts mid-waveform at a non-zero sample — which is a POP, and it is
+// audible at the end of the boot chime, where the emulator's own hitches land.
+// Real hardware emits something during an underrun; zeros are the honest
+// model, and they keep the stream's timeline continuous so the host device
+// never goes idle in the middle of a sound.
+//
+// Bounded, because a gap is only noticed when a transfer happens: without a
+// limit, a machine that plays nothing for ten minutes and then beeps would
+// have ten minutes of silence inserted ahead of the beep. Past the bound it is
+// not an underrun, it is a new sound, and the device restarting from idle is
+// then correct.
+void AwacsCell::fillUnderrun(u64& cursorTb)
+{
+    if (cursorTb >= nowTb_ || !played_)
+        return;
+    const u64 gapTb = nowTb_ - cursorTb;
+    if (gapTb > kMaxGapTb) {
+        cursorTb = nowTb_;
+        return;
+    }
+    u32 gap = static_cast<u32>(bytesForTb(gapTb)) & ~(kFrameBytes - 1u);
+    if (!gap)
+        return;
+    ++underruns_;
+    pushSilence(gap);
+    cursorTb += tbForBytes(gap);
+}
+
+void AwacsCell::pushSilence(u32 n)
+{
+    if (ring_.size() + n > kRingCap) {
+        const size_t drop = ring_.size() + n - kRingCap;
+        ring_.erase(ring_.begin(),
+                    ring_.begin() + static_cast<ptrdiff_t>(
+                                        drop < ring_.size() ? drop : ring_.size()));
+    }
+    ring_.insert(ring_.end(), n, 0u);
+    if (capture && capture->size() + n <= captureCap)
+        capture->insert(capture->end(), n, 0u);
+    played_ += n;
+}
+
 u32 AwacsCell::dmaGive(const u8* src, u32 n)
 {
-    if (playTb_ < nowTb_ && played_)
-        ++underruns_; // the guest did not refill in time; a real codec clicks
+    fillUnderrun(playTb_);
     u32 can = credit(playTb_);
     if (can > n)
         can = n;

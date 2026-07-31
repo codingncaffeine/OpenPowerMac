@@ -1,6 +1,7 @@
 #include "opm/r128.hpp"
 
 #include <cstdio> // the CRTC mode-change report; MSVC pulls this in, gcc does not
+#include <cstring> // memmove, for the blitter's row copies
 
 namespace opm {
 
@@ -124,9 +125,405 @@ static std::map<u32, u64> gRegReadsUnbacked;
 
 const std::map<u32, u64>& r128RegReadsUnbacked() { return gRegReadsUnbacked; }
 
+// 📇 THE ENGINE REGISTERS, BY NAME, FROM THE VENDOR'S OWN DOCUMENT.
+//
+// ATI's `RAGE 128 PRO Register Reference Guide` (RRG-G04500-C rev 1.01, Jan
+// 2000) is the authority for everything in the GUI block; its OEM edition
+// leaves sections 3.31–3.34 — the parameter FIFO, GUI engine control/status
+// and GUI bus mastering — as `<No description>`, so the CCE/PM4 offsets below
+// are marked and come from QEMU's map instead. An offset that neither names
+// gets no name at all: a log that prints `+0908` and nothing else is telling
+// the truth about what is known, which is the point of the instrument.
+struct R128Name {
+    u32 off;
+    const char* name;
+};
+static const R128Name kEngNames[] = {
+    {0x0700, "PM4_BUFFER_OFFSET"},
+    {0x0704, "PM4_BUFFER_CNTL"},
+    {0x0708, "PM4_BUFFER_WM_CNTL"},
+    {0x070c, "PM4_BUFFER_DL_RPTR_ADDR"},
+    {0x0710, "PM4_BUFFER_DL_RPTR"},
+    {0x0714, "PM4_BUFFER_DL_WPTR"},
+    {0x0718, "PM4_BUFFER_DL_WPTR_DELAY"},
+    {0x071c, "PM4_VC_FPU_SETUP"},
+    {0x0720, "PM4_FPU_CNTL"},
+    {0x0724, "PM4_VC_FORMAT"},
+    {0x0728, "PM4_VC_CNTL"},
+    {0x072c, "PM4_VC_I01"},
+    {0x0730, "PM4_VC_VLOFF"},
+    {0x0734, "PM4_VC_VLSIZE"},
+    {0x0738, "PM4_IW_INDOFF"},
+    {0x073c, "PM4_IW_INDSIZE"},
+    {0x0740, "CRC_CMDFIFO_ADDR"},
+    {0x0744, "CRC_CMDFIFO_DOUT"},
+    {0x0748, "PM4_FPU_FPX1"},
+    {0x074c, "PM4_FPU_FPY1"},
+    {0x0750, "PM4_FPU_FPX2"},
+    {0x0754, "PM4_FPU_FPY2"},
+    {0x0758, "PM4_FPU_FPY3"},
+    {0x075c, "PM4_FPU_FPY4"},
+    {0x0760, "PM4_FPU_FPY5"},
+    {0x0764, "PM4_FPU_FPY6"},
+    {0x0768, "PM4_FPU_FPR"},
+    {0x076c, "PM4_FPU_FPG"},
+    {0x0770, "PM4_FPU_FPB"},
+    {0x0774, "PM4_FPU_FPA"},
+    {0x0780, "PM4_FPU_INTXY0"},
+    {0x0784, "PM4_FPU_INTXY1"},
+    {0x0788, "PM4_FPU_INTXY2"},
+    {0x078c, "PM4_FPU_INTARGB"},
+    {0x0790, "PM4_FPU_FPTWICEAREA"},
+    {0x0794, "PM4_FPU_DMAJOR01"},
+    {0x0798, "PM4_FPU_DMAJOR12"},
+    {0x079c, "PM4_FPU_DMAJOR02"},
+    {0x07a0, "PM4_FPU_STAT"},
+    {0x07a4, "PM4_VC_DEBUG_CONFIG"},
+    {0x07a8, "PM4_VC_STAT"},
+    {0x07b0, "PM4_VC_TIMESTAMP0"},
+    {0x07b4, "PM4_VC_TIMESTAMP1"},
+    {0x07b8, "PM4_STAT"},
+    {0x07d0, "PM4_TEST_CNTL"},
+    {0x07d4, "PM4_MICROCODE_ADDR"},
+    {0x07d8, "PM4_MICROCODE_RADDR"},
+    {0x07dc, "PM4_MICROCODE_DATAH"},
+    {0x07e0, "PM4_MICROCODE_DATAL"},
+    {0x07e4, "PM4_CMDFIFO_ADDR"},
+    {0x07e8, "PM4_CMDFIFO_DATAH"},
+    {0x07ec, "PM4_CMDFIFO_DATAL"},
+    {0x07f0, "PM4_BUFFER_ADDR"},
+    {0x07f4, "PM4_BUFFER_DATAH"},
+    {0x07f8, "PM4_BUFFER_DATAL"},
+    {0x07fc, "PM4_MICRO_CNTL"},
+    {0x0900, "VID_BUFFER_CONTROL"},
+    {0x0950, "CAP0_TRIG_CNTL"},
+    {0x09c0, "CAP1_TRIG_CNTL"},
+    {0x0a14, "BM_QUEUE_FREE_STATUS"},
+    {0x0a88, "BM_ABORT"},
+    {0x0b00, "SURFACE_DELAY"},
+    {0x0b04, "SURFACE0_LOWER_BOUND"},
+    {0x0b08, "SURFACE0_UPPER_BOUND"},
+    {0x0b0c, "SURFACE0_INFO"},
+    {0x0b14, "SURFACE1_LOWER_BOUND"},
+    {0x0b18, "SURFACE1_UPPER_BOUND"},
+    {0x0b1c, "SURFACE1_INFO"},
+    {0x0b24, "SURFACE2_LOWER_BOUND"},
+    {0x0b28, "SURFACE2_UPPER_BOUND"},
+    {0x0b2c, "SURFACE2_INFO"},
+    {0x0b34, "SURFACE3_LOWER_BOUND"},
+    {0x0b38, "SURFACE3_UPPER_BOUND"},
+    {0x0b3c, "SURFACE3_INFO"},
+    {0x0b44, "AGP_CNTL_B"},
+    {0x0c00, "VIPH_CH0_DATA"},
+    {0x0c04, "VIPH_CH1_DATA"},
+    {0x0c08, "VIPH_CH2_DATA"},
+    {0x0c0c, "VIPH_CH3_DATA"},
+    {0x0e40, "RBBM_STATUS"},
+    {0x1000, "PM4_FIFO_DATA_EVEN"},
+    {0x1004, "PM4_FIFO_DATA_ODD"},
+    {0x1404, "DST_OFFSET"},
+    {0x1408, "DST_PITCH"},
+    {0x140c, "DST_WIDTH"},
+    {0x1410, "DST_HEIGHT"},
+    {0x1414, "SRC_X"},
+    {0x1418, "SRC_Y"},
+    {0x141c, "DST_X"},
+    {0x1420, "DST_Y"},
+    {0x1428, "SRC_PITCH_OFFSET"},
+    {0x142c, "DST_PITCH_OFFSET"},
+    {0x1434, "SRC_Y_X"},
+    {0x1438, "DST_Y_X"},
+    {0x143c, "DST_HEIGHT_WIDTH"},
+    {0x146c, "DP_GUI_MASTER_CNTL"},
+    {0x1470, "BRUSH_SCALE"},
+    {0x1474, "BRUSH_Y_X"},
+    {0x1478, "DP_BRUSH_BKGD_CLR"},
+    {0x147c, "DP_BRUSH_FRGD_CLR"},
+    {0x1588, "DST_WIDTH_X"},
+    {0x158c, "DST_HEIGHT_WIDTH_8"},
+    {0x1590, "SRC_X_Y"},
+    {0x1594, "DST_X_Y"},
+    {0x1598, "DST_WIDTH_HEIGHT"},
+    {0x159c, "DST_WIDTH_X_INCY"},
+    {0x15a0, "DST_HEIGHT_Y"},
+    {0x15a4, "DST_X_SUB"},
+    {0x15a8, "DST_Y_SUB"},
+    {0x15ac, "SRC_OFFSET"},
+    {0x15b0, "SRC_PITCH"},
+    {0x15b4, "DST_WIDTH_BW"},
+    {0x15c0, "CLR_CMP_CNTL"},
+    {0x15c4, "CLR_CMP_CLR_SRC"},
+    {0x15c8, "CLR_CMP_CLR_DST"},
+    {0x15cc, "CLR_CMP_MSK"},
+    {0x15d8, "DP_SRC_FRGD_CLR"},
+    {0x15dc, "DP_SRC_BKGD_CLR"},
+    {0x15e0, "GUI_SCRATCH_REG0"},
+    {0x15e4, "GUI_SCRATCH_REG1"},
+    {0x15e8, "GUI_SCRATCH_REG2"},
+    {0x15ec, "GUI_SCRATCH_REG3"},
+    {0x15f0, "GUI_SCRATCH_REG4"},
+    {0x15f4, "GUI_SCRATCH_REG5"},
+    {0x1600, "LEAD_BRES_ERR"},
+    {0x1604, "LEAD_BRES_INC"},
+    {0x1608, "LEAD_BRES_DEC"},
+    {0x160c, "TRAIL_BRES_ERR"},
+    {0x1610, "TRAIL_BRES_INC"},
+    {0x1614, "TRAIL_BRES_DEC"},
+    {0x1618, "TRAIL_X"},
+    {0x161c, "LEAD_BRES_LNTH"},
+    {0x1620, "TRAIL_X_SUB"},
+    {0x1624, "LEAD_BRES_LNTH_SUB"},
+    {0x1628, "DST_BRES_ERR"},
+    {0x162c, "DST_BRES_INC"},
+    {0x1630, "DST_BRES_DEC"},
+    {0x1634, "DST_BRES_LNTH"},
+    {0x1638, "DST_BRES_LNTH_SUB"},
+    {0x1640, "SC_LEFT"},
+    {0x1644, "SC_RIGHT"},
+    {0x1648, "SC_TOP"},
+    {0x164c, "SC_BOTTOM"},
+    {0x1654, "SRC_SC_RIGHT"},
+    {0x165c, "SRC_SC_BOTTOM"},
+    {0x1660, "AUX_SC_CNTL"},
+    {0x1664, "AUX1_SC_LEFT"},
+    {0x1668, "AUX1_SC_RIGHT"},
+    {0x166c, "AUX1_SC_TOP"},
+    {0x1670, "AUX1_SC_BOTTOM"},
+    {0x1674, "AUX2_SC_LEFT"},
+    {0x1678, "AUX2_SC_RIGHT"},
+    {0x167c, "AUX2_SC_TOP"},
+    {0x1680, "AUX2_SC_BOTTOM"},
+    {0x1684, "AUX3_SC_LEFT"},
+    {0x1688, "AUX3_SC_RIGHT"},
+    {0x168c, "AUX3_SC_TOP"},
+    {0x1690, "AUX3_SC_BOTTOM"},
+    {0x16a0, "GUI_DEBUG0"},
+    {0x16a4, "GUI_DEBUG1"},
+    {0x16a8, "GUI_DEBUG2"},
+    {0x16ac, "GUI_DEBUG3"},
+    {0x16b0, "GUI_DEBUG4"},
+    {0x16b4, "GUI_DEBUG5"},
+    {0x16b8, "GUI_DEBUG6"},
+    {0x16bc, "GUI_PROBE"},
+    {0x16c0, "DP_CNTL"},
+    {0x16c4, "DP_DATATYPE"},
+    {0x16c8, "DP_MIX"},
+    {0x16cc, "DP_WRITE_MSK"},
+    {0x16d0, "DP_CNTL_XDIR_YDIR_YMAJOR"},
+    {0x16e0, "DEFAULT_OFFSET"},
+    {0x16e4, "DEFAULT_PITCH"},
+    {0x16e8, "DEFAULT_SC_BOTTOM_RIGHT"},
+    {0x16ec, "SC_TOP_LEFT"},
+    {0x16f0, "SC_BOTTOM_RIGHT"},
+    {0x16f4, "SRC_SC_BOTTOM_RIGHT"},
+    {0x1700, "DST_TILE"},
+    {0x1704, "FLUSH_1"},
+    {0x1708, "FLUSH_2"},
+    {0x170c, "FLUSH_3"},
+    {0x1710, "FLUSH_4"},
+    {0x1714, "FLUSH_5"},
+    {0x1718, "FLUSH_6"},
+    {0x171c, "FLUSH_7"},
+    {0x1720, "WAIT_UNTIL"},
+    {0x1724, "CACHE_CNTL"},
+    {0x1740, "GUI_STAT"},
+    {0x1744, "PC_GUI_MODE"},
+    {0x1748, "PC_GUI_CTLSTAT"},
+    {0x1760, "PC_DEBUG_MODE"},
+    {0x1780, "BRES_DST_ERR_DEC"},
+    {0x1784, "TRAIL_BRES_T12_ERR_DEC"},
+    {0x1788, "TRAIL_BRES_T12_INC"},
+    {0x178c, "DP_T12_CNTL"},
+    {0x1790, "DST_BRES_T1_LNTH"},
+    {0x1794, "DST_BRES_T2_LNTH"},
+    {0x17c0, "HOST_DATA0"},
+    {0x17c4, "HOST_DATA1"},
+    {0x17c8, "HOST_DATA2"},
+    {0x17cc, "HOST_DATA3"},
+    {0x17d0, "HOST_DATA4"},
+    {0x17d4, "HOST_DATA5"},
+    {0x17d8, "HOST_DATA6"},
+    {0x17dc, "HOST_DATA7"},
+    {0x17e0, "HOST_DATA_LAST"},
+    {0x1800, "TEX_CNTL"},
+    {0x18cc, "W_START"},
+    {0x1980, "SECONDARY_SCALE_PITCH"},
+    {0x1984, "SECONDARY_SCALE_X_INC"},
+    {0x1988, "SECONDARY_SCALE_Y_INC"},
+    {0x198c, "SECONDARY_SCALE_HACC"},
+    {0x1990, "SECONDARY_SCALE_VACC"},
+    {0x1994, "SCALE_SRC_HEIGHT_WIDTH"},
+    {0x1998, "SCALE_OFFSET_0"},
+    {0x199c, "SCALE_PITCH"},
+    {0x19a0, "SCALE_X_INC"},
+    {0x19a4, "SCALE_Y_INC"},
+    {0x19a8, "SCALE_HACC"},
+    {0x19ac, "SCALE_VACC"},
+    {0x19b0, "SCALE_DST_X_Y"},
+    {0x19b4, "SCALE_DST_HEIGHT_WIDTH"},
+    {0x19d4, "MC_SRC2_CNTL"},
+    {0x19d8, "MC_SRC1_CNTL"},
+    {0x19dc, "MC_DST_CNTL"},
+    {0x19e0, "MC_START_CNTL"},
+    {0x1a00, "SCALE_3D_CNTL"},
+    {0x1a0c, "COMPOSITE_SHADOW_ID"},
+    {0x1a20, "SCALE_3D_DATATYPE"},
+    {0x1a24, "CLR_CMP_CLR_3D"},
+    {0x1a28, "CLR_CMP_MSK_3D"},
+    {0x1a30, "CONSTANT_COLOR"},
+    {0x1ad4, "Z_VIS"},
+    {0x1bc4, "SETUP_CNTL"},
+    {0x1bc8, "SOLID_COLOR"},
+    {0x1bcc, "WINDOW_XY_OFFSET"},
+    {0x1bd0, "DRAW_LINE_POINT"},
+    {0x1bd4, "SETUP_CNTL_PM4"},
+    {0x1c80, "DST_PITCH_OFFSET_C"},
+    {0x1c84, "DP_GUI_MASTER_CNTL_C"},
+    {0x1c88, "SC_TOP_LEFT_C"},
+    {0x1c8c, "SC_BOTTOM_RIGHT_C"},
+    {0x1ca0, "MISC_3D_STATE_CNTL_REG"},
+    {0x1d34, "CONSTANT_COLOR_C"},
+    {0x1d44, "PLANE_3D_MASK_C"},
+};
+
+const char* r128RegName(u32 off)
+{
+    for (const auto& n : kEngNames)
+        if (n.off == off)
+            return n.name;
+    return nullptr;
+}
+
+// The engine half of the card: CCE/PM4 at 0x07xx, video at 0x09xx, bus
+// mastering at 0x0Axx, the surface apertures at 0x0Bxx, the PM4 FIFO windows
+// at 0x1000/0x1004, and the whole GUI block from 0x1400 up. The display half
+// below 0x0700 is modelled and understood, and logging it would bury the
+// engine traffic under the driver's DDC bit-banging — which is exactly what
+// happened to the existing ring.
+static constexpr u32 kEngLo = 0x0700, kEngHi = 0x2000;
+static size_t gEngLogMax = 0;
+static std::vector<R128EngEv> gEngHead, gEngTail, gEngStitched;
+static size_t gEngTailAt = 0;
+static u64 gEngDropped = 0;
+
+void r128SetEngineLog(size_t maxEntries) { gEngLogMax = maxEntries; }
+u64 r128EngineLogDropped() { return gEngDropped; }
+
+static void noteEngine(u32 off, u32 val, u32 pc, u64 at, bool wr)
+{
+    if (!gEngLogMax || off < kEngLo || off >= kEngHi)
+        return;
+    const size_t half = gEngLogMax > 1 ? gEngLogMax / 2 : 1;
+    if (gEngHead.size() < half) {
+        gEngHead.push_back({at, off, val, pc, wr});
+        return;
+    }
+    if (gEngTail.size() < half) {
+        gEngTail.push_back({at, off, val, pc, wr});
+        return;
+    }
+    // The ring is full: one event leaves for each that arrives, and the count
+    // of them is part of the report.
+    ++gEngDropped;
+    gEngTail[gEngTailAt] = {at, off, val, pc, wr};
+    gEngTailAt = (gEngTailAt + 1) % half;
+}
+
+const std::vector<R128EngEv>& r128EngineLog()
+{
+    gEngStitched = gEngHead;
+    for (size_t k = 0; k < gEngTail.size(); ++k)
+        gEngStitched.push_back(gEngTail[(gEngTailAt + k) % gEngTail.size()]);
+    return gEngStitched;
+}
+
+// =========================== THE 2D ENGINE ===============================
+//
+// Offsets, field positions and semantics are ATI's own, from the `RAGE 128
+// PRO Register Reference Guide` (RRG-G04500-C rev 1.01); QEMU's ati_2d.c is
+// the behavioural oracle for how the pieces combine into a blit. Names,
+// offsets, bit meanings and observed behaviour are facts; the code below is
+// ours.
+//
+// ⚠ dingusppc's atirage.md is the MACH64 Rage Pro — a different register map
+// entirely (SRC_OFF_PITCH 0x180). It must not be mixed in here.
+static constexpr u32 kDstOffset = 0x1404, kDstPitch = 0x1408;
+static constexpr u32 kDstWidth = 0x140C, kDstHeight = 0x1410;
+static constexpr u32 kSrcX = 0x1414, kSrcY = 0x1418;
+static constexpr u32 kDstX = 0x141C, kDstY = 0x1420;
+static constexpr u32 kSrcPitchOffset = 0x1428, kDstPitchOffset = 0x142C;
+static constexpr u32 kSrcYX = 0x1434, kDstYX = 0x1438;
+static constexpr u32 kDstHeightWidth = 0x143C;
+static constexpr u32 kDpGuiMasterCntl = 0x146C;
+static constexpr u32 kDpBrushFrgdClr = 0x147C;
+static constexpr u32 kDstWidthX = 0x1588;
+static constexpr u32 kSrcXY = 0x1590, kDstXY = 0x1594;
+static constexpr u32 kDstWidthHeight = 0x1598, kDstWidthXIncy = 0x159C;
+static constexpr u32 kDstHeightY = 0x15A0;
+static constexpr u32 kSrcOffset = 0x15AC, kSrcPitch = 0x15B0;
+static constexpr u32 kDstWidthBw = 0x15B4;
+static constexpr u32 kClrCmpCntl = 0x15C0, kClrCmpMsk = 0x15CC;
+static constexpr u32 kScLeft = 0x1640, kScRight = 0x1644;
+static constexpr u32 kScTop = 0x1648, kScBottom = 0x164C;
+static constexpr u32 kSrcScRight = 0x1654, kSrcScBottom = 0x165C;
+static constexpr u32 kAuxScCntl = 0x1660;
+static constexpr u32 kDpCntl = 0x16C0, kDpDatatype = 0x16C4;
+static constexpr u32 kDpMix = 0x16C8, kDpWriteMsk = 0x16CC;
+static constexpr u32 kDefaultOffset = 0x16E0, kDefaultPitch = 0x16E4;
+static constexpr u32 kDefaultScBr = 0x16E8;
+static constexpr u32 kScTopLeft = 0x16EC, kScBottomRight = 0x16F0;
+static constexpr u32 kSrcScBottomRight = 0x16F4;
+static constexpr u32 kWaitUntil = 0x1720;
+static constexpr u32 kGuiStat = 0x1740;
+static constexpr u32 kPcGuiCtlstat = 0x1748;
+// PM4_STAT sits in the CCE block, but it carries the SAME status flip-flops as
+// GUI_STAT — free-FIFO count in 11:0, PM4_BUSY at 16, GUI_ACTIVE at 31 — read
+// through the command engine's own address. Answering zero says "no FIFO
+// entries free", which is the opposite of idle.
+static constexpr u32 kPm4Stat = 0x07B8;
+static constexpr u32 kScTopLeftC = 0x1C88, kScBottomRightC = 0x1C8C;
+// GUI_STAT: GUI_FIFOCNT is bits 11:0 and its RESET DEFAULT IS 0x40 — the
+// number of free CMDFIFO entries. Every busy bit (16..29) and GUI_ACTIVE
+// (31, the OR of them) reads clear here, which is the truth for an engine
+// that finishes each operation inside the store that triggered it.
+static constexpr u32 kGuiStatIdle = 0x00000040u;
+// The engine's virtual address space is 64 MB: the low 32 MB is the frame
+// buffer and the high 32 MB is AGP_BASE + offset(24:0) — system memory this
+// cell cannot reach. DST_OFFSET/SRC_OFFSET are 26-bit with the low 4 bits
+// hardwired to zero.
+static constexpr u32 kEngAddrMask = 0x03FFFFF0u;
+static constexpr u32 kVramSpan = 32u << 20;
+
+static R128EngStats gEng;
+static std::map<u32, u64> gRopUnimpl;
+// ON by default, and that default is load-bearing: the capi never touches
+// these knobs, so the shipping app takes whatever is here. `--no-ati-2d`
+// restores the pre-engine card bit for bit, which is what proves a boot that
+// never uses the engine is unchanged by its arrival.
+static bool gEng2dOn = true;
+void r128SetEngine2d(bool on) { gEng2dOn = on; }
+
+const R128EngStats& r128EngStats() { return gEng; }
+const std::map<u32, u64>& r128RopUnimplemented() { return gRopUnimpl; }
+
+
 u32 R128Cell::regRead(u32 idx)
 {
     const u32 off = idx << 2;
+    // GUI_STAT and PM4_STAT: engine idle, command FIFO empty. Ahead of the
+    // switch so that --no-ati-2d falls through to exactly the register model
+    // that was here before the engine existed, unbacked-read census included.
+    //
+    // ⚠⚠ ZERO IS NOT IDLE HERE, IT IS THE WORST ANSWER AVAILABLE. Bits 11:0
+    // are the count of FREE command-FIFO entries, and the reset default is
+    // 0x40. Answering zero tells a driver the FIFO is completely full, so a
+    // driver that waits for room before writing waits for ever — and it never
+    // appears in the unclaimed-access log, because the card claims its whole
+    // aperture. Session 30 wrote this down for mac-io as *claiming an address
+    // and implementing it are different things*; this is the same trap, on
+    // the register a command engine's bring-up reads first.
+    if (gEng2dOn && (off == kGuiStat || off == kPm4Stat))
+        return kGuiStatIdle;
     switch (off) {
     case kConfigAper0Base: {
         // The framebuffer aperture BASE, not its size. Returning 32 MB here
@@ -239,6 +636,470 @@ u32 R128Cell::regRead(u32 idx)
     }
 }
 
+// A 14-bit signed coordinate. The scissors and the destination origin run
+// -8192..8191, and a rectangle placed at a negative X against a scissor of 0
+// is ordinary: it is how a window clipped at the screen edge is drawn.
+static int sx14(u32 v)
+{
+    const int t = static_cast<int>(v & 0x3FFFu);
+    return t >= 0x2000 ? t - 0x4000 : t;
+}
+
+// 🎨 ROP3, ALL 256 OF THEM, AS ONE FUNCTION.
+//
+// A Windows ternary raster op is a TRUTH TABLE, not an opcode: the code's bit
+// at index (P<<2)|(S<<1)|D gives the result for that combination of pattern,
+// source and destination. So there is nothing to special-case — evaluate the
+// table across all the bits of a pixel at once and every op is exact.
+//
+// Enumerating a handful of named ops instead (SRCCOPY, PATCOPY, …) is what
+// this engine did first, and it left 252 of them as "declined": correct, but
+// it means a guest doing something as ordinary as XOR-ing a selection outline
+// gets nothing drawn. Checked against ATI's own table in r128_reg.h —
+// ROP3_S 0xCC, ROP3_P 0xF0, ROP3_D 0xAA, ROP3_Dn 0x55, ROP3_DSx 0x66,
+// ROP3_DSa 0x88, ROP3_DSo 0xEE, ROP3_DPx 0x5A, ROP3_Pn 0x0F — all reproduced
+// by this one expression, and the unit tests assert exactly that.
+static u32 rop3(u32 rop, u32 P, u32 S, u32 D)
+{
+    u32 r = 0;
+    if (rop & 0x01u) r |= ~P & ~S & ~D;
+    if (rop & 0x02u) r |= ~P & ~S &  D;
+    if (rop & 0x04u) r |= ~P &  S & ~D;
+    if (rop & 0x08u) r |= ~P &  S &  D;
+    if (rop & 0x10u) r |=  P & ~S & ~D;
+    if (rop & 0x20u) r |=  P & ~S &  D;
+    if (rop & 0x40u) r |=  P &  S & ~D;
+    if (rop & 0x80u) r |=  P &  S &  D;
+    return r;
+}
+// Which inputs the op actually reads. Two minterms that differ only in one
+// input, and agree in the table, mean the op ignores that input — so an op
+// that never looks at the source must not be refused for wanting a source
+// surface it was never going to read.
+static bool ropUsesSrc(u32 rop) { return (rop & 0x33u) != ((rop >> 2) & 0x33u); }
+static bool ropUsesPat(u32 rop) { return (rop & 0x0Fu) != ((rop >> 4) & 0x0Fu); }
+static bool ropUsesDst(u32 rop) { return (rop & 0x55u) != ((rop >> 1) & 0x55u); }
+
+void R128Cell::engBlit()
+{
+    // --- how wide is a pixel ------------------------------------------
+    const u32 dt = rd(kDpDatatype);
+    u32 bpp = 0;
+    switch (dt & 0xFu) {
+    case 2: case 7: case 8: case 9: bpp = 8; break;  // pseudocolor, 332, Y8
+    case 3: case 4: bpp = 16; break;                 // aRGB1555, RGB565
+    case 5: bpp = 24; break;
+    case 6: bpp = 32; break;
+    default: break;                                  // YUV and 3D-only types
+    }
+    if (!bpp) {
+        ++gEng.badBpp;
+        return;
+    }
+    const u32 bypp = bpp / 8u;
+
+    // --- what operation -----------------------------------------------
+    const u32 mix = rd(kDpMix);
+    const u32 rop = (mix >> 16) & 0xFFu;
+    const u32 srcSource = (mix >> 8) & 0x7u;
+    // 3 and 4 are "loaded thru hostdata": the CPU feeds pixels through
+    // HOST_DATA0..7 after the trigger, which is a stream, not a rectangle
+    // copy. Stage 3 of the plan. Counted rather than half-drawn.
+    if (srcSource == 3u || srcSource == 4u) {
+        ++gEng.hostData;
+        return;
+    }
+    const bool usesSrc = ropUsesSrc(rop);
+    const bool usesPat = ropUsesPat(rop);
+    const bool usesDst = ropUsesDst(rop);
+
+    // The pattern operand. Brush datatype 13 is a solid colour taken from
+    // DP_BRUSH_FRGD_CLR, and 15 the manual says to "treat as 13". The mono
+    // and colour brushes (0..12) need the pattern registers, which this
+    // engine does not model — so if the op would actually READ the pattern,
+    // decline rather than paint a solid guess where a chequer belongs.
+    u32 pat = 0;
+    if (usesPat) {
+        const u32 brush = (dt >> 8) & 0xFu;
+        if (brush != 13u && brush != 15u) {
+            ++gEng.brushUnimpl;
+            return;
+        }
+        pat = rd(kDpBrushFrgdClr);
+    }
+    // The source operand must be colour pixels from memory. A MONO source is
+    // a 1-bit mask expanded through DP_SRC_FRGD_CLR/BKGD_CLR, which is its
+    // own path and belongs with host-data blits.
+    if (usesSrc && ((dt >> 16) & 0x3u) != 3u) {
+        ++gEng.monoSrc;
+        return;
+    }
+
+    // --- pitches, in bytes ---------------------------------------------
+    // DST_PITCH/SRC_PITCH bits 9:0 are the pitch in units of EIGHT PIXELS,
+    // so the byte stride is pitch*8*(bpp/8) = pitch*bpp. ⚠ 24 bpp is the
+    // exception the manual calls out: there the field is programmed in
+    // bytes*8, so the stride is pitch*8 and the general formula would be
+    // three times too large.
+    auto strideOf = [&](u32 v) -> u32 {
+        const u32 p = v & 0x3FFu;
+        return bpp == 24u ? p * 8u : p * bpp;
+    };
+    const u32 dstStride = strideOf(rd(kDstPitch));
+    const u32 srcStride = strideOf(rd(kSrcPitch));
+    if (!dstStride || (usesSrc && !srcStride)) {
+        ++gEng.zeroPitch;
+        return;
+    }
+
+    const u32 dstOff = rd(kDstOffset) & kEngAddrMask;
+    const u32 srcOff = rd(kSrcOffset) & kEngAddrMask;
+    if (dstOff >= kVramSpan || (usesSrc && srcOff >= kVramSpan)) {
+        // The upper half of the engine's address space is AGP: system RAM
+        // reached by bus mastering, which this card does not model. Drawing
+        // into VRAM instead would corrupt the screen; say so and stop.
+        ++gEng.agpTarget;
+        return;
+    }
+
+    // --- the rectangle --------------------------------------------------
+    const u32 dpc = rd(kDpCntl);
+    const bool l2r = (dpc & 0x1u) != 0;  // DST_X_DIR: 1 = left to right
+    const bool t2b = (dpc & 0x2u) != 0;  // DST_Y_DIR: 1 = top to bottom
+    // Only bits 12:0 carry a rectangle extent; 15:13 alias the Bresenham
+    // length and belong to trapezoids, which this engine does not draw.
+    const int w = static_cast<int>(rd(kDstWidth) & 0x1FFFu);
+    const int h = static_cast<int>(rd(kDstHeight) & 0x1FFFu);
+    if (w <= 0 || h <= 0)
+        return;
+    // Running right-to-left or bottom-to-top, the programmed origin is the
+    // FAR corner: the rectangle extends back from it.
+    const int dx0 = l2r ? sx14(rd(kDstX)) : sx14(rd(kDstX)) + 1 - w;
+    const int dy0 = t2b ? sx14(rd(kDstY)) : sx14(rd(kDstY)) + 1 - h;
+    const int sx0 = l2r ? sx14(rd(kSrcX)) : sx14(rd(kSrcX)) + 1 - w;
+    const int sy0 = t2b ? sx14(rd(kSrcY)) : sx14(rd(kSrcY)) + 1 - h;
+
+    // --- the scissor, inclusive on all four edges -----------------------
+    const int scl = sx14(rd(kScLeft)), scr = sx14(rd(kScRight));
+    const int sct = sx14(rd(kScTop)), scb = sx14(rd(kScBottom));
+    int x0 = dx0 > scl ? dx0 : scl;
+    int y0 = dy0 > sct ? dy0 : sct;
+    int x1 = (dx0 + w - 1) < scr ? (dx0 + w - 1) : scr;
+    int y1 = (dy0 + h - 1) < scb ? (dy0 + h - 1) : scb;
+    if (x1 < x0 || y1 < y0 || x0 < 0 || y0 < 0) {
+        // Wholly clipped, or clipped to a region that starts off the left or
+        // top of the surface — nothing addressable is left.
+        ++gEng.clippedOut;
+        return;
+    }
+    const u32 cw = static_cast<u32>(x1 - x0 + 1);
+    const u32 ch = static_cast<u32>(y1 - y0 + 1);
+    // The source follows the destination's clip, so clipping the top or left
+    // of the destination CLIPS the image rather than sliding it.
+    const int csx = sx0 + (x0 - dx0);
+    const int csy = sy0 + (y0 - dy0);
+    if (usesSrc && (csx < 0 || csy < 0)) {
+        ++gEng.clippedOut;
+        return;
+    }
+
+    // --- does it fit in VRAM -------------------------------------------
+    auto lastByte = [&](u32 off, u32 stride, int px, int py, u32 rows) {
+        return static_cast<u64>(off) +
+               static_cast<u64>(py + static_cast<int>(rows) - 1) * stride +
+               static_cast<u64>(px) * bypp + bypp;
+    };
+    if (lastByte(dstOff, dstStride, x0, y0, ch) > vram.size() ||
+        (usesSrc && lastByte(srcOff, srcStride, csx, csy, ch) > vram.size())) {
+        ++gEng.offVram;
+        return;
+    }
+
+    // ⚠ A COLOUR-KEY FUNCTION THIS ENGINE DOES NOT APPLY. The manual's own
+    // two renderings of CLR_CMP_FN_SRC contradict each other about which
+    // sense of the comparison suppresses the pixel, so implementing it from
+    // the document would be a guess in the one place a guess is invisible —
+    // transparent pixels drawn opaque look like an ordinary drawing bug. The
+    // blit still runs; the count says how often the omission could matter,
+    // and a non-zero count is the instruction to go and settle the semantics.
+    const u32 cmp = rd(kClrCmpCntl);
+    if ((cmp & 0x7u) || ((cmp >> 8) & 0x7u))
+        ++gEng.colorCompare;
+
+    // --- draw -----------------------------------------------------------
+    //
+    // ⚠ BYTE ORDER. This model's VRAM holds pixels exactly as the guest
+    // wrote them through the big-endian aperture, and the scanout in
+    // opm_screen reads a 32-bpp pixel as byte0=unused, byte1=R, byte2=G,
+    // byte3=B. A fill colour arriving in DP_BRUSH_FRGD_CLR is a plain 32-bit
+    // number, so it has to be stored MOST SIGNIFICANT BYTE FIRST for the
+    // three readers of this memory — the CPU, the scanout and this engine —
+    // to agree. Storing it the other way round is exactly the bug that once
+    // made a grey desktop come out olive.
+    const u32 wmask = rd(kDpWriteMsk);
+    // A write mask of zero means "mask nothing" here rather than "write
+    // nothing": the reset value is 0 and GMC_WR_MSK_DIS sets it to all ones,
+    // so a driver that never programs it must still be able to draw.
+    const u32 mask = wmask ? wmask : 0xFFFFFFFFu;
+    auto pixAt = [&](size_t o) {
+        u32 v = 0;
+        for (u32 k = 0; k < bypp; ++k)
+            v = (v << 8) | vram[o + k];
+        return v;
+    };
+    auto putPix = [&](size_t o, u32 v) {
+        if (mask != 0xFFFFFFFFu)
+            v = (pixAt(o) & ~mask) | (v & mask);
+        for (u32 k = 0; k < bypp; ++k)
+            vram[o + k] = static_cast<u8>(v >> (8 * (bypp - 1 - k)));
+    };
+
+    const bool plain = mask == 0xFFFFFFFFu;
+    if (!usesSrc && !usesDst) {
+        // The result does not depend on anything that varies across the
+        // rectangle, so evaluate the op ONCE and fill. This is PATCOPY,
+        // BLACKNESS and WHITENESS, and every other op that reduces to a
+        // constant — no special cases, they just land here.
+        ++gEng.fills;
+        const u32 fill = rop3(rop, pat, 0, 0);
+        for (u32 r = 0; r < ch; ++r) {
+            const size_t d = dstOff + (static_cast<size_t>(y0) + r) * dstStride +
+                             static_cast<size_t>(x0) * bypp;
+            for (u32 c = 0; c < cw; ++c)
+                putPix(d + static_cast<size_t>(c) * bypp, fill);
+        }
+    } else if (rop == 0xCCu && plain) {
+        // Straight SRCCOPY with no write mask: whole rows at a time.
+        ++gEng.copies;
+        for (u32 r = 0; r < ch; ++r) {
+            // Overlapping copies: the row ORDER is what makes a downward
+            // scroll correct, and memmove makes each row correct however the
+            // spans overlap horizontally.
+            const u32 rr = t2b ? r : ch - 1u - r;
+            const size_t d = dstOff + (static_cast<size_t>(y0) + rr) * dstStride +
+                             static_cast<size_t>(x0) * bypp;
+            const size_t s = srcOff + (static_cast<size_t>(csy) + rr) * srcStride +
+                             static_cast<size_t>(csx) * bypp;
+            memmove(&vram[d], &vram[s], static_cast<size_t>(cw) * bypp);
+        }
+    } else {
+        // The general case: evaluate the truth table per pixel.
+        ++gEng.copies;
+        for (u32 r = 0; r < ch; ++r) {
+            const u32 rr = t2b ? r : ch - 1u - r;
+            const size_t d = dstOff + (static_cast<size_t>(y0) + rr) * dstStride +
+                             static_cast<size_t>(x0) * bypp;
+            const size_t s = srcOff + (static_cast<size_t>(csy) + rr) * srcStride +
+                             static_cast<size_t>(csx) * bypp;
+            // ⚠ Direction matters here for the same reason the row order
+            // does. memmove sorts out a horizontal overlap on its own; a hand
+            // loop does not, and walking the wrong way across a row that
+            // overlaps its own source reads pixels it has already written.
+            // DST_X_DIR is the driver saying which way is safe — follow it.
+            for (u32 c = 0; c < cw; ++c) {
+                const u32 cc = l2r ? c : cw - 1u - c;
+                const size_t dp = d + static_cast<size_t>(cc) * bypp;
+                const u32 S = usesSrc ? pixAt(s + static_cast<size_t>(cc) * bypp)
+                                      : 0u;
+                const u32 D = usesDst ? pixAt(dp) : 0u;
+                putPix(dp, rop3(rop, pat, S, D));
+            }
+        }
+    }
+    ++gEng.blits;
+    gEng.pixels += static_cast<u64>(cw) * ch;
+    // Keep the painted span honest: the screen dump and the "did anything
+    // reach the framebuffer" report both read it, and a desktop drawn
+    // entirely by the engine would otherwise look like a machine that never
+    // painted at all.
+    const u32 lo = dstOff + static_cast<u32>(y0) * dstStride +
+                   static_cast<u32>(x0) * bypp;
+    const u32 hi = static_cast<u32>(lastByte(dstOff, dstStride, x1, y1, 1) - 1);
+    if (lo < fbLo)
+        fbLo = lo;
+    if (hi > fbHi)
+        fbHi = hi;
+}
+
+// Absorb a write into the engine block. Returns true when the write has been
+// fully handled and must not also fall through to the plain register store.
+bool R128Cell::engWrite(u32 off, u32 v)
+{
+    switch (off) {
+    // --- composite registers: normalise into the canonical pair ---------
+    //
+    // Every one of these is marked [W] in the reference guide — they are
+    // write-only aliases, so nothing is lost by decomposing them, and
+    // decomposing is what lets the blit read ONE canonical set.
+    case kDstPitchOffset:
+        regs_[kDstOffset] = (v & 0x1FFFFFu) << 5;
+        regs_[kDstPitch] = (v >> 21) & 0x3FFu;
+        return true;
+    case kSrcPitchOffset:
+        regs_[kSrcOffset] = (v & 0x1FFFFFu) << 5;
+        regs_[kSrcPitch] = (v >> 21) & 0x3FFu;
+        return true;
+    case kSrcYX:
+        regs_[kSrcX] = v & 0x3FFFu;
+        regs_[kSrcY] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kDstYX:
+        regs_[kDstX] = v & 0x3FFFu;
+        regs_[kDstY] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kSrcXY:
+        regs_[kSrcY] = v & 0x3FFFu;
+        regs_[kSrcX] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kDstXY:
+        regs_[kDstY] = v & 0x3FFFu;
+        regs_[kDstX] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kDstHeightY:
+        regs_[kDstY] = v & 0x3FFFu;
+        regs_[kDstHeight] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kScTopLeft:
+    case kScTopLeftC: // "Aliased to SC_TOP_LEFT"
+        regs_[kScLeft] = v & 0x3FFFu;
+        regs_[kScTop] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kScBottomRight:
+    case kScBottomRightC: // "Aliased to SC_BOTTOM_RIGHT"
+        regs_[kScRight] = v & 0x3FFFu;
+        regs_[kScBottom] = (v >> 16) & 0x3FFFu;
+        return true;
+    case kSrcScBottomRight:
+        regs_[kSrcScRight] = v & 0x3FFFu;
+        regs_[kSrcScBottom] = (v >> 16) & 0x3FFFu;
+        return true;
+
+    // --- the master control, and its side effects -----------------------
+    case kDpGuiMasterCntl: {
+        regs_[kDpGuiMasterCntl] = v;
+        // The GMC word CARRIES the datapath fields; writing it is how a
+        // driver sets datatype and mix in one store. Field positions are the
+        // reference guide's: brush 7:4, dst 11:8, src 13:12, byte-pixel
+        // order 14, ROP3 23:16, source select 26:24.
+        regs_[kDpDatatype] = ((v & 0x0F00u) >> 8) |    // dst  -> 3:0
+                             ((v & 0x30F0u) << 4) |    // brush -> 11:8, src -> 17:16
+                             ((v & 0x4000u) << 16);    // byte order -> 30
+        regs_[kDpMix] = (v & 0x00FF0000u) |            // ROP3 stays at 23:16
+                        ((v & 0x07000000u) >> 16);     // source -> 10:8
+        // ⭐ A GMC WRITE RESETS THE DIRECTION. The reference guide says so
+        // twice, under DP_CNTL's DST_X_DIR and DST_Y_DIR: "This bit is set
+        // to '1' by a GUI_MASTER_CNTL write." QEMU does not model it, and
+        // without it a blit that follows a reversed-direction blit would
+        // inherit a direction the hardware had already cleared — which shows
+        // up as one torn rectangle after a scroll and nothing else.
+        regs_[kDpCntl] = rd(kDpCntl) | 0x3u;
+        if (!(v & 0x1u)) { // GMC_SRC_PITCH_OFFSET_CNTL
+            regs_[kSrcOffset] = rd(kDefaultOffset);
+            regs_[kSrcPitch] = rd(kDefaultPitch);
+        }
+        if (!(v & 0x2u)) { // GMC_DST_PITCH_OFFSET_CNTL
+            regs_[kDstOffset] = rd(kDefaultOffset);
+            regs_[kDstPitch] = rd(kDefaultPitch);
+        }
+        if (!(v & 0x4u)) { // GMC_SRC_CLIPPING
+            regs_[kSrcScRight] = rd(kDefaultScBr) & 0x3FFFu;
+            regs_[kSrcScBottom] = (rd(kDefaultScBr) >> 16) & 0x3FFFu;
+        }
+        if (!(v & 0x8u)) { // GMC_DST_CLIPPING
+            regs_[kScLeft] = 0;
+            regs_[kScTop] = 0;
+            regs_[kScRight] = rd(kDefaultScBr) & 0x3FFFu;
+            regs_[kScBottom] = (rd(kDefaultScBr) >> 16) & 0x3FFFu;
+        }
+        if (v & 0x10000000u) // GMC_CLR_CMP_CNTL_DIS
+            regs_[kClrCmpCntl] = 0;
+        if (v & 0x20000000u) // GMC_AUX_CLIP_DIS: clear every AUXn_SC_ENB
+            regs_[kAuxScCntl] = rd(kAuxScCntl) & ~0x00010101u;
+        if (v & 0x40000000u) { // GMC_WR_MSK_DIS
+            regs_[kDpWriteMsk] = 0xFFFFFFFFu;
+            regs_[kClrCmpMsk] = 0xFFFFFFFFu;
+        }
+        return true;
+    }
+
+    // --- the initiators -------------------------------------------------
+    //
+    // "Trajectory registers ... set up the source and destination
+    // trajectories and initiate draw operations" (§2.1.5). The write that
+    // supplies the WIDTH is the one that starts the engine; DST_WIDTH_BW is
+    // the only one the guide names outright ("this is an initiator
+    // register"), and QEMU's oracle supplies the rest of the set.
+    case kDstWidth:
+        regs_[kDstWidth] = v & 0x3FFFu;
+        engBlit();
+        return true;
+    case kDstWidthBw:
+        regs_[kDstWidth] = v & 0x3FFFu;
+        engBlit();
+        return true;
+    case kDstHeightWidth:
+        regs_[kDstWidth] = v & 0x3FFFu;
+        regs_[kDstHeight] = (v >> 16) & 0x3FFFu;
+        engBlit();
+        return true;
+    case kDstWidthHeight:
+        regs_[kDstHeight] = v & 0x3FFFu;
+        regs_[kDstWidth] = (v >> 16) & 0x3FFFu;
+        engBlit();
+        return true;
+    case kDstWidthX:
+        regs_[kDstX] = v & 0x3FFFu;
+        regs_[kDstWidth] = (v >> 16) & 0x3FFFu;
+        engBlit();
+        return true;
+    case kDstWidthXIncy:
+        regs_[kDstX] = v & 0x3FFFu;
+        regs_[kDstWidth] = (v >> 16) & 0x3FFFu;
+        engBlit();
+        // ...and then step down one scanline, which is what the INCY in the
+        // name is for: it draws a run of single rows without reprogramming Y.
+        regs_[kDstY] = (rd(kDstY) + 1u) & 0x3FFFu;
+        return true;
+
+    // --- the pixel cache -------------------------------------------------
+    case kPcGuiCtlstat:
+        // ⭐ THESE ARE SELF-CLEARING COMMAND PULSES, NOT STORAGE. ATI's own
+        // wording, on every one of bits 0..9: "Once a bit in the field is set,
+        // it will remain set until the flush is complete, then the Pixel Cache
+        // will automatically clear it."
+        //
+        // The accelerator writes 0x000000FF here — `R128_PC_FLUSH_ALL`, flush
+        // and read-invalidate both the GUI and non-GUI sides — and then reads
+        // the register back. Storing the value and answering it back for ever
+        // reports a cache flush that NEVER COMPLETES, and it does it silently,
+        // because the offset is inside an aperture this card claims.
+        //
+        // This model has no pixel cache to flush and every blit is already
+        // resident in VRAM by the time the triggering store returns, so the
+        // flush is complete the instant it is asked for. Answer accordingly:
+        // command bits clear, and the read-only status bits 24..31 (PC_DIRTY,
+        // PC_BUSY_FLUSH, PC_BUSY_GUI, PC_BUSY) all idle. That is the whole
+        // register, so it reads back zero.
+        ++gEng.cacheFlushes;
+        regs_[kPcGuiCtlstat] = 0;
+        return true;
+
+    // --- stalls ----------------------------------------------------------
+    case kWaitUntil:
+        // Every WAIT_UNTIL event asks the command FIFO to stall until some
+        // engine reaches a milestone. This engine completes each operation
+        // inside the store that triggered it, so every milestone is already
+        // behind us and the stall is a no-op — which is the honest answer
+        // here, not a shortcut. Counted, because a driver leaning on
+        // EVENT_CRTC_OFFSET for page flips would need the CRTC side too.
+        ++gEng.waitUntil;
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
 void R128Cell::note(u32 off, u32 val, bool wr)
 {
     // The card's own FCode bring-up issues thousands of accesses around
@@ -269,6 +1130,8 @@ u32 R128Cell::read(u32 off, u32 len)
     readCount[off & ~3u]++;
     const u32 native = regRead(off >> 2);
     note(off & ~3u, native, false);
+    noteEngine(off & ~3u, native, pcRef ? *pcRef : 0, stamp ? *stamp : 0,
+               false);
     if (len == 4)
         return swap32(native);
     u32 r = 0;
@@ -293,7 +1156,14 @@ void R128Cell::write(u32 off, u32 v, u32 len)
     }
     const u64 at = stamp ? *stamp : 0;
     note(off & ~3u, native, true);
+    noteEngine(off & ~3u, native, pcRef ? *pcRef : 0, at, true);
     const u32 aligned = off & ~3u;
+    // The GUI block first: a write there may be an alias to normalise or the
+    // initiator of a draw, and in either case it must not also land in the
+    // plain register store under its own offset.
+    if (gEng2dOn && aligned >= 0x1400u && aligned < 0x2000u &&
+        engWrite(aligned, native))
+        return;
     if (aligned == kClockCntlIndex) {
         pllAddr_ = native & 0xFFu;
         // write-enable bit 7: data writes land in the PLL file

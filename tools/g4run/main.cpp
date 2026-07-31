@@ -549,6 +549,7 @@ int main(int argc, char** argv)
     const char* serialLogPath = nullptr; // --serial-log FILE
     u64 serialRate = 0;                // --serial-rate N
     u64 atiLogFrom = 0;                // --ati-log-from N
+    u64 atiEngLog = 0;                 // --ati-engine-log N
     u64 ataLogFrom = 0;                // --ata-log-from N
     bool ataLatch = false;             // --ata-latch
     u64 wmapFrom = 0, wmapTo = 0;      // --wmap FROM TO
@@ -826,12 +827,27 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ata-latch")) ataLatch = true;
         else if (!strcmp(a, "--ata-log-from"))
             ataLogFrom = strtoull(next(), nullptr, 0);
-        else if (!strcmp(a, "--ati-log-from"))
-            atiLogFrom = strtoull(next(), nullptr, 0);
-        else if (!strcmp(a, "--ati-vbl"))
-            atiVbl = true;
-        else if (!strcmp(a, "--no-ati-vbl"))
-            atiVbl = false;
+        // ⚠ TWO FLAGS, ONE BRANCH, ON PURPOSE. This else-if chain is at MSVC's
+        // block-nesting ceiling: adding one more link is C1061 "blocks nested
+        // too deeply" and the file stops compiling. Any new option has to join
+        // an existing branch until the chain is restructured into a table.
+        else if (!strcmp(a, "--ati-log-from") ||
+                 !strcmp(a, "--ati-engine-log")) {
+            const bool eng = strstr(a, "engine") != nullptr;
+            const u64 n = strtoull(next(), nullptr, 0);
+            (eng ? atiEngLog : atiLogFrom) = n;
+        }
+        // Three card switches in one branch — see the note on --ati-log-from:
+        // this chain is at MSVC's block-nesting ceiling, so collapsing links
+        // is the only way to add an option. Folding these three together
+        // frees two.
+        else if (!strcmp(a, "--ati-vbl") || !strcmp(a, "--no-ati-vbl") ||
+                 !strcmp(a, "--no-ati-2d")) {
+            if (!strcmp(a, "--no-ati-2d"))
+                r128SetEngine2d(false);
+            else
+                atiVbl = strncmp(a, "--no", 4) != 0;
+        }
         else if (!strcmp(a, "--kl-timer"))
             klTimer = true;
         else if (!strcmp(a, "--no-kl-timer"))
@@ -1121,6 +1137,8 @@ int main(int argc, char** argv)
         bus.rxPaceInsns = serialRate;
     if (atiLogFrom)
         bus.ati().logFrom = atiLogFrom;
+    if (atiEngLog)
+        r128SetEngineLog(static_cast<size_t>(atiEngLog));
     if (ataLogFrom) {
         bus.ataLogFrom = ataLogFrom;
         // One window, every ATA instrument. The DBDMA logs were unwindowed
@@ -1967,9 +1985,20 @@ int main(int argc, char** argv)
                 // A trace through a syscall that prints neither shows the
                 // dispatcher running and cannot say what was asked or what
                 // came back.
-                printf(" | r0=%08x r3=%08x r4=%08x lr=%08x cr0=%x\n",
+                //
+                // r28/r29/r31 are here for the ATI Resource Manager's wait:
+                // r31 is its device record (the card base is [r31+4] and the
+                // completion fence is the POINTER at [r31+0xC4]), and r28:r29
+                // is the 64-bit deadline the engine timestamp is compared
+                // against. Printing the pointer and the value being compared
+                // is what turns "it polls something in memory" into an
+                // address -- and an address says whether the fence lives in
+                // VRAM or in system RAM, which decides what has to write it.
+                printf(" | r0=%08x r3=%08x r4=%08x lr=%08x cr0=%x"
+                       " r28=%08x r29=%08x r31=%08x\n",
                        cpu.st.gpr[0], cpu.st.gpr[3], cpu.st.gpr[4], cpu.st.lr,
-                       (cpu.st.cr >> 28) & 15u);
+                       (cpu.st.cr >> 28) & 15u, cpu.st.gpr[28], cpu.st.gpr[29],
+                       cpu.st.gpr[31]);
             if (executed + 1 == traceFrom + traceLines)
                 printf("-- trace window done (%llu lines)\n",
                        static_cast<unsigned long long>(traceLines));
@@ -5323,6 +5352,62 @@ int main(int argc, char** argv)
                 for (size_t i = 0; i < ub.size() && i < 12; ++i)
                     printf("--   %04x  %llu reads\n", ub[i].second,
                            static_cast<unsigned long long>(ub[i].first));
+            }
+        }
+        // ⭐ WHAT THE 2D ENGINE ACTUALLY DID. "The driver wrote engine
+        // registers" and "the engine drew something" are different claims,
+        // and the gap between them is every way a blit can be declined. Each
+        // refusal has its own counter so an unimplemented raster op or an
+        // unreachable destination is a number here rather than a screen that
+        // is wrong for no stated reason.
+        {
+            const auto& e = r128EngStats();
+            printf("-- ati 2D ENGINE: %llu blits (%llu copy, %llu fill), "
+                   "%llu pixels; wait_until %llu\n",
+                   static_cast<unsigned long long>(e.blits),
+                   static_cast<unsigned long long>(e.copies),
+                   static_cast<unsigned long long>(e.fills),
+                   static_cast<unsigned long long>(e.pixels),
+                   static_cast<unsigned long long>(e.waitUntil));
+            printf("--   declined: rop %llu, bpp %llu, pitch0 %llu, "
+                   "off-vram %llu, agp %llu, clipped %llu, hostdata %llu; "
+                   "colour-key ignored %llu\n",
+                   static_cast<unsigned long long>(e.ropUnimpl),
+                   static_cast<unsigned long long>(e.badBpp),
+                   static_cast<unsigned long long>(e.zeroPitch),
+                   static_cast<unsigned long long>(e.offVram),
+                   static_cast<unsigned long long>(e.agpTarget),
+                   static_cast<unsigned long long>(e.clippedOut),
+                   static_cast<unsigned long long>(e.hostData),
+                   static_cast<unsigned long long>(e.colorCompare));
+            const auto& ru = r128RopUnimplemented();
+            if (!ru.empty()) {
+                printf("--   raster ops not implemented (rop3:count):");
+                for (const auto& [r, n] : ru)
+                    printf(" %02x:%llu", r,
+                           static_cast<unsigned long long>(n));
+                printf("\n");
+            }
+        }
+        // ⛳ THE ENGINE COMMAND STREAM ITSELF (--ati-engine-log N). The census
+        // above says WHICH engine registers the guest touched and how often;
+        // only this says what it ASKED FOR. A blit is a run of register writes
+        // ending in a trigger, so the order and the values are the entire
+        // content of the request — and the register written LAST is the one
+        // that starts the operation.
+        {
+            const auto& el = r128EngineLog();
+            if (!el.empty()) {
+                printf("-- ati ENGINE stream (0x0700-0x1fff): %zu captured, "
+                       "%llu dropped between head and tail\n",
+                       el.size(),
+                       static_cast<unsigned long long>(r128EngineLogDropped()));
+                for (const auto& e : el)
+                    printf("   %c +%04x %08x %-24s pc=%08x @%llu\n",
+                           e.wr ? 'w' : 'r', e.off, e.val,
+                           r128RegName(e.off) ? r128RegName(e.off)
+                                              : "(unnamed)",
+                           e.pc, static_cast<unsigned long long>(e.at));
             }
         }
         // The vertical blank, end to end in one line. The register traffic log

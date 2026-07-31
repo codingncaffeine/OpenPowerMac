@@ -175,6 +175,30 @@ private:
     }
     u32 regRead(u32 idx);
     void note(u32 off, u32 val, bool wr);
+    // --- The 2D engine ---------------------------------------------------
+    //
+    // ⭐ ALL ENGINE STATE LIVES IN `regs_`, WHICH IS ALREADY SNAPSHOTTED, AND
+    // THAT IS THE WHOLE DESIGN. A member struct of engine registers would
+    // change sizeof(R128Cell) and therefore sizeof(SawtoothBus), which the
+    // layout digest hashes — every existing snapshot would die and
+    // kSnapVersion would have to move. Instead the aliases and the composite
+    // registers are NORMALISED into their canonical offsets as they are
+    // written, and a blit reads its parameters back out of the same map. The
+    // engine adds no state of its own at all; it only adds behaviour.
+    u32 rd(u32 off) const
+    {
+        auto it = regs_.find(off);
+        return it != regs_.end() ? it->second : 0;
+    }
+    // Execute the pending operation. Called from write() on the register the
+    // guest wrote LAST — the Rage's trajectory registers "initiate draw
+    // operations" (§2.1.5 of ATI's reference guide), so the trigger is a
+    // write, not a command word.
+    void engBlit();
+    // Absorb a write into the engine block: normalise aliases, apply the
+    // side effects of a DP_GUI_MASTER_CNTL write, and initiate on a trigger.
+    // Returns true when it has fully handled the write.
+    bool engWrite(u32 off, u32 v);
 
     std::map<u32, u32> regs_; // sparse store, offsets word-aligned
     std::map<u32, u32> seen_; // first-touch dedup for the log
@@ -196,5 +220,68 @@ private:
 // written at that offset — reads this card answered with zero and always will.
 // See the census in r128.cpp for why this is separate from readCount.
 const std::map<u32, u64>& r128RegReadsUnbacked();
+
+// --- The engine command stream, in order ---------------------------------
+//
+// The register census says WHICH engine registers the guest touches, and the
+// unbacked-read census says which of those this model never answers. Neither
+// can say what a BLIT LOOKS LIKE — and a blit is a dozen writes whose meaning
+// is their order and their values, with the trigger being the last one. The
+// existing `log` cannot serve: it is a 4096-entry ring shared with the card's
+// own FCode bring-up, and it deduplicates reads.
+//
+// So capture the engine half of the card on its own (0x0700–0x1FFF: the
+// CCE/PM4 block, video, bus mastering, the surface apertures and the whole
+// GUI block), in order, with values — head plus a ring tail, and the number
+// that fell between them REPORTED rather than dropped in silence. A truncated
+// sample is not evidence of absence; this project has paid for that twice.
+//
+// File-statics behind free functions, deliberately: adding a member to
+// R128Cell changes sizeof(SawtoothBus), which kills every snapshot.
+struct R128EngEv {
+    u64 at;
+    u32 off, val, pc;
+    bool wr;
+};
+void r128SetEngineLog(size_t maxEntries);
+// The capture, already stitched: the head, then the ring tail oldest-first.
+const std::vector<R128EngEv>& r128EngineLog();
+u64 r128EngineLogDropped();
+// A register's name from ATI's own reference guide where the OEM edition
+// documents it, and from QEMU's map where that edition redacts the CCE block.
+// nullptr where neither names it — an offset with no name is a finding, not a
+// gap to be filled with a guess.
+const char* r128RegName(u32 off);
+
+// --- What the 2D engine did, and what it refused to do -------------------
+//
+// A blitter that quietly declines is worse than one that is absent: the
+// screen is wrong and nothing says why. Every path that ends without drawing
+// increments one of these, so an unimplemented raster op or an unreachable
+// destination is a NUMBER IN THE REPORT rather than a rendering mystery.
+struct R128EngStats {
+    u64 blits = 0;       // operations executed
+    u64 pixels = 0;      // destination pixels written
+    u64 fills = 0, copies = 0;
+    u64 ropUnimpl = 0;   // (all 256 ROP3s are evaluated; kept for the report)
+    u64 brushUnimpl = 0; // an op that reads a pattern this engine has no data for
+    u64 monoSrc = 0;     // a 1-bit source expanded through frgd/bkgd — not built
+    u64 badBpp = 0;      // a destination datatype it cannot size
+    u64 zeroPitch = 0;   // a pitch of zero — nothing addressable
+    u64 offVram = 0;     // a rectangle that would run off the end of VRAM
+    u64 agpTarget = 0;   // an offset in the upper 32 MB: AGP, not VRAM
+    u64 clippedOut = 0;  // entirely outside the scissor
+    u64 hostData = 0;    // source is HOST_DATA (stage 3, not built yet)
+    u64 colorCompare = 0; // a colour-key function this engine ignores
+    u64 waitUntil = 0;   // WAIT_UNTIL events, all satisfiable at once here
+    u64 cacheFlushes = 0; // PC_GUI_CTLSTAT flush/invalidate pulses answered
+};
+const R128EngStats& r128EngStats();
+// --no-ati-2d: put the card back the way it was before the engine existed,
+// so a boot that never touches the GUI block can be shown to be unchanged.
+void r128SetEngine2d(bool on);
+// The raster ops that were refused, busiest first, so "which op do I have to
+// implement next" is answered by the instrument and not by guesswork.
+const std::map<u32, u64>& r128RopUnimplemented();
 
 } // namespace opm

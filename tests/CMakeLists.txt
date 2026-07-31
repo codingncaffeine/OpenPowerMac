@@ -5,6 +5,7 @@ add_executable(opm_unit
   unit/test_mmu.cpp
   unit/test_chip.cpp
   unit/test_ati.cpp
+  unit/test_r128_2d.cpp
   unit/test_macio.cpp
   unit/test_snapshot.cpp
   unit/test_ata.cpp

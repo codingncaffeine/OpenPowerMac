@@ -5,8 +5,10 @@
 #include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -549,6 +551,53 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                          w1 & 3u, match ? "   <== MATCHES the faulting EA" : "");
                 s += b;
             }
+        }
+    }
+    // 📋 THE REGISTERS. A guest polling a device holds the base address it is
+    // polling in a register — this capture showed a loop calling a little-
+    // endian accessor (lwbrx/stwbrx + eieio at DBDMA offsets 0x04/0x0C) with
+    // the base in r3, and no way to see what that base WAS. Thirty-two words
+    // is nothing next to another ten-minute run.
+    for (u32 row = 0; row < 8; ++row) {
+        snprintf(b, sizeof b, "--   r%-2u %08x  r%-2u %08x  r%-2u %08x  r%-2u %08x\n",
+                 row * 4, cpu.st.gpr[row * 4], row * 4 + 1,
+                 cpu.st.gpr[row * 4 + 1], row * 4 + 2, cpu.st.gpr[row * 4 + 2],
+                 row * 4 + 3, cpu.st.gpr[row * 4 + 3]);
+        s += (row == 0) ? std::string("-- gprs:\n") + b : std::string(b);
+    }
+    // ⭐ WHAT THE MACHINE ASKED FOR AND NOBODY ANSWERED. Every access that no
+    // device claims master-aborts (reads all-ones, writes dropped) and lands
+    // here, keyed by address. A driver polling a register block this emulator
+    // does not model reads 0xFFFFFFFF forever and waits forever — which is
+    // exactly the shape of a boot that stops during extension loading.
+    //
+    // Sorted by traffic, because the one being polled in a loop is the one
+    // with the enormous count. ⚠ firstPc names Open Firmware's shared access
+    // primitive rather than the driver, which is why the bus also tracks LR.
+    {
+        const auto& lg = m->bus->accessLog();
+        std::vector<std::pair<u64, const std::pair<const u32, SawtoothBus::Acc>*>>
+            hot;
+        for (const auto& kv : lg)
+            hot.push_back({kv.second.reads + kv.second.writes, &kv});
+        std::sort(hot.begin(), hot.end(),
+                  [](const auto& a, const auto& c) { return a.first > c.first; });
+        snprintf(b, sizeof b,
+                 "-- unclaimed bus accesses: %zu distinct addresses, busiest "
+                 "first:\n",
+                 lg.size());
+        s += b;
+        for (size_t k = 0; k < hot.size() && k < 12; ++k) {
+            const auto& kv = *hot[k].second;
+            snprintf(b, sizeof b,
+                     "--   %08x  reads=%llu writes=%llu lastWr=%08x "
+                     "firstPc=%08x @%llu\n",
+                     kv.first,
+                     static_cast<unsigned long long>(kv.second.reads),
+                     static_cast<unsigned long long>(kv.second.writes),
+                     kv.second.lastWr, kv.second.firstPc,
+                     static_cast<unsigned long long>(kv.second.firstAt));
+            s += b;
         }
     }
     s += m->bus->pic().describe();

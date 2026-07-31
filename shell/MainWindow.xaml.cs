@@ -485,6 +485,37 @@ public partial class MainWindow : Window
         UpdateTitle();
     }
 
+    // Eject rather than "detach", because that is the decision being made: a
+    // Mac with a bootable CD in the drive boots the CD, so taking it out is
+    // how you tell it to boot the disk you just installed onto. Open Firmware
+    // is where that preference lives, and this is the honest way to express it
+    // without teaching the shell to rewrite NVRAM.
+    private void OnEjectCd(object sender, RoutedEventArgs e)
+    {
+        _settings.CdPath = "";
+        _settings.Save();
+        UpdateTitle();
+        if (_session is { Running: true })
+            MessageBox.Show(
+                this,
+                "CD ejected.\n\nThe machine is running and opened its media "
+                + "when it started — this takes effect the next time you "
+                + "start it.",
+                "Eject CD", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    // 🩺 The report a stall needs, delivered to the console pane so it can be
+    // read and copied. Asked for on the machine's own thread — see
+    // MachineSession.RequestDiagnostics.
+    private void OnDiagnostics(object sender, RoutedEventArgs e)
+    {
+        if (_session is { Running: true } s)
+            s.RequestDiagnostics();
+        else
+            MessageBox.Show(this, "The machine is not running.", "Diagnostics",
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
     private void OnChooseAti(object sender, RoutedEventArgs e)
     {
         var dlg = new OpenFileDialog

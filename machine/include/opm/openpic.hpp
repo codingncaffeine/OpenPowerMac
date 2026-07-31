@@ -1,6 +1,7 @@
 #pragma once
 #include "opm/types.hpp"
 
+#include <string>
 #include <vector>
 
 namespace opm {
@@ -36,6 +37,12 @@ public:
     // priority does not beat the task priority, or an earlier interrupt is
     // still in service and was never EOId.
     void dumpState() const;
+    // ⭐ The same report as a string. This is the instrument that named the
+    // session-29 wedge — a level-triggered source held high that nothing ever
+    // lowered, sitting in service and blocking every other device — and that
+    // failure mode looks exactly like a frozen machine from the outside. A GUI
+    // has no stdout, so opm_diag needs it in this form.
+    std::string describe() const;
     // --vbl-trace N: print the first N iack/eoi events. `log` is capped at 512
     // AND snapshotted, so on a resume its tail sits in Open Firmware's era and
     // it cannot answer "which iack went un-EOI'd". A static, so sizeof(OpenPic)

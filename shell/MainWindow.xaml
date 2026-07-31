@@ -12,6 +12,11 @@
             <MenuItem Header="_File">
                 <MenuItem x:Name="miRom" Header="Choose Boot ROM…" Click="OnChooseRom" />
                 <MenuItem x:Name="miCd" Header="Choose CD Image…" Click="OnChooseCd" />
+                <!-- Ejecting the CD is how a Mac chooses to boot from its hard
+                     disk: Open Firmware prefers the CD while one is in the
+                     drive. Without this the only way back to the disk was to
+                     edit shell.json. -->
+                <MenuItem x:Name="miCdEject" Header="_Eject CD (boot from hard disk)" Click="OnEjectCd" />
                 <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
                 <Separator />
                 <!-- The disks. Built on open (OnHardDiskOpened) because the
@@ -41,6 +46,10 @@
                 <Separator />
                 <MenuItem x:Name="miSound" Header="_Sound" IsCheckable="True"
                           Click="OnSoundToggled" />
+                <Separator />
+                <!-- For the machine that stopped doing anything. See opm_diag. -->
+                <MenuItem x:Name="miDiag" Header="_Diagnostics — why is it stuck?"
+                          Click="OnDiagnostics" />
             </MenuItem>
         </Menu>
 

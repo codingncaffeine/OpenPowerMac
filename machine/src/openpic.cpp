@@ -167,24 +167,44 @@ u32 OpenPic::iack()
 // taskPri_, and cpuLine() additionally requires that nothing is still in
 // service. Any of those three silently turns a raised line into no
 // interrupt at all, and none of them are visible from a raise count.
-void OpenPic::dumpState() const
+std::string OpenPic::describe() const
 {
-    printf("-- openpic state: taskPri=%u inService=%d cpuLine=%d\n",
-           taskPri_, inService_, cpuLine() ? 1 : 0);
+    char b[256];
+    std::string out;
+    snprintf(b, sizeof b,
+             "-- openpic state: taskPri=%u inService=%d cpuLine=%d\n",
+             taskPri_, inService_, cpuLine() ? 1 : 0);
+    out += b;
+    // ⚠ THE RAISE TALLY SITS BESIDE THE LINE STATE ON PURPOSE. A LEVEL source
+    // that is stuck raises exactly ONCE and then stays high, so its count
+    // reads like a device barely used — which is how the session-29 wedge hid
+    // behind `src 10 x1`. The shape to look for is line=1 with a SMALL count,
+    // not a big one.
     for (u32 s = 0; s < kSources; ++s) {
         if (!line_[s] && !pending_[s] && !vp_[s])
             continue;
-        printf("   src %2u vp=%08x pri=%u %s line=%d pending=%d dest=%08x\n",
-               s, vp_[s], (vp_[s] >> 16) & 0xFu,
-               (vp_[s] & 0x80000000u) ? "MASKED" : "enabled",
-               line_[s] ? 1 : 0, pending_[s] ? 1 : 0, dest_[s]);
+        snprintf(b, sizeof b,
+                 "   src %2u vp=%08x pri=%u %s line=%d pending=%d raised=%llu "
+                 "dest=%08x\n",
+                 s, vp_[s], (vp_[s] >> 16) & 0xFu,
+                 (vp_[s] & 0x80000000u) ? "MASKED" : "enabled",
+                 line_[s] ? 1 : 0, pending_[s] ? 1 : 0,
+                 static_cast<unsigned long long>(raiseCount[s]), dest_[s]);
+        out += b;
     }
-    printf("--   unclaimed writes into the controller window (%zu):\n",
-           unclaimed.size());
-    for (size_t k = 0; k < unclaimed.size() && k < 24; ++k)
-        printf("     +%05x <- %08x @%llu\n", unclaimed[k].off,
-               unclaimed[k].val,
-               static_cast<unsigned long long>(unclaimed[k].at));
+    snprintf(b, sizeof b,
+             "--   unclaimed writes into the controller window (%zu):\n",
+             unclaimed.size());
+    out += b;
+    for (size_t k = 0; k < unclaimed.size() && k < 24; ++k) {
+        snprintf(b, sizeof b, "     +%05x <- %08x @%llu\n", unclaimed[k].off,
+                 unclaimed[k].val,
+                 static_cast<unsigned long long>(unclaimed[k].at));
+        out += b;
+    }
+    return out;
 }
+
+void OpenPic::dumpState() const { fputs(describe().c_str(), stdout); }
 
 } // namespace opm

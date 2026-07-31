@@ -79,6 +79,19 @@ OPM_API int32_t opm_halted(const OpmMachine* m);
 // instruction-paced runs never wait, by design.
 OPM_API uint64_t opm_idle_ns(const OpmMachine* m);
 
+// 🩺 WHY IS THIS MACHINE NOT DOING ANYTHING? Fills `buf` with a text report of
+// the state a stall actually depends on: where the processor is and whether it
+// is asleep or halted, the interrupt controller (which source is raised, which
+// is in service, and how many times each has raised), and both ATA cells with
+// their data-phase counters. Returns the bytes written.
+//
+// ⭐ It exists because a wedge that happens while someone is USING the machine
+// is unreproducible from the command line — an OS install cannot be driven
+// headlessly — and every instrument this project owns printed to a stdout the
+// app does not have. A frozen emulator and a guest waiting forever on a device
+// look identical from outside; only these counters separate them.
+OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap);
+
 // Queue text for the serial console (CRs included by the caller).
 OPM_API void opm_serial(OpmMachine* m, const char* text);
 

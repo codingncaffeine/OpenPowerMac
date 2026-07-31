@@ -59,6 +59,11 @@ public:
     // stopped reading" and "the drive stopped offering" look identical from
     // the register trace; only the cell's own counters tell them apart.
     void dumpState(const char* who) const;
+    // The same report as a string, so it can reach somewhere other than this
+    // process's stdout. A GUI has no stdout, and a machine that wedges while
+    // the user is driving it interactively is exactly the machine whose state
+    // is worth having — see opm_diag.
+    std::string describe(const char* who) const;
 
     // Run the deferred command, if its BSY window has elapsed. Called from
     // the machine's peripheral tick.

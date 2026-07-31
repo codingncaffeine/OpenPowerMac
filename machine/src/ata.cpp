@@ -80,27 +80,43 @@ u32 AtaCell::intRegRead(u32 lane, u32 len) const
     return r;
 }
 
+std::string AtaCell::describe(const char* who) const
+{
+    char b[512];
+    std::string s;
+    snprintf(b, sizeof b,
+             "-- %s ata cell: present=%d disk=%d status=%02x err=%02x "
+             "nsect=%02x lba=%02x%02x%02x dev=%02x devctl=%02x irq=%d\n",
+             who, present() ? 1 : 0, disk_ ? 1 : 0, status_, error_, nsect_,
+             bcHi_, bcLo_, lba0_, dev_, devctl_, irq_ ? 1 : 0);
+    s += b;
+    snprintf(b, sizeof b,
+             "--   data phase: %zu bytes, %zu drained; readLba=%llu "
+             "readLeft=%u wrLeft=%u pulled=%u\n",
+             data_.size(), dataAt_,
+             static_cast<unsigned long long>(readLba_), readLeft_, wrLeft_,
+             pulled_);
+    s += b;
+    snprintf(b, sizeof b,
+             "--   dmaArmed=%d pending=%d pendCmd=%02x pendAtTb=%llu "
+             "nowTb=%llu cmdDelayTb=%llu multiple=%u\n",
+             dmaArmed_ ? 1 : 0, pending_ ? 1 : 0, pendCmd_,
+             static_cast<unsigned long long>(pendAtTb_),
+             static_cast<unsigned long long>(tbRef ? *tbRef : 0),
+             static_cast<unsigned long long>(cmdDelayTb_), multiple_);
+    s += b;
+    s += "--   cell regs +200..+2f0:";
+    for (u32 k = 0; k < 16; ++k) {
+        snprintf(b, sizeof b, " %08x", ctl_[k]);
+        s += b;
+    }
+    s += "\n";
+    return s;
+}
+
 void AtaCell::dumpState(const char* who) const
 {
-    printf("-- %s ata cell: present=%d disk=%d status=%02x err=%02x "
-           "nsect=%02x lba=%02x%02x%02x dev=%02x devctl=%02x irq=%d\n",
-           who, present() ? 1 : 0, disk_ ? 1 : 0, status_, error_, nsect_,
-           bcHi_, bcLo_, lba0_, dev_, devctl_, irq_ ? 1 : 0);
-    printf("--   data phase: %zu bytes, %zu drained; readLba=%llu "
-           "readLeft=%u wrLeft=%u pulled=%u\n",
-           data_.size(), dataAt_,
-           static_cast<unsigned long long>(readLba_), readLeft_, wrLeft_,
-           pulled_);
-    printf("--   dmaArmed=%d pending=%d pendCmd=%02x pendAtTb=%llu "
-           "nowTb=%llu cmdDelayTb=%llu multiple=%u\n",
-           dmaArmed_ ? 1 : 0, pending_ ? 1 : 0, pendCmd_,
-           static_cast<unsigned long long>(pendAtTb_),
-           static_cast<unsigned long long>(tbRef ? *tbRef : 0),
-           static_cast<unsigned long long>(cmdDelayTb_), multiple_);
-    printf("--   cell regs +200..+2f0:");
-    for (u32 k = 0; k < 16; ++k)
-        printf(" %08x", ctl_[k]);
-    printf("\n");
+    fputs(describe(who).c_str(), stdout);
 }
 
 void AtaCell::diskStartRead()

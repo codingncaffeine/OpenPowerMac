@@ -82,6 +82,15 @@ public sealed class MachineSession
     public void SendMouse(int dx, int dy, uint buttons) =>
         _mouseQ.Enqueue((dx, dy, buttons));
 
+    // 🩺 Ask for a state report. ⚠ It is a REQUEST rather than a call because
+    // the machine belongs to the run thread: reading its devices from the UI
+    // thread while that thread is inside opm_run is a data race, and the one
+    // moment anybody wants this is the moment the machine looks stuck — which
+    // is exactly when racing it would turn a diagnosable stall into a crash.
+    // The loop honours it between chunks and the text arrives on ConsoleQ.
+    private volatile bool _diagWanted;
+    public void RequestDiagnostics() => _diagWanted = true;
+
     private void Run(ShellSettings s)
     {
         Running = true;
@@ -172,6 +181,15 @@ public sealed class MachineSession
                 // chunk to its ceiling for a machine doing no work at all.
                 if (dt < 8 && executed != before) chunk = Math.Min(chunk * 2, 40_000_000);
                 else if (dt > 30) chunk = Math.Max(chunk / 2, 100_000);
+
+                // Between chunks, never during one — see RequestDiagnostics.
+                if (_diagWanted)
+                {
+                    _diagWanted = false;
+                    var db = new byte[16384];
+                    uint dn = Native.opm_diag(m, db, (uint)db.Length);
+                    ConsoleQ.Enqueue(System.Text.Encoding.ASCII.GetString(db, 0, (int)dn));
+                }
 
                 while (_serialQ.TryDequeue(out var text))
                     Native.opm_serial(m, text);

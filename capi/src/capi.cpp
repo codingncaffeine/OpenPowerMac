@@ -256,6 +256,54 @@ OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
     m->bus->deviceStateChanged();
 }
 
+OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
+{
+    if (!buf || !cap)
+        return 0;
+    const Cpu& cpu = m->cpu;
+    char b[512];
+    std::string s = "\n===== machine diagnostics =====\n";
+    snprintf(b, sizeof b,
+             "-- cpu: pc=%08x msr=%08x executed=%llu tb=%llu dec=%08x\n"
+             "--   napping=%d halted=%d%s%s\n",
+             cpu.st.pc, cpu.st.msr,
+             static_cast<unsigned long long>(m->executed),
+             static_cast<unsigned long long>(cpu.st.tb), cpu.st.dec,
+             cpu.napping ? 1 : 0, cpu.halted ? 1 : 0,
+             cpu.halted ? " reason=" : "",
+             cpu.halted ? cpu.haltReason.c_str() : "");
+    s += b;
+    snprintf(b, sizeof b, "--   irq lines: ext=%d dec=%d smi=%d pm=%d\n",
+             cpu.extIrqLine ? 1 : 0, cpu.decPending ? 1 : 0,
+             cpu.smiPending ? 1 : 0, cpu.pmPending ? 1 : 0);
+    s += b;
+    // ⏳ Whether this process is waiting or spinning, which says whether the
+    // guest is asleep-and-idle or awake-and-stuck. They look the same from a
+    // progress bar that stopped moving.
+    snprintf(b, sizeof b,
+             "-- pacing: realtime=%d slips=%llu idleWaits=%llu idleMs=%llu "
+             "skipped=%llu askCostUs=%llu\n",
+             m->realtime ? 1 : 0,
+             static_cast<unsigned long long>(m->pace.slips),
+             static_cast<unsigned long long>(m->idle.waits),
+             static_cast<unsigned long long>(m->idle.waitedNs / 1000000ull),
+             static_cast<unsigned long long>(m->idle.skipped),
+             static_cast<unsigned long long>(m->idle.overshootNs / 1000ull));
+    s += b;
+    s += m->bus->pic().describe();
+    s += m->bus->hd().describe("hd");
+    s += m->bus->cd().describe("cd");
+    s += "===== end =====\n";
+
+    uint32_t n = 0;
+    while (n + 1 < cap && n < s.size()) {
+        buf[n] = s[n];
+        ++n;
+    }
+    buf[n] = 0;
+    return n;
+}
+
 OPM_API uint32_t opm_console(OpmMachine* m, char* buf, uint32_t cap)
 {
     const std::string& con = m->bus->console();

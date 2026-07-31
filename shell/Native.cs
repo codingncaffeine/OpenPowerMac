@@ -41,6 +41,11 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern int opm_halted(IntPtr m);
 
+    // Why is this machine not doing anything? See opm_diag — processor,
+    // interrupt controller and both ATA cells, in one report.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_diag(IntPtr m, byte[] buf, uint cap);
+
     // Nanoseconds spent off the host processor since the machine was created.
     // Over elapsed time it is the share of a core the emulator is NOT burning.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
 
 namespace OpenPowerMac.Shell;
@@ -186,9 +187,30 @@ public sealed class MachineSession
                 if (_diagWanted)
                 {
                     _diagWanted = false;
-                    var db = new byte[16384];
+                    var db = new byte[65536];
                     uint dn = Native.opm_diag(m, db, (uint)db.Length);
-                    ConsoleQ.Enqueue(System.Text.Encoding.ASCII.GetString(db, 0, (int)dn));
+                    string text = System.Text.Encoding.ASCII.GetString(db, 0, (int)dn);
+                    ConsoleQ.Enqueue(text);
+                    // ⭐ AND TO A FILE. A wedge is reported by someone reading a
+                    // scrolling text pane and retyping what they see, which is
+                    // the step where the useful half gets dropped. Writing it
+                    // out means the report can be handed over whole.
+                    try
+                    {
+                        string dir = Path.Combine(
+                            Environment.GetFolderPath(
+                                Environment.SpecialFolder.LocalApplicationData),
+                            "OpenPowerMac");
+                        Directory.CreateDirectory(dir);
+                        string path = Path.Combine(
+                            dir, $"diag-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+                        File.WriteAllText(path, text);
+                        ConsoleQ.Enqueue($"[shell] diagnostics written to {path}\n");
+                    }
+                    catch (Exception ex)
+                    {
+                        ConsoleQ.Enqueue($"[shell] could not write diagnostics file: {ex.Message}\n");
+                    }
                 }
 
                 while (_serialQ.TryDequeue(out var text))

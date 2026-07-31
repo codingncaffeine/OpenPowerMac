@@ -43,3 +43,6 @@ tests/data/
 shell/bin/
 shell/obj/
 shell/native/
+
+# Release artifact (dotnet publish) — built every pass, never committed
+shell/publish/

@@ -66,23 +66,20 @@ static constexpr u32 kCrtcVblankInt = 0x00000001u;
 // later Radeon parts use a wider one, and treating every bit as writable lets
 // an acknowledge clear latches the hardware would have held.
 static constexpr u32 kGenIntAckMask = 0x000F040Fu;
-// One blank per frame of GUEST-PERCEIVED time, which is NOT the nominal 60 Hz
-// at 25 MHz (that would be 416,666).
+// One blank per frame: 60 Hz against a 25 MHz timebase.
 //
-// The timebase runs at bus/4 ≈ 24.94 MHz and the OHCI cell calls 25000 ticks a
-// millisecond, so nominally a frame is 416,666 ticks. But --fast-tb advances the
-// timebase far faster than instructions retire: a boot to the desktop logs
-// tb = 173,964,736,438, which is 6,958 s at 25 MHz, while the OS's own Ticks
-// reaches 9358, which is 156 s. Guest time is compressed about 44.6x, so the
-// nominal period would hand the guest ~2,550 blanks per second of its own time.
-// Polling devices survive that because nothing gates on their rate; an interrupt
-// does not.
+// This used to be 225,000,000 — 540 times too long — and its own comment
+// explained why: the OS's Ticks reached 9,358 while the timebase said 6,958
+// seconds had passed, so "guest-perceived time" looked 44.6x compressed and
+// the constant was scaled to suit. That 44.6x was not a property of the
+// machine. It was a defect: the guest calibrated its clock against a KeyLargo
+// timer nothing answered, saturated its timebase frequency to 2^30, and ran
+// every Duration 43x long (SawtoothBus::kKlTimerLo). With the timer answering,
+// Ticks tracks the timebase at 60 Hz and the nominal period is simply correct.
 //
-// 225,000,000 is one blank per frame as the guest experiences it, cross-checked
-// two ways: it yields 14 blanks over a 200 M-instruction window whose Ticks
-// advance ~170, and it matches the OS's own decrementer reload of 1,118,587 tb
-// times the ~15.9 reloads it takes per tick. --ati-vbl-tb overrides it.
-static constexpr u64 kTbPerVblank = 225000000ull;
+// A constant chosen to cancel a bug outlives the bug and reads like a model.
+// --ati-vbl-tb still overrides it.
+static constexpr u64 kTbPerVblank = 416666ull;
 // Harness knobs, not machine state — see the notes in the header.
 static u64 gVblTbPeriod = 0;
 static int gVblTrace = 0;

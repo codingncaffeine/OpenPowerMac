@@ -203,6 +203,10 @@ public:
     u64 devGen_ = 0, devGenSeen_ = ~0ull;
     u64 devDueTb_ = 0, devDueStamp_ = 0;
     bool cpuIrq_ = false;
+    // KeyLargo timer: the timebase at the last reload, the value reloaded,
+    // and the machine's current timebase (kept here because a register read
+    // has no clock of its own). See kKlTimerLo.
+    u64 klTimerTb_ = 0, klTimerVal_ = 0, klTb_ = 0;
     // DIAGNOSTIC (--no-dev-gate): service every device on every instruction,
     // the way the machine did before the gate existed. A gate is a claim —
     // "nothing can have changed" — and a claim about timing needs a control
@@ -316,6 +320,10 @@ public:
     void systemReset()
     {
         memset(unin_, 0, kUniNSize);
+        // The processor restart takes the timebase back to zero, so the
+        // timer's reload point has to come with it or the counter would sit
+        // frozen (clamped) until the guest happened to write it.
+        klTimerTb_ = klTimerVal_ = klTb_ = 0;
     }
 
     struct Acc {
@@ -331,6 +339,31 @@ public:
     // each new register the ROM consults stays visible. Blocks earn real
     // device models as the boot demands behavior a store can't fake.
     static constexpr u32 kMacIoBase = 0xF3000000u;
+    // KeyLargo's free-running timer, mac-io +0x15000 — and THE MACHINE'S
+    // CLOCK IS CALIBRATED AGAINST IT. Open Firmware publishes the node
+    // (`timer`, compatible "keylargo-timer", reg 0x15000/0x1000,
+    // clock-frequency 18,432,000) whether or not anything answers there, and
+    // the Mac OS ROM's HWInit times the processor against it: at 0x0020f55c
+    // it zeroes the 64-bit counter at +0x38/+0x3c with `stwbrx` (the register
+    // file is little-endian), reloads the decrementer with 0x000FFFFF, spins
+    // until it passes zero, and reads the counter back with `lwbrx`.
+    //
+    // With nothing there the counter read back ZERO, and the ROM's 64-bit
+    // divide helper at 0x0020f5c0 returns -1 for a zero divisor — so
+    // 0xFFFFFFFF landed in NKProcessorInfo.BusClockRateHz (+0x08) and its /4,
+    // 0x3FFFFFFF, in DecClockRateHz (+0x0c). DriverServicesLib then converted
+    // EVERY Duration at 2^30 Hz instead of 25 MHz: the 60.15 Hz tick chain
+    // asked for 16,626 µs and was handed 16,626 × 0x3FFFFFFF / 10^6 =
+    // 17,852,031 timebase ticks — 43x too long, which is the whole reason the
+    // guest's clock ran at 1.4 Hz. One unanswered register, every timed thing
+    // in the OS.
+    //
+    // The count is derived from the TIMEBASE, like the VIA's and the USB
+    // frame clock, so --fast-tb scales it with everything else and the guest
+    // measures the ratio this machine actually runs at. 18,432,000 counts per
+    // 25,000,000 timebase ticks is 2304/3125 exactly.
+    static constexpr u32 kKlTimerLo = 0x15038u; // +0x3c holds the high word
+    static constexpr u64 kKlTimerNum = 2304ull, kKlTimerDen = 3125ull;
     // KeyLargo GPIO block: 0x30 bytes at mac-io +0x50 (QEMU hw/misc/macio).
     static constexpr u32 kGpioBase = 0x50u;
     static constexpr u32 kGpioSize = 0x30u;
@@ -420,8 +453,12 @@ public:
     {
         // The display's notion of "now" is used when the driver ARMS the
         // blank, which happens inside a register write and therefore before
-        // the gate below can open. One store keeps it exact.
+        // the gate below can open. One store keeps it exact. The KeyLargo
+        // timer is read the same way — inside a load, with the gate shut —
+        // and it is what the guest calibrates its whole clock against, so it
+        // gets the same unconditional store.
         ati_.noteTb(tb);
+        klTb_ = tb;
         if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_ &&
             insnCount < devDueStamp_)
             return cpuIrq_;
@@ -682,6 +719,12 @@ private:
                 }
                 return v;
             }
+            if (off - kKlTimerLo < 8u && off - kKlTimerLo + len <= 8u) {
+                u8 img[8];
+                klTimerImage(klTimerCount(), img);
+                klNote(kMacIoBase + off, 0, false);
+                return get(img + (off - kKlTimerLo), len);
+            }
             const u32 v = get(kl_.data() + off, len);
             klNote(kMacIoBase + off, 0, false);
             return v;
@@ -844,6 +887,11 @@ private:
                     hd_.write(off - 0x1F000u, v, len);
                     hdDma_.wake(); // a command can open a fresh data phase
                 }
+                return;
+            }
+            if (off - kKlTimerLo < 8u && off - kKlTimerLo + len <= 8u) {
+                klTimerWrite(off, v, len);
+                klNote(kMacIoBase + off, v, true);
                 return;
             }
             u8 gpioOld[8] = {};
@@ -1360,6 +1408,44 @@ private:
     {
         for (u32 k = 0; k < len; ++k)
             p[k] = static_cast<u8>(v >> (8 * (len - 1 - k)));
+    }
+
+    // --- KeyLargo timer (see kKlTimerLo) ---------------------------------
+    // 64 bits counting up at 18.432 MHz of GUEST time, presented as two
+    // little-endian 32-bit registers so that the guest's lwbrx reads it
+    // right way round.
+    u64 klTimerCount() const
+    {
+        // The timebase RESTARTS at zero on a processor reset (Open Firmware's
+        // `reset-all` does one mid-boot) and is restored wholesale by a
+        // snapshot, so "now" can legitimately be earlier than the reload
+        // point. An unsigned subtract there would hand the guest a count near
+        // 2^64 and a calibrated clock built on it — clamp instead.
+        const u64 dt = klTb_ > klTimerTb_ ? klTb_ - klTimerTb_ : 0ull;
+        return klTimerVal_ + dt * kKlTimerNum / kKlTimerDen;
+    }
+    static void klTimerImage(u64 c, u8 img[8])
+    {
+        for (u32 k = 0; k < 8; ++k)
+            img[k] = static_cast<u8>(c >> (8 * k));
+    }
+    static u64 klTimerFromImage(const u8 img[8])
+    {
+        u64 c = 0;
+        for (u32 k = 0; k < 8; ++k)
+            c |= static_cast<u64>(img[k]) << (8 * k);
+        return c;
+    }
+    // Any store in the window reloads: the ROM zeroes both halves, and the
+    // rebase has to happen on each of them or the second write would carry
+    // the elapsed time of the first.
+    void klTimerWrite(u32 off, u32 v, u32 len)
+    {
+        u8 img[8];
+        klTimerImage(klTimerCount(), img);
+        put(img + (off - kKlTimerLo), v, len);
+        klTimerVal_ = klTimerFromImage(img);
+        klTimerTb_ = klTb_;
     }
 
     void note(u32 pa, u32 v, bool wr)

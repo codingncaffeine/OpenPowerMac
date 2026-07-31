@@ -32,7 +32,9 @@ constexpr u32 kSnapMagic = 0x314D504Fu; // 'OPM1'
 // changes sizeof(SawtoothBus) and so is refused by the layout digest anyway.
 // The number is bumped so the refusal reads as a deliberate change rather
 // than as a mystery.
-constexpr u32 kSnapVersion = 10; // 10: the device-service gate
+// 11 adds the KeyLargo timer's reload point and value. It also changes
+// sizeof(SawtoothBus), so old files are refused by the digest either way.
+constexpr u32 kSnapVersion = 11; // 11: the KeyLargo timer
 
 u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 {
@@ -863,6 +865,11 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     w.raw(unin_, kUniNSize);
     w.u64v(kl_.size());
     w.raw(kl_.data(), kl_.size());
+    // The KeyLargo timer is not in kl_ — it is derived from the timebase, so
+    // what has to travel is where it was last reloaded and to what. klTb_ is
+    // restored from the CPU's timebase by the machine's own load, not stored.
+    w.u64v(klTimerTb_);
+    w.u64v(klTimerVal_);
     w.u32v(sccPtr_[0]);
     w.u32v(sccPtr_[1]);
     w.raw(sccWr_, sizeof sccWr_);
@@ -969,6 +976,8 @@ void SawtoothBus::snapLoad(SnapReader& r)
     e = r.beginSection("BUS ");
     r.raw(unin_, kUniNSize);
     bytesInPlace(r, kl_, "mac-io register store");
+    klTimerTb_ = r.u64v();
+    klTimerVal_ = r.u64v();
     sccPtr_[0] = r.u32v();
     sccPtr_[1] = r.u32v();
     r.raw(sccWr_, sizeof sccWr_);
@@ -1057,6 +1066,11 @@ void SawtoothBus::snapLoad(SnapReader& r)
     devGenSeen_ = ~0ull;
     devDueTb_ = 0;
     devDueStamp_ = 0;
+    // Likewise the KeyLargo timer's notion of "now", which the run loop
+    // refreshes on the first serviceDevices call. Starting it at the reload
+    // point makes the first read report the reloaded value rather than a
+    // count derived from a timebase this machine has not reached yet.
+    klTb_ = klTimerTb_;
 }
 
 // --- whole machine --------------------------------------------------------

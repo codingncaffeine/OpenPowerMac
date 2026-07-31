@@ -23,6 +23,17 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_run(IntPtr m, ulong insns);
 
+    // Advance the timebase from the host clock (25 MHz) rather than from the
+    // instruction count, anchored to wherever the machine is now. fastTb is
+    // ignored while this is on.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void opm_set_realtime(IntPtr m, int on);
+
+    // Times the machine could not keep up and the debt was forgiven. Many
+    // slips means it is not running at real time and its tick rate is a lie.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong opm_rt_slips(IntPtr m);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);
 

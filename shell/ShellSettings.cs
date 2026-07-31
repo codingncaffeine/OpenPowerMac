@@ -25,24 +25,32 @@ public sealed class ShellSettings
     // has to MATCH what the DIMMs advertise — it does not set it.
     public uint RamMb { get; set; } = 64;
 
-    // Extra timebase cycles per instruction. 60 is a COMPROMISE and both
-    // directions off it are worse — measured, one variable, same run length:
+    // Pace the guest's timebase from the HOST CLOCK — 25 MHz, exactly what a
+    // Sawtooth runs — instead of from the instruction count. With it on the
+    // machine's own 60 Hz chain emits 60 Ticks per host second by
+    // construction, on any host, and Mac OS gets (this host's MIPS)/60
+    // instructions to spend on each tick instead of a number FastTb fixed in
+    // advance. Turn it off only for a deterministic run.
+    public bool Realtime { get; set; } = true;
+
+    // Extra timebase cycles per instruction, used when Realtime is off: the
+    // machine advances the timebase (1 + FastTb)/4 ticks per instruction.
     //
-    //   fast-tb  60 -> 11.0 MIPS, 857,259 exceptions, the OS sets its own
-    //                  32bpp mode and paints 1,261,505 bytes
-    //   fast-tb 300 ->  8.7 MIPS, 4,997,821 exceptions, and the 68K world
-    //                  never even starts inside the same 3.3 B instructions
+    // ⚠⚠ 60 WAS THE VALUE HERE UNTIL 2026-07-30 AND IT NO LONGER BOOTS. Now
+    // that the KeyLargo timer is answered the guest's clock is correct, and
+    // Mac OS spends about 32,000 emulated instructions on each 60 Hz tick —
+    // the 68K VBL chain, the Time Manager, CrsrTask. FastTb 60 leaves it
+    // 416,666 x 4/61 = 27,300, less than the work costs, so the machine
+    // services ticks back to back and the boot dies at 2.5 G instructions
+    // with a uniform grey screen. Measured on cold boots scored by distinct
+    // scanlines: 60 fails; 30, 15, 8, 4 and 1 all reach the desktop with the
+    // recorded baseline's 462 of 480, 292 disk commands and 1,261,505 bytes
+    // painted.
     //
-    // Raising it is the decrementer storm: the guest spends so much of itself
-    // in exception handling that it stops making progress. Lowering it slows
-    // guest time further, and guest time is ALREADY slow — 3.9 ticks per host
-    // second against a real 60, or about 12 once the Open Firmware era, where
-    // the counter is not running, is discounted.
-    //
-    // (An earlier note here claimed 60 ran guest time seven times fast and
-    // that 7 landed near real time. The instrument says otherwise in the
-    // direction that matters, and the instrument wins.)
-    public uint FastTb { get; set; } = 60;
+    // 4 is the value for a ~24 MIPS loop (1.06x real). This shell's loop runs
+    // nearer 55, so instruction pacing here would run guest time about 2.8x
+    // fast — which is the whole reason Realtime is the default.
+    public uint FastTb { get; set; } = 4;
 
     // The card must be visible from the start. Held invisible until 236M it
     // misses Open Firmware's PCI probe entirely, its FCode never runs, and no
@@ -68,8 +76,19 @@ public sealed class ShellSettings
         try
         {
             if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<ShellSettings>(
-                           File.ReadAllText(FilePath)) ?? new ShellSettings();
+            {
+                var s = JsonSerializer.Deserialize<ShellSettings>(
+                            File.ReadAllText(FilePath)) ?? new ShellSettings();
+                // ⚠ Every settings file written before 2026-07-30 carries
+                // FastTb 60, and 60 no longer reaches the OS: it leaves Mac OS
+                // less time per 60 Hz tick than its own tick work costs, so
+                // the machine services ticks back to back and stops at a grey
+                // screen. Changing the default alone does not reach an
+                // install that already saved one — hence the clamp here.
+                if (s.FastTb > 30)
+                    s.FastTb = 4;
+                return s;
+            }
         }
         catch { /* fall through to defaults */ }
         return new ShellSettings();

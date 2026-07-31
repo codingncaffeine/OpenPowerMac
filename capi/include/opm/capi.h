@@ -16,10 +16,16 @@ typedef struct OpmMachine OpmMachine;
 
 // Create a Sawtooth. Any of cdPath/hdPath/atiRomPath may be null.
 //
-// fastTb scales the timebase. 60 was the practiced value for reaching the
-// firmware, but it runs guest time about seven times fast and drives the OS
-// era into a decrementer storm — measured at one 60 Hz tick per host second
-// against a real sixty. 7 lands near real time at present host speed.
+// fastTb scales the timebase: the machine advances it (1 + fastTb)/4 ticks per
+// instruction, so it fixes guest time to THIS host's throughput. ⚠⚠ THAT IS A
+// TRAP AT HIGH VALUES ONCE THE GUEST'S CLOCK IS CORRECT. Mac OS spends about
+// 32,000 emulated instructions on each 60 Hz tick (the 68K VBL chain, the
+// Time Manager, CrsrTask), and fastTb 60 leaves it 416,666/15.25 = 27,300 —
+// less than the work costs, so the machine services ticks back to back and
+// never boots. Measured: fastTb 60 stops dead at 2.5 G instructions with one
+// distinct scanline on screen; 30 and below reach the desktop. Prefer
+// opm_set_realtime, which sizes the interval from the host clock instead of
+// guessing, and leave fastTb for deterministic runs.
 //
 // hdPath is not optional in practice: every boot that reaches Mac OS does so
 // from the hard disk, and a machine created without one only reaches the
@@ -39,6 +45,22 @@ OPM_API void opm_ati_at(OpmMachine* m, uint64_t insn);
 
 // Execute up to `insns` more instructions; returns the machine's total.
 OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns);
+
+// Pace the timebase from the HOST CLOCK (25 MHz, one tick per 40 ns) instead
+// of from the instruction count, and anchor it to where the machine is now.
+// This is what makes the guest's clock true: its 60 Hz chain then emits 60
+// Ticks per host second on any host, and the emulator has (instructions per
+// second)/60 instructions to spend on each tick rather than a number fixed by
+// fastTb. Call it any time; it re-anchors. fastTb is ignored while it is on.
+OPM_API void opm_set_realtime(OpmMachine* m, int32_t on);
+
+// How many times the machine could not keep up and the debt was forgiven. A
+// run with many slips is not running at real time and its tick rate is a lie.
+OPM_API uint64_t opm_rt_slips(const OpmMachine* m);
+
+// The guest's timebase. /25,000,000 is its uptime in its own seconds; over
+// host seconds it says whether the machine is actually running at real time.
+OPM_API uint64_t opm_tb(const OpmMachine* m);
 
 // Queue text for the serial console (CRs included by the caller).
 OPM_API void opm_serial(OpmMachine* m, const char* text);

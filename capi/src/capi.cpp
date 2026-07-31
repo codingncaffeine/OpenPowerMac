@@ -3,6 +3,7 @@
 #include "opm/cpu.hpp"
 #include "opm/sawtooth.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -22,6 +23,18 @@ struct OpmMachine {
     uint64_t executed = 0;
     uint32_t fastTb = 0;
     size_t consoleAt = 0; // drained-up-to mark
+    // Real-time pacing: the timebase follows the HOST CLOCK instead of the
+    // instruction count. This is what makes the guest's clock true — with it
+    // on, the machine's own 60 Hz tick chain emits 60 Ticks per HOST second
+    // whatever this host's throughput turns out to be, and the emulator gets
+    // (instructions per second)/60 instructions to spend on each of them.
+    // Instruction pacing cannot promise either: it fixes a tb-per-instruction
+    // ratio, so a faster host runs guest time faster, and past some speed the
+    // 60 Hz work no longer fits in the interval it is given. See the note on
+    // SawtoothBus::klTimerOn.
+    bool realtime = false;
+    std::chrono::steady_clock::time_point rtBase{};
+    uint64_t rtTbBase = 0, rtSlips = 0;
 
     ~OpmMachine() { delete bus; }
 };
@@ -63,19 +76,14 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     m->snoop.cpu = &m->cpu;
     m->bus->attachSnoop(&m->snoop);
     m->cpu.reset();
-    m->bus->pcRef = &m->cpu.st.pc;
-    m->bus->stamp = &m->executed;
-    m->bus->cd().stamp = &m->executed;
-    m->bus->pic().stamp = &m->executed;
+    // ⚠ EVERY CELL, THROUGH THE BUS. This was a hand-written list and it was
+    // missing hd() and hdDma() — see SawtoothBus::setStamp. The app had no
+    // working hard disk at all: the drive raised BSY on its first command and
+    // never lowered it, which is exactly what Mac OS reports as a disk it
+    // cannot read and offers to initialise.
+    m->bus->setPcRef(&m->cpu.st.pc);
+    m->bus->setStamp(&m->executed);
     m->bus->pmu().tbRef = &m->cpu.st.tb;
-    m->bus->ataDma().stamp = &m->executed;
-    m->bus->ataDma().pcRef = &m->cpu.st.pc;
-    for (u32 f = 0; f < 2; ++f) {
-        m->bus->ohci(f).stamp = &m->executed;
-        m->bus->ohci(f).pcRef = &m->cpu.st.pc;
-    }
-    m->bus->ati().stamp = &m->executed;
-    m->bus->ati().pcRef = &m->cpu.st.pc;
     return m;
 }
 
@@ -95,7 +103,40 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     // inside step() instead of being a second call per instruction — see
     // Cpu::extraCycles. Set here rather than at create so that whatever
     // changes fastTb is honoured on the next entry.
-    cpu.extraCycles = m->fastTb;
+    cpu.extraCycles = m->realtime ? 0u : m->fastTb;
+    if (m->realtime) {
+        // 25 MHz = bus/4, one timebase tick every 40 ns, sampled every 1024
+        // instructions; at most 1 ms of debt is ever injected at once, because
+        // handing the guest a whole host stall as one delta fires a burst of
+        // decrementer interrupts that models nothing. Same constants as
+        // g4run's --realtime, deliberately: the two have to say the same thing
+        // about the same machine.
+        constexpr uint64_t kNsPerTick = 40, kCatchup = 25000;
+        while (m->executed < until && !cpu.halted) {
+            cpu.step();
+            if ((m->executed & 0x3FFu) == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now - m->rtBase)
+                        .count());
+                const uint64_t want = m->rtTbBase + ns / kNsPerTick;
+                if (want > cpu.st.tb) {
+                    uint64_t delta = want - cpu.st.tb;
+                    if (delta > kCatchup) {
+                        delta = kCatchup;
+                        m->rtBase = now;
+                        m->rtTbBase = cpu.st.tb + delta;
+                        ++m->rtSlips;
+                    }
+                    cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));
+                }
+            }
+            cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb, m->executed));
+            ++m->executed;
+        }
+        return m->executed;
+    }
     while (m->executed < until && !cpu.halted) {
         cpu.step();
         // One call, and it does nothing at all unless a device could have
@@ -107,6 +148,24 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     }
     return m->executed;
 }
+
+// ⚠ The anchor is the timebase the machine is ACTUALLY at, not zero: a
+// resumed or already-running machine is billions of ticks in, and pacing
+// "0 + elapsed" against it leaves the target behind the timebase forever, so
+// the clock never advances at all. g4run learned this the same way.
+OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
+{
+    m->realtime = on != 0;
+    m->rtBase = std::chrono::steady_clock::now();
+    m->rtTbBase = m->cpu.st.tb;
+}
+
+OPM_API uint64_t opm_rt_slips(const OpmMachine* m) { return m->rtSlips; }
+
+// The guest's own clock. Divided by 25,000,000 it is the machine's uptime in
+// its own seconds, and divided by host seconds it says whether this machine
+// is running at real time — the only way to check pacing from outside.
+OPM_API uint64_t opm_tb(const OpmMachine* m) { return m->cpu.st.tb; }
 
 // ⚠ Every entry point that pokes a device from OUTSIDE the run loop has to
 // say so, or the loop's device-service gate will keep answering from its

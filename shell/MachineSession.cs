@@ -88,11 +88,20 @@ public sealed class MachineSession
             if (!string.IsNullOrWhiteSpace(s.AtiRomPath) && s.AtiAt > 0)
                 Native.opm_ati_at(m, s.AtiAt);
 
+            // Pace the timebase from the host clock. This is what makes the
+            // guest's clock true — see ShellSettings.Realtime — and it also
+            // makes the machine independent of how fast this host happens to
+            // be, which instruction pacing cannot be.
+            if (s.Realtime)
+                Native.opm_set_realtime(m, 1);
+
             // Report the hard disk too. Without it in this line there was no
             // way to tell a machine booting from disk apart from one that
             // never had a disk at all — and that is the whole question when
             // the screen shows a flashing "?" folder.
-            ConsoleQ.Enqueue($"[shell] machine up — {s.RamMb} MB, fast-tb {s.FastTb}" +
+            ConsoleQ.Enqueue($"[shell] machine up — {s.RamMb} MB, " +
+                             (s.Realtime ? "clock paced from the host (25 MHz)"
+                                         : $"fast-tb {s.FastTb}") +
                              (string.IsNullOrWhiteSpace(s.HdPath) ? ", NO HD" : ", HD attached") +
                              (string.IsNullOrWhiteSpace(s.CdPath) ? "" : ", CD attached") +
                              // AtiAt is the instruction at which the card

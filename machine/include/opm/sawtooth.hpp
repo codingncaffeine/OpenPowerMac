@@ -169,6 +169,22 @@ public:
         // samples, +0x8900 asks it for them.
         sndOut_.dmaBus = sndIn_.dmaBus = this;
         sndOut_.dev = sndIn_.dev = &snd_;
+        // ⭐ THE CHANNELS THIS MACHINE HAS BUT DRIVES NOTHING WITH — 0x8000 to
+        // 0x87FF, which the CHRP map assigns to SCSI0, floppy, ethernet tx/rx
+        // and the two SCC ports' tx/rx pairs. They carry no device here, but
+        // they are REAL CHANNELS and their control registers have to behave.
+        //
+        // ⛔ Leaving them to the generic mac-io register store is what hung the
+        // Mac OS 9 boot during extension loading. A driver shuts a channel
+        // down by writing FLUSH (0x2000) to ChannelControl and then spinning
+        // on ChannelStatus until the hardware clears it — measured, at
+        // 006772bc, polling +0x8700 (channel 7, SCC receive B) forever. A dumb
+        // register store never clears anything, so the wait never ends. The
+        // engine already clears FLUSH the instant it is asked; it simply was
+        // never reached. Same code for every channel, so there is no
+        // second-class one to get subtly wrong.
+        for (DbdmaChannel& ch : dmaGen_)
+            ch.dmaBus = this;
         // The machine's clock, handed to the cells that model a DURATION.
         // Wired here rather than by the consumer for the reason setStamp
         // exists: a per-consumer wiring list is how the app ended up with a
@@ -787,6 +803,8 @@ public:
         ati_.stamp = s;
         ataDma_.stamp = hdDma_.stamp = s;
         sndOut_.stamp = sndIn_.stamp = s;
+        for (DbdmaChannel& ch : dmaGen_)
+            ch.stamp = s;
     }
     void setPcRef(const u32* p)
     {
@@ -796,6 +814,8 @@ public:
         ati_.pcRef = p;
         ataDma_.pcRef = hdDma_.pcRef = p;
         sndOut_.pcRef = sndIn_.pcRef = p;
+        for (DbdmaChannel& ch : dmaGen_)
+            ch.pcRef = p;
     }
 
     size_t ramBytes() const { return ram_.size(); }
@@ -896,6 +916,10 @@ private:
                 return ataDma_.read(off - 0x8B00u, len);
             if (off - 0x8A00u < 0x100u)
                 return hdDma_.read(off - 0x8A00u, len);
+            // Channels 0-7: real engines with nothing attached. See the note
+            // in the constructor — a register store here hangs the OS boot.
+            if (off - 0x8000u < 0x800u)
+                return dmaGen_[(off >> 8) & 7u].read(off & 0xFFu, len);
             if (soundOn) {
                 if (off - 0x8800u < 0x100u)
                     return sndOut_.read(off - 0x8800u, len);
@@ -1083,6 +1107,12 @@ private:
             }
             if (off - 0x8A00u < 0x100u) {
                 hdDma_.write(off - 0x8A00u, v, len);
+                return;
+            }
+            // Channels 0-7 — see the read path and the constructor. FLUSH has
+            // to clear, and only the engine does that.
+            if (off - 0x8000u < 0x800u) {
+                dmaGen_[(off >> 8) & 7u].write(off & 0xFFu, v, len);
                 return;
             }
             if (soundOn) {
@@ -1730,6 +1760,9 @@ private:
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
     R128Cell ati_;
     DbdmaChannel ataDma_, hdDma_;
+    // Channels 0-7 (+0x8000..+0x87FF): present, deviceless. See the
+    // constructor for why they cannot be left to the register store.
+    DbdmaChannel dmaGen_[8];
     AwacsCell snd_;
     DbdmaChannel sndOut_, sndIn_;
     std::vector<u8> atiRom_;

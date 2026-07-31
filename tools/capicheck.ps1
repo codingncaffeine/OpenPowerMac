@@ -83,8 +83,16 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
         $tb = [Opm]::opm_tb($m) - $tb0
         $dS = $s - $pTime; $dTb = $tb - $pTb
         $pTime = $s; $pTb = $tb
-        Write-Host ("   t={0,5:N1}s  {1,12:N0} insns  {2,6:N1} MIPS  tb now {3,6:N2} MHz ({4:N2}x real)" -f `
-            $s, $exec, ($exec / $s / 1e6), ($dTb / $dS / 1e6), ($dTb / $dS / 25e6))
+        # The guest resets its own timebase (Open Firmware's mid-boot PMU
+        # reset), so a delta can be negative. Say that, rather than printing a
+        # negative frequency and inviting someone to explain it as pacing.
+        if ($dTb -lt 0) {
+            Write-Host ("   t={0,5:N1}s  {1,12:N0} insns  {2,6:N1} MIPS  tb went BACKWARDS (the guest reset its timebase)" -f `
+                $s, $exec, ($exec / $s / 1e6))
+        } else {
+            Write-Host ("   t={0,5:N1}s  {1,12:N0} insns  {2,6:N1} MIPS  tb now {3,6:N2} MHz ({4:N2}x real)" -f `
+                $s, $exec, ($exec / $s / 1e6), ($dTb / $dS / 1e6), ($dTb / $dS / 25e6))
+        }
     }
 }
 

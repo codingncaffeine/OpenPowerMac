@@ -256,6 +256,89 @@ OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
     m->bus->deviceStateChanged();
 }
 
+// The exception vectors by name. A report that prints 900 and lets the reader
+// remember what that is will eventually be misread — it was, once, as a DSI.
+static const char* excName(u32 v)
+{
+    switch (v) {
+    case 0x100: return "RESET";
+    case 0x200: return "MACHINE-CHECK";
+    case 0x300: return "DSI";
+    case 0x400: return "ISI";
+    case 0x500: return "EXTERNAL";
+    case 0x600: return "ALIGNMENT";
+    case 0x700: return "PROGRAM";
+    case 0x800: return "FP-UNAVAIL";
+    case 0x900: return "DECREMENTER";
+    case 0xC00: return "SYSCALL";
+    case 0xD00: return "TRACE";
+    case 0xF00: return "PERFMON";
+    case 0xF20: return "ALTIVEC";
+    default: return "?";
+    }
+}
+
+// ⚠ ONLY THESE WRITE DAR/DSISR. Every other vector leaves whatever the last
+// data fault put there, so printing those fields beside a DECREMENTER shows a
+// stale address that looks exactly like a live one.
+static bool excSetsDar(u32 v) { return v == 0x300 || v == 0x600; }
+
+// 🔎 A READ-ONLY address translation, for dumping code the guest is running.
+//
+// ⛔ Cpu::translate CANNOT be used here even with mmuProbe: its failure paths
+// call raiseExc, so a diagnostic that probed an unmapped address would vector
+// the machine it was trying to observe. An instrument that mutates its subject
+// invents bugs — so this walks BATs and the page table by hand, reading RAM
+// only. ⚠ Same caveat as the PTE dump: the real walk reads through the data
+// cache, so a mapping written and not yet flushed is invisible here.
+static bool diagXlate(const Cpu& cpu, SawtoothBus& bus, u32 ea, bool fetch,
+                      u32& pa)
+{
+    const u32* batu = fetch ? cpu.st.ibatu : cpu.st.dbatu;
+    const u32* batl = fetch ? cpu.st.ibatl : cpu.st.dbatl;
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 u = batu[i], l = batl[i];
+        if (!(u & 3u)) // neither Vs nor Vp
+            continue;
+        const u32 bl = (u >> 2) & 0x7FFu;
+        const u32 mask = ~((bl << 17) | 0x1FFFFu);
+        if ((ea & mask) != (u & mask & 0xFFFE0000u))
+            continue;
+        pa = (l & 0xFFFE0000u) | (ea & ~mask);
+        return true;
+    }
+    const u32 sr = cpu.st.sr[ea >> 28];
+    if (sr & 0x80000000u)
+        return false; // direct-store
+    const u32 vsid = sr & 0x00FFFFFFu;
+    const u32 pi = (ea >> 12) & 0xFFFFu;
+    const u32 api = pi >> 10;
+    const u32 htaborg = cpu.st.sdr1 & 0xFFFF0000u;
+    const u32 htabmask = cpu.st.sdr1 & 0x1FFu;
+    for (int pass = 0; pass < 2; ++pass) {
+        const u32 hash = pass == 0 ? ((vsid & 0x7FFFFu) ^ pi)
+                                   : (~((vsid & 0x7FFFFu) ^ pi) & 0x7FFFFu);
+        const u32 pteg = htaborg |
+                         ((((hash >> 10) & 0x1FFu) & htabmask) << 16) |
+                         ((hash & 0x3FFu) << 6);
+        for (u32 slot = 0; slot < 8; ++slot) {
+            const u32 w0 = bus.read32(pteg + slot * 8u);
+            if (!(w0 & 0x80000000u))
+                continue;
+            if (((w0 >> 7) & 0xFFFFFFu) != vsid)
+                continue;
+            if (((w0 >> 6) & 1u) != static_cast<u32>(pass))
+                continue;
+            if ((w0 & 0x3Fu) != api)
+                continue;
+            pa = (bus.read32(pteg + slot * 8u + 4) & 0xFFFFF000u) |
+                 (ea & 0xFFFu);
+            return true;
+        }
+    }
+    return false;
+}
+
 OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
 {
     if (!buf || !cap)
@@ -347,10 +430,22 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         for (u64 k = 0; k < n; ++k) {
             const Cpu::ExcRec& r =
                 cpu.excRing[(cpu.excRingAt - n + k) & (Cpu::kExcRing - 1u)];
-            snprintf(b, sizeof b,
-                     "--   %03x srr0=%08x srr1=%08x dar=%08x dsisr=%08x @%llu\n",
-                     r.vec, r.srr0, r.srr1, r.dar, r.dsisr,
-                     static_cast<unsigned long long>(r.tb));
+            // ⚠ DAR/DSISR only for the vectors that actually write them —
+            // see excSetsDar. Printing them beside a DECREMENTER shows the
+            // last data fault's address looking exactly like a live one, and
+            // that misread a whole capture once.
+            if (excSetsDar(r.vec))
+                snprintf(b, sizeof b,
+                         "--   %03x %-12s srr0=%08x srr1=%08x dar=%08x "
+                         "dsisr=%08x @%llu\n",
+                         r.vec, excName(r.vec), r.srr0, r.srr1, r.dar, r.dsisr,
+                         static_cast<unsigned long long>(r.tb));
+            else
+                snprintf(b, sizeof b,
+                         "--   %03x %-12s srr0=%08x srr1=%08x %-28s @%llu\n",
+                         r.vec, excName(r.vec), r.srr0, r.srr1,
+                         "(dar/dsisr not set by this)",
+                         static_cast<unsigned long long>(r.tb));
             s += b;
         }
     }
@@ -358,20 +453,39 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // a physical address, so the code it is sitting in can be read straight
     // out of RAM — no translation to get wrong. Sixteen words around pc is
     // enough to see whether it is a loop and what it is testing.
-    if (!(cpu.st.msr & 0x0020u)) {
-        const u32 at = (cpu.st.pc & ~0x1Fu) - 32u;
-        snprintf(b, sizeof b, "-- code at pc (IR=0, physical) from %08x:\n", at);
+    // ⚠ TRANSLATED WHEN IT HAS TO BE. The first version of this only printed
+    // when IR was clear, on the reasoning that the pc is then physical and
+    // there is nothing to get wrong — which meant the case that matters most,
+    // a guest spinning in ORDINARY user-mode code, printed nothing at all.
+    for (int which = 0; which < 2; ++which) {
+        const u32 ea = which ? cpu.st.srr0 : cpu.st.pc;
+        if (which && (ea == 0 || ea == cpu.st.pc))
+            continue;
+        u32 base = ea;
+        bool ok = true;
+        const bool ir = (cpu.st.msr & 0x0020u) != 0;
+        if (ir)
+            ok = diagXlate(cpu, *m->bus, ea, true, base);
+        if (!ok) {
+            snprintf(b, sizeof b, "-- code at %s %08x: NOT MAPPED\n",
+                     which ? "srr0" : "pc  ", ea);
+            s += b;
+            continue;
+        }
+        // Walk back four instructions so the top of a short loop is visible.
+        const u32 from = base - 16u;
+        snprintf(b, sizeof b, "-- code at %s %08x (%s %08x):\n",
+                 which ? "srr0" : "pc  ", ea, ir ? "pa" : "physical", from);
         s += b;
         for (u32 row = 0; row < 6; ++row) {
-            snprintf(b, sizeof b, "--   %08x:", at + row * 16u);
+            snprintf(b, sizeof b, "--   %08x:", ea - 16u + row * 16u);
             s += b;
             for (u32 w = 0; w < 4; ++w) {
                 snprintf(b, sizeof b, " %08x",
-                         m->bus->read32(at + row * 16u + w * 4u));
+                         m->bus->read32(from + row * 16u + w * 4u));
                 s += b;
             }
-            s += (at + row * 16u == (cpu.st.pc & ~0xFu)) ? "   <== pc row\n"
-                                                         : "\n";
+            s += (row == 1) ? "   <== the faulting/current row\n" : "\n";
         }
     }
     // 🔎 THE PAGE TABLE, FOR THE ADDRESS THAT FAULTED. A DSI with DSISR bit 1

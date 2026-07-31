@@ -48,6 +48,31 @@ public:
             snoop->snoopWrite(pa, len);
     }
 
+    // ⏱ WHAT TIME IT IS, ASKED FROM INSIDE A GUEST LOAD OR STORE.
+    //
+    // A run loop is allowed to charge several instructions to the clock at
+    // once, which leaves the processor's timebase behind the machine by up to
+    // a batch — and a device access happens INSIDE one of those instructions,
+    // before the loop has written anything down. A device that models a
+    // duration has to be able to ASK. The KeyLargo timer is exactly that case,
+    // and it is what the guest calibrates its whole clock against: an answer
+    // that is a batch stale there is a bus frequency wrong by the same factor,
+    // which is the failure this machine spent session 26 on.
+    //
+    // Calling it also ENDS the batch. The loop chose its length when no device
+    // was in play; an interrupt line this access raises has to reach the
+    // processor on the next instruction, not whenever a batch sized for an
+    // idle machine happens to finish.
+    //
+    // Wired by Cpu::attach, so there is one wiring site and no front end can
+    // forget it. Null means nothing is batching: keep your own answer.
+    u64 (*deviceClock)(void*) = nullptr;
+    void* deviceClockCtx = nullptr;
+    u64 deviceNow(u64 fallback)
+    {
+        return deviceClock ? deviceClock(deviceClockCtx) : fallback;
+    }
+
     virtual u8  read8(u32 pa) = 0;
     virtual u16 read16(u32 pa) = 0;
     virtual u32 read32(u32 pa) = 0;

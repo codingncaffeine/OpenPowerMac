@@ -110,4 +110,58 @@ inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 budget)
     return napSkipSlow(cpu, bus, budget);
 }
 
+// ---- the batch ------------------------------------------------------------
+//
+// The same reasoning as the nap skip, for a processor that is AWAKE. There the
+// question was "how many steps can I skip"; here it is "how many can I run
+// before anything outside the processor could possibly matter" — and it has
+// the same two answers, because they are the same two deadlines.
+//
+// What a batch buys is the clock. Cpu::tick is 13% of the desktop profile and
+// it runs on every emulated instruction to answer a question that only has a
+// new answer when the timebase crosses the bus divisor or the decrementer goes
+// negative; the device gate is another 2.8% of asking a question whose answer
+// is cached. Over a run of instructions that nothing can observe, both are
+// computed once. See the contract on Cpu::pendCycles.
+//
+// ⚠ THIS IS A LOWER BOUND AND IT HAS TO STAY ONE. Every clamp here is a claim
+// that nothing can happen sooner; a wrong one does not crash, it delivers an
+// interrupt late and moves the whole timeline. --no-batch is the control.
+inline u64 batchSteps(const Cpu& cpu, const SawtoothBus& bus, u64 budget)
+{
+    if (budget < 2)
+        return budget;
+    const u32 cyclesPerStep = 1u + cpu.extraCycles;
+    u64 n = budget;
+    // The decrementer's own deadline: run to the step where tick() would have
+    // asked for the interrupt, and no further. Exact, not approximate — this
+    // is the clamp that lets the clock be applied in one piece.
+    const u64 dec = cpu.stepsUntilDec(cyclesPerStep);
+    if (dec < n)
+        n = dec;
+    // The nearest timed device event, converted through the same cycles per
+    // step the clock advances at. A device the GUEST touches is not in here
+    // and does not need to be: that access ends the batch from the inside
+    // (Bus::deviceClock).
+    const u64 dueTb = bus.deviceDueTb();
+    if (dueTb <= cpu.st.tb)
+        return 1; // already due: service it before running anything
+    const u64 cycles = (dueTb - cpu.st.tb) * cpu.cyclesPerTbTick;
+    const u64 s = cycles / cyclesPerStep; // floor: never overshoot
+    if (s < n)
+        n = s;
+    return n ? n : 1;
+}
+
+// Run one batch: size it, run it, and report how many instructions it was.
+// The caller services devices afterwards, exactly as it does after a step.
+// ⚠ `executed` IS ADVANCED HERE, per instruction, not by the caller. See the
+// note on Cpu::runSteps: the machine's instruction counter is wired into every
+// device cell and three harness features are timed against it, so it may not
+// sit still for the length of a batch.
+inline u64 runBatch(Cpu& cpu, SawtoothBus& bus, u64& executed, u64 budget)
+{
+    return cpu.runSteps(batchSteps(cpu, bus, budget), executed);
+}
+
 } // namespace opm

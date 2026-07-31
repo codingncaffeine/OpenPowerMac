@@ -263,6 +263,7 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
 void Cpu::tlbInvalidateClass(u32 ea)
 {
     ++mmuGen; // retires the one-page instruction translation cache
+    batchBreak = true; // …and the block the line executor is running from
     const u32 set = (ea >> 12) & 63u;
     for (u32 way = 0; way < 2; ++way) {
         itlb[set][way].v = false;
@@ -273,6 +274,7 @@ void Cpu::tlbInvalidateClass(u32 ea)
 void Cpu::tlbFlushAll()
 {
     ++mmuGen;
+    batchBreak = true;
     for (u32 s = 0; s < 64; ++s) {
         for (u32 w = 0; w < 2; ++w) {
             itlb[s][w] = TlbEntry{};

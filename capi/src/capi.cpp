@@ -84,7 +84,6 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     // cannot read and offers to initialise.
     m->bus->setPcRef(&m->cpu.st.pc);
     m->bus->setStamp(&m->executed);
-    m->bus->pmu().tbRef = &m->cpu.st.tb;
     return m;
 }
 
@@ -120,7 +119,14 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         // device deadline is now in timebase, so that is buildable, and it is
         // not built.
         while (m->executed < until && !cpu.halted) {
-            cpu.step();
+            // Batched to the next clock sample, so the host-paced top-up below
+            // still lands every 1024 instructions. Anything shorter ends the
+            // batch by itself — a device access, a write to DEC, the core
+            // going to sleep. See machine/include/opm/pace.hpp.
+            const uint64_t toSample = 1024u - (m->executed & 1023u);
+            const uint64_t left = until - m->executed;
+            runBatch(cpu, bus, m->executed,
+                     toSample < left ? toSample : left);
             if ((m->executed & 0x3FFu) == 0) {
                 const auto now = std::chrono::steady_clock::now();
                 const uint64_t ns = static_cast<uint64_t>(
@@ -140,7 +146,6 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
                 }
             }
             cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
-            ++m->executed;
         }
         return m->executed;
     }
@@ -154,13 +159,14 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
             cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
             continue;
         }
-        cpu.step();
+        // A run of instructions with the clock charged once and the devices
+        // looked at once, bounded by the first moment either could matter.
+        runBatch(cpu, bus, m->executed, until - m->executed);
         // One call, and it does nothing at all unless a device could have
         // moved — see SawtoothBus::serviceDevices. Ticking every device and
         // recomputing seven interrupt lines on every emulated instruction was
         // a quarter of the whole emulator's host time.
         cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
-        ++m->executed;
     }
     return m->executed;
 }

@@ -98,7 +98,7 @@ void Cpu::step()
                           (smiPending || extIrqLine || decPending || pmPending);
         if (!wake) {
             OPM_COUNT(napSteps);
-            tick(1 + extraCycles);
+            charge(1 + extraCycles);
             return;
         }
         napping = false;
@@ -117,26 +117,26 @@ void Cpu::step()
         if (smiPending) {
             smiPending = false;
             raiseExc(Exc::Smi, st.pc, 0);
-            tick(extraCycles);
+            charge(extraCycles);
             return;
         }
         if (extIrqLine) {
             ++extIrqs;
             raiseExc(Exc::External, st.pc, 0);
-            tick(extraCycles);
+            charge(extraCycles);
             return;
         }
         if (decPending) {
             decPending = false;
             ++decIrqs;
             raiseExc(Exc::Decrementer, st.pc, 0);
-            tick(extraCycles);
+            charge(extraCycles);
             return;
         }
         if (pmPending) {
             pmPending = false;
             raiseExc(Exc::PerfMon, st.pc, 0);
-            tick(extraCycles);
+            charge(extraCycles);
             return;
         }
     }
@@ -148,22 +148,33 @@ void Cpu::step()
     if ((st.iabr & 2u) && ((cia ^ st.iabr) & 0xFFFFFFFCu) == 0 &&
         ((st.iabr & 1u) != 0) == ((st.msr & msr::IR) != 0)) {
         raiseExc(Exc::Iabr, cia, 0);
-        tick(1 + extraCycles);
+        charge(1 + extraCycles);
         return;
     }
 
     u32 insn, row;
     OPM_PH(Fetch);
     if (!fetchDecoded(cia, insn, row)) { // ISI raised by translate()
-        tick(1 + extraCycles);
+        charge(1 + extraCycles);
         return;
     }
+    execRow(insn, row);
+}
+
+// The dispatch tail. Reached from step() with the word off the fetch path, and
+// from runSteps' line executor with the word read straight out of a resident
+// block — the rules below are the same rules either way, which is the point of
+// there being one of them.
+void Cpu::execRow(u32 insn, u32 row)
+{
+    raisedThisStep = false;
+    const u32 cia = st.pc;
     OPM_PH(Decode);
     curInsn = insn;
     if (row == kNoRow) {
         ++unknownWords[insn];
         raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-        tick(1 + extraCycles);
+        charge(1 + extraCycles);
         return;
     }
     const InsnDesc* d = kIsa + row;
@@ -173,22 +184,22 @@ void Cpu::step()
     if (const u8 gate = dispPre[row]) {
         if (gate & kPreIll) {
             raiseExc(Exc::Program, cia, kSrr1ProgIllegal);
-            tick(1 + extraCycles);
+            charge(1 + extraCycles);
             return;
         }
         if ((gate & kPrePriv) && userMode()) {
             raiseExc(Exc::Program, cia, kSrr1ProgPrivileged);
-            tick(1 + extraCycles);
+            charge(1 + extraCycles);
             return;
         }
         if ((gate & kPreFp) && !(st.msr & msr::FP)) {
             raiseExc(Exc::FpUnavailable, cia, 0);
-            tick(1 + extraCycles);
+            charge(1 + extraCycles);
             return;
         }
         if ((gate & kPreVec) && !(st.msr & msr::VEC)) {
             raiseExc(Exc::VecUnavailable, cia, 0);
-            tick(1 + extraCycles);
+            charge(1 + extraCycles);
             return;
         }
     }
@@ -205,7 +216,7 @@ void Cpu::step()
     OPM_PH(Exec);
     fn(*this, insn, *d);
     OPM_PH(Tick);
-    tick(1 + extraCycles);
+    charge(1 + extraCycles);
 
     // Performance monitor, minimal-honest: PMC1/PMC2 count cycles (event 1,
     // one per instruction at the provisional 1 cycle/insn rate) or completed
@@ -236,6 +247,14 @@ void Cpu::step()
         }
     }
 
+    // ⚠ THE PHASE HAS TO BE HANDED BACK HERE. Everything after this point —
+    // the trace check, the return, and then the run loop's own per-instruction
+    // bookkeeping until the next Decode marker — is the LOOP's cost, not the
+    // clock's. Leaving Tick set through it billed the line executor's exit
+    // tests to tick+perfmon and read 36.1% on a machine whose clock advance is
+    // now three instructions. Third time this project has been lied to by a
+    // marker that outlived the work it named; see the note in prof.hpp.
+    OPM_PH(Other);
     if (halted || raisedThisStep)
         return;
 
@@ -260,6 +279,115 @@ u64 Cpu::run(u64 n)
     for (; i < n && !halted; ++i)
         step();
     return i;
+}
+
+// A batch: n instructions with the clock charged once at the end instead of
+// once per instruction. See the contract on Cpu::pendCycles, and pace.hpp for
+// how a caller sizes n.
+//
+// ⚠ THE EARLY EXIT IS THE WHOLE CORRECTNESS ARGUMENT. Everything the caller
+// proved about this run of instructions was proved before the first one ran:
+// that no device could act, that the decrementer could not fire, that nothing
+// would read the clock behind the loop's back. Any of those becoming false
+// sets batchBreak, and the batch ends on the instruction that did it — so the
+// machine is never left running past the point where the reasoning stopped
+// applying.
+// ⭐ THE LINE EXECUTOR. Straight-line code is executed out of the block the
+// fetch cache is already holding: the block's 32 bytes carry the eight
+// instruction words AND their decoded ISA rows, so a run of instructions
+// inside one costs an array index each instead of a translation-cache check, a
+// slot index, a tag compare and two loads. That per-instruction fetch work is
+// 14.7% of the desktop profile with another 7.6% in the translation cache, and
+// it is the whole of what a block executor can remove — the handlers
+// themselves (35.1%) and memory (7.5%) are untouched, because a translated
+// block would still have to call exactly the same helpers.
+//
+// ⚠ WHAT THE INNER LOOP IS ALLOWED TO ASSUME, AND WHY EACH ONE HOLDS. It runs
+// with the fetch path skipped, so every input to that path has to be
+// unchanged, and every check step() would have made per instruction has to be
+// either made here or provably invariant:
+//
+//   the block is still ours   checked every instruction (fl->base). Every
+//                             writer of memory or of a cache drops the line —
+//                             stores, dcbz/dcbf/dcbi, castouts, dirty L2
+//                             installs, snoops, icbi, reset — and that same
+//                             contract is what the four-way control already
+//                             proved transparent.
+//   the mapping is unchanged  MSR, the segment registers, the BATs, SDR1 and
+//                             the TLB all end the batch when written; see the
+//                             batchBreak sites.
+//   the pc fell through       checked every instruction. A branch or an
+//                             exception leaves the line by definition.
+//   no async is pending       hoisted: nothing inside a batch can raise one
+//                             (see the contract on pendCycles), and the one
+//                             thing that could — enabling MSR[EE] with a line
+//                             already asserted — is an mtmsr, which ends it.
+//   no nap, no IABR, no
+//   trace, no perfmon         hoisted: all four are checked once per line and
+//                             hand the whole line back to step() if live.
+u64 Cpu::runSteps(u64 n, u64& stamp)
+{
+    batchBreak = false;
+    batching = true;
+    const u64 first = stamp;
+    // ⚠ `i` IS THE CALLER'S OWN COUNTER, not a local copy written back at the
+    // end: see the note on the declaration. Counting here and publishing later
+    // is free, and it hands every device in the machine an instruction number
+    // that is up to a batch stale.
+    u64& i = stamp;
+    const u64 until = first + n;
+    while (i < until) {
+        // The conditions the inner loop hoists. Rare enough that paying for
+        // the check once per line is free, and live rarely enough that the
+        // fallback costs nothing measurable: iabr and the trace bits are debug
+        // features, mmcr0 is zero for this machine's whole life, and a napping
+        // core belongs to the nap skip.
+        const bool slow =
+            lineExecOff || napping || st.mmcr0 || (st.iabr & 2u) ||
+            (st.msr & (msr::SE | msr::BE)) ||
+            ((st.msr & msr::EE) &&
+             (smiPending || extIrqLine || decPending || pmPending));
+        u32 word = 0;
+        FetchLine* fl;
+        {
+            // The probe is the fetch path — bill it there. Left unmarked it
+            // inherited whatever phase the previous instruction ended in, and
+            // the one piece of real work the line executor still does per line
+            // showed up as loop overhead.
+            OPM_MARK(Fetch);
+            fl = slow ? nullptr : fetchBlockFast(st.pc, word);
+        }
+        if (!fl) {
+            // No block, or something the line loop may not assume away. One
+            // instruction the ordinary way — which also FILLS the block, so
+            // the next trip round finds it.
+            step();
+            ++i;
+            if (batchBreak || halted)
+                break;
+            continue;
+        }
+        OPM_COUNT(lineEntries);
+        const u32 base = fl->base;
+        for (;;) {
+            const u32 cia = st.pc;
+            OPM_COUNT(lineInsns);
+            execRow(fl->w[word], fl->row[word]);
+            ++i;
+            if (batchBreak || halted)
+                goto done;
+            if (i >= until || st.pc != cia + 4u || ++word == 8u ||
+                fl->base != base)
+                break;
+        }
+    }
+done:
+    batching = false;
+    {
+        OPM_MARK(Tick); // the batch's whole clock advance, in one place
+        syncClock();
+    }
+    return i - first;
 }
 
 } // namespace opm

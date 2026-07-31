@@ -167,7 +167,14 @@ public:
         // Wired here rather than by the consumer for the reason setStamp
         // exists: a per-consumer wiring list is how the app ended up with a
         // hard disk that never completed a command.
+        //
+        // ⚠ It is the MACHINE's clock and not the processor's. The two differ
+        // by whatever a batched run loop is holding, and only this one is
+        // refreshed on the path a device access takes — see noteNow(). The PMU
+        // used to be handed &cpu.st.tb by each front end and would have read a
+        // batch stale.
         cd_.tbRef = hd_.tbRef = &nowTb_;
+        pmu_.tbRef = &nowTb_;
     }
 
     bool attachAtiRom(const char* path)
@@ -496,8 +503,8 @@ public:
         // The display's notion of "now" is used when the driver ARMS the
         // blank, which happens inside a register write and therefore before
         // the gate below can open. One store keeps it exact — see nowTb_.
-        ati_.noteTb(tb);
         nowTb_ = tb;
+        ati_.noteTb(tb);
         if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_)
             return cpuIrq_;
         ++devServices_;
@@ -512,6 +519,25 @@ public:
             if (d < devDueTb_)
                 devDueTb_ = d;
         return cpuIrq_;
+    }
+    // ⏱ SET THE MACHINE'S CLOCK FROM THE PROCESSOR'S, ON THE ONE PATH THAT
+    // CANNOT WAIT FOR THE RUN LOOP.
+    //
+    // Called from read() and write() the moment an access turns out not to be
+    // plain RAM. A batched loop is holding cycles it has not applied, so the
+    // timebase it last wrote here is behind; every device that models a
+    // duration reads this. It is also what ENDS the batch, so the interrupt
+    // line this access may raise reaches the processor on the next
+    // instruction rather than at the end of a batch sized for an idle machine.
+    //
+    // The display gets the same value in the same breath: its driver ARMS a
+    // vertical blank from inside a register write, and "now" at that moment is
+    // what the blank is scheduled against.
+    void noteNow()
+    {
+        const u64 t = deviceNow(nowTb_);
+        nowTb_ = t;
+        ati_.noteTb(t);
     }
     // A machine whose devices were poked from outside the run loop (the shell
     // attaching media, a test rig) must not be answered from the cache.
@@ -746,6 +772,7 @@ private:
         if (ramFast(pa, len))
             return get(ram_.data() + pa, len);
         ++devGen_;
+        noteNow();
         const u32 off = macioOff(pa);
         if (off != 0xFFFFFFFFu) {
             if (off >= 0x16000u && off < 0x18000u) {
@@ -919,6 +946,7 @@ private:
             return;
         }
         ++devGen_;
+        noteNow();
         if (const u32 moff = macioOff(pa); moff != 0xFFFFFFFFu) {
             const u32 off = moff;
             if (off >= 0x16000u && off < 0x18000u) {

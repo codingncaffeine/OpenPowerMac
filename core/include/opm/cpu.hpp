@@ -236,9 +236,8 @@ struct Cpu {
     // Advance the clock by `steps` steps' worth of cycles without executing
     // anything. Chunked because tick() takes a 32-bit cycle count and a nap
     // can legitimately span millions of steps.
-    void clockAdvance(u64 steps, u32 cyclesPerStep)
+    void clockAdvanceCycles(u64 cycles)
     {
-        u64 cycles = steps * static_cast<u64>(cyclesPerStep);
         while (cycles) {
             const u32 c = cycles > 0x3F000000ull
                               ? 0x3F000000u
@@ -247,6 +246,77 @@ struct Cpu {
             tick(c);
         }
     }
+    void clockAdvance(u64 steps, u32 cyclesPerStep)
+    {
+        clockAdvanceCycles(steps * static_cast<u64>(cyclesPerStep));
+    }
+
+    // ---- the clock, and who owns it --------------------------------------
+    //
+    // ⏱ CHARGED PER INSTRUCTION, APPLIED PER BATCH. tick() is the second most
+    // expensive thing in this emulator after the instruction handlers — 13% of
+    // the desktop profile — and it runs to answer the same question every
+    // time: has the timebase crossed the bus divisor, and has the decrementer
+    // gone negative. Over a run of instructions in which nothing can OBSERVE
+    // the clock, the answer only has to be computed once.
+    //
+    // So step() CHARGES cycles and a batch APPLIES them. The contract that
+    // makes this exact rather than approximate has three parts, and all three
+    // are enforced somewhere a reader can find:
+    //
+    //   1. the batch may not span anything that could change its own bounds —
+    //      Cpu::batchBreak, set by a device access (Bus::deviceClock), by a
+    //      write to DEC or the timebase, and by the core going to sleep;
+    //   2. the batch may not span the decrementer's deadline — the caller
+    //      sizes it with stepsUntilDec (machine/include/opm/pace.hpp);
+    //   3. anything that READS the clock syncs it first — the guest through
+    //      mfspr/mftb/mtspr, the devices through Bus::deviceNow, the harness
+    //      through tbNow().
+    // Miss one and the machine keeps running with a clock that is behind,
+    // which is not a crash, it is a wrong measurement — so `--no-batch` is
+    // the control, and the equivalence is proved the way the nap skip was:
+    // same stop pc, same timebase to the tick, same guest Ticks.
+    u64 pendCycles = 0;
+    bool batching = false;   // a caller owns the clock advance: see runSteps
+    bool batchBreak = false; // …and something happened that ends its batch
+    void charge(u32 cycles)
+    {
+        pendCycles += cycles;
+        if (!batching)
+            syncClock();
+    }
+    void syncClock()
+    {
+        const u64 c = pendCycles;
+        if (!c)
+            return;
+        pendCycles = 0;
+        clockAdvanceCycles(c);
+    }
+    // The timebase as it stands RIGHT NOW, charged cycles included. Pure: it
+    // computes what syncClock would produce without producing it, so an
+    // instrument or a device can read the clock without perturbing the run.
+    u64 tbNow() const
+    {
+        if (!pendCycles || !cyclesPerTbTick)
+            return st.tb;
+        return st.tb + (cycleAccum + pendCycles) / cyclesPerTbTick;
+    }
+    // Execute up to n instructions with the clock charged but not applied.
+    // Stops early on batchBreak or halt. See pace.hpp for how n is chosen —
+    // a caller that picks it wrongly does not crash, it delivers an interrupt
+    // late.
+    //
+    // ⚠ `stamp` IS THE MACHINE'S INSTRUCTION COUNTER AND IT IS ADVANCED HERE,
+    // one per instruction, NOT by the caller afterwards. It has to be live
+    // inside the batch: the bus hands it to every device cell, three harness
+    // features are timed against it (the display's config-space visibility
+    // window, the paced serial injection, the ATA traffic logs), and every
+    // instrument in g4run quotes it. Adding a batch's worth at the end left
+    // all of them reading a count that was up to a batch behind — a lying
+    // instrument first, and a real behaviour difference second. The state
+    // differential (tools/diffstate.sh) is what caught it.
+    u64 runSteps(u64 n, u64& stamp);
 
     // Set when execution cannot continue (pre-P2 stand-in for the exception
     // model: traps, sc, illegal ops halt with a reason instead of vectoring).
@@ -260,7 +330,20 @@ struct Cpu {
     const u8* dispPre = nullptr;     // pre-dispatch gate bits per ISA row
 
     Cpu();
-    void attach(Bus& b) { bus = &b; }
+    // ⏱ ONE WIRING SITE. The bus is handed the processor's clock here rather
+    // than by each front end, for the reason SawtoothBus::setStamp exists: the
+    // last piece of run-loop wiring that was written out twice was missing the
+    // hard disk in one copy, and the app ran for weeks without one.
+    void attach(Bus& b)
+    {
+        bus = &b;
+        b.deviceClock = [](void* p) -> u64 {
+            Cpu& c = *static_cast<Cpu*>(p);
+            c.batchBreak = true;
+            return c.tbNow();
+        };
+        b.deviceClockCtx = this;
+    }
     void reset()
     {
         st = CpuState{};
@@ -269,6 +352,10 @@ struct Cpu {
         extIrqLine = smiPending = decPending = pmPending = false;
         napping = false;
         cycleAccum = 0;
+        // The clock restarts at zero, so cycles charged against the old one
+        // are not owed against the new one.
+        pendCycles = 0;
+        batchBreak = true;
         fetchDrop();
         tlbFlushAll();
     }
@@ -281,6 +368,15 @@ struct Cpu {
     // Execute up to n instructions; returns the number actually executed.
     u64 run(u64 n);
     void step();
+    // The dispatch tail of step(): everything from "we have the instruction
+    // word and its ISA row" onwards — the gates, the handler, the pc, the
+    // clock, the performance monitor and the trace. step() reaches it through
+    // the fetch path; the line executor reaches it with the word and row read
+    // straight out of a resident block. ⚠ ONE COPY, DELIBERATELY: two
+    // execution paths that each implement the dispatch rules is the shape of
+    // bug this project has already paid for twice, and the second copy is
+    // always the one nobody measures.
+    void execRow(u32 insn, u32 row);
 
     // Vector to an exception per the UM ch.4 model: SRR0/SRR1 composition,
     // MSR transition (clears VEC/POW/EE/PR/FP/FE0/SE/BE/FE1/PM/IR/DR/RI,
@@ -497,7 +593,46 @@ struct Cpu {
     // machine is fast" and "this machine is asleep", and the MIPS figure
     // cannot tell them apart on its own. See machine/include/opm/pace.hpp.
     u64 napSkipped = 0;
+    // Instructions executed straight out of a resident block, without the
+    // per-instruction fetch path — see runSteps. The interesting number is
+    // this divided by the number of times a line was entered, which is the
+    // average run of straight-line code this machine actually executes.
+    u64 lineInsns = 0, lineEntries = 0;
     static u32 fetchSlot(u32 pa) { return (pa >> 5) & (kFetchLines - 1u); }
+
+    // ⭐ THE BLOCK COVERING `ea`, IF IT IS ALREADY HERE. A pure probe: the
+    // translation cache must hit and the block must be resident. It never
+    // walks, never fills, never reads the bus and never raises — so a caller
+    // that gets null has lost nothing by asking, and can take the ordinary
+    // fetch path, which fills the block as a side effect and leaves the next
+    // probe hitting.
+    //
+    // This is what makes a line executor cheap: every line below runs once per
+    // LINE here and once per INSTRUCTION in step(). What it must not do is
+    // outlive its inputs — see Cpu::runSteps, where the invariant is that
+    // every writer of MSR, a segment register, the BATs, SDR1, the TLB or the
+    // block itself ends the batch.
+    FetchLine* fetchBlockFast(u32 ea, u32& word)
+    {
+        if (fetchCacheOff)
+            return nullptr;
+        if (st.msr & msr::LE)
+            ea ^= 4u; // PEM 3.1.4.4, as in fetchDecoded
+        if (xlGen != mmuGen || xlPage != (ea >> 12) ||
+            xlMsr != (st.msr & (msr::IR | msr::PR | msr::LE)) ||
+            xlSr != st.sr[ea >> 28])
+            return nullptr;
+        const u32 pa = xlPa | (ea & 0xFFFu);
+        FetchLine& fl = fetchLine[fetchSlot(pa)];
+        if (fl.base != (pa & ~31u))
+            return nullptr;
+        word = (pa >> 2) & 7u;
+        return &fl;
+    }
+    // DIAGNOSTIC (--no-line-exec): take one instruction per trip through the
+    // run loop, the way the machine did before whole blocks were executed in
+    // one go. The control for runSteps' inner loop.
+    bool lineExecOff = false;
     void fetchDrop()
     {
         for (FetchLine& e : fetchLine)

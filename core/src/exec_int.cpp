@@ -943,8 +943,25 @@ void h_mfspr(Cpu& c, u32 i, const InsnDesc&)
     if (sprAccessFault(c, spr, tb || p != nullptr,
                        tb || sprUserReadable(spr)))
         return;
-    if (spr == 268) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb); return; }
-    if (spr == 269) { c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb >> 32); return; }
+    // ⏱ THE GUEST IS READING THE CLOCK, so the clock has to be current. A
+    // batched run loop charges cycles and applies them later; every one of
+    // these arms is an OBSERVER, and an observer that reads a stale timebase
+    // is how a guest calibrates itself against a machine that is not the one
+    // it is running on. Syncing costs exactly the tick() the batch deferred,
+    // so a guest that reads the timebase constantly loses nothing and one
+    // that does not, wins.
+    if (spr == 268) {
+        c.syncClock();
+        c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb);
+        return;
+    }
+    if (spr == 269) {
+        c.syncClock();
+        c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb >> 32);
+        return;
+    }
+    if (spr == 22) // DEC, read through the same table as the rest below
+        c.syncClock();
     // The thermal unit re-samples on its own interval, so its status is fresh
     // whenever software looks. Refreshing on the read as well as on the write
     // matters: the only consumer arms the unit once and then polls THRM1[TIV]
@@ -1012,6 +1029,11 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         return;
     }
     if (spr == 22) { // DEC: MSB 0->1 by any means requests the exception
+        // ⏱ Apply what the batch owes BEFORE the reload — those decrements
+        // belong to the old value — and end the batch, because its length was
+        // computed from a decrementer that no longer exists.
+        c.syncClock();
+        c.batchBreak = true;
         const u32 old = c.st.dec;
         c.st.dec = v;
         ++c.decWrites;
@@ -1030,8 +1052,21 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
             c.decPending = true;
         return;
     }
-    if (spr == 284) { c.st.tb = (c.st.tb & 0xFFFFFFFF00000000ull) | v; return; }
-    if (spr == 285) { c.st.tb = (c.st.tb & 0xFFFFFFFFull) | (static_cast<u64>(v) << 32); return; }
+    // Writing the timebase: the charged cycles belong to the value being
+    // replaced, so apply them first, and end the batch — every deadline the
+    // caller computed was in the old timebase's terms.
+    if (spr == 284) {
+        c.syncClock();
+        c.batchBreak = true;
+        c.st.tb = (c.st.tb & 0xFFFFFFFF00000000ull) | v;
+        return;
+    }
+    if (spr == 285) {
+        c.syncClock();
+        c.batchBreak = true;
+        c.st.tb = (c.st.tb & 0xFFFFFFFFull) | (static_cast<u64>(v) << 32);
+        return;
+    }
     if (spr == 287) return; // PVR is mfspr-only
     if (spr == 1008) { // HID0: honor cache-control transitions
         const u32 old = c.st.hid0;
@@ -1044,12 +1079,15 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
     // it against MSR and the segment register directly; the BATs and the page
     // table base are what it cannot see, so writing one has to retire it.
     // SDR1 (25) and the eight BAT pairs (528-543) are the whole set.
-    if (spr == 25 || (spr >= 528 && spr <= 543))
+    if (spr == 25 || (spr >= 528 && spr <= 543)) {
         ++c.mmuGen;
+        c.batchBreak = true; // the mapping moved: see Cpu::runSteps
+    }
     *sprPtr(c, spr) = v;
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)
 {
+    c.syncClock(); // an observer of the clock: see h_mfspr
     const u32 tbr = f_spr(i);
     if (tbr == 269)
         c.st.gpr[f_rt(i)] = static_cast<u32>(c.st.tb >> 32);
@@ -1064,12 +1102,21 @@ void h_mtmsr(Cpu& c, u32 i, const InsnDesc&)
     // MSR[POW] with a HID0 power mode selected enters nap/doze/sleep: no
     // further instructions until an enabled interrupt (TB keeps ticking).
     if ((c.st.msr & msr::POW) &&
-        (c.st.hid0 & 0x00E00000u)) // DOZE | NAP | SLEEP
+        (c.st.hid0 & 0x00E00000u)) { // DOZE | NAP | SLEEP
         c.napping = true;
+        // End the batch: a sleeping core is the nap skip's job, and it can
+        // charge the whole sleep at once where a batch would step through it
+        // one asleep instruction at a time. At the Finder desktop that is 64%
+        // of every step the machine takes.
+        c.batchBreak = true;
+    }
 }
-void h_mtsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.sr[f_sr(i)] = c.st.gpr[f_rt(i)]; }
+// ⚠ A SEGMENT REGISTER IS A MAPPING, so writing one ends the batch: the line
+// executor resolved the block it is running from before this instruction ran.
+// See Cpu::runSteps.
+void h_mtsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.sr[f_sr(i)] = c.st.gpr[f_rt(i)]; c.batchBreak = true; }
 void h_mfsr(Cpu& c, u32 i, const InsnDesc&)  { c.st.gpr[f_rt(i)] = c.st.sr[f_sr(i)]; }
-void h_mtsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.sr[c.st.gpr[f_rb(i)] >> 28] = c.st.gpr[f_rt(i)]; }
+void h_mtsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.sr[c.st.gpr[f_rb(i)] >> 28] = c.st.gpr[f_rt(i)]; c.batchBreak = true; }
 void h_mfsrin(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.sr[c.st.gpr[f_rb(i)] >> 28]; }
 
 // ---- cache / sync / hints --------------------------------------------------

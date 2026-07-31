@@ -389,6 +389,30 @@ int main(int argc, char** argv)
     // --no-nap-skip: step an asleep processor one instruction at a time (the
     // control for machine/include/opm/pace.hpp).
     bool napSkipOn = true;
+    // --no-batch: apply the clock and service the devices on every single
+    // instruction, the way the machine did before batching existed. The
+    // control for pace.hpp's batchSteps and for Cpu::runSteps.
+    bool batchOn = true;
+    // --no-line-exec: never run a whole resident block in one go. The control
+    // for Cpu::runSteps' inner loop.
+    bool lineExecOff = false;
+    // 🔬 --fingerprint-every N: THE STATE DIFFERENTIAL.
+    //
+    // Every claim in this tree that some new machinery is transparent has been
+    // settled by running with it off and comparing a handful of report lines —
+    // stop pc, timebase, disk commands, painted bytes. That is a good gate and
+    // it is a COARSE one: it compares four numbers out of a 256 MB machine,
+    // and it can only say "the same" about a whole run.
+    //
+    // This compares everything. The fingerprint is FNV-1a over the complete
+    // serialized machine — RAM, every register, every device cell — taken at
+    // exact instruction counts, so two runs of the same window print two
+    // streams of numbers and the FIRST line that differs names the window the
+    // divergence happened in. The batch is clamped to land on each mark, so
+    // the counts are the same in both runs whatever the batching does.
+    //
+    // tools/diffstate.sh runs the pair.
+    u64 fpEvery = 0, fpNext = ~0ull;
     unsigned profHz = 0;               // --profile HZ (g4prof only)
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
     bool fastTbSet = false;            // CLI wins over a resumed value
@@ -522,6 +546,12 @@ int main(int argc, char** argv)
         // ships with the switch that turns it off, because that is the only
         // way a claim about one gets settled.
         if (!strcmp(a, "--no-nap-skip")) { napSkipOn = false; continue; }
+        if (!strcmp(a, "--no-batch")) { batchOn = false; continue; }
+        if (!strcmp(a, "--no-line-exec")) { lineExecOff = true; continue; }
+        if (!strcmp(a, "--fingerprint-every") && i + 1 < argc) {
+            fpEvery = strtoull(argv[++i], nullptr, 0);
+            continue;
+        }
         if (!strcmp(a, "--profile")) {
             profHz = static_cast<unsigned>(strtoul(next(), nullptr, 0));
             continue;
@@ -1088,6 +1118,7 @@ int main(int argc, char** argv)
     // the default, --no-ohci-port-power must be able to put the old state back.
     bus.devGateOff = !devGate;
     cpu.fetchCacheOff = !icache;
+    cpu.lineExecOff = lineExecOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);
     bus.ohci(1).setLivePortPower(ohciPortPower);
     if (ohciNdpSet) {
@@ -1121,7 +1152,6 @@ int main(int argc, char** argv)
     bus.setPcRef(&cpu.st.pc);
     bus.setStamp(&executed);
     bus.lrRef = &cpu.st.lr;
-    bus.pmu().tbRef = &cpu.st.tb; // VIA time = TB/32 (real clock ratio)
     bus.pmu().portAIn = static_cast<u8>(viaA);
     cpu.l2Inert = l2Inert;
     if (l2Inert)
@@ -1255,6 +1285,10 @@ int main(int argc, char** argv)
     // normally sitting dirty in the L1 — the unflushed read came back 19,298
     // on a machine whose Ticks was 404,342.
     const u64 executedAtStart = executed, tbAtStart = cpu.st.tb;
+    // Marks are counted from where THIS run starts, so a resumed pair lines up
+    // whatever instruction count the snapshot carries.
+    if (fpEvery)
+        fpNext = executed + fpEvery;
     cpu.l1dFlushAll(true);
     cpu.l2FlushAll(true);
     const u32 ticksAtStart = bus.read32(0x0000416Au);
@@ -1320,6 +1354,64 @@ int main(int argc, char** argv)
         OPM_PH(DevTick);
         cpu.setExternalIrq(bus.serviceDevices(cpu.st.tb));
         OPM_PH(Other);
+    };
+
+    // How many instructions the run loop may hand to one batch, before
+    // pace.hpp's own clamps. Three callers can only ever be handed one:
+    //
+    //  - --no-batch, the control;
+    //  - the two-rate modes (--fast-tb-until / --fast-tb-after), where the
+    //    harness's clock advance is a SECOND tick() from this loop rather
+    //    than a constant carried by step(), so a batch of k instructions
+    //    would be charged one instruction's worth of it;
+    //  - and under --realtime the batch stops at the next clock sample, so
+    //    the host-paced top-up still lands every 1024 instructions.
+    // Stop exactly on the next fingerprint mark, or the two runs being
+    // compared are photographed at different instructions and every line
+    // differs. Applies to the nap skip as well as to the batch — both charge
+    // many instructions at once.
+    auto fpClamp = [&](u64 done, u64 want) -> u64 {
+        if (fpEvery && fpNext > done && fpNext - done < want)
+            return fpNext - done;
+        return want;
+    };
+
+    // The whole machine, as one number, at an exact instruction count. See
+    // fpEvery. Costs a full serialization — about a fifth of a second for a
+    // 256 MB machine — so it is a per-100-M-instruction instrument, not a
+    // per-instruction one.
+    auto fingerprint = [&](u64 done) {
+        if (!fpEvery || done < fpNext)
+            return;
+        const HarnessState h{done,      fastTb,   fastTbUntil, parkSeen,
+                             parkArmed, ataPoked, emPoked};
+        printf("FP @%llu %016llx\n", static_cast<unsigned long long>(done),
+               static_cast<unsigned long long>(
+                   snapshotFingerprint(cpu, bus, h)));
+        fflush(stdout);
+        // With --snapshot-out, the FIRST mark is also written out in full.
+        // A fingerprint says two machines differ; two snapshots say WHERE,
+        // which is the question that follows immediately.
+        if (snapOut) {
+            SnapWriter w;
+            saveSnapshot(cpu, bus, h, w);
+            writeSnapshotFile(snapOut, w.buf);
+            snapOut = nullptr;
+        }
+        while (fpNext <= done)
+            fpNext += fpEvery;
+    };
+
+    auto batchBudget = [&](u64 done) -> u64 {
+        if (!batchOn || (!mergedTick && !realtime))
+            return 1;
+        u64 want = maxInsns - done;
+        if (realtime) {
+            const u64 toSample = 1024u - (done & 1023u);
+            if (toSample < want)
+                want = toSample;
+        }
+        return fpClamp(done, want);
     };
 
     // Symbolize on demand. The table cannot exist until the Mac OS ROM is in
@@ -1578,14 +1670,16 @@ int main(int argc, char** argv)
             if (const u64 n =
                     (realtime || !napSkipOn)
                         ? 0
-                        : napSkip(cpu, bus, maxInsns - executed)) {
+                        : napSkip(cpu, bus,
+                                  fpClamp(executed, maxInsns - executed))) {
                 executed += n;
                 tickPeripherals();
+                fingerprint(executed);
                 continue;
             }
-            cpu.step();
+            runBatch(cpu, bus, executed, batchBudget(executed));
             tickPeripherals();
-            ++executed;
+            fingerprint(executed);
         }
 
     while (!bench && executed < maxInsns && !cpu.halted) {
@@ -1636,6 +1730,7 @@ int main(int argc, char** argv)
                        "nothing written\n");
             fflush(stdout);
         }
+        fingerprint(executed);
         cpu.step();
         OPM_PH(Instr);
         // kATAMgrAddATABus (fn 0x93) fails with -56, and its worker
@@ -4288,6 +4383,29 @@ int main(int argc, char** argv)
                breaks ? static_cast<double>(ranInsns) /
                             static_cast<double>(breaks)
                       : 0.0);
+#if OPM_PROFILING
+        // ⭐ HOW MUCH STRAIGHT-LINE CODE THIS MACHINE ACTUALLY RUNS. The line
+        // executor's whole saving is the fetch work it does once per LINE
+        // instead of once per instruction, so instructions-per-entry IS the
+        // multiplier — an average of 1 would mean it bought nothing at all.
+        if (cpu.lineEntries) {
+            // ⚠ Against instructions actually EXECUTED, not against the step
+            // count. At the desktop most steps are skipped asleep and never
+            // reach an executor at all, so the step count as a denominator
+            // makes an executor that covers nine tenths of the real work read
+            // as 40%.
+            const u64 ran =
+                ranInsns > cpu.napSkipped ? ranInsns - cpu.napSkipped : 1;
+            printf("--   line executor: %llu instructions over %llu entries = "
+                   "%.2f per entry (%.1f%% of instructions executed)\n",
+                   static_cast<unsigned long long>(cpu.lineInsns),
+                   static_cast<unsigned long long>(cpu.lineEntries),
+                   static_cast<double>(cpu.lineInsns) /
+                       static_cast<double>(cpu.lineEntries),
+                   100.0 * static_cast<double>(cpu.lineInsns) /
+                       static_cast<double>(ran));
+        }
+#endif
     }
     // Where the host time went. Sampled, so it is a distribution and not a
     // ledger: percentages under about 1% are noise at any realistic rate.

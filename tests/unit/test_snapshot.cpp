@@ -382,7 +382,6 @@ TEST_CASE("a restored machine executes identically")
     u64 executed = 0;
     bus.stamp = &executed;
     bus.pcRef = &cpu.st.pc;
-    bus.pmu().tbRef = &cpu.st.tb;
 
     auto advance = [&](u64 n, std::vector<u32>* rec) {
         for (u64 k = 0; k < n; ++k) {

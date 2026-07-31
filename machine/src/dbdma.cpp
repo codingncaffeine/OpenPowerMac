@@ -92,6 +92,19 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
             // Anything else tells a driver its transfer is still coming when
             // nothing is ever going to arrive.
             if ((status_ & kActive) && cmdPtr_ && dmaBus) {
+                // ⛔⛔ SNOOP FIRST, exactly as the run loop does before it
+                // touches a descriptor. This line went in without it and the
+                // omission cost a boot: the status word landed in RAM
+                // underneath a LIVE, STALE cache line, so the driver polling
+                // that descriptor read xferStatus=0000 for ever while memory
+                // held 8400 — a completion the guest could not see. The
+                // diagnostic read RAM and reported the descriptor complete,
+                // which is precisely the disagreement that named it.
+                //
+                // It covers the read below as well as the write: the engine
+                // must not take a request count out of a line the processor
+                // has dirty either.
+                dmaBus->snoopBeforeDmaWrite(cmdPtr_, 16);
                 const u32 req = swap32(dmaBus->read32(cmdPtr_)) & 0xFFFFu;
                 dmaBus->write32(cmdPtr_ + 12,
                                 swap32((0x8400u << 16) |

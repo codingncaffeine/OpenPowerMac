@@ -5,6 +5,7 @@
 #include "opm/sawtooth.hpp"
 
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -112,12 +113,29 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         // g4run's --realtime, deliberately: the two have to say the same thing
         // about the same machine.
         constexpr uint64_t kNsPerTick = 40, kCatchup = 25000;
-        // ⚠ NO napSkip ON THIS PATH, DELIBERATELY. Under real-time pacing the
-        // timebase comes from the host clock, so charging a run of asleep
-        // steps to it would advance the clock twice. The honest fix for an
-        // idle machine here is to SLEEP until the earliest deadline — every
-        // device deadline is now in timebase, so that is buildable, and it is
-        // not built.
+        // ⚠⚠⚠ THIS PACES IN ONE DIRECTION ONLY, AND SINCE THE EMULATOR GOT
+        // FAST THAT IS NO LONGER ENOUGH. The top-up below can only ADD time.
+        // The guest's timebase also advances architecturally — one cycle per
+        // instruction over the bus divisor, a quarter of a tick each — so once
+        // the machine retires more than 100 M instructions per host second the
+        // architectural rate alone EXCEEDS 25 MHz and the top-up never fires
+        // again. Measured through this DLL at the Finder desktop: 192 MIPS,
+        // timebase 48.4 MHz, 1.93x real. THE GUEST'S CLOCK GAINS AN HOUR EVERY
+        // HOUR, and the faster this emulator gets the worse it will be.
+        //
+        // ⛔ DO NOT "just sleep when ahead" — it was tried, measured and
+        // reverted on 2026-07-31. Sleeping the excess whenever the lead passed
+        // 2 ms drove the machine to 0.39x real with 13,320 slips over a 300 s
+        // boot, because the sleep and the slip REBASE below form a limit
+        // cycle: oversleep (a host sleep quantum is milliseconds, the lead is
+        // microseconds) -> fall behind -> the catch-up cap fires -> rtTbBase
+        // is rebased to now -> instantly "ahead" again -> sleep. A correct
+        // throttle has to pace against a fixed origin with hysteresis, or not
+        // rebase on the slip, and it needs its own measurement pass.
+        //
+        // The right shape is the one pace.hpp already describes: an idle
+        // machine should SLEEP TO THE EARLIEST DEVICE DEADLINE, which is now
+        // expressible because every deadline is in timebase.
         while (m->executed < until && !cpu.halted) {
             // Batched to the next clock sample, so the host-paced top-up below
             // still lands every 1024 instructions. Anything shorter ends the

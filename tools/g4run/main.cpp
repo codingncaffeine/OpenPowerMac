@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1337,6 +1338,12 @@ int main(int argc, char** argv)
                     }
                     cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));
                 }
+                // ⚠ NOTHING PACES THE OTHER DIRECTION, and since the emulator
+                // got fast that is a real error rather than a theoretical one:
+                // past about 100 MIPS the architectural clock alone outruns
+                // 25 MHz, this branch stops firing, and the guest's timebase
+                // reads 1.93x real. ⛔ Sleeping the excess was tried, measured
+                // and reverted — see the note in capi's opm_run.
             }
         } else if (fastTb && executed < fastTbUntil) {
             cpu.tick(fastTb);

@@ -30,7 +30,10 @@ DEFAULT_SERIAL='" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 pro
 # matched, and a session was spent bisecting a machine change that had
 # nothing to do with it. g4run only prints "cd attach FAILED" and carries
 # on; this stops the run instead.
-OPM_CD="${OPM_CD:-/c/Users/gamer/Downloads/PowerMacG4.iso}"
+# 2026-08-01: the user consolidated the loose Downloads media into
+# "Downloads/Open Power Mac/" — PowerMacG4.iso, the 9.2.2 universal
+# install, the restore DVD and the 8.6 material all live there now.
+OPM_CD="${OPM_CD:-/c/Users/gamer/Downloads/Open Power Mac/PowerMacG4.iso}"
 [ -f "$OPM_CD" ] || { echo "FAIL: boot CD missing: $OPM_CD (set OPM_CD)"; exit 1; }
 
 # ⚠ --fast-tb WAS 60 UNTIL 2026-07-30 AND IS NOW 4. With the KeyLargo timer

@@ -293,6 +293,93 @@ TEST_CASE("cce: HOSTDATA_BLT colour keeps the guest's MEMORY byte order")
     CHECK(r.c.vram[stride * 3u + 4u * 4u + 0u] == 0x55);
 }
 
+TEST_CASE("cce: BITBLT_MULTI (0x9B) copies through the engine's blit path")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    // Plant a 2x2 source pattern at (2,1) on a 32-px-wide 32bpp surface.
+    const size_t stride = 4u * 8u * 4u;
+    for (u32 yy = 0; yy < 2; ++yy)
+        for (u32 xx = 0; xx < 2; ++xx)
+            r.c.vram[(1 + yy) * stride + (2 + xx) * 4 + 1] =
+                static_cast<u8>(0xA0 + yy * 2 + xx);
+    // SETTINGS: src+dst pitch/offset supplied, clip supplied, no brush,
+    // 32bpp, src type = dst, SRCCOPY, source loaded from video memory.
+    const u32 gc = 1u | 2u | 8u | (15u << 4) | (6u << 8) | (3u << 12) |
+                   (0xCCu << 16) | (2u << 24);
+    r.fifo(0xC0009B00u | (7u << 16)); // 8-DWord body
+    r.fifo(gc);
+    r.fifo(0x00800000u); // SRC_PITCH_OFFSET
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET
+    r.fifo(0x00000000u); // SC_TOP_LEFT
+    r.fifo(0x001F001Fu); // SC_BOT_RITE
+    r.fifo(0x00020001u); // SRC_X=2 | SRC_Y=1
+    r.fifo(0x000A0005u); // DST_X=10 | DST_Y=5
+    r.fifo(0x00020002u); // SRC_W=2 | SRC_H=2
+    const auto& e = r128EngStats();
+    CHECK(e.copies - before.copies == 1);
+    CHECK(e.pixels - before.pixels == 4);
+    CHECK(r.c.vram[5 * stride + 10 * 4 + 1] == 0xA0);
+    CHECK(r.c.vram[6 * stride + 11 * 4 + 1] == 0xA3);
+    CHECK(r128CceP3Skipped().count(0x9Bu) == 0);
+}
+
+TEST_CASE("cce: SMALL_TEXT (0x93) draws transparent glyphs and NEXTCHAR "
+          "(0x19) reuses its colour")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    const size_t stride = 4u * 8u * 4u;
+    const u32 gc = 2u | 8u | (15u << 4) | (6u << 8) | (0xCCu << 16);
+    // One glyph: dx=0, rise dy=2, 2x2, bits MSB-first 1101 -> pixels
+    // (5,8) (6,8) set, (5,9) clear, (6,9) set with base (5,10).
+    r.fifo(0xC0009300u | (7u << 16)); // 8-DWord body
+    r.fifo(gc);
+    r.fifo(0x00800000u);                              // DST_PITCH_OFFSET
+    r.fifo(0x00000000u);                              // SC_TOP_LEFT
+    r.fifo(0x001F001Fu);                              // SC_BOT_RITE
+    r.fifo(0x00FF0000u);                              // FRGD: red
+    r.fifo(0x000A0005u);                              // BAS_Y=10 | BAS_X=5
+    r.fifo((2u << 25) | (2u << 16) | (2u << 8) | 0u); // H=2 W=2 dy=2 dx=0
+    r.fifo(0xD0000000u);                              // bits 1101
+    const auto& e = r128EngStats();
+    CHECK(e.pixels - before.pixels == 3);
+    CHECK(r.c.vram[8 * stride + 5 * 4 + 1] == 0xFF);  // (5,8) red
+    CHECK(r.c.vram[9 * stride + 5 * 4 + 1] == 0x00);  // (5,9) untouched
+    CHECK(r.c.vram[9 * stride + 6 * 4 + 1] == 0xFF);  // (6,9) red
+    // NEXTCHAR: engine-layout words, colour remembered from SMALL_TEXT.
+    r.fifo(0xC0001900u | (2u << 16)); // 3-DWord body
+    r.fifo(0x0014000Cu);              // DST_Y=20 | DST_X=12
+    r.fifo(0x00010002u);              // DST_H=1 | DST_W=2
+    r.fifo(0x80000000u);              // one set bit -> (12,20)
+    CHECK(r.c.vram[20 * stride + 12 * 4 + 1] == 0xFF);
+    CHECK(r128CceP3Skipped().count(0x93u) == 0);
+    CHECK(r128CceP3Skipped().count(0x19u) == 0);
+}
+
+TEST_CASE("cce: SET_SCISSORS (0x1E) clips the next fill")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    r.fifo(0xC0001E00u | (1u << 16)); // 2-DWord body
+    r.fifo(0x00010001u);              // top=1 left=1
+    r.fifo(0x00020002u);              // bottom=2 right=2
+    // A PAINT that supplies NO clip of its own: its GMC write reloads the
+    // DEFAULT clipping — TL forced to (0,0), BR from
+    // DEFAULT_SC_BOTTOM_RIGHT, which SET_SCISSORS just set to (2,2) — so
+    // the 5x5 rect clips to the 3x3 window at the origin.
+    const u32 gc = 2u | (13u << 4) | (6u << 8) | (0xF0u << 16);
+    r.fifo(0xC0009100u | (4u << 16)); // 5-DWord body
+    r.fifo(gc);
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET
+    r.fifo(0x00AA0000u); // FRGD
+    r.fifo(0x00000000u); // TOP|LEFT = 0,0
+    r.fifo(0x00050005u); // BOTM|RITE = 5,5
+    const auto& e = r128EngStats();
+    CHECK(e.pixels - before.pixels == 9);
+    CHECK(r128CceP3Skipped().count(0x1Eu) == 0);
+}
+
 TEST_CASE("cce: an indirect body drives the 2D engine through PACKET0")
 {
     CceRig r;

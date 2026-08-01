@@ -965,6 +965,177 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
     return true;
 }
 
+// BITBLT_MULTI (0x9B): N screen-to-screen copies, per rect three words —
+// [SRC_X|SRC_Y] [DST_X|DST_Y] [SRC_W|SRC_H], every one a HALF-SWAP of the
+// engine's register layout, routed onto the engine's direction-correct copy
+// path. This is the op a WINDOW DRAG submits: with it skipped, the window's
+// pixels never moved and the exposed area kept stale content — the user's
+// "fine until I move it". ⚠ The spec's prose calls the second word the
+// destination's "bottom-right corner" while naming the fields DST_X/DST_Y
+// and declaring the geometry identical to the source; it is treated as the
+// TOP-LEFT. If every dragged window lands offset by its own size, this is
+// the line to revisit.
+static bool cceOpBitbltMulti(R128Cell& c, const u32* body, u32 n)
+{
+    u32 i = cceSettings(c, body, n);
+    if (i > n)
+        return false;
+    while (i + 3u <= n) {
+        const u32 s = body[i], d = body[i + 1u], wh = body[i + 2u];
+        i += 3u;
+        if (!(wh >> 16) || !(wh & 0x3FFFu))
+            continue;
+        cceRegWrite(c, 0x1434u, (s >> 16) | (s << 16));   // SRC_Y_X
+        cceRegWrite(c, 0x1438u, (d >> 16) | (d << 16));   // DST_Y_X
+        cceRegWrite(c, 0x143Cu, (wh >> 16) | (wh << 16)); // H_W: draw
+    }
+    return true;
+}
+
+// Destination state for the ops that write VRAM directly, gathered from the
+// engine's CANONICAL registers (the 0x16EC aliases are normalised away).
+struct CceDst {
+    u32 bpp = 0, dstOff = 0, pitchBytes = 0;
+    int scL = 0, scR = 0, scT = 0, scB = 0;
+};
+static bool cceDstState(R128Cell& c, u32 dstType, CceDst& d)
+{
+    switch (dstType) {
+    case 3u:
+    case 4u: d.bpp = 2; break;
+    case 6u: d.bpp = 4; break;
+    default: ++gEng.badBpp; return false;
+    }
+    d.dstOff = c.peek(0x1404u);
+    d.pitchBytes = c.peek(0x1408u) * 8u * d.bpp;
+    d.scL = static_cast<int>(c.peek(0x1640u) & 0x3FFFu);
+    d.scR = static_cast<int>(c.peek(0x1644u) & 0x3FFFu);
+    d.scT = static_cast<int>(c.peek(0x1648u) & 0x3FFFu);
+    d.scB = static_cast<int>(c.peek(0x164Cu) & 0x3FFFu);
+    return true;
+}
+static u32 cceConvColor(u32 rgbq, u32 dstType)
+{
+    const u32 rr = (rgbq >> 16) & 0xFFu, gg = (rgbq >> 8) & 0xFFu,
+              bb = rgbq & 0xFFu;
+    if (dstType == 4u)
+        return ((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3);
+    if (dstType == 3u)
+        return ((rr >> 3) << 10) | ((gg >> 3) << 5) | (bb >> 3);
+    return rgbq;
+}
+// One TRANSPARENT mono glyph: set bits draw the foreground, clear bits
+// leave the destination — the text ops' rendering. Bit consumption matches
+// the HOSTDATA mono path (row-major, continuous across DWORDs, PIX_ORDER
+// picks the end).
+static void cceDrawMonoGlyph(R128Cell& c, const CceDst& d, int bx, int by,
+                             u32 wPx, u32 hPx, const u32* raster, u32 mWords,
+                             u32 fg, bool lsbFirst)
+{
+    u64 bit = 0;
+    const u64 avail = static_cast<u64>(mWords) * 32u;
+    for (u32 yy = 0; yy < hPx; ++yy)
+        for (u32 xx = 0; xx < wPx; ++xx, ++bit) {
+            if (bit >= avail)
+                return;
+            const u32 word = raster[bit >> 5];
+            const u32 bIdx = static_cast<u32>(bit & 31u);
+            const u32 on =
+                lsbFirst ? (word >> bIdx) & 1u : (word >> (31u - bIdx)) & 1u;
+            if (!on)
+                continue;
+            const int px = bx + static_cast<int>(xx);
+            const int py = by + static_cast<int>(yy);
+            if (px < d.scL || px > d.scR || py < d.scT || py > d.scB)
+                continue;
+            const u64 at = static_cast<u64>(d.dstOff) +
+                           static_cast<u64>(py) * d.pitchBytes +
+                           static_cast<u64>(px) * d.bpp;
+            if (at + d.bpp > c.vram.size())
+                continue;
+            for (u32 k = 0; k < d.bpp; ++k)
+                c.vram[at + k] =
+                    static_cast<u8>(fg >> (8u * (d.bpp - 1u - k)));
+            ++gEng.pixels;
+        }
+}
+
+// SMALL_TEXT (0x93): a run of packed mono glyphs. Body after SETTINGS:
+// [FRGD_COLOUR (RGBQUAD)] [BAS_Y|BAS_X] then per glyph
+// [H 31:25 | W 23:16 | Ydev 15:8 | Xdev 7:0] + ceil(W*H/32) raster DWORDs.
+// The pen ADVANCES by each glyph's Xdev (the SDK's worked example: x1=0 for
+// the first glyph), and Ydev is the glyph's rise above the baseline. The
+// foreground RGBQUAD is remembered in DP_SRC_FRGD_CLR for NEXTCHAR.
+static bool cceOpSmallText(R128Cell& c, const u32* body, u32 n)
+{
+    const u32 i = cceSettings(c, body, n);
+    if (i > n || i + 2u > n)
+        return false;
+    const u32 gc = body[0];
+    const bool lsbFirst = (gc >> 14) & 1u;
+    CceDst d;
+    if (!cceDstState(c, (gc >> 8) & 0xFu, d))
+        return false;
+    const u32 fgq = body[i];
+    const u32 fg = cceConvColor(fgq, (gc >> 8) & 0xFu);
+    cceRegWrite(c, 0x15D8u, fgq); // NEXTCHAR's "default foreground"
+    int penX = static_cast<short>(body[i + 1u] & 0xFFFFu);
+    const int basY = static_cast<short>(body[i + 1u] >> 16);
+    u32 j = i + 2u;
+    while (j < n) {
+        const u32 g = body[j];
+        const u32 dx = g & 0xFFu, dy = (g >> 8) & 0xFFu;
+        const u32 w = (g >> 16) & 0xFFu, h = g >> 25;
+        const u32 m = (w * h + 31u) / 32u;
+        if (j + 1u + m > n)
+            return false; // malformed against the header count
+        penX += static_cast<int>(dx);
+        if (w && h)
+            cceDrawMonoGlyph(c, d, penX, basY - static_cast<int>(dy), w, h,
+                             &body[j + 1u], m, fg, lsbFirst);
+        j += 1u + m;
+    }
+    ++gEng.blits;
+    return true;
+}
+
+// NEXTCHAR (0x19): one glyph, no SETTINGS — the current GMC supplies the
+// destination type and pixel order, DP_SRC_FRGD_CLR (set by SMALL_TEXT)
+// the colour. Body: [DST_Y|DST_X] [DST_H|DST_W] [raster...], both words in
+// the ENGINE's own layout for once.
+static bool cceOpNextChar(R128Cell& c, const u32* body, u32 n)
+{
+    if (n < 3u)
+        return false;
+    const u32 gmc = c.peek(0x146Cu);
+    CceDst d;
+    if (!cceDstState(c, (gmc >> 8) & 0xFu, d))
+        return false;
+    const u32 fg = cceConvColor(c.peek(0x15D8u), (gmc >> 8) & 0xFu);
+    const u32 yx = body[0], hw = body[1];
+    cceDrawMonoGlyph(c, d, static_cast<short>(yx & 0xFFFFu),
+                     static_cast<short>(yx >> 16), hw & 0xFFFFu, hw >> 16,
+                     &body[2], n - 2u, fg, (gmc >> 14) & 1u);
+    ++gEng.blits;
+    return true;
+}
+
+// SET_SCISSORS (0x1E): [TOP_LEFT][BOTTOM_RIGHT], the same field layout the
+// SETTINGS block uses. Written to the LIVE scissor aliases AND to
+// DEFAULT_SC_BOTTOM_RIGHT: a later packet whose GUI_CONTROL says "use the
+// default clipping" reloads TL=(0,0), BR=DEFAULT_SC_BOTTOM_RIGHT, so a
+// SET_SCISSORS that skipped the default register would be undone by the
+// very next op's GMC write.
+static bool cceOpSetScissors(R128Cell& c, const u32* body, u32 n)
+{
+    if (n < 2u)
+        return false;
+    cceRegWrite(c, 0x16ECu, body[0]);
+    cceRegWrite(c, 0x16F0u, body[1]);
+    cceRegWrite(c, 0x16E8u, body[1]);
+    return true;
+}
+
 // Fetch a pending indirect body and SPLICE IT AT THE PARSE HEAD, so the
 // body executes after the packet that dispatched it and before whatever the
 // guest queued next — the order the hardware gives.
@@ -1069,6 +1240,14 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
             done = cceOpPaintMulti(c, body, n);
         else if (op == 0x94u) // HOSTDATA_BLT — SDK F.11
             done = cceOpHostBlt(c, body, n);
+        else if (op == 0x9Bu) // BITBLT_MULTI — SDK F.18
+            done = cceOpBitbltMulti(c, body, n);
+        else if (op == 0x93u) // SMALL_TEXT — SDK F.10
+            done = cceOpSmallText(c, body, n);
+        else if (op == 0x19u) // NEXTCHAR — SDK F.16
+            done = cceOpNextChar(c, body, n);
+        else if (op == 0x1Eu) // SET_SCISSORS — SDK F.22
+            done = cceOpSetScissors(c, body, n);
         if (!done)
             ++gCceP3[op];
         gCceHead += 1u + n;

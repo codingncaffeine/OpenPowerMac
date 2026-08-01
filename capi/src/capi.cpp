@@ -71,6 +71,11 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     if (rom.size() != SawtoothBus::kRomSize)
         return nullptr;
     OpmMachine* m = new OpmMachine();
+    // A fresh machine gets a fresh command-stream parser: the shell calls
+    // this on every Start of the same process, and a previous machine that
+    // stopped mid-packet would otherwise poison the new stream (see
+    // r128CceReset in opm/r128.hpp).
+    r128CceReset();
     m->bus = new SawtoothBus(size_t(ramMb ? ramMb : 256) * 1024 * 1024,
                              std::move(rom));
     if (cdPath && *cdPath)

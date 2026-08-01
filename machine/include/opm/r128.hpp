@@ -343,6 +343,17 @@ void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
 // contract as the ROP map: the next thing to implement is a number in the
 // report, not a guess.
 const std::map<u32, u64>& r128CceP3Skipped();
+// ⚠ MUST be called when a machine is CREATED. The parser's staging FIFO is
+// process-global (a file-static, to keep sizeof(R128Cell) and every
+// snapshot untouched), and the shell creates a fresh machine on every
+// Stop/Start of the SAME process. A previous machine that died mid-stream
+// leaves a half-consumed packet staged; the new machine's first FIFO words
+// are then parsed as that stale header's body and the whole stream is
+// desynchronised — fences land only where the misparse happens to hit the
+// scratch registers, which presents as "the desktop drew for a while and
+// then froze mid-redraw". Found from a user diag capture after a
+// Stop/Start.
+void r128CceReset();
 const R128EngStats& r128EngStats();
 // --no-ati-2d: put the card back the way it was before the engine existed,
 // so a boot that never touches the GUI block can be shown to be unchanged.

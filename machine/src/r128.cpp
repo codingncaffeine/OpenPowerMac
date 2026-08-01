@@ -628,6 +628,19 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
 // parse loop performs it at the packet boundary.
 static std::vector<u32> gCcePendingInd;
 
+// A machine is being created: no packet stream exists yet, whatever a
+// previous machine in this process left staged. See the header note — a
+// stale half-packet here desynchronises every subsequent submission, and
+// it presented as "the desktop drew for a while after a Stop/Start and
+// then froze mid-redraw".
+void r128CceReset()
+{
+    gCceFifo.clear();
+    gCceHead = 0;
+    gCceDepth = 0;
+    gCcePendingInd.clear();
+}
+
 static void cceRegWrite(R128Cell& c, u32 off, u32 native)
 {
     // Through the front door: the same path a guest MMIO store takes, so a

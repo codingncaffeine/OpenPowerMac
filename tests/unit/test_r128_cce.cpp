@@ -66,6 +66,30 @@ struct CceRig {
 
 } // namespace
 
+TEST_CASE("cce: a machine's stream survives a predecessor that died "
+          "mid-packet")
+{
+    // The shell creates a fresh machine per Start of one process, and the
+    // parser's staging FIFO is process-global. Leave a half-consumed
+    // packet behind, reset as opm_create does, and the next machine's
+    // stream must parse cleanly from its first word.
+    {
+        CceRig dying;
+        dying.fifo(0x00050578u); // Type-0 claiming 6 data words...
+        dying.fifo(0x11111111u); // ...gets two and "the machine stops"
+        dying.fifo(0x22222222u);
+    }
+    r128CceReset();
+    CceRig r;
+    const auto before = r128EngStats();
+    r.fifo(0x00010578u);
+    r.fifo(0xCAFEBABEu);
+    r.fifo(0x0000CAFEu);
+    CHECK(r128EngStats().ccePkt0 - before.ccePkt0 == 1);
+    CHECK(r.c.peek(0x15E0u) == 0xCAFEBABEu);
+    CHECK(r.c.peek(0x15E4u) == 0x0000CAFEu);
+}
+
 TEST_CASE("cce: the measured six-DWORD submission lands the fence")
 {
     CceRig r;

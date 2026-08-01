@@ -453,6 +453,12 @@ int main(int argc, char** argv)
     bool realtime = false;             // --realtime: TB from the host clock
     u32 callLo = 0, callHi = 0;        // --call-trace LO HI
     u64 callFrom = 0;                  // --call-trace-at N: gate
+    // --trap-log N: the first N A-traps after --bp-from, each with the FILE it
+    // names. The existing census says WHICH traps happen and how often, and
+    // that is what narrowed this to file I/O — but "which file was not found"
+    // is not answerable from a count. A File Manager parameter block carries
+    // ioNamePtr at PB+18, pointing at a Pascal string.
+    u32 trapLogN = 0, trapLogged = 0;
     u32 t68Lo = 0, t68Hi = 0;          // --trace-68k LO HI
     u32 t68Cap = 4000;                 // --trace-68k-lines N
     u64 watchFrom = 0;                 // --watch-from N: value-watch gate
@@ -910,9 +916,11 @@ int main(int argc, char** argv)
             if (!strcmp(a, "--callog")) callogPc = v;
             else traceAtPc = v;
         }
-        else if (!strcmp(a, "--trace-lines") || !strcmp(a, "--callog-max")) {
+        else if (!strcmp(a, "--trace-lines") || !strcmp(a, "--callog-max") ||
+                 !strcmp(a, "--trap-log")) {
             const u64 v = strtoull(next(), nullptr, 0);
             if (!strcmp(a, "--callog-max")) callogMax = static_cast<u32>(v);
+            else if (!strcmp(a, "--trap-log")) trapLogN = static_cast<u32>(v);
             else traceLines = v;
         }
         else if (!strcmp(a, "--watch-va"))
@@ -3098,6 +3106,38 @@ int main(int argc, char** argv)
             if (atFetch && (cpu.st.gpr[27] & 0xF000u) == 0xA000u) {
                 const u32 t = cpu.st.gpr[27] & 0x0FFFu;
                 ++trapAll[t];
+                // --trap-log: name the FILE, not just the trap. A File
+                // Manager parameter block is in A0 (r16) and ioNamePtr is at
+                // PB+18; a plausible Pascal string there is the answer to
+                // "which file". ⚠ guest() flushes the caches write-back, so
+                // this is an instrument that PERTURBS — hence hard-gated by
+                // --bp-from and capped. Data is preserved (write-back, not
+                // invalidate), timing and cache state are not.
+                if (trapLogN && trapLogged < trapLogN && executed >= bpFrom) {
+                    ++trapLogged;
+                    const u32 a0 = cpu.st.gpr[16];
+                    char nm[40] = {};
+                    const long long np = guest(a0 + 18u, 4);
+                    if (np > 0) {
+                        const long long ln = guest(static_cast<u32>(np), 1);
+                        if (ln > 0 && ln < 32) {
+                            for (long long k = 0; k < ln; ++k) {
+                                const long long c =
+                                    guest(static_cast<u32>(np) + 1u +
+                                              static_cast<u32>(k), 1);
+                                nm[k] = (c >= 32 && c < 127)
+                                            ? static_cast<char>(c)
+                                            : '.';
+                            }
+                        }
+                    }
+                    printf("TRAP $A%03x %-18s pc68=%08x D0=%08x A0=%08x%s%s%s "
+                           "@%llu\n",
+                           t, trapName(t), cur68, cpu.st.gpr[8], a0,
+                           nm[0] ? " name=\"" : "", nm, nm[0] ? "\"" : "",
+                           static_cast<unsigned long long>(executed));
+                    fflush(stdout);
+                }
                 if (t == 0x03Du || t == 0x04Eu) { // _DrvrInstall / _AddDrive
                     static int di = 0;
                     if (di < 40) {

@@ -72,7 +72,9 @@ void usage()
             "  --va VA      virtual address to label OFF with, so branch targets read\n"
             "               in guest terms; defaults to OFF\n"
             "  --count N    instructions to print (default 32)\n"
-            "  --find W,..  find a sequence of big-endian 32-bit words; print offsets\n"
+            "  --find W,..  find a sequence of big-endian 32-bit words and\n"
+            "               disassemble each hit. Each W may be HEX or HEX/MASK,\n"
+            "               so 900000e0/fc00ffff is 'stw ANY,224(ANY)'\n"
             "  --callers VA find every direct b/bl whose target is VA\n"
             "  --pef-scan   find 'Joy!peff' containers and list sections + exports\n"
             "  --near VA    with --pef-scan: print only the exports at or below VA,\n"
@@ -346,10 +348,19 @@ int main(int argc, char** argv)
     }
 
     if (find) {
-        std::vector<u32> pat;
+        // Each element is HEX or HEX/MASK. The mask is what lets this answer
+        // "does ANY code write offset 224 of ANY register" — the fields that
+        // vary between two instances of one idiom are the register numbers, so
+        // a search that cannot ignore them only finds code already seen. An
+        // exact word is mask ffffffff, so the old form is unchanged.
+        std::vector<u32> pat, msk;
         for (const char* p = find; *p;) {
             pat.push_back(static_cast<u32>(strtoul(p, nullptr, 16)));
             const char* c = strchr(p, ',');
+            const char* s = strchr(p, '/');
+            msk.push_back(s && (!c || s < c)
+                              ? static_cast<u32>(strtoul(s + 1, nullptr, 16))
+                              : 0xFFFFFFFFu);
             if (!c)
                 break;
             p = c + 1;
@@ -359,16 +370,27 @@ int main(int argc, char** argv)
         // Word-aligned only: every producer of these patterns is aligned code,
         // and an unaligned "hit" in a 64 MB dump is noise by construction.
         size_t hits = 0;
+        char ftext[128];
         for (size_t off = 0; off + pat.size() * 4 <= buf.size(); off += 4) {
             bool ok = true;
             for (size_t k = 0; k < pat.size(); ++k)
-                if (be32(&buf[off + k * 4]) != pat[k]) {
+                if ((be32(&buf[off + k * 4]) & msk[k]) != (pat[k] & msk[k])) {
                     ok = false;
                     break;
                 }
             if (!ok)
                 continue;
-            printf("%08llx\n", static_cast<unsigned long long>(off));
+            // Disassembled, because a column of offsets is not a reading: a
+            // masked search returns instructions nobody has looked at yet, and
+            // judging them is the whole point of asking.
+            for (size_t k = 0; k < pat.size(); ++k) {
+                const size_t o = off + k * 4;
+                const u32 w = be32(&buf[o]);
+                const u32 pc = static_cast<u32>(vaBase + (o - paBase));
+                disassemble(w, pc, ftext, sizeof ftext, Style::Gnu);
+                printf("%08llx  %08x: %08x  %s\n",
+                       static_cast<unsigned long long>(o), pc, w, ftext);
+            }
             ++hits;
         }
         printf("-- %zu hit(s) of %zu word(s) in %s\n", hits, pat.size(), path);

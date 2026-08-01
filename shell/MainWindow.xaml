@@ -48,6 +48,21 @@
                 <MenuItem x:Name="miAutoBoot" Header="Auto-boot script (display + USB + mac-boot)"
                           IsCheckable="True" Click="OnAutoBootToggled" />
                 <Separator />
+                <!-- Sizes the machine's RAM on the NEXT start: the DIMMs'
+                     SPD data is derived from this figure and the ROM
+                     validates it, so only totals real PC100 modules can
+                     express are offered. 1.5 GB = three 512 MB modules,
+                     the most a Sawtooth takes and the most OS 9 uses. -->
+                <MenuItem x:Name="miRam" Header="M_emory"
+                          SubmenuOpened="OnMemoryOpened">
+                    <MenuItem Header="_64 MB" Tag="64" Click="OnSetRam" />
+                    <MenuItem Header="_128 MB" Tag="128" Click="OnSetRam" />
+                    <MenuItem Header="_256 MB" Tag="256" Click="OnSetRam" />
+                    <MenuItem Header="_512 MB" Tag="512" Click="OnSetRam" />
+                    <MenuItem Header="1 _GB" Tag="1024" Click="OnSetRam" />
+                    <MenuItem Header="1._5 GB" Tag="1536" Click="OnSetRam" />
+                </MenuItem>
+                <Separator />
                 <MenuItem x:Name="miSound" Header="_Sound" IsCheckable="True"
                           Click="OnSoundToggled" />
                 <Separator />

@@ -756,6 +756,33 @@ public partial class MainWindow : Window
         _settings.Save();
     }
 
+    private void OnMemoryOpened(object sender, RoutedEventArgs e)
+    {
+        foreach (var item in miRam.Items.OfType<MenuItem>())
+            item.IsChecked = item.Tag is string t &&
+                             uint.TryParse(t, out uint mb) &&
+                             mb == _settings.RamMb;
+    }
+
+    // Takes effect on the next Start, exactly like the hard disk: the
+    // machine sized its DIMMs (and the guest read their SPD) when it was
+    // created.
+    private void OnSetRam(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem mi || mi.Tag is not string tag ||
+            !uint.TryParse(tag, out uint mb) || mb == _settings.RamMb)
+            return;
+        _settings.RamMb = mb;
+        _settings.Save();
+        if (_session is { Running: true })
+            MessageBox.Show(
+                this,
+                $"Memory set to {(mb >= 1024 ? $"{mb / 1024.0:0.#} GB" : $"{mb} MB")}.\n\n"
+                + "The machine is running, and it sized its DIMMs when it "
+                + "started — this takes effect the next time you start it.",
+                "Memory", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
     // Takes effect on the next Start. The guest's codec runs either way — the
     // samples are drained whether or not anyone is listening, because the
     // queue is bounded — so this only decides whether they reach a speaker,

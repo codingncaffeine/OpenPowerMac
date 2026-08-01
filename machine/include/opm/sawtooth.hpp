@@ -1229,7 +1229,17 @@ private:
             return;
         }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
-            ati_.write(pa - atiRegBar_, v, len);
+            const u32 off = pa - atiRegBar_;
+            ati_.write(off, v, len);
+            // The card is a BUS MASTER, and this is the one place it acts as
+            // one: writing the transfer address starts a fetch out of system
+            // memory. The walk lives here rather than in the cell because the
+            // BUS owns RAM and the snoop responder — the cell is a leaf device
+            // with no route to either, and giving it one would add members and
+            // kill every snapshot.
+            if ((off & ~3u) == 0x0A50u)
+                r128BusMasterFetch(ati_, ram_.data(),
+                                   static_cast<u32>(ram_.size()), snoop);
             return;
         }
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {

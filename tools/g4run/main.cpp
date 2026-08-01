@@ -5354,6 +5354,28 @@ int main(int argc, char** argv)
                            static_cast<unsigned long long>(ub[i].first));
             }
         }
+        // The CCE and bus-master blocks, by VALUE. The census says how often
+        // an offset was touched; when a driver's bring-up leaves a state
+        // machine half-configured, what matters is what it LEFT THERE — and
+        // those writes happen once, early, so they are long gone from any
+        // ring by the time the machine misbehaves. Values survive in the
+        // register store, and therefore across a snapshot resume, which is
+        // the only way to read them at a hang that starts a billion
+        // instructions after the write that caused it.
+        {
+            static const u32 kWatch[] = {0x0704, 0x0708, 0x070C, 0x0710,
+                                         0x0714, 0x07B8, 0x07FC, 0x0A10,
+                                         0x0A14, 0x0A18, 0x0A50, 0x0A88,
+                                         0x0040, 0x0044, 0x15E0, 0x15E4,
+                                         0x1720, 0x1740, 0x1748};
+            printf("-- ati cce/bus-master state:");
+            for (u32 o : kWatch) {
+                const char* nm = r128RegName(o);
+                printf(" %s(%03x)=%08x", nm ? nm : "?", o,
+                       bus.ati().peek(o));
+            }
+            printf("\n");
+        }
         // ⭐ WHAT THE 2D ENGINE ACTUALLY DID. "The driver wrote engine
         // registers" and "the engine drew something" are different claims,
         // and the gap between them is every way a blit can be declined. Each
@@ -5371,7 +5393,8 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(e.waitUntil));
             printf("--   declined: rop %llu, bpp %llu, pitch0 %llu, "
                    "off-vram %llu, agp %llu, clipped %llu, hostdata %llu; "
-                   "colour-key ignored %llu\n",
+                   "colour-key ignored %llu; bus-master fetches %llu (%llu bad "
+                   "addr), cache flushes %llu\n",
                    static_cast<unsigned long long>(e.ropUnimpl),
                    static_cast<unsigned long long>(e.badBpp),
                    static_cast<unsigned long long>(e.zeroPitch),
@@ -5379,7 +5402,10 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(e.agpTarget),
                    static_cast<unsigned long long>(e.clippedOut),
                    static_cast<unsigned long long>(e.hostData),
-                   static_cast<unsigned long long>(e.colorCompare));
+                   static_cast<unsigned long long>(e.colorCompare),
+                   static_cast<unsigned long long>(e.bmFetches),
+                   static_cast<unsigned long long>(e.bmBadAddr),
+                   static_cast<unsigned long long>(e.cacheFlushes));
             const auto& ru = r128RopUnimplemented();
             if (!ru.empty()) {
                 printf("--   raster ops not implemented (rop3:count):");

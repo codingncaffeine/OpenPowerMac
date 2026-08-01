@@ -1,6 +1,7 @@
 #include "opm/r128.hpp"
 
 #include <cstdio> // the CRTC mode-change report; MSVC pulls this in, gcc does not
+#include "opm/bus.hpp" // SnoopSink: the bus-master fetch answers to it
 #include <cstring> // memmove, for the blitter's row copies
 
 namespace opm {
@@ -502,6 +503,76 @@ static std::map<u32, u64> gRopUnimpl;
 // never uses the engine is unchanged by its arrival.
 static bool gEng2dOn = true;
 void r128SetEngine2d(bool on) { gEng2dOn = on; }
+
+// The bus-master block. 0x0A10 carries a BUSY bit at 27 that the accelerator
+// polls; 0x0A50 takes the physical address of the transfer. Neither is named
+// in either ATI register guide — the guides document exactly two registers of
+// this block, BM_QUEUE_FREE_STATUS 0x0A14 and BM_ABORT 0x0A88 — so these are
+// recorded as OBSERVED BEHAVIOUR and nothing more.
+static constexpr u32 kBmChunk0 = 0x0A18;
+static constexpr u32 kBmStatus = 0x0A10;
+static constexpr u32 kBmAddr = 0x0A50;
+static constexpr u32 kGuiScratch0 = 0x15E0, kGuiScratch1 = 0x15E4;
+
+void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
+                        SnoopSink* snoop)
+{
+    if (!gEng2dOn || !ram)
+        return;
+    // The address is 16-byte aligned by the driver (`clrrwi r3,r31,4`) and is
+    // PHYSICAL: the accelerator has just set BM_PTR_FORCE_TO_PCI in
+    // BM_CHUNK_0_VAL, which is what "address this as plain PCI rather than
+    // through the AGP aperture" means.
+    const u32 pa = c.peek(kBmAddr) & ~0xFu;
+    if (!pa || static_cast<u64>(pa) + 8u > ramSize) {
+        ++gEng.bmBadAddr;
+        return;
+    }
+    // ⚠ SNOOP THE READ. The guest wrote those bytes with ordinary stores, so
+    // they may still be sitting in a dirty cache line; a master that reads
+    // around the cache gets stale memory and the comparison fails for a
+    // reason that looks nothing like a coherency bug. Session 30 paid for the
+    // write direction of exactly this.
+    if (snoop)
+        snoop->snoopRead(pa, 8);
+    // Little-endian throughout: the guest builds this with stwbrx and reads
+    // the registers back with lwbrx.
+    auto le32 = [&](u32 at) {
+        return u32(ram[at]) | (u32(ram[at + 1]) << 8) |
+               (u32(ram[at + 2]) << 16) | (u32(ram[at + 3]) << 24);
+    };
+    // ⭐ 0x0A50 POINTS AT A DESCRIPTOR, NOT AT THE DATA.
+    //
+    // Measured: the first fetch this model ever performed read
+    // {0x000015E0, 0x005EC000} — a TARGET REGISTER OFFSET (0x15E0 is
+    // GUI_SCRATCH_REG0 exactly) followed by a SOURCE ADDRESS, and that
+    // address is precisely `buffer + 4096`, which is where the accelerator's
+    // own code plants its timestamp (`addi r4,r29,4096`). Treating the
+    // descriptor as the data is what surfaced both values, so the version of
+    // this function that was wrong is what named the format.
+    const u32 dstReg = le32(pa) & 0x3FFCu;
+    const u32 src = le32(pa + 4) & ~3u;
+    if (!dstReg || !src || static_cast<u64>(src) + 8u > ramSize) {
+        ++gEng.bmBadAddr;
+        return;
+    }
+    if (snoop)
+        snoop->snoopRead(src, 8);
+    // ⚠ TWO WORDS, because two is all that has ever been observed: the
+    // self-test compares exactly GUI_SCRATCH_REG0 and REG1 against the pair
+    // it planted. Nothing establishes where a longer transfer would take its
+    // length from, so a longer one is not invented here.
+    c.setReg(dstReg, le32(src));
+    c.setReg(dstReg + 4u, le32(src + 4u));
+    (void)kGuiScratch0;
+    (void)kGuiScratch1;
+    // The transfer is complete before the store that started it returns, so
+    // BM busy (0x0A10 bit 27) is already clear — which is what the register
+    // reads back as, and the accelerator's wait loop exits on the first pass.
+    c.setReg(kBmStatus, 0);
+    ++gEng.bmFetches;
+    (void)kBmChunk0;
+}
 
 const R128EngStats& r128EngStats() { return gEng; }
 const std::map<u32, u64>& r128RopUnimplemented() { return gRopUnimpl; }

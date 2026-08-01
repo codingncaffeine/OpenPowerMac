@@ -93,6 +93,11 @@ public:
         return it != regs_.end() ? it->second : 0;
     }
     u32 pal(u32 i) const { return pal_[i & 0xFFu]; }
+    // Set a register in NATIVE (little-endian) form from outside the guest's
+    // register path — for the bus-master engine, which writes registers as a
+    // RESULT rather than because the guest stored to them. A method, not a
+    // member, so sizeof(R128Cell) and every snapshot are untouched.
+    void setReg(u32 off, u32 nativeVal) { regs_[off & ~3u] = nativeVal; }
 
     // --- Vertical blank as an INTERRUPT, not merely a status bit ----------
     //
@@ -275,7 +280,32 @@ struct R128EngStats {
     u64 colorCompare = 0; // a colour-key function this engine ignores
     u64 waitUntil = 0;   // WAIT_UNTIL events, all satisfiable at once here
     u64 cacheFlushes = 0; // PC_GUI_CTLSTAT flush/invalidate pulses answered
+    u64 bmFetches = 0;    // bus-master fetches into the GUI scratch registers
+    u64 bmBadAddr = 0;    // ...whose address was not in system memory
 };
+
+
+struct SnoopSink; // opm/bus.hpp — only a pointer is needed here
+
+// 🚚 THE BUS-MASTER FETCH — the card reading system memory on its own.
+//
+// Writing a physical address to 0x0A50 makes the card bus-master EIGHT BYTES
+// from there into GUI_SCRATCH_REG0/REG1 (little-endian: +0 into REG0, +4 into
+// REG1). ⚠ This is DERIVED FROM OBSERVED BEHAVIOUR, not from a datasheet:
+// neither ATI register guide documents the 0x0A00 block beyond two names, and
+// no open-source driver touches 0x0A50 at all. What pins it down is Mac OS's
+// ATI Graphics Accelerator, which uses exactly this as its bus-master
+// self-test — it plants an UpTime timestamp in memory, writes the address
+// here, waits for 0x0A10 bit 27 to clear, and compares the scratch registers
+// against what it planted. A card that cannot do this is recorded as having
+// no working bus mastering, and the accelerator then never enables
+// acceleration at all.
+//
+// Lives here rather than on the bus because the counters are file-statics in
+// r128.cpp — a counter added to SawtoothBus changes its size and kills every
+// snapshot.
+void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
+                        SnoopSink* snoop);
 const R128EngStats& r128EngStats();
 // --no-ati-2d: put the card back the way it was before the engine existed,
 // so a boot that never touches the GUI block can be shown to be unchanged.

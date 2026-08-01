@@ -15,6 +15,18 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void opm_destroy(IntPtr m);
 
+    // Pack a host folder into a classic HFS image for the CD slot — the
+    // shared-folder transfer path. UTF-8 marshalling explicitly: names with
+    // ™ and friends must survive, and the ANSI default mangles them into
+    // bytes the path layer rejects.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_hfs_build(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string folder,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string outPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string volName,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] System.Text.StringBuilder err,
+        uint errCap);
+
     // Defer PCI visibility of the ATI card: the practiced boot hides it past
     // OF's console choice (~228M insns) so the serial console stays owned.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

@@ -106,8 +106,47 @@ public sealed class MachineSession
         string reason = "stopped";
         try
         {
+            // 📁 The shared folder rides the CD slot: packed fresh into a
+            // classic HFS image at every Start, so the folder is the single
+            // source of truth and the guest mounts it like an inserted
+            // disc. An explicitly chosen CD image keeps the slot — the
+            // console says which happened either way.
+            string? cdPath =
+                string.IsNullOrWhiteSpace(s.CdPath) ? null : s.CdPath;
+            if (!string.IsNullOrWhiteSpace(s.SharedFolderPath))
+            {
+                if (cdPath != null)
+                {
+                    ConsoleQ.Enqueue("[shell] shared folder skipped — the "
+                                     + "CD slot has an image; eject the CD "
+                                     + "to mount the folder\n");
+                }
+                else
+                {
+                    var img = Path.Combine(Path.GetTempPath(),
+                                           "opm_shared.img");
+                    var volName = Path.GetFileName(
+                        s.SharedFolderPath.TrimEnd('\\', '/'));
+                    if (string.IsNullOrWhiteSpace(volName))
+                        volName = "Shared";
+                    var err = new StringBuilder(512);
+                    if (Native.opm_hfs_build(s.SharedFolderPath, img,
+                                             volName, err, 512) != 0)
+                    {
+                        cdPath = img;
+                        ConsoleQ.Enqueue(
+                            $"[shell] shared folder mounted read-only as "
+                            + $"“{volName}”: {s.SharedFolderPath}\n");
+                    }
+                    else
+                    {
+                        ConsoleQ.Enqueue("[shell] shared folder NOT mounted: "
+                                         + $"{err}\n");
+                    }
+                }
+            }
             m = Native.opm_create(s.RomPath,
-                                  string.IsNullOrWhiteSpace(s.CdPath) ? null : s.CdPath,
+                                  cdPath,
                                   string.IsNullOrWhiteSpace(s.HdPath) ? null : s.HdPath,
                                   string.IsNullOrWhiteSpace(s.AtiRomPath) ? null : s.AtiRomPath,
                                   s.RamMb, s.FastTb);

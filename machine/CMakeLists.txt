@@ -15,6 +15,7 @@ set(OPM_MACHINE_SRC
   src/dbdma.cpp
   src/snapshot.cpp
   src/hostclock.cpp
+  src/hfs.cpp
 )
 
 add_library(opmmachine STATIC ${OPM_MACHINE_SRC})

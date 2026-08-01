@@ -92,6 +92,15 @@ OPM_API uint64_t opm_idle_ns(const OpmMachine* m);
 // look identical from outside; only these counters separate them.
 OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap);
 
+// 📁 Build a classic HFS volume image from a host folder (UTF-8 paths),
+// for attaching in the CD slot — the shared-folder transfer path. Returns 1
+// on success; on failure returns 0 and writes the reason into err
+// (truncated to errCap). Pure host-side work: no machine required,
+// callable before opm_create.
+OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
+                          const char* volName, char* err,
+                          uint32_t errCap);
+
 // Queue text for the serial console (CRs included by the caller).
 OPM_API void opm_serial(OpmMachine* m, const char* text);
 

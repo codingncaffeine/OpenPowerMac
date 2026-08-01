@@ -44,6 +44,12 @@ public sealed class ShellSettings
             RecentHds.RemoveRange(MaxRecentHds, RecentHds.Count - MaxRecentHds);
     }
 
+    // The shared folder: packed into a classic HFS image at every Start and
+    // attached in the CD slot, where the guest mounts it like an inserted
+    // disc. Read-only by design — the folder is the single source of truth.
+    // An explicitly chosen CD image wins the slot; the console says so.
+    public string SharedFolderPath { get; set; } = "";
+
     // Required for any picture. Without the card's FCode there is no display
     // node, so the OS has nothing to bind a driver to.
     public string AtiRomPath { get; set; } = "";

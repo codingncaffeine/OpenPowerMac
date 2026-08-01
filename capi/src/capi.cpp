@@ -4,6 +4,7 @@
 #include "opm/hostclock.hpp"
 #include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
+#include "opm/hfs.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -229,6 +230,29 @@ OPM_API uint64_t opm_idle_ns(const OpmMachine* m) { return m->idle.waitedNs; }
 // its own seconds, and divided by host seconds it says whether this machine
 // is running at real time — the only way to check pacing from outside.
 OPM_API uint64_t opm_tb(const OpmMachine* m) { return m->cpu.st.tb; }
+
+// The shared folder: pack a host folder into a classic HFS image the CD
+// slot can serve. Host-side only — the machine is not involved, so the
+// shell calls it before opm_create.
+OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
+                          const char* volName, char* err, uint32_t errCap)
+{
+    std::string e;
+    const bool ok =
+        folderUtf8 && outPathUtf8 &&
+        hfsBuildImage(folderUtf8, outPathUtf8,
+                      volName && *volName ? volName : "Shared", e);
+    if (!ok && err && errCap) {
+        if (e.empty())
+            e = "hfs build failed";
+        const uint32_t n =
+            e.size() < errCap - 1 ? static_cast<uint32_t>(e.size())
+                                  : errCap - 1;
+        memcpy(err, e.data(), n);
+        err[n] = 0;
+    }
+    return ok ? 1 : 0;
+}
 
 // ⚠ Every entry point that pokes a device from OUTSIDE the run loop has to
 // say so, or the loop's device-service gate will keep answering from its

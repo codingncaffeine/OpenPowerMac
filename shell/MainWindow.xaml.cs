@@ -504,6 +504,36 @@ public partial class MainWindow : Window
                 "Eject CD", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
+    // 📁 The shared folder: chosen here, packed into an HFS volume at every
+    // Start (MachineSession.Run), mounted by the guest like an inserted CD.
+    private void OnChooseShared(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFolderDialog
+        {
+            Title = "Choose a folder to share with the guest (mounted " +
+                    "read-only at every start)",
+        };
+        if (dlg.ShowDialog(this) != true)
+            return;
+        _settings.SharedFolderPath = dlg.FolderName;
+        _settings.Save();
+        UpdateTitle();
+        if (_session is { Running: true })
+            MessageBox.Show(
+                this,
+                "Shared folder set.\n\nThe volume is built when the machine "
+                + "starts, so it appears the next time you start it.",
+                "Shared Folder", MessageBoxButton.OK,
+                MessageBoxImage.Information);
+    }
+
+    private void OnClearShared(object sender, RoutedEventArgs e)
+    {
+        _settings.SharedFolderPath = "";
+        _settings.Save();
+        UpdateTitle();
+    }
+
     // 🩺 The report a stall needs, delivered to the console pane so it can be
     // read and copied. Asked for on the machine's own thread — see
     // MachineSession.RequestDiagnostics.

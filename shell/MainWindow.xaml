@@ -17,6 +17,13 @@
                      drive. Without this the only way back to the disk was to
                      edit shell.json. -->
                 <MenuItem x:Name="miCdEject" Header="_Eject CD (boot from hard disk)" Click="OnEjectCd" />
+                <Separator />
+                <!-- The shared folder: packed into a read-only HFS volume at
+                     every Start and mounted in the guest like an inserted
+                     CD. Drop .sit/.bin files in it on the host, drag them
+                     off the mounted volume in Mac OS. -->
+                <MenuItem x:Name="miShared" Header="Choose Shared Folder…" Click="OnChooseShared" />
+                <MenuItem x:Name="miSharedClear" Header="Stop Sharing Folder" Click="OnClearShared" />
                 <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
                 <Separator />
                 <!-- The disks. Built on open (OnHardDiskOpened) because the

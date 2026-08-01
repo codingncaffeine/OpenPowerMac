@@ -559,6 +559,13 @@ struct Cpu {
     struct WpHit {
         u32 pc, pa, val, len, lr;
         u64 tb;
+        // ⚠ The INSTRUCTION COUNT, not only the timebase. Every other
+        // instrument in this project — heartbeats, snapshots, --bp-from,
+        // --trace-from — is keyed on instructions, and a watch that reports
+        // only tb cannot be lined up against any of them without interpolating
+        // a rate that is not even constant. Correlating a store against when
+        // the machine changed behaviour is the whole use of this log.
+        u64 at;
         // r24 is the 68K program counter inside the NanoKernel's emulator.
         // A store made by emulated 68K code reports a pc in 0x68xxxxxx --
         // the emulator's own dispatch, which names nothing and is the same
@@ -573,6 +580,30 @@ struct Cpu {
     };
     std::vector<WpHit> wpLog;
     u32 wpMax = 64;
+    // Which bytes of the watched range were EVER written, and from where.
+    // A watch aimed at one field answers "was it written?" with silence, and
+    // silence is not an answer: the same question asked of the bus watch
+    // reported zero hits for a word that provably changed. Watching the whole
+    // RECORD and censusing it by address puts the control INSIDE the run —
+    // a neighbouring field known to change is the proof the watch was armed
+    // and looking, so the silence of the field under test means what it says.
+    // The log cannot do this job: it is capped, so a busy neighbour fills it
+    // and the quiet field's absence becomes an artefact of the cap.
+    // The LENGTH belongs with the count: a dcbz writes 32 bytes from one
+    // address, so a census that recorded only the address would report a
+    // block-zero of the record as a store to its first field and every other
+    // field as untouched.
+    struct WpSpan {
+        u64 n = 0;
+        u32 len = 0; // widest store seen at this address
+    };
+    std::map<u32, WpSpan> wpByPa; // first byte of each store -> count, width
+    std::map<u32, u64> wpByPc;    // storing pc -> count
+    u64 wpHits = 0;               // total, including those past wpMax
+    // Record a store landing in the watched range; returns whether it did.
+    // Shared by the ordinary store path and by dcbz, which writes 32 zero
+    // bytes and reaches no other write path in this model.
+    bool wpNote(u32 pa, u32 len, u64 v);
     // --wp-from N: ignore stores before instruction N. A 64-entry log fills
     // with Open Firmware and boot-payload memsets thousands of times before
     // the OS era starts, so an ungated watch reports the WRONG WINDOW rather

@@ -378,6 +378,17 @@ int main(int argc, char** argv)
     u32 wpMaxArg = 0;                     // --wp-max N: raise the 64 cap
     u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
                                           // store watchpoint (CPU side)
+    // --wp-va VA [--wp-va-end VA]: the same watchpoint aimed at a GUEST
+    // VIRTUAL address. Guest data lives at addresses the guest knows and we
+    // do not: a field inside a driver's context record is named by a
+    // disassembly as a virtual address, and hand-computing its physical one
+    // is a guess. The existing --watch-va translates for the BUS watch, which
+    // an ordinary cached store never reaches.
+    u32 wpVa = 0, wpVaEnd = 0;
+    // --rp-va: the same for the READ census. Stores answer "who changed this";
+    // only reads answer "who still consumes it", which is the question a stale
+    // handle poses — and every address worth asking it about here is virtual.
+    u32 rpVa = 0, rpVaEnd = 0;
     u32 wpForce = 0;                      // --wp-force V: DIAGNOSTIC, see
     bool wpForceSet = false;              // Cpu::wpForce — not machine truth
     u32 watchMemPa = 0, watchMemEnd = 0;  // --watch-mem [--watch-mem-end]
@@ -557,6 +568,21 @@ int main(int argc, char** argv)
     bool wmapPcSet = false;
     u32 watchVa = 0;                   // --watch-va ADDR
     u64 traceFrom = 0;                 // --trace-from N: full trace window
+    // --callog PC: EVERY arrival at one address, as a table. "Who calls this,
+    // how often, and with what" is the question that costs the most to answer
+    // by hand here: the caller is only in LR, `ppcdis --callers` cannot see a
+    // call made through a TVector (and returns 0, which reads as "no callers"),
+    // and --trace-at-pc shows exactly ONE arrival. A count, an LR histogram and
+    // the first N argument sets answer it in a single run.
+    u32 callogPc = 0;
+    u32 callogMax = 32;
+    u64 callogHits = 0;
+    std::map<u32, u64> callogByLr;
+    struct CallogArgs {
+        u64 at;
+        u32 lr, r3, r4, r5, r6, r7, r8;
+    };
+    std::vector<CallogArgs> callogLog;
     u32 traceAtPc = 0;                 // --trace-at-pc ADDR: arm on arrival
     bool traceArmed = false;
     u64 traceLines = 2000;             // --trace-lines M
@@ -695,22 +721,42 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--ati-rom")) atiRomPath = next();
         else if (!strcmp(a, "--ati-at"))
             atiAt = strtoull(next(), nullptr, 0);
-        else if (!strcmp(a, "--wp")) {
-            wpPa = static_cast<u32>(strtoul(next(), nullptr, 0));
-            if (!wpEnd) wpEnd = wpPa + 3u;
+        // ⚠ MSVC's else-if chain here is AT its nesting ceiling (C1061), so
+        // the virtual forms JOIN these branches rather than adding new ones.
+        else if (!strcmp(a, "--wp") || !strcmp(a, "--wp-va")) {
+            const u32 at = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!strcmp(a, "--wp-va")) {
+                wpVa = at;
+                if (!wpVaEnd) wpVaEnd = at + 3u;
+            } else {
+                wpPa = at;
+                if (!wpEnd) wpEnd = wpPa + 3u;
+            }
         }
-        else if (!strcmp(a, "--rp")) {
-            rpPa = static_cast<u32>(strtoul(next(), nullptr, 0));
-            if (!rpEnd) rpEnd = rpPa + 3u;
+        else if (!strcmp(a, "--rp") || !strcmp(a, "--rp-va")) {
+            const u32 at = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!strcmp(a, "--rp-va")) {
+                rpVa = at;
+                if (!rpVaEnd) rpVaEnd = at + 3u;
+            } else {
+                rpPa = at;
+                if (!rpEnd) rpEnd = rpPa + 3u;
+            }
         }
-        else if (!strcmp(a, "--rp-end"))
-            rpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--rp-end") || !strcmp(a, "--rp-va-end")) {
+            const u32 at = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!strcmp(a, "--rp-va-end")) rpVaEnd = at;
+            else rpEnd = at;
+        }
         else if (!strcmp(a, "--wp-from"))
             wpFrom = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--wp-max"))
             wpMaxArg = static_cast<u32>(strtoul(next(), nullptr, 0));
-        else if (!strcmp(a, "--wp-end"))
-            wpEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
+        else if (!strcmp(a, "--wp-end") || !strcmp(a, "--wp-va-end")) {
+            const u32 at = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!strcmp(a, "--wp-va-end")) wpVaEnd = at;
+            else wpEnd = at;
+        }
         else if (!strcmp(a, "--wp-force")) {
             wpForce = static_cast<u32>(strtoul(next(), nullptr, 0));
             wpForceSet = true;
@@ -857,10 +903,18 @@ int main(int argc, char** argv)
             atiVblTb = strtoull(next(), nullptr, 0);
         else if (!strcmp(a, "--trace-from"))
             traceFrom = strtoull(next(), nullptr, 0);
-        else if (!strcmp(a, "--trace-at-pc"))
-            traceAtPc = static_cast<u32>(strtoul(next(), nullptr, 0));
-        else if (!strcmp(a, "--trace-lines"))
-            traceLines = strtoull(next(), nullptr, 0);
+        // ⚠ C1061: --callog/--callog-max join these branches, they do not add
+        // their own. Same reason --wp-va joins --wp.
+        else if (!strcmp(a, "--trace-at-pc") || !strcmp(a, "--callog")) {
+            const u32 v = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!strcmp(a, "--callog")) callogPc = v;
+            else traceAtPc = v;
+        }
+        else if (!strcmp(a, "--trace-lines") || !strcmp(a, "--callog-max")) {
+            const u64 v = strtoull(next(), nullptr, 0);
+            if (!strcmp(a, "--callog-max")) callogMax = static_cast<u32>(v);
+            else traceLines = v;
+        }
         else if (!strcmp(a, "--watch-va"))
             watchVa = static_cast<u32>(strtoul(next(), nullptr, 0));
         else {
@@ -1194,6 +1248,16 @@ int main(int argc, char** argv)
     }
     u64 executed = 0;
     cpu.wpStamp = &executed; // the gate needs the live instruction counter
+    // --wp-va resolution state. The retry is a COUNTDOWN and not an alignment
+    // test on `executed`, because a batch or a nap-skip advances that counter
+    // in jumps and an alignment test can be stepped straight over — an
+    // instrument that never arms is indistinguishable from one that armed and
+    // saw nothing.
+    u64 wpVaNext = 0;
+    u32 wpVaPa = 0;
+    u64 wpVaAt = 0; // instruction count at which it resolved
+    u64 rpVaNext = 0;
+    u32 rpVaPa = 0;
     // Instrument census. A watch that emits nothing is ambiguous between
     // "never fired", "fired with nothing to say", and "its gate never
     // opened" — this session lost several runs to exactly that, because a
@@ -1531,6 +1595,28 @@ int main(int argc, char** argv)
         cpu.raisedThisStep = raised;
         cpu.mmuProbe = false;
         return out; // -1 when the address does not translate to RAM
+    };
+
+    // Translate a guest VIRTUAL range for an instrument, with no side effect
+    // on the machine being observed. Deliberately does NOT flush the caches
+    // the way guest() must: a translation needs no data, and an observer that
+    // writes invents bugs. Returns false until the mapping exists; sets `flat`
+    // false when the range crosses into a different physical page, which a
+    // single [pa, paEnd] watch cannot express.
+    auto xlateRange = [&](u32 va, u32 vaEnd, u32& pa0, u32& pa1, bool& flat) {
+        cpu.mmuProbe = true;
+        const CpuState saved = cpu.st;
+        const bool raised = cpu.raisedThisStep;
+        cpu.st.msr |= 0x30u;
+        const CpuState armed = cpu.st;
+        const bool ok0 = cpu.translate(va, false, false, pa0);
+        cpu.st = armed;
+        const bool ok1 = cpu.translate(vaEnd, false, false, pa1);
+        cpu.st = saved;
+        cpu.raisedThisStep = raised;
+        cpu.mmuProbe = false;
+        flat = ok0 && ok1 && pa1 - pa0 == vaEnd - va;
+        return ok0 && ok1;
     };
 
     // Structure dumpers. "Is the drive queue empty?" and "which drivers are
@@ -1941,6 +2027,42 @@ int main(int argc, char** argv)
                 cpu.mmuProbe = false;
             }
         }
+        // --wp-va: the CPU-side store watchpoint aimed at a guest VIRTUAL
+        // address. Same translation as --watch-va above, a different watch.
+        // That one lives in Bus::write and never sees an ordinary cached
+        // store, which is how a field PROVED to change reported zero hits and
+        // read as "nothing ever writes this".
+        if (wpVa && !cpu.wpEnd && executed >= wpVaNext) {
+            wpVaNext = executed + 0x40000ull;
+            u32 pa0 = 0, pa1 = 0;
+            bool flat = false;
+            if (xlateRange(wpVa, wpVaEnd, pa0, pa1, flat)) {
+                cpu.wpPa = pa0;
+                cpu.wpEnd = flat ? pa1 : (pa0 | 0xFFFu);
+                wpVaPa = pa0;
+                wpVaAt = executed;
+                printf("-- wp-va %08x..%08x -> PA %08x..%08x%s @%llu\n", wpVa,
+                       wpVaEnd, cpu.wpPa, cpu.wpEnd,
+                       flat ? "" : "  WARNING: crosses a page, clamped",
+                       static_cast<unsigned long long>(executed));
+                fflush(stdout);
+            }
+        }
+        if (rpVa && !cpu.rpEnd && executed >= rpVaNext) {
+            rpVaNext = executed + 0x40000ull;
+            u32 pa0 = 0, pa1 = 0;
+            bool flat = false;
+            if (xlateRange(rpVa, rpVaEnd, pa0, pa1, flat)) {
+                cpu.rpPa = pa0;
+                cpu.rpEnd = flat ? pa1 : (pa0 | 0xFFFu);
+                rpVaPa = pa0;
+                printf("-- rp-va %08x..%08x -> PA %08x..%08x%s @%llu\n", rpVa,
+                       rpVaEnd, cpu.rpPa, cpu.rpEnd,
+                       flat ? "" : "  WARNING: crosses a page, clamped",
+                       static_cast<unsigned long long>(executed));
+                fflush(stdout);
+            }
+        }
         // A single-step view, windowed in TIME. --trace starts at
         // instruction zero, which is useless three billion in; the range
         // tracers only see code whose address you already know. What was
@@ -1958,6 +2080,22 @@ int main(int argc, char** argv)
         // runs healthily at boot and pathologically at the desktop arms during
         // the boot and shows the healthy pass. --bp-from already means "ignore
         // hits before N" for breakpoints; it means the same here.
+        // --callog: every arrival, not the first. `pc` is the instruction
+        // ABOUT to run, so the arguments and LR are exactly as the caller left
+        // them. ⚠ If the address is the top of a loop rather than an entry
+        // point, each iteration counts as an arrival — which is the honest
+        // reading of "arrived here", and the LR histogram makes the two cases
+        // tell themselves apart: one caller repeated is a loop, many callers
+        // is an entry point.
+        if (callogPc && pc == callogPc && executed >= bpFrom) {
+            ++callogHits;
+            ++callogByLr[cpu.st.lr];
+            if (callogLog.size() < callogMax)
+                callogLog.push_back({executed, cpu.st.lr, cpu.st.gpr[3],
+                                     cpu.st.gpr[4], cpu.st.gpr[5],
+                                     cpu.st.gpr[6], cpu.st.gpr[7],
+                                     cpu.st.gpr[8]});
+        }
         if (traceAtPc && !traceArmed && pc == traceAtPc && executed >= bpFrom) {
             traceArmed = true;
             traceFrom = executed;
@@ -4238,6 +4376,13 @@ int main(int argc, char** argv)
     // saw nothing, or the watch never started looking. Three instruments
     // this session reported silence of the second kind and it was read as
     // silence of the first.
+    // Same rule as --wp-va: a watch that was asked for but never armed must say
+    // so, or its silence gets read as a measurement.
+    if (rpVa && !rpVaPa)
+        printf("-- rp-va %08x..%08x NEVER RESOLVED: the address did not "
+               "translate at any point in this run. THIS IS NOT A NULL "
+               "RESULT — the watch was never armed.\n",
+               rpVa, rpVaEnd);
     if (cpu.rpEnd) {
         // Who READS this range. "0 readers" and "read by one site a million
         // times" are opposite diagnoses for a buffer the machine fills, and no
@@ -4266,10 +4411,103 @@ int main(int argc, char** argv)
            cpu.l2SkewByPc.size() == 1 ? "" : "s");
     for (const auto& [at, n] : cpu.l2SkewByPc)
         printf("   pc=%08x  x%llu\n", at, static_cast<unsigned long long>(n));
+    // ⚠ Printed when a watch was ASKED FOR, not only when one was armed. A
+    // --wp-va whose address never translated leaves cpu.wpEnd at zero, and
+    // reporting nothing in that case is the instrument saying "no stores"
+    // when what happened is "never looked".
+    if (callogPc) {
+        // Printed even at zero, because "nothing ever calls it" and "the
+        // address was wrong" are different findings and silence is neither.
+        printf("-- callog %08x%s: %llu arrival%s from %zu caller%s\n", callogPc,
+               sym(callogPc), static_cast<unsigned long long>(callogHits),
+               callogHits == 1 ? "" : "s", callogByLr.size(),
+               callogByLr.size() == 1 ? "" : "s");
+        for (const auto& [at, n] : callogByLr)
+            printf("   lr=%08x%s  x%llu\n", at, sym(at),
+                   static_cast<unsigned long long>(n));
+        for (const CallogArgs& c : callogLog)
+            printf("   @%-12llu lr=%08x r3=%08x r4=%08x r5=%08x r6=%08x "
+                   "r7=%08x r8=%08x\n",
+                   static_cast<unsigned long long>(c.at), c.lr, c.r3, c.r4,
+                   c.r5, c.r6, c.r7, c.r8);
+        if (callogLog.size() >= callogMax)
+            printf("   (argument list capped at %u — raise with --callog-max)\n",
+                   callogMax);
+    }
+    if (wpVa && !wpVaPa)
+        printf("-- wp-va %08x..%08x NEVER RESOLVED: the address did not "
+               "translate at any point in this run. THIS IS NOT A NULL "
+               "RESULT — the watch was never armed.\n",
+               wpVa, wpVaEnd);
     if (cpu.wpEnd) {
-        printf("-- watchpoint %08x..%08x: %zu store%s%s\n", cpu.wpPa,
-               cpu.wpEnd, cpu.wpLog.size(), cpu.wpLog.size() == 1 ? "" : "s",
-               cpu.wpLog.size() >= cpu.wpMax ? " (capped)" : "");
+        printf("-- watchpoint %08x..%08x: %llu store%s (%zu logged%s)\n",
+               cpu.wpPa, cpu.wpEnd,
+               static_cast<unsigned long long>(cpu.wpHits),
+               cpu.wpHits == 1 ? "" : "s", cpu.wpLog.size(),
+               cpu.wpLog.size() >= cpu.wpMax ? ", CAPPED" : "");
+        if (wpVaPa) {
+            // Did the instrument stay aimed? A virtual address is resolved
+            // once; if the guest remapped the page afterwards, the watch spent
+            // the rest of the run on physical bytes that are no longer the
+            // field, and every conclusion drawn from its silence is void.
+            cpu.mmuProbe = true;
+            const CpuState wSaved = cpu.st;
+            cpu.st.msr |= 0x30u;
+            u32 nowPa = 0;
+            const bool ok = cpu.translate(wpVa, false, false, nowPa);
+            cpu.st = wSaved;
+            cpu.mmuProbe = false;
+            printf("   armed @%llu; VA %08x %s\n",
+                   static_cast<unsigned long long>(wpVaAt), wpVa,
+                   !ok ? "NO LONGER TRANSLATES — the watch may have gone stale"
+                       : nowPa == wpVaPa
+                             ? "still maps to the same PA (the watch stayed "
+                               "aimed)"
+                             : "NOW MAPS ELSEWHERE — the watch went stale");
+            if (ok && nowPa != wpVaPa)
+                printf("   was PA %08x, now PA %08x\n", wpVaPa, nowPa);
+        }
+        // The census, which is what makes a range watch answer a question the
+        // capped log cannot: WHICH bytes of the range were ever written. A
+        // field under test and a neighbour known to change go in the same
+        // watch, and the neighbour's row is the positive control for the
+        // field's absence — in the same run, on the same armed instrument.
+        if (!cpu.wpByPa.empty()) {
+            printf("   written, by address (%zu distinct):\n",
+                   cpu.wpByPa.size());
+            for (const auto& [at, s] : cpu.wpByPa)
+                printf("     pa %08x +%-2u  (va %08x, +%-4d)  x%llu\n", at,
+                       s.len, wpVaPa ? wpVa + (at - wpVaPa) : at,
+                       static_cast<int>(at - cpu.wpPa),
+                       static_cast<unsigned long long>(s.n));
+            // The gaps ARE the finding. Naming the bytes nothing wrote is the
+            // difference between "the watch saw nothing" and "the watch saw
+            // this record change and never this field".
+            std::string gaps;
+            u32 run0 = 0;
+            bool inGap = false;
+            for (u32 p = cpu.wpPa; p <= cpu.wpEnd; ++p) {
+                bool hit = false;
+                for (const auto& [at, s] : cpu.wpByPa)
+                    if (p >= at && p < at + s.len) { hit = true; break; }
+                if (!hit && !inGap) { run0 = p; inGap = true; }
+                if ((hit || p == cpu.wpEnd) && inGap) {
+                    const u32 last = hit ? p - 1 : p;
+                    gaps += " +" + std::to_string(run0 - cpu.wpPa) + ".." +
+                            std::to_string(last - cpu.wpPa);
+                    inGap = false;
+                }
+            }
+            printf("   NEVER written, by offset from %08x:%s\n", cpu.wpPa,
+                   gaps.empty() ? " (none — every byte was written)"
+                                : gaps.c_str());
+        }
+        if (!cpu.wpByPc.empty()) {
+            printf("   by storing pc (%zu distinct):\n", cpu.wpByPc.size());
+            for (const auto& [at, n] : cpu.wpByPc)
+                printf("     pc=%08x%s  x%llu\n", at, sym(at),
+                       static_cast<unsigned long long>(n));
+        }
         // Name the CALLER, not the primitive. With --trace-of the dictionary
         // is loaded, so the LR resolves to the word the store was compiled
         // into; without it the bare address still beats naming nothing.
@@ -4290,9 +4528,10 @@ int main(int argc, char** argv)
         u64 prevTb = 0, prevDec = 0, prevExt = 0;
         for (const Cpu::WpHit& h : cpu.wpLog) {
             printf("   pa %08x <- %0*x  by pc=%08x lr=%08x%s r68=%08x "
-                   "tb=%llu dtb=%llu ddec=%lld dext=%lld\n",
+                   "@%llu tb=%llu dtb=%llu ddec=%lld dext=%lld\n",
                    h.pa, static_cast<int>(h.len * 2), h.val, h.pc, h.lr,
                    ofOwner(h.lr).c_str(), h.r24,
+                   static_cast<unsigned long long>(h.at),
                    static_cast<unsigned long long>(h.tb),
                    static_cast<unsigned long long>(
                        prevTb && h.tb > prevTb ? h.tb - prevTb : 0),

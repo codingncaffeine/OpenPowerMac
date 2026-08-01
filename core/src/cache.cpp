@@ -315,6 +315,24 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
     return v;
 }
 
+bool Cpu::wpNote(u32 pa, u32 len, u64 v)
+{
+    if (!wpEnd || pa > wpEnd || pa + len <= wpPa)
+        return false;
+    if (wpFrom && wpStamp && *wpStamp < wpFrom)
+        return false;
+    ++wpHits;
+    WpSpan& s = wpByPa[pa];
+    ++s.n;
+    if (len > s.len) s.len = len;
+    ++wpByPc[st.pc - 4];
+    if (wpLog.size() < wpMax)
+        wpLog.push_back({st.pc - 4, pa, static_cast<u32>(v), len, st.lr, st.tb,
+                         wpStamp ? *wpStamp : 0, st.gpr[24], decIrqs,
+                         extIrqs});
+    return true;
+}
+
 void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
 {
     OPM_MARK(Write);
@@ -323,13 +341,8 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
     // is no longer what the buffer says. Checked here rather than in the
     // callers so no store path can miss it.
     fetchDropRange(pa, len);
-    if (wpEnd && pa <= wpEnd && pa + len > wpPa &&
-        (!wpFrom || !wpStamp || *wpStamp >= wpFrom)) {
-        if (wpLog.size() < wpMax)
-            wpLog.push_back({st.pc - 4, pa, static_cast<u32>(v), len, st.lr,
-                             st.tb, st.gpr[24], decIrqs, extIrqs});
-        if (wpForceSet && len == 4 && pa == wpPa) v = wpForce; // diagnostic
-    }
+    if (wpEnd && wpNote(pa, len, v) && wpForceSet && len == 4 && pa == wpPa)
+        v = wpForce; // diagnostic
     if (!dceOn() || (wimg & kWimgI)) {
         noteL2Skew(pa, true);
         switch (len) {
@@ -410,6 +423,11 @@ bool Cpu::l1dPeek32(u32 pa, u32& w)
 void Cpu::dcbzLine(u32 pa)
 {
     fetchDropAt(pa);
+    // A dcbz is a store of 32 zero bytes and it reaches memWrite by no path,
+    // so a watchpoint on a field that a dcbz clears reported that field as
+    // never written. That is this instrument's answer in its exact wrong
+    // direction, and "why is this field zero" is the question being asked.
+    if (wpEnd) wpNote(pa, 32u, 0);
     DLine* e = lineFind(*this, pa);
     if (!e) {
         DLine& n = lineVictim(*this, pa);

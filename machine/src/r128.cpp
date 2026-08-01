@@ -893,8 +893,15 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
             continue;
         if (srcType == 3u) {
             // COLOUR host data: the raster is packed destination-format
-            // pixels, byte-stream in big-endian DWORD order, rows
-            // continuous — an icon/pixmap push, copied as-is.
+            // pixels, rows continuous — an icon/pixmap push, copied
+            // byte-for-byte. ⚠ The stream's DWORDs are LITTLE-ENDIAN
+            // (both the FIFO ingest and the GART fetch compose them LE),
+            // so stream byte s is lane (s & 3), LSB FIRST. Extracting
+            // MSB-first reverses every pixel: a white menu bar's
+            // 00 FF FF FF lands as FF FF FF 00 and scans out YELLOW —
+            // the packet path's copy of the fill engine's old olive-
+            // desktop byte-order bug, caught by the user's eyes in the
+            // first interactive session.
             const u64 availB = static_cast<u64>(m) * 4u;
             u64 sb = 0;
             for (u32 yy = 0; yy < hPx; ++yy) {
@@ -913,7 +920,7 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
                     for (u32 k = 0; k < bpp; ++k) {
                         const u64 s = sb + k;
                         c.vram[at + k] = static_cast<u8>(
-                            raster[s >> 2] >> (8u * (3u - (s & 3u))));
+                            raster[s >> 2] >> (8u * (s & 3u)));
                     }
                     ++gEng.pixels;
                 }

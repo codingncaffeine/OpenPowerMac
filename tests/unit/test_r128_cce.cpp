@@ -244,37 +244,53 @@ TEST_CASE("cce: HOSTDATA_BLT (0x94) expands a mono glyph MSB-first")
     CHECK(r.c.vram[stride * 1u + 5u * 4u + 1u] == 0x00); // (5,1) bk
 }
 
-TEST_CASE("cce: HOSTDATA_BLT colour variant copies packed pixels as-is")
+TEST_CASE("cce: HOSTDATA_BLT colour keeps the guest's MEMORY byte order")
 {
     CceRig r;
     const auto before = r128EngStats();
-    // SRC_TYPE 3 = colour, same format as dst (32bpp). No brush (15).
+    // The contract under test is byte ORDER, so the packet goes through
+    // the indirect path: the raster bytes are planted in guest RAM in
+    // framebuffer order and must land in VRAM in that same order. The
+    // GART fetch composes DWORDs little-endian, so an extractor that
+    // walks them MSB-first reverses every pixel — white 00 FF FF FF
+    // becomes FF FF FF 00, which scans out yellow; that bug shipped once
+    // and the user's eyes caught it on the menu bar.
     const u32 gc = 2u | 8u | (15u << 4) | (6u << 8) | (3u << 12) |
                    (0xCCu << 16);
-    r.fifo(0xC0009400u | (12u << 16)); // 13-DWord body
-    r.fifo(gc);
-    r.fifo(0x00800000u); // DST_PITCH_OFFSET
-    r.fifo(0x00000000u); // SC_TOP_LEFT
-    r.fifo(0x001F001Fu); // SC_BOT_RITE
-    r.fifo(0x00000000u); // FRGD (ineffective for colour)
-    r.fifo(0x00000000u); // BKGD (ineffective)
-    r.fifo(0x00020003u); // BaseY=2 | BaseX=3
-    r.fifo(0x00020002u); // HEIGHT=2 | WIDTH=2
-    r.fifo(0x00000004u); // NUMBER = 4 DWORDs (2x2 @ 32bpp)
-    r.fifo(0x11223344u);
-    r.fifo(0x55667788u);
-    r.fifo(0x99AABBCCu);
-    r.fifo(0xDDEEFF00u);
+    // Whole Type-3 packet in the indirect body; put32 is little-endian,
+    // so memory bytes [A1 B2 C3 D4] are put32(0xD4C3B2A1).
+    r.body({
+        0xC0009400u | (12u << 16), // header: 13-DWord body
+        gc,
+        0x00800000u,               // DST_PITCH_OFFSET
+        0x00000000u,               // SC_TOP_LEFT
+        0x001F001Fu,               // SC_BOT_RITE
+        0x00000000u,               // FRGD (ineffective for colour)
+        0x00000000u,               // BKGD (ineffective)
+        0x00020003u,               // BaseY=2 | BaseX=3
+        0x00020002u,               // HEIGHT=2 | WIDTH=2
+        0x00000004u,               // NUMBER = 4 DWORDs (2x2 @ 32bpp)
+        0xD4C3B2A1u,               // memory bytes A1 B2 C3 D4
+        0xD8C7B6A5u,               // memory bytes A5 B6 C7 D8
+        0x44332211u,               // memory bytes 11 22 33 44
+        0x88776655u,               // memory bytes 55 66 77 88
+    });
+    r.fifo(0x000101CEu); // Type-0, 2 regs @ 0x0738: dispatch the body
+    r.fifo(0x00101000u);
+    r.fifo(0x0000000Eu); // 14 DWORDs
     const auto& e = r128EngStats();
     CHECK(e.blits - before.blits == 1);
     CHECK(e.pixels - before.pixels == 4);
     CHECK(e.hostData == before.hostData); // no decline
     const size_t stride = 4u * 8u * 4u;
-    // (3,2) holds the first pixel, bytes in stream order.
-    CHECK(r.c.vram[stride * 2u + 3u * 4u + 0u] == 0x11);
-    CHECK(r.c.vram[stride * 2u + 3u * 4u + 3u] == 0x44);
-    // (4,3) holds the fourth pixel.
-    CHECK(r.c.vram[stride * 3u + 4u * 4u + 0u] == 0xDD);
+    // (3,2) holds the first pixel, bytes exactly as planted in RAM.
+    CHECK(r.c.vram[stride * 2u + 3u * 4u + 0u] == 0xA1);
+    CHECK(r.c.vram[stride * 2u + 3u * 4u + 1u] == 0xB2);
+    CHECK(r.c.vram[stride * 2u + 3u * 4u + 2u] == 0xC3);
+    CHECK(r.c.vram[stride * 2u + 3u * 4u + 3u] == 0xD4);
+    // (4,2) is the second pixel, (4,3) the fourth.
+    CHECK(r.c.vram[stride * 2u + 4u * 4u + 0u] == 0xA5);
+    CHECK(r.c.vram[stride * 3u + 4u * 4u + 0u] == 0x55);
 }
 
 TEST_CASE("cce: an indirect body drives the 2D engine through PACKET0")

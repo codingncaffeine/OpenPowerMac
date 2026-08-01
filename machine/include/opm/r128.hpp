@@ -334,11 +334,17 @@ void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
 // the words of one packet resumes with the tail lost. Snapshots are minted
 // at quiescent points, and the stat line makes a truncation visible.
 void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
-                     u32 ramSize, u32 gartBase, SnoopSink* snoop);
+                     u32 ramSize, u32 gartBase, u32 aperBase,
+                     SnoopSink* snoop);
 // Direct dispatch for a guest that writes PM4_IW_INDSIZE itself rather than
 // through a packet (SDK §5.3.3 names that flow too).
 void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
-                     u32 gartBase, SnoopSink* snoop);
+                     u32 gartBase, u32 aperBase, SnoopSink* snoop);
+// Diagnostics: how many packet-stream words sit STAGED (accepted but not
+// yet consumed by a complete packet), and the word at the parse head —
+// a large backlog behind one absurd header is what a desynchronised
+// stream looks like from outside.
+size_t r128CceStaged(u32& headWord);
 // Type-3 opcodes that arrived and were skipped, by opcode byte — the same
 // contract as the ROP map: the next thing to implement is a number in the
 // report, not a guess.

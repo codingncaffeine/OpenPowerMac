@@ -592,6 +592,51 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
         }
     }
+    // 🎨 THE COMMAND ENGINE, because "the desktop froze mid-redraw" is a
+    // question about the packet stream: a healthy stream has zero (or a
+    // packet's worth of) staged words; a large backlog behind one absurd
+    // header IS a desynchronised stream, and the skipped-op map names any
+    // operation the guest submitted that this model declined.
+    {
+        const auto& e = r128EngStats();
+        u32 headWord = 0;
+        const size_t staged = r128CceStaged(headWord);
+        snprintf(b, sizeof b,
+                 "-- cce: %llu fifo words, pkt0 %llu pkt1 %llu pkt2 %llu "
+                 "pkt3 %llu, indirect %llu (%llu words, gart miss %llu); "
+                 "STAGED %llu",
+                 (unsigned long long)e.cceWords, (unsigned long long)e.ccePkt0,
+                 (unsigned long long)e.ccePkt1, (unsigned long long)e.ccePkt2,
+                 (unsigned long long)e.ccePkt3,
+                 (unsigned long long)e.cceIndFetch,
+                 (unsigned long long)e.cceIndWords,
+                 (unsigned long long)e.cceGartMiss,
+                 (unsigned long long)staged);
+        s += b;
+        if (staged) {
+            snprintf(b, sizeof b,
+                     " <== head word %08x (type %u, wants %u body words)",
+                     headWord, headWord >> 30, ((headWord >> 16) & 0x3FFFu) + 1u);
+            s += b;
+        }
+        s += "\n";
+        snprintf(b, sizeof b,
+                 "--   agp: gart base %08x aperture base %08x\n",
+                 m->bus->agpGartBase(), m->bus->agpAperBase());
+        s += b;
+        snprintf(b, sizeof b,
+                 "--   2d: %llu blits (%llu copy, %llu fill), %llu px; "
+                 "declined: hostdata %llu badbpp %llu\n",
+                 (unsigned long long)e.blits, (unsigned long long)e.copies,
+                 (unsigned long long)e.fills, (unsigned long long)e.pixels,
+                 (unsigned long long)e.hostData, (unsigned long long)e.badBpp);
+        s += b;
+        for (const auto& [op, n] : r128CceP3Skipped()) {
+            snprintf(b, sizeof b, "--   pkt3 opcode 0x%02x SKIPPED x%llu\n",
+                     op, (unsigned long long)n);
+            s += b;
+        }
+    }
     // 📇 …AND THE OTHER INPUTS TO THE SAME PREDICATE. The ROM routine that
     // calls the stub also consults ExpandMem (low-memory long at 0x2B6): it
     // reads emSize at +2, and only if that exceeds 0x31C does it test the field

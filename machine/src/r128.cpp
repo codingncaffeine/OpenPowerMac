@@ -618,7 +618,7 @@ static u32 cceBswap(u32 v)
 }
 
 static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
-                     SnoopSink* snoop);
+                     u32 aperBase, SnoopSink* snoop);
 
 // An INDSIZE write seen while a packet is still executing must not fetch on
 // the spot: the fetched body has to land BETWEEN this packet and the next
@@ -660,14 +660,34 @@ static void cceRegWrite(R128Cell& c, u32 off, u32 native)
 // page-aligned), so the walk tries the raw base first and the page-masked
 // base second, and the first eight walks are printed with which one
 // answered — the instrument decides, not an assumption.
-static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase, u32 agp,
-                        u32& out, SnoopSink* snoop)
+static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
+                        u32 aperBase, u32 agp, u32& out, SnoopSink* snoop)
 {
     auto le32 = [&](u32 at) {
         return u32(ram[at]) | (u32(ram[at + 1]) << 8) |
                (u32(ram[at + 2]) << 16) | (u32(ram[at + 3]) << 24);
     };
     static int walkLog = 0;
+    // The GART indexes APERTURE-RELATIVE pages: subtract the AGP aperture
+    // base (bridge config +0x90) first. On a 64 MB machine the driver
+    // programmed base 0 and this line was invisible; at 1.5 GB the
+    // aperture sits above RAM, and an unsubtracted address indexed pages
+    // far past the table — the fetched garbage then parsed as packets,
+    // one absurd header swallowed every later real submission, and the
+    // desktop froze mid-redraw with the fence never landing.
+    const u32 aper = aperBase & 0xFFFFF000u;
+    if (aper) {
+        if (agp < aper) {
+            ++gEng.cceGartMiss;
+            if (walkLog < 8) {
+                ++walkLog;
+                printf("-- cce gart MISS: agp=%08x below aperture %08x\n",
+                       agp, aper);
+            }
+            return false;
+        }
+        agp -= aper;
+    }
     const u32 idx = agp >> 12;
     const u32 bases[2] = {gartBase, gartBase & ~0xFFFu};
     for (int b = 0; b < 2; ++b) {
@@ -1153,7 +1173,7 @@ static bool cceOpSetScissors(R128Cell& c, const u32* body, u32 n)
 // body executes after the packet that dispatched it and before whatever the
 // guest queued next — the order the hardware gives.
 static void cceDrainPending(R128Cell& c, const u8* ram, u32 ramSize,
-                            u32 gartBase, SnoopSink* snoop)
+                            u32 gartBase, u32 aperBase, SnoopSink* snoop)
 {
     while (!gCcePendingInd.empty()) {
         const u32 sizeDwords = gCcePendingInd.front();
@@ -1176,8 +1196,8 @@ static void cceDrainPending(R128Cell& c, const u8* ram, u32 ramSize,
         body.reserve(n);
         for (u32 i = 0; i < n; ++i) {
             u32 w = 0;
-            if (!cceGartRead(ram, ramSize, gartBase, indOff + 4u * i, w,
-                             snoop))
+            if (!cceGartRead(ram, ramSize, gartBase, aperBase,
+                             indOff + 4u * i, w, snoop))
                 break;
             ++gEng.cceIndWords;
             body.push_back(w);
@@ -1188,20 +1208,20 @@ static void cceDrainPending(R128Cell& c, const u8* ram, u32 ramSize,
 }
 
 void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
-                     u32 gartBase, SnoopSink* snoop)
+                     u32 gartBase, u32 aperBase, SnoopSink* snoop)
 {
     if (!gEng2dOn || !ram)
         return;
     gCceDepth = 64; // dispatch budget for this guest-visible entry
     gCcePendingInd.push_back(sizeDwords);
-    cceParse(c, ram, ramSize, gartBase, snoop);
+    cceParse(c, ram, ramSize, gartBase, aperBase, snoop);
 }
 
 static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
-                     SnoopSink* snoop)
+                     u32 aperBase, SnoopSink* snoop)
 {
     for (;;) {
-        cceDrainPending(c, ram, ramSize, gartBase, snoop);
+        cceDrainPending(c, ram, ramSize, gartBase, aperBase, snoop);
         const size_t avail = gCceFifo.size() - gCceHead;
         if (!avail)
             break;
@@ -1279,7 +1299,8 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
 }
 
 void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
-                     u32 ramSize, u32 gartBase, SnoopSink* snoop)
+                     u32 ramSize, u32 gartBase, u32 aperBase,
+                     SnoopSink* snoop)
 {
     if (!gEng2dOn || !ram)
         return;
@@ -1290,7 +1311,14 @@ void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
     ++gEng.cceWords;
     gCceDepth = 64; // dispatch budget for this guest-visible entry
     gCceFifo.push_back(cceBswap(raw));
-    cceParse(c, ram, ramSize, gartBase, snoop);
+    cceParse(c, ram, ramSize, gartBase, aperBase, snoop);
+}
+
+size_t r128CceStaged(u32& headWord)
+{
+    const size_t staged = gCceFifo.size() - gCceHead;
+    headWord = staged ? gCceFifo[gCceHead] : 0;
+    return staged;
 }
 
 

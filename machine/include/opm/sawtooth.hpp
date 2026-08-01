@@ -345,6 +345,17 @@ public:
         auto it = cfgSpace_.find(0x88Cu);
         return it == cfgSpace_.end() ? 0u : it->second;
     }
+    // The AGP APERTURE base (+0x90): the PCI address where AGP space
+    // starts. The GART indexes aperture-RELATIVE pages, so the card-side
+    // walk must subtract this before indexing. On a 64 MB machine the
+    // driver programmed 0 and the subtraction was invisible; on a 1.5 GB
+    // machine the aperture sits above RAM and an unsubtracted address
+    // indexed garbage far past the table.
+    u32 agpAperBase() const
+    {
+        auto it = cfgSpace_.find(0x890u);
+        return it == cfgSpace_.end() ? 0u : it->second;
+    }
 
     u8 read8(u32 pa) override { return static_cast<u8>(read(pa, 1)); }
     u16 read16(u32 pa) override { return static_cast<u16>(read(pa, 2)); }
@@ -1322,13 +1333,13 @@ private:
             else if ((off & ~3u) == 0x1000u || (off & ~3u) == 0x1004u)
                 r128CceFifoWord(ati_, v, len, ram_.data(),
                                 static_cast<u32>(ram_.size()), agpGartBase(),
-                                snoop);
+                                agpAperBase(), snoop);
             // A guest that writes PM4_IW_INDSIZE directly (SDK §5.3.3's
             // other flow) dispatches the same way a packet-written one does.
             else if ((off & ~3u) == 0x073Cu)
                 r128CceIndirect(ati_, ati_.peek(0x073Cu), ram_.data(),
                                 static_cast<u32>(ram_.size()), agpGartBase(),
-                                snoop);
+                                agpAperBase(), snoop);
             return;
         }
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {

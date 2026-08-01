@@ -57,10 +57,12 @@ struct CceRig {
             at += 4;
         }
     }
+    u32 aperBase = 0;
     void fifo(u32 word)
     {
         r128CceFifoWord(c, be(word), 4, ram.data(),
-                        static_cast<u32>(ram.size()), kGartBase, nullptr);
+                        static_cast<u32>(ram.size()), kGartBase, aperBase,
+                        nullptr);
     }
 };
 
@@ -88,6 +90,36 @@ TEST_CASE("cce: a machine's stream survives a predecessor that died "
     CHECK(r128EngStats().ccePkt0 - before.ccePkt0 == 1);
     CHECK(r.c.peek(0x15E0u) == 0xCAFEBABEu);
     CHECK(r.c.peek(0x15E4u) == 0x0000CAFEu);
+}
+
+TEST_CASE("cce: the GART indexes aperture-relative pages")
+{
+    // The .AGP driver programs the AGP aperture BASE into the bridge, and
+    // AGP addresses are aperture-offsets from it. On the 64 MB machine the
+    // base was 0 and the subtraction was invisible; on the 1.5 GB machine
+    // the aperture sits above RAM and an unsubtracted address indexed
+    // garbage far past the table — the desktop drew, then froze
+    // mid-redraw when a garbage fetch swallowed the following packets.
+    r128CceReset();
+    CceRig r;
+    r.aperBase = 0x60000000u;
+    {
+        u32 at = CceRig::kBodyPa;
+        for (int i = 0; i < 4; ++i, at += 4)
+            r.put32(at, 0x80000000u);
+    }
+    const auto before = r128EngStats();
+    r.fifo(0x000101CEu);
+    r.fifo(0x60101000u); // aperture base + the same 0x101000 offset
+    r.fifo(0x00000004u);
+    const auto& e = r128EngStats();
+    CHECK(e.cceIndWords - before.cceIndWords == 4);
+    CHECK(e.cceGartMiss == before.cceGartMiss);
+    // And an address BELOW the aperture is a counted miss, not a walk.
+    r.fifo(0x000101CEu);
+    r.fifo(0x00101000u);
+    r.fifo(0x00000004u);
+    CHECK(r128EngStats().cceGartMiss > before.cceGartMiss);
 }
 
 TEST_CASE("cce: the measured six-DWORD submission lands the fence")

@@ -894,9 +894,14 @@ int main(int argc, char** argv)
         // is the only way to add an option. Folding these three together
         // frees two.
         else if (!strcmp(a, "--ati-vbl") || !strcmp(a, "--no-ati-vbl") ||
-                 !strcmp(a, "--no-ati-2d")) {
+                 !strcmp(a, "--no-ati-2d") || !strcmp(a, "--no-agp-caps")) {
             if (!strcmp(a, "--no-ati-2d"))
                 r128SetEngine2d(false);
+            else if (!strcmp(a, "--no-agp-caps"))
+                // Diagnostic A/B: build the machine WITHOUT the AGP
+                // capability chains — the pre-2026-08-01 config space.
+                // See the note on opm::gSkipAgpCaps.
+                opm::gSkipAgpCaps = true;
             else
                 atiVbl = strncmp(a, "--no", 4) != 0;
         }
@@ -5149,6 +5154,24 @@ int main(int argc, char** argv)
                    ((cl[k].pa >> 28) & 7u) * 2u, cl[k].pa & 0x00FFFFFFu,
                    cl[k].val, cl[k].pc & ~1u, (cl[k].pc & 1u) ? 'w' : 'r',
                    static_cast<unsigned long long>(cl[k].at));
+        // The AGP host function (f0 dev 11, 106b:0020) gets its own COMPLETE
+        // section: whether Mac OS's .AGP driver ever probes it — and what it
+        // read when it did — is the question the 100-entry tail cannot
+        // answer. Bus-0 dev-11 idsel latch is 0x800 | reg, so
+        // (latch & 0xFFFF00) == 0x000800 selects exactly this function.
+        size_t agpN = 0;
+        for (const auto& e : cl)
+            if (((e.pa >> 28) & 7u) == 0u &&
+                (e.pa & 0x00FFFF00u) == 0x00000800u)
+                ++agpN;
+        printf("-- agp host fn (f0 dev 11, 106b:0020) config accesses: %zu\n",
+               agpN);
+        for (const auto& e : cl)
+            if (((e.pa >> 28) & 7u) == 0u &&
+                (e.pa & 0x00FFFF00u) == 0x00000800u)
+                printf("   reg +%02x %08x pc=%08x %c @%llu\n", e.pa & 0xFFu,
+                       e.val, e.pc & ~1u, (e.pc & 1u) ? 'w' : 'r',
+                       static_cast<unsigned long long>(e.at));
     }
     {
         const auto& il = bus.i2cLog();
@@ -5688,6 +5711,23 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(e.bmFetches),
                    static_cast<unsigned long long>(e.bmBadAddr),
                    static_cast<unsigned long long>(e.cacheFlushes));
+            printf("--   cce pio: %llu fifo words, pkt0 %llu, pkt1 %llu, "
+                   "pkt2 %llu, pkt3 %llu (unimplemented ops in the map "
+                   "below), bad width %llu; indirect "
+                   "%llu (%llu words, gart miss %llu, nested %llu)\n",
+                   static_cast<unsigned long long>(e.cceWords),
+                   static_cast<unsigned long long>(e.ccePkt0),
+                   static_cast<unsigned long long>(e.ccePkt1),
+                   static_cast<unsigned long long>(e.ccePkt2),
+                   static_cast<unsigned long long>(e.ccePkt3),
+                   static_cast<unsigned long long>(e.cceBadWidth),
+                   static_cast<unsigned long long>(e.cceIndFetch),
+                   static_cast<unsigned long long>(e.cceIndWords),
+                   static_cast<unsigned long long>(e.cceGartMiss),
+                   static_cast<unsigned long long>(e.cceIndNested));
+            for (const auto& [op, n] : r128CceP3Skipped())
+                printf("--     pkt3 opcode 0x%02x  x%llu\n", op,
+                       static_cast<unsigned long long>(n));
             const auto& ru = r128RopUnimplemented();
             if (!ru.empty()) {
                 printf("--   raster ops not implemented (rop3:count):");

@@ -20,6 +20,20 @@ namespace opm {
 struct SnapWriter;
 struct SnapReader;
 
+// --no-agp-caps: build the machine with the PRE-2026-08-01 config space —
+// no AGP capability chains on the Uni-N AGP host function or the card.
+// A diagnostic A/B control in the --no-ati-2d mould, kept because the caps
+// are now load-bearing (they are what makes `.AGP` install, the ARM
+// initialise, and the accelerator draw) and "with/without the machine
+// change" should stay a one-flag question. ⚠ It exists because of a
+// GOOSE CHASE worth remembering: a question-mark boot was blamed on these
+// seeds through a whole bisect — with the flag, without the flag, the
+// stall never moved — and the actual cause was the boot CD missing from
+// ~/Downloads ("cd attach FAILED" had been in the log from the first run;
+// hd.img alone was never bootable). A null result without a positive
+// control is not a finding. Set before construction.
+inline bool gSkipAgpCaps = false;
+
 // Power Mac G4 AGP "Sawtooth" — the project's primary machine.
 //
 // M-SAW-0 founding skeleton: RAM at 0, the 1 MB New World boot ROM (flash)
@@ -148,6 +162,32 @@ public:
                     if (r != 0x08)
                         cfgSeed(b, 0x00000800u | r, 0);
             }
+            // The AGP function is not just a host bridge with a different
+            // device id: Mac OS's driver loader reads its CAPABILITIES
+            // POINTER (+0x34) exactly once, at ~6.6 G, and decides whether
+            // this machine has AGP at all. Measured 2026-08-01: five reads
+            // — +34 (got 0), +00 x2, +10 x2 — then the device is never
+            // touched again, the .AGP ndrv is never attached to the
+            // uni-north-agp node Open Firmware built, and the ATI Resource
+            // Manager's OpenDriver(".AGP") returns fnfErr 1.3 G later,
+            // which is the whole desktop hang. So: a real AGP 2.0
+            // capability chain (status bit 4 -> cap at +0x80, rates
+            // 1x/2x/4x, SBA, RQ depth 31), and the Uni-N GART block
+            // (+0x8C..+0x98, base/AGP-base/control/status) seeded ZERO so
+            // the driver's reads see a bridge at reset rather than the
+            // 0xFFFFFFFF master-abort an unseeded register answers.
+            if (!gSkipAgpCaps) {
+                cfgSeed(0, 0x00000804u, 0x00100000u); // status: cap list
+                cfgSeed(0, 0x00000834u, 0x00000080u); // cap ptr -> +0x80
+                cfgSeed(0, 0x00000880u, 0x00200002u); // AGP cap, rev 2.0
+                cfgSeed(0, 0x00000884u, 0x1F000207u); // AGP status: RQ 31,
+                                                      // SBA, 4x/2x/1x
+                cfgSeed(0, 0x00000888u, 0);           // AGP command
+                cfgSeed(0, 0x0000088Cu, 0);           // GART base
+                cfgSeed(0, 0x00000890u, 0);           // AGP aperture base
+                cfgSeed(0, 0x00000894u, 0);           // GART control
+                cfgSeed(0, 0x00000898u, 0);           // internal status
+            }
         }
         // ATI Rage 128 Pro AGP at f0 device 16 (the AGP slot, "SLOT-A"
         // per the real card's dump): 1002:5046 'PF', class display.
@@ -160,6 +200,28 @@ public:
         for (u32 r = 0x04; r <= 0x38; r += 4)
             if (r != 0x08)
                 cfgSeed(0, 0x00010000u | r, 0);
+        // The card's own AGP capability, at 0x50 exactly as on the real
+        // 'PF': the ARM reads the MMIO mirror of PCI config 0x58
+        // (AGP_COMMAND) at 0x0F58 — measured session 31 — which pins the
+        // capability base at 0x50. The .AGP driver walks the MASTER's
+        // capability chain too (dotagp.pef 0x8c4, second FindAGPCapability
+        // call), and its walk does not zero-check the pointer: a bare
+        // pointer of 0 lands on the vendor byte, 0x02, which reads as a
+        // false AGP capability at offset 0 and feeds the driver the
+        // command register as AGP status. PM capability chained at 0x5C.
+        if (!gSkipAgpCaps) {
+            cfgSeed(0, 0x00010004u, 0x00100000u); // status: cap list
+            cfgSeed(0, 0x00010034u, 0x00000050u); // cap ptr -> +0x50
+            cfgSeed(0, 0x00010050u, 0x00205C02u); // AGP cap, rev 2.0,
+                                                  // -> PM at 0x5C
+            cfgSeed(0, 0x00010054u, 0x1F000207u); // AGP status: RQ 31,
+                                                  // SBA, 4x/2x/1x
+            cfgSeed(0, 0x00010058u, 0);           // AGP command
+            cfgSeed(0, 0x0001005Cu, 0x00010001u); // PM cap v1.0, end of
+                                                  // chain — as on the
+                                                  // real 'PF'
+            cfgSeed(0, 0x00010060u, 0);           // PMCSR (D0)
+        }
         ataDma_.dmaBus = this;
         ataDma_.dev = &cd_;
         hdDma_.dmaBus = this;
@@ -273,6 +335,15 @@ public:
         const u32 key = (b << 28) | (latch & 0x00FFFF00u) |
                         ((latch & 0xFFu) & 0xFCu);
         cfgSpace_[key] = nativeLeWord;
+    }
+
+    // The Uni-N GART base as the .AGP driver programmed it: the AGP host
+    // function's config register +0x8C (bus 0, dev-11 idsel latch 0x800).
+    // Zero until the driver runs — the card-side GART walk declines on it.
+    u32 agpGartBase() const
+    {
+        auto it = cfgSpace_.find(0x88Cu);
+        return it == cfgSpace_.end() ? 0u : it->second;
     }
 
     u8 read8(u32 pa) override { return static_cast<u8>(read(pa, 1)); }
@@ -1240,6 +1311,24 @@ private:
             if ((off & ~3u) == 0x0A50u)
                 r128BusMasterFetch(ati_, ram_.data(),
                                    static_cast<u32>(ram_.size()), snoop);
+            // The CCE's PIO packet FIFO: each store hands the command
+            // engine one DWORD of packet stream, and executing the stream
+            // is what lands the ARM's GUI_SCRATCH fence. Routed from here
+            // for the same reason as the bus-master fetch above — packet
+            // execution can dispatch an INDIRECT buffer, which the card
+            // fetches out of system RAM through the Uni-N GART, and only
+            // the bus owns RAM, the snoop responder and the bridge's
+            // config space where the GART base lives.
+            else if ((off & ~3u) == 0x1000u || (off & ~3u) == 0x1004u)
+                r128CceFifoWord(ati_, v, len, ram_.data(),
+                                static_cast<u32>(ram_.size()), agpGartBase(),
+                                snoop);
+            // A guest that writes PM4_IW_INDSIZE directly (SDK §5.3.3's
+            // other flow) dispatches the same way a packet-written one does.
+            else if ((off & ~3u) == 0x073Cu)
+                r128CceIndirect(ati_, ati_.peek(0x073Cu), ram_.data(),
+                                static_cast<u32>(ram_.size()), agpGartBase(),
+                                snoop);
             return;
         }
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {
@@ -1476,7 +1565,11 @@ private:
             }
             cfgSpace_[key & ~3u] = word;
         }
-        if (cfgLog_.size() < 2048)
+        // 65536, not 2048: the old cap filled during Open Firmware's probe,
+        // so every Mac-OS-era access (a driver reading a device's config)
+        // fell off the end — and a head-capped log answers "did the OS
+        // driver ever probe this device" with a silence that reads as no.
+        if (cfgLog_.size() < 65536)
             cfgLog_.push_back({stamp ? *stamp : 0,
                                (b << 28) | (cfgAddr_[b] & 0x00FFFFFFu),
                                wr ? v : out, (pcRef ? *pcRef : 0) |

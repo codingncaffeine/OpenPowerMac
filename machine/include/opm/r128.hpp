@@ -282,6 +282,20 @@ struct R128EngStats {
     u64 cacheFlushes = 0; // PC_GUI_CTLSTAT flush/invalidate pulses answered
     u64 bmFetches = 0;    // bus-master fetches into the GUI scratch registers
     u64 bmBadAddr = 0;    // ...whose address was not in system memory
+    // The CCE's PIO packet path (PM4_FIFO_DATA_EVEN/ODD). Measured
+    // 2026-08-01: with a real AGP bridge the ARM configures BUFFER_CNTL
+    // mode 7 and submits through this FIFO — the no-ring finding of
+    // session 32 was the AGP-less machine's path, not the machine's.
+    u64 cceWords = 0;     // DWORDs accepted into the PIO FIFO
+    u64 ccePkt0 = 0;      // Type-0 packets executed (register bursts)
+    u64 ccePkt1 = 0;      // Type-1 packets executed (two registers)
+    u64 ccePkt2 = 0;      // Type-2 fillers skipped
+    u64 ccePkt3 = 0;      // Type-3 packets SKIPPED — opcodes go in the map
+    u64 cceBadWidth = 0;  // a FIFO write that was not a 32-bit store
+    u64 cceIndFetch = 0;  // indirect-buffer dispatches
+    u64 cceIndWords = 0;  // DWORDs fetched from indirect buffers
+    u64 cceGartMiss = 0;  // an AGP address whose GART entry was invalid
+    u64 cceIndNested = 0; // an indirect dispatch from inside an indirect body
 };
 
 
@@ -306,6 +320,29 @@ struct SnoopSink; // opm/bus.hpp — only a pointer is needed here
 // snapshot.
 void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
                         SnoopSink* snoop);
+// 📦 THE CCE's PIO PACKET PATH — a guest write to PM4_FIFO_DATA_EVEN/ODD
+// (0x1000/0x1004) hands the command engine one DWORD of packet stream.
+// SDK-G04000 App F gives the four packet types; Type-0 is a register-write
+// burst, which is why the stage-1 register engine is the executor. A Type-0
+// to PM4_IW_INDOFF/INDSIZE dispatches an INDIRECT BUFFER: the card fetches
+// the body itself from AGP space through the Uni-N GART (whose table the
+// .AGP driver builds in system RAM). `raw`/`len` are the guest store as the
+// bus saw it; `gartBase` is the bridge's GART base config register
+// (106b:0020 +0x8C) at the moment of the write.
+//
+// ⚠ The staged FIFO words live in a file-static — a snapshot taken between
+// the words of one packet resumes with the tail lost. Snapshots are minted
+// at quiescent points, and the stat line makes a truncation visible.
+void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
+                     u32 ramSize, u32 gartBase, SnoopSink* snoop);
+// Direct dispatch for a guest that writes PM4_IW_INDSIZE itself rather than
+// through a packet (SDK §5.3.3 names that flow too).
+void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
+                     u32 gartBase, SnoopSink* snoop);
+// Type-3 opcodes that arrived and were skipped, by opcode byte — the same
+// contract as the ROP map: the next thing to implement is a number in the
+// report, not a guess.
+const std::map<u32, u64>& r128CceP3Skipped();
 const R128EngStats& r128EngStats();
 // --no-ati-2d: put the card back the way it was before the engine existed,
 // so a boot that never touches the GUI block can be shown to be unchanged.

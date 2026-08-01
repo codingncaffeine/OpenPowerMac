@@ -577,6 +577,523 @@ void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
 const R128EngStats& r128EngStats() { return gEng; }
 const std::map<u32, u64>& r128RopUnimplemented() { return gRopUnimpl; }
 
+// ── The CCE's PIO packet path ──────────────────────────────────────────────
+//
+// Measured 2026-08-01, the first boot with a working .AGP driver: the ARM
+// sets PM4_BUFFER_CNTL mode 7 (64 CCE packet PIO / 64 vertex BM / 64
+// indirect BM), uploads the microcode, and submits through the FIFO. The
+// first submission ever seen was six DWORDs:
+//
+//   000101ce 00101000 00000018   Type-0, 2 regs @0x0738: PM4_IW_INDOFF =
+//                                0x101000 (an AGP address), PM4_IW_INDSIZE =
+//                                0x18 DWORDs -> dispatch an indirect buffer
+//   00010578 d9c4e0d7 00000001   Type-0, 2 regs @0x15E0: GUI_SCRATCH_REG0/1
+//                                <- a 64-bit UpTime fence
+//
+// and the ARM then polls GUI_SCRATCH_REG0/1 (43.7 M reads each) for the
+// fence to land — the software-fence idiom, working because a FIFO'd write
+// executes in command order. Executing the packets IS the fence mechanism;
+// nothing here free-runs.
+//
+// Packet formats are SDK-G04000 App F (r128sdk.txt 12575-12800): Type-0
+// header = TYPE 31:30 | COUNT 29:16 (N-1) | ONE_REG_WR 15 | BASE_INDEX 10:0
+// in DWORDs; Type-1 = two indexed registers; Type-2 = filler; Type-3 =
+// TYPE | COUNT (N-1) | IT_OPCODE 15:8 with an N-DWord body.
+//
+// ⚠ The staging FIFO is a file-static: a snapshot taken between the words
+// of one packet loses the partial packet on resume. Snapshots are minted at
+// quiescent points; the word counter makes a truncation visible.
+static std::vector<u32> gCceFifo;
+static size_t gCceHead = 0;
+static int gCceDepth = 0;
+static std::map<u32, u64> gCceP3;
+const std::map<u32, u64>& r128CceP3Skipped() { return gCceP3; }
+
+static constexpr u32 kIwIndOff = 0x0738, kIwIndSize = 0x073C;
+
+static u32 cceBswap(u32 v)
+{
+    return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) |
+           (v << 24);
+}
+
+static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
+                     SnoopSink* snoop);
+
+// An INDSIZE write seen while a packet is still executing must not fetch on
+// the spot: the fetched body has to land BETWEEN this packet and the next
+// one, and a parse re-entered mid-packet would re-read the in-flight header
+// and desynchronise the whole stream — the unit test caught exactly that as
+// a garbage register spray. So execution only RECORDS the dispatch, and the
+// parse loop performs it at the packet boundary.
+static std::vector<u32> gCcePendingInd;
+
+static void cceRegWrite(R128Cell& c, u32 off, u32 native)
+{
+    // Through the front door: the same path a guest MMIO store takes, so a
+    // packet's register write triggers the same engine side effects, lands
+    // in the same logs, and needs no second dispatch table. write() swaps a
+    // 4-byte store, so hand it the pre-swapped image.
+    c.write(off & 0x3FFCu, cceBswap(native), 4);
+    if ((off & 0x3FFCu) == kIwIndSize)
+        gCcePendingInd.push_back(native);
+}
+
+// One GART-translated LE32 read out of AGP space. The Uni-N GART table is in
+// system RAM where the .AGP driver built it (base = 106b:0020 config +0x8C);
+// entries are little-endian, bit 0 valid, 31:12 the physical page — the
+// layout Linux's uninorth-agp documents. ⚠ The base register's low bits are
+// not yet established (the driver was seen writing 0x03105D00, which is not
+// page-aligned), so the walk tries the raw base first and the page-masked
+// base second, and the first eight walks are printed with which one
+// answered — the instrument decides, not an assumption.
+static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase, u32 agp,
+                        u32& out, SnoopSink* snoop)
+{
+    auto le32 = [&](u32 at) {
+        return u32(ram[at]) | (u32(ram[at + 1]) << 8) |
+               (u32(ram[at + 2]) << 16) | (u32(ram[at + 3]) << 24);
+    };
+    static int walkLog = 0;
+    const u32 idx = agp >> 12;
+    const u32 bases[2] = {gartBase, gartBase & ~0xFFFu};
+    for (int b = 0; b < 2; ++b) {
+        const u64 ea = static_cast<u64>(bases[b]) + static_cast<u64>(idx) * 4u;
+        if (!bases[b] || ea + 4u > ramSize)
+            continue;
+        if (snoop)
+            snoop->snoopRead(static_cast<u32>(ea), 4);
+        const u32 entry = le32(static_cast<u32>(ea));
+        if (!(entry & 1u))
+            continue;
+        const u32 pa = (entry & 0xFFFFF000u) | (agp & 0xFFFu);
+        if (static_cast<u64>(pa) + 4u > ramSize)
+            continue;
+        if (walkLog < 8) {
+            ++walkLog;
+            printf("-- cce gart: agp=%08x idx=%x entry@%08llx=%08x -> "
+                   "pa=%08x (%s base)\n",
+                   agp, idx, static_cast<unsigned long long>(ea), entry, pa,
+                   b ? "masked" : "raw");
+        }
+        if (snoop)
+            snoop->snoopRead(pa, 4);
+        out = le32(pa);
+        return true;
+    }
+    ++gEng.cceGartMiss;
+    if (walkLog < 8) {
+        ++walkLog;
+        printf("-- cce gart MISS: agp=%08x idx=%x base=%08x\n", agp, idx,
+               gartBase);
+    }
+    return false;
+}
+
+// ── The 2D operation packets (SDK App F.7) ────────────────────────────────
+//
+// Every 2D packet's body opens with the same SETTINGS structure:
+// [GUI_CONTROL] — bit-compatible with DP_GUI_MASTER_CNTL, and its low flag
+// bits complement the register's default-load semantics exactly: packet bit
+// set = "the datum follows in SETUP_BODY" = register bit set = "leave the
+// current value alone", so GUI_CONTROL is written to the GMC VERBATIM after
+// the supplied data land in their registers — then the ordered optional
+// SETUP_BODY: [SRC_PITCH_OFFSET b0] [DST_PITCH_OFFSET b1]
+// [SRC_SC_BOT_RITE b2] [SC_TOP_LEFT + SC_BOT_RITE b3]
+// {BRUSH_PACKET per bits 7:4} [BRUSH_Y_X b31].
+//
+// Consumes from `body` (bounded by the Type-3 COUNT, so a malformed body
+// can be declined without desynchronising the stream) and returns the index
+// past SETTINGS, or n+1 to signal "decline".
+static u32 cceSettings(R128Cell& c, const u32* body, u32 n)
+{
+    if (!n)
+        return 1;
+    u32 i = 0;
+    const u32 gc = body[i++];
+    if (gc & 1u) { // SRC_PITCH_OFFSET
+        if (i >= n) return n + 1;
+        cceRegWrite(c, 0x1428u, body[i++]);
+    }
+    if (gc & 2u) { // DST_PITCH_OFFSET
+        if (i >= n) return n + 1;
+        cceRegWrite(c, 0x142Cu, body[i++]);
+    }
+    if (gc & 4u) { // SRC_SC_BOT_RITE
+        if (i >= n) return n + 1;
+        cceRegWrite(c, 0x16F4u, body[i++]);
+    }
+    if (gc & 8u) { // SC_TOP_LEFT + SC_BOT_RITE
+        if (i + 1u >= n) return n + 1;
+        cceRegWrite(c, 0x16ECu, body[i++]);
+        cceRegWrite(c, 0x16F0u, body[i++]);
+    }
+    // The brush packet, sized by BRUSH_TYPE (Table F-2). Only the solid
+    // brush draws today; pattern data still lands in the brush registers so
+    // nothing is silently dropped, and an op that needs the pattern is the
+    // blitter's brushUnimpl decline, visible in the report.
+    const u32 brush = (gc >> 4) & 0xFu;
+    static const int kBrushDwords[16] = {4,  3,  3,  2, 3, 2, 3, 2,
+                                         34, 33, 33, -1, -1, 1, -1, 0};
+    int bn = kBrushDwords[brush];
+    if (bn < 0) {
+        // 8x8 / 8x1 / 1x8 COLOUR patterns: 16*N / 2*N / 2*N DWORDs where N
+        // is bytes-per-pixel from DST_TYPE (Table F-3).
+        static const int kBpp[16] = {0, 0, 1, 2, 2, 3, 4, 1,
+                                     0, 0, 0, 0, 0, 0, 0, 0};
+        const int bpp = kBpp[(gc >> 8) & 0xFu];
+        if (!bpp)
+            return n + 1;
+        bn = (brush == 11u ? 16 : 2) * bpp;
+    }
+    if (i + static_cast<u32>(bn) > n)
+        return n + 1;
+    switch (brush) {
+    case 0: // [BKGD][FRGD][BMP1][BMP2]
+        cceRegWrite(c, 0x1478u, body[i]);
+        cceRegWrite(c, 0x147Cu, body[i + 1u]);
+        break;
+    case 1:
+    case 3:
+    case 5:
+    case 7:
+    case 9:
+    case 10:
+    case 13: // solid: [FRGD] alone
+        cceRegWrite(c, 0x147Cu, body[i]);
+        break;
+    case 2:
+    case 4:
+    case 6:
+    case 8:
+        cceRegWrite(c, 0x1478u, body[i]);
+        if (bn > 1)
+            cceRegWrite(c, 0x147Cu, body[i + 1u]);
+        break;
+    default:
+        break;
+    }
+    i += static_cast<u32>(bn);
+    if (gc >> 31) { // BRUSH_Y_X follows
+        if (i >= n) return n + 1;
+        cceRegWrite(c, 0x1474u, body[i++]);
+    }
+    // Now the control word itself, verbatim — see the header comment.
+    cceRegWrite(c, 0x146Cu, gc);
+    return i;
+}
+
+// PAINT (0x91): rectangles [TOP|LEFT][BOTM|RITE] after SETTINGS. The engine
+// initiates on DST_HEIGHT_WIDTH, exactly as the register path does.
+// ⚠ Bottom-right is taken as EXCLUSIVE (width = RITE-LEFT), the GDI
+// convention the packet's own WIN31_ROP field points at; if the desktop
+// ever draws one pixel short everywhere, this is the bit to revisit.
+static bool cceOpPaint(R128Cell& c, const u32* body, u32 n)
+{
+    u32 i = cceSettings(c, body, n);
+    if (i > n)
+        return false;
+    while (i + 2u <= n) {
+        const u32 tl = body[i], br = body[i + 1u];
+        i += 2u;
+        const u32 left = tl & 0xFFFFu, top = tl >> 16;
+        const u32 rite = br & 0xFFFFu, botm = br >> 16;
+        const u32 w = (rite - left) & 0x3FFFu;
+        const u32 h = (botm - top) & 0x3FFFu;
+        if (!w || !h)
+            continue;
+        cceRegWrite(c, 0x1438u, tl);              // DST_Y_X
+        cceRegWrite(c, 0x143Cu, (h << 16) | w);   // DST_HEIGHT_WIDTH: draw
+    }
+    return true;
+}
+
+// PAINT_MULTI (0x9A): same fill as PAINT, different parameter shape — the
+// SDK's own words. Pairs of [DST_X|DST_Y] (⚠ x HIGH, y LOW — inverted from
+// both PAINT and the DST_Y_X register) and [DST_W|DST_H] (w HIGH, h LOW).
+// Both are half-swaps of the register layouts, and width/height are given
+// directly, so no corner arithmetic and no inclusivity question.
+static bool cceOpPaintMulti(R128Cell& c, const u32* body, u32 n)
+{
+    u32 i = cceSettings(c, body, n);
+    if (i > n)
+        return false;
+    while (i + 2u <= n) {
+        const u32 xy = body[i], wh = body[i + 1u];
+        i += 2u;
+        const u32 w = wh >> 16, h = wh & 0xFFFFu;
+        if (!w || !h)
+            continue;
+        cceRegWrite(c, 0x1438u, (xy >> 16) | (xy << 16)); // DST_Y_X
+        cceRegWrite(c, 0x143Cu, (wh >> 16) | (wh << 16)); // H_W: draw
+    }
+    return true;
+}
+
+// HOSTDATA_BLT (0x94): bit-packed mono bitmaps expanded through
+// foreground/background — the large-glyph text path (SDK F.11, mirroring
+// the Windows LARGEBITGLYPH). The engine's register-path mono expansion is
+// not built (monoSrc is a decline counter), so the expansion happens here,
+// honouring the engine's CURRENT destination state: pitch/offset from the
+// DST registers, the scissor, and the destination type from GUI_CONTROL.
+// FRGD/BKGD arrive as RGBQUAD and are converted to the destination format.
+static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
+{
+    const u32 i0 = cceSettings(c, body, n);
+    if (i0 > n || i0 + 2u > n)
+        return false;
+    const u32 gc = body[0];
+    const u32 dstType = (gc >> 8) & 0xFu;
+    const u32 srcType = (gc >> 12) & 3u;   // 0 mono opaque, 1 transparent,
+                                           // 3 colour ("same as DST")
+    const bool lsbFirst = (gc >> 14) & 1u; // PIX_ORDER
+    if (srcType == 2u) {
+        ++gEng.hostData; // reserved encoding — decline loudly
+        return false;
+    }
+    u32 bpp = 0;
+    switch (dstType) {
+    case 3u:
+    case 4u: bpp = 2; break;
+    case 6u: bpp = 4; break;
+    default:
+        ++gEng.badBpp;
+        return false;
+    }
+    auto conv = [&](u32 rgbq) -> u32 {
+        const u32 rr = (rgbq >> 16) & 0xFFu, gg = (rgbq >> 8) & 0xFFu,
+                  bb = rgbq & 0xFFu;
+        if (dstType == 4u) // RGB565
+            return ((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3);
+        if (dstType == 3u) // aRGB1555
+            return ((rr >> 3) << 10) | ((gg >> 3) << 5) | (bb >> 3);
+        return rgbq;
+    };
+    const u32 fg = conv(body[i0]), bk = conv(body[i0 + 1u]);
+    const u32 dstOff = c.peek(0x1404u);
+    const u32 pitchBytes = c.peek(0x1408u) * 8u * bpp;
+    // The engine normalises SC_TOP_LEFT/SC_BOTTOM_RIGHT into the split
+    // canonical cells — read those, not the alias offsets.
+    const int scL = static_cast<int>(c.peek(0x1640u) & 0x3FFFu),
+              scR = static_cast<int>(c.peek(0x1644u) & 0x3FFFu),
+              scT = static_cast<int>(c.peek(0x1648u) & 0x3FFFu),
+              scB = static_cast<int>(c.peek(0x164Cu) & 0x3FFFu);
+    u32 i = i0 + 2u;
+    while (i + 3u <= n) {
+        const u32 baseYX = body[i], hw = body[i + 1u], m = body[i + 2u];
+        i += 3u;
+        if (i + m > n)
+            return false; // malformed: header count disagrees
+        const int bx = static_cast<int>(baseYX & 0xFFFFu);
+        const int by = static_cast<int>(baseYX >> 16);
+        const u32 wPx = hw & 0xFFFFu, hPx = hw >> 16;
+        const u32* raster = &body[i];
+        i += m;
+        if (!wPx || !hPx || !m)
+            continue;
+        if (srcType == 3u) {
+            // COLOUR host data: the raster is packed destination-format
+            // pixels, byte-stream in big-endian DWORD order, rows
+            // continuous — an icon/pixmap push, copied as-is.
+            const u64 availB = static_cast<u64>(m) * 4u;
+            u64 sb = 0;
+            for (u32 yy = 0; yy < hPx; ++yy) {
+                for (u32 xx = 0; xx < wPx; ++xx, sb += bpp) {
+                    if (sb + bpp > availB)
+                        break;
+                    const int px = bx + static_cast<int>(xx);
+                    const int py = by + static_cast<int>(yy);
+                    if (px < scL || px > scR || py < scT || py > scB)
+                        continue;
+                    const u64 at = static_cast<u64>(dstOff) +
+                                   static_cast<u64>(py) * pitchBytes +
+                                   static_cast<u64>(px) * bpp;
+                    if (at + bpp > c.vram.size())
+                        continue;
+                    for (u32 k = 0; k < bpp; ++k) {
+                        const u64 s = sb + k;
+                        c.vram[at + k] = static_cast<u8>(
+                            raster[s >> 2] >> (8u * (3u - (s & 3u))));
+                    }
+                    ++gEng.pixels;
+                }
+            }
+            ++gEng.blits;
+            continue;
+        }
+        // Mono: bits consumed row-major and CONTINUOUSLY across the DWORDs
+        // (the linear HOSTDATA trajectory); PIX_ORDER picks the end each
+        // DWORD is consumed from.
+        u64 bit = 0;
+        const u64 avail = static_cast<u64>(m) * 32u;
+        for (u32 yy = 0; yy < hPx; ++yy) {
+            for (u32 xx = 0; xx < wPx; ++xx, ++bit) {
+                if (bit >= avail)
+                    break;
+                const u32 wIdx = static_cast<u32>(bit >> 5);
+                const u32 bIdx = static_cast<u32>(bit & 31u);
+                const u32 word = raster[wIdx];
+                const u32 on = lsbFirst ? (word >> bIdx) & 1u
+                                        : (word >> (31u - bIdx)) & 1u;
+                if (!on && srcType == 1u)
+                    continue; // transparent background
+                const int px = bx + static_cast<int>(xx);
+                const int py = by + static_cast<int>(yy);
+                if (px < scL || px > scR || py < scT || py > scB)
+                    continue;
+                const u64 at = static_cast<u64>(dstOff) +
+                               static_cast<u64>(py) * pitchBytes +
+                               static_cast<u64>(px) * bpp;
+                if (at + bpp > c.vram.size())
+                    continue;
+                const u32 v = on ? fg : bk;
+                for (u32 k = 0; k < bpp; ++k)
+                    c.vram[at + k] =
+                        static_cast<u8>(v >> (8u * (bpp - 1u - k)));
+                ++gEng.pixels;
+            }
+        }
+        ++gEng.blits;
+    }
+    return true;
+}
+
+// Fetch a pending indirect body and SPLICE IT AT THE PARSE HEAD, so the
+// body executes after the packet that dispatched it and before whatever the
+// guest queued next — the order the hardware gives.
+static void cceDrainPending(R128Cell& c, const u8* ram, u32 ramSize,
+                            u32 gartBase, SnoopSink* snoop)
+{
+    while (!gCcePendingInd.empty()) {
+        const u32 sizeDwords = gCcePendingInd.front();
+        gCcePendingInd.erase(gCcePendingInd.begin());
+        if (gCceDepth <= 0) {
+            // A chain of indirect dispatches longer than any real frame's
+            // submission is a cycle — a body re-dispatching itself would
+            // hang the EMULATOR, not the guest. The budget is set at each
+            // guest-visible entry; overruns are counted, not silent.
+            ++gEng.cceIndNested;
+            continue;
+        }
+        --gCceDepth;
+        const u32 indOff = c.peek(kIwIndOff);
+        const u32 n = sizeDwords & 0xFFFFu;
+        if (!n || n > 0x4000u)
+            continue;
+        ++gEng.cceIndFetch;
+        std::vector<u32> body;
+        body.reserve(n);
+        for (u32 i = 0; i < n; ++i) {
+            u32 w = 0;
+            if (!cceGartRead(ram, ramSize, gartBase, indOff + 4u * i, w,
+                             snoop))
+                break;
+            ++gEng.cceIndWords;
+            body.push_back(w);
+        }
+        gCceFifo.insert(gCceFifo.begin() + static_cast<long>(gCceHead),
+                        body.begin(), body.end());
+    }
+}
+
+void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
+                     u32 gartBase, SnoopSink* snoop)
+{
+    if (!gEng2dOn || !ram)
+        return;
+    gCceDepth = 64; // dispatch budget for this guest-visible entry
+    gCcePendingInd.push_back(sizeDwords);
+    cceParse(c, ram, ramSize, gartBase, snoop);
+}
+
+static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
+                     SnoopSink* snoop)
+{
+    for (;;) {
+        cceDrainPending(c, ram, ramSize, gartBase, snoop);
+        const size_t avail = gCceFifo.size() - gCceHead;
+        if (!avail)
+            break;
+        const u32 w = gCceFifo[gCceHead];
+        const u32 type = w >> 30;
+        if (type == 2u) { // filler
+            ++gCceHead;
+            ++gEng.ccePkt2;
+            continue;
+        }
+        if (type == 0u) {
+            const u32 n = ((w >> 16) & 0x3FFFu) + 1u;
+            if (avail < 1u + n)
+                break;
+            const u32 base = (w & 0x7FFu) << 2;
+            const bool oneReg = (w >> 15) & 1u;
+            gCceHead += 1u; // consume the header BEFORE executing: a body
+                            // word may queue an indirect dispatch, and the
+                            // splice point is wherever the head stands.
+            for (u32 i = 0; i < n; ++i)
+                cceRegWrite(c, oneReg ? base : base + 4u * i,
+                            gCceFifo[gCceHead + i]);
+            gCceHead += n;
+            ++gEng.ccePkt0;
+            continue;
+        }
+        if (type == 1u) {
+            if (avail < 3u)
+                break;
+            cceRegWrite(c, (w & 0x7FFu) << 2, gCceFifo[gCceHead + 1u]);
+            cceRegWrite(c, ((w >> 11) & 0x7FFu) << 2,
+                        gCceFifo[gCceHead + 2u]);
+            gCceHead += 3u;
+            ++gEng.ccePkt1;
+            continue;
+        }
+        // Type-3: an operation packet. COUNT = N-1 body DWORDs; the body is
+        // consumed exactly by the HEADER count whatever the op does, so a
+        // half-understood operation can never desynchronise the stream.
+        const u32 n = ((w >> 16) & 0x3FFFu) + 1u;
+        if (avail < 1u + n)
+            break;
+        const u32 op = (w >> 8) & 0xFFu;
+        const u32* body = &gCceFifo[gCceHead + 1u];
+        bool done = false;
+        if (op == 0x91u) // PAINT — SDK F.9
+            done = cceOpPaint(c, body, n);
+        else if (op == 0x9Au) // PAINT_MULTI — SDK F.17
+            done = cceOpPaintMulti(c, body, n);
+        else if (op == 0x94u) // HOSTDATA_BLT — SDK F.11
+            done = cceOpHostBlt(c, body, n);
+        if (!done)
+            ++gCceP3[op];
+        gCceHead += 1u + n;
+        ++gEng.ccePkt3;
+    }
+    // Compact once drained so the staging vector cannot grow without bound
+    // across a long session.
+    if (gCceHead == gCceFifo.size()) {
+        gCceFifo.clear();
+        gCceHead = 0;
+    } else if (gCceHead > 0x10000u) {
+        gCceFifo.erase(gCceFifo.begin(),
+                       gCceFifo.begin() + static_cast<long>(gCceHead));
+        gCceHead = 0;
+    }
+}
+
+void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
+                     u32 ramSize, u32 gartBase, SnoopSink* snoop)
+{
+    if (!gEng2dOn || !ram)
+        return;
+    if (len != 4u) {
+        ++gEng.cceBadWidth;
+        return;
+    }
+    ++gEng.cceWords;
+    gCceDepth = 64; // dispatch budget for this guest-visible entry
+    gCceFifo.push_back(cceBswap(raw));
+    cceParse(c, ram, ramSize, gartBase, snoop);
+}
+
 
 u32 R128Cell::regRead(u32 idx)
 {

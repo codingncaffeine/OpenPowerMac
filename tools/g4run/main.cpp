@@ -1258,6 +1258,7 @@ int main(int argc, char** argv)
     u64 wpVaAt = 0; // instruction count at which it resolved
     u64 rpVaNext = 0;
     u32 rpVaPa = 0;
+    u32 wpVaMoves = 0, rpVaMoves = 0; // times the guest remapped the range
     // Instrument census. A watch that emits nothing is ambiguous between
     // "never fired", "fired with nothing to say", and "its gate never
     // opened" — this session lost several runs to exactly that, because a
@@ -2032,34 +2033,46 @@ int main(int argc, char** argv)
         // That one lives in Bus::write and never sees an ordinary cached
         // store, which is how a field PROVED to change reported zero hits and
         // read as "nothing ever writes this".
-        if (wpVa && !cpu.wpEnd && executed >= wpVaNext) {
+        // ⛔ RE-AIM, do not resolve once. Open Firmware maps low memory one to
+        // one and Mac OS does not: the same VA that answers PA 0078b000 in the
+        // firmware era answers 0078f03c under the OS. A watch resolved on the
+        // first mapping that appears spends the run on bytes that stopped
+        // being the field, reports zero stores, and that reads exactly like
+        // "nothing ever writes it" — which is the answer this instrument was
+        // built to stop getting wrong. Every move is printed, and the report
+        // says how many there were.
+        if (wpVa && executed >= wpVaNext) {
             wpVaNext = executed + 0x40000ull;
             u32 pa0 = 0, pa1 = 0;
             bool flat = false;
-            if (xlateRange(wpVa, wpVaEnd, pa0, pa1, flat)) {
+            if (xlateRange(wpVa, wpVaEnd, pa0, pa1, flat) && pa0 != wpVaPa) {
+                if (wpVaPa) ++wpVaMoves;
                 cpu.wpPa = pa0;
                 cpu.wpEnd = flat ? pa1 : (pa0 | 0xFFFu);
                 wpVaPa = pa0;
                 wpVaAt = executed;
-                printf("-- wp-va %08x..%08x -> PA %08x..%08x%s @%llu\n", wpVa,
+                printf("-- wp-va %08x..%08x -> PA %08x..%08x%s @%llu%s\n", wpVa,
                        wpVaEnd, cpu.wpPa, cpu.wpEnd,
                        flat ? "" : "  WARNING: crosses a page, clamped",
-                       static_cast<unsigned long long>(executed));
+                       static_cast<unsigned long long>(executed),
+                       wpVaMoves ? "  (RE-AIMED: the guest remapped it)" : "");
                 fflush(stdout);
             }
         }
-        if (rpVa && !cpu.rpEnd && executed >= rpVaNext) {
+        if (rpVa && executed >= rpVaNext) {
             rpVaNext = executed + 0x40000ull;
             u32 pa0 = 0, pa1 = 0;
             bool flat = false;
-            if (xlateRange(rpVa, rpVaEnd, pa0, pa1, flat)) {
+            if (xlateRange(rpVa, rpVaEnd, pa0, pa1, flat) && pa0 != rpVaPa) {
+                if (rpVaPa) ++rpVaMoves;
                 cpu.rpPa = pa0;
                 cpu.rpEnd = flat ? pa1 : (pa0 | 0xFFFu);
                 rpVaPa = pa0;
-                printf("-- rp-va %08x..%08x -> PA %08x..%08x%s @%llu\n", rpVa,
+                printf("-- rp-va %08x..%08x -> PA %08x..%08x%s @%llu%s\n", rpVa,
                        rpVaEnd, cpu.rpPa, cpu.rpEnd,
                        flat ? "" : "  WARNING: crosses a page, clamped",
-                       static_cast<unsigned long long>(executed));
+                       static_cast<unsigned long long>(executed),
+                       rpVaMoves ? "  (RE-AIMED: the guest remapped it)" : "");
                 fflush(stdout);
             }
         }
@@ -4445,28 +4458,13 @@ int main(int argc, char** argv)
                static_cast<unsigned long long>(cpu.wpHits),
                cpu.wpHits == 1 ? "" : "s", cpu.wpLog.size(),
                cpu.wpLog.size() >= cpu.wpMax ? ", CAPPED" : "");
-        if (wpVaPa) {
-            // Did the instrument stay aimed? A virtual address is resolved
-            // once; if the guest remapped the page afterwards, the watch spent
-            // the rest of the run on physical bytes that are no longer the
-            // field, and every conclusion drawn from its silence is void.
-            cpu.mmuProbe = true;
-            const CpuState wSaved = cpu.st;
-            cpu.st.msr |= 0x30u;
-            u32 nowPa = 0;
-            const bool ok = cpu.translate(wpVa, false, false, nowPa);
-            cpu.st = wSaved;
-            cpu.mmuProbe = false;
-            printf("   armed @%llu; VA %08x %s\n",
-                   static_cast<unsigned long long>(wpVaAt), wpVa,
-                   !ok ? "NO LONGER TRANSLATES — the watch may have gone stale"
-                       : nowPa == wpVaPa
-                             ? "still maps to the same PA (the watch stayed "
-                               "aimed)"
-                             : "NOW MAPS ELSEWHERE — the watch went stale");
-            if (ok && nowPa != wpVaPa)
-                printf("   was PA %08x, now PA %08x\n", wpVaPa, nowPa);
-        }
+        if (wpVaPa)
+            printf("   VA %08x, last aimed @%llu; the guest remapped it %u "
+                   "time%s%s\n",
+                   wpVa, static_cast<unsigned long long>(wpVaAt), wpVaMoves,
+                   wpVaMoves == 1 ? "" : "s",
+                   wpVaMoves ? " — PAs below span more than one mapping"
+                             : "");
         // The census, which is what makes a range watch answer a question the
         // capped log cannot: WHICH bytes of the range were ever written. A
         // field under test and a neighbour known to change go in the same
@@ -4476,10 +4474,15 @@ int main(int argc, char** argv)
             printf("   written, by address (%zu distinct):\n",
                    cpu.wpByPa.size());
             for (const auto& [at, s] : cpu.wpByPa)
-                printf("     pa %08x +%-2u  (va %08x, +%-4d)  x%llu\n", at,
-                       s.len, wpVaPa ? wpVa + (at - wpVaPa) : at,
-                       static_cast<int>(at - cpu.wpPa),
-                       static_cast<unsigned long long>(s.n));
+                if (wpVaPa && !wpVaMoves)
+                    printf("     pa %08x +%-2u  (va %08x, +%-4d)  x%llu\n", at,
+                           s.len, wpVa + (at - wpVaPa),
+                           static_cast<int>(at - cpu.wpPa),
+                           static_cast<unsigned long long>(s.n));
+                else
+                    printf("     pa %08x +%-2u  (+%-4d)  x%llu\n", at, s.len,
+                           static_cast<int>(at - cpu.wpPa),
+                           static_cast<unsigned long long>(s.n));
             // The gaps ARE the finding. Naming the bytes nothing wrote is the
             // difference between "the watch saw nothing" and "the watch saw
             // this record change and never this field".

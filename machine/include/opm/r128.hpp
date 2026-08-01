@@ -296,6 +296,29 @@ struct R128EngStats {
     u64 cceIndWords = 0;  // DWORDs fetched from indirect buffers
     u64 cceGartMiss = 0;  // an AGP address whose GART entry was invalid
     u64 cceIndNested = 0; // an indirect dispatch from inside an indirect body
+    // The CCE ring (SDK §5.3): packets bus-mastered out of AGP space between
+    // DL_RPTR and DL_WPTR, with the read pointer written back into system
+    // memory at DL_RPTR_ADDR — the transport a 3D-era driver arms with
+    // PM4_MICRO_CNTL FREERUN. The 2D queue measured on this machine is PIO
+    // (mode 7); these stay zero until something turns the ring on.
+    u64 cceRingKicks = 0; // WPTR doorbells that found fetchable work
+    u64 cceRingWords = 0; // DWORDs fetched out of the ring
+    u64 cceRingStall = 0; // a ring fetch that missed the GART — kick abandoned
+    // The 3D pipeline (SDK ch 6 / App F.24-F.27).
+    u64 tris = 0;         // triangles rasterised
+    u64 lines3d = 0;      // 3D lines drawn
+    u64 points3d = 0;     // 3D points drawn
+    u64 triPixels = 0;    // pixels the 3D pipe wrote
+    u64 triCulled = 0;    // triangles removed by the winding cull
+    u64 triDegen = 0;     // zero-area or fully-clipped triangles
+    u64 vtxFetched = 0;   // vertices decoded, all walk modes
+    u64 vtxGartMiss = 0;  // vertex-walker fetches that missed the GART
+    u64 prim3dDecline = 0; // a 3D primitive packet refused whole
+    u64 gated3d = 0;      // 3D register writes dropped: SCALE_3D_FN not 2
+    u64 texSamples = 0;   // texel fetches, both units
+    u64 texUnimpl = 0;    // texture datatype this engine cannot decode
+    u64 texGartMiss = 0;  // an AGP texture fetch that missed the GART
+    u64 zTile = 0;        // Z_PITCH_C had Z_TILE set — layout not modelled
 };
 
 
@@ -360,6 +383,45 @@ const std::map<u32, u64>& r128CceP3Skipped();
 // then froze mid-redraw". Found from a user diag capture after a
 // Stop/Start.
 void r128CceReset();
+
+// --- The 3D engine (r128_3d.cpp) ------------------------------------------
+//
+// The memory routes CCE work needs beyond the packet stream itself: the
+// vertex walker and AGP-resident textures both read system RAM through the
+// Uni-N GART, and every card-initiated access is snooped. Stack-passed,
+// never stored — the cell stays a leaf device and no snapshot moves.
+struct CceMem {
+    const u8* ram = nullptr;
+    u32 ramSize = 0, gartBase = 0, aperBase = 0;
+    SnoopSink* snoop = nullptr;
+};
+// One GART-translated LE32 read out of AGP space (the parser's own walk,
+// exported for the 3D unit's vertex and texture fetches).
+bool r128CceGartRead(const CceMem& m, u32 agp, u32& out);
+// The 3D Type-3 packets: 0x25 3D_RNDR_GEN_PRIM (inline FTLVERTEX stream),
+// 0x23 3D_RNDR_GEN_INDX_PRIM (vertex walker over an AGP-space buffer),
+// 0x2E NEXT_VERTEX_BUNDLE (continuation of the last 0x23), 0x2C
+// LOAD_PALETTE. Returns false — a counted decline — on a body it cannot
+// honour; the stream is bounded by the Type-3 header either way.
+bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n,
+                 const CceMem& m);
+// Register writes the 3D unit owns: the fog table pair at 0x1A14/0x1A18 and
+// the SCALE_3D_FN write gate over the 3D context block (0x1C90-0x1D44).
+// Returns true when the write is fully handled (stored or deliberately
+// dropped); the caller must not also store it.
+bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v);
+// Machine creation: forget the NEXT_VERTEX_BUNDLE continuation latch, the
+// CCE palettes and the fog table — same contract and caller as
+// r128CceReset, which invokes this itself.
+void r128Cce3dReset();
+// The CCE ring: a PM4_BUFFER_DL_WPTR or PM4_MICRO_CNTL write may hand the
+// engine a span of ring DWORDs to fetch through the GART and execute
+// (SDK §5.3). Runs only in the bus-mastered-packet modes with the
+// microengine free-running; afterwards the read pointer is written back to
+// system memory at PM4_BUFFER_DL_RPTR_ADDR, snooped. Routed from the bus
+// like the FIFO path, because only the bus owns RAM and the GART base.
+void r128CceRingKick(R128Cell& c, u8* ram, u32 ramSize, u32 gartBase,
+                     u32 aperBase, SnoopSink* snoop);
 const R128EngStats& r128EngStats();
 // --no-ati-2d: put the card back the way it was before the engine existed,
 // so a boot that never touches the GUI block can be shown to be unchanged.

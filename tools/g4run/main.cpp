@@ -5728,6 +5728,39 @@ int main(int argc, char** argv)
             for (const auto& [op, n] : r128CceP3Skipped())
                 printf("--     pkt3 opcode 0x%02x  x%llu\n", op,
                        static_cast<unsigned long long>(n));
+            // The ring stays all-zero until a 3D-era driver arms it with
+            // PM4_MICRO_CNTL FREERUN; a stall here is a GART hole under a
+            // live ring and the first thing to read at a 3D hang.
+            if (e.cceRingKicks || e.cceRingStall)
+                printf("--   cce ring: %llu kicks, %llu words fetched, "
+                       "%llu stalls\n",
+                       static_cast<unsigned long long>(e.cceRingKicks),
+                       static_cast<unsigned long long>(e.cceRingWords),
+                       static_cast<unsigned long long>(e.cceRingStall));
+            // ⭐ THE 3D PIPELINE. Printed whenever it was touched — a 3D app
+            // that launched and drew nothing is exactly the situation the
+            // decline counters exist to explain.
+            if (e.tris || e.lines3d || e.points3d || e.prim3dDecline ||
+                e.gated3d || e.vtxFetched)
+                printf("-- ati 3D: %llu tris (%llu culled, %llu degen), "
+                       "%llu lines, %llu points, %llu pixels; vtx %llu "
+                       "(%llu gart miss); tex samples %llu (%llu unimpl, "
+                       "%llu gart miss); declined prims %llu, gated writes "
+                       "%llu, tiled-z %llu\n",
+                       static_cast<unsigned long long>(e.tris),
+                       static_cast<unsigned long long>(e.triCulled),
+                       static_cast<unsigned long long>(e.triDegen),
+                       static_cast<unsigned long long>(e.lines3d),
+                       static_cast<unsigned long long>(e.points3d),
+                       static_cast<unsigned long long>(e.triPixels),
+                       static_cast<unsigned long long>(e.vtxFetched),
+                       static_cast<unsigned long long>(e.vtxGartMiss),
+                       static_cast<unsigned long long>(e.texSamples),
+                       static_cast<unsigned long long>(e.texUnimpl),
+                       static_cast<unsigned long long>(e.texGartMiss),
+                       static_cast<unsigned long long>(e.prim3dDecline),
+                       static_cast<unsigned long long>(e.gated3d),
+                       static_cast<unsigned long long>(e.zTile));
             const auto& ru = r128RopUnimplemented();
             if (!ru.empty()) {
                 printf("--   raster ops not implemented (rop3:count):");

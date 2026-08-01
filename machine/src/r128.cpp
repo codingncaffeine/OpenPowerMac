@@ -368,6 +368,8 @@ static const R128Name kEngNames[] = {
     {0x19e0, "MC_START_CNTL"},
     {0x1a00, "SCALE_3D_CNTL"},
     {0x1a0c, "COMPOSITE_SHADOW_ID"},
+    {0x1a14, "FOG_TABLE_INDEX"},
+    {0x1a18, "FOG_TABLE_DATA"},
     {0x1a20, "SCALE_3D_DATATYPE"},
     {0x1a24, "CLR_CMP_CLR_3D"},
     {0x1a28, "CLR_CMP_MSK_3D"},
@@ -382,8 +384,45 @@ static const R128Name kEngNames[] = {
     {0x1c84, "DP_GUI_MASTER_CNTL_C"},
     {0x1c88, "SC_TOP_LEFT_C"},
     {0x1c8c, "SC_BOTTOM_RIGHT_C"},
+    {0x1c90, "Z_OFFSET_C"},
+    {0x1c94, "Z_PITCH_C"},
+    {0x1c98, "Z_STEN_CNTL_C"},
+    {0x1c9c, "TEX_CNTL_C"},
     {0x1ca0, "MISC_3D_STATE_CNTL_REG"},
+    {0x1ca4, "TEXTURE_CLR_CMP_CLR_C"},
+    {0x1ca8, "TEXTURE_CLR_CMP_MSK_C"},
+    {0x1cac, "FOG_COLOR_C"},
+    {0x1cb0, "PRIM_TEX_CNTL_C"},
+    {0x1cb4, "PRIM_TEXTURE_COMBINE_CNTL_C"},
+    {0x1cb8, "TEX_SIZE_PITCH_C"},
+    {0x1cbc, "PRIM_TEX_0_OFFSET_C"},
+    {0x1cc0, "PRIM_TEX_1_OFFSET_C"},
+    {0x1cc4, "PRIM_TEX_2_OFFSET_C"},
+    {0x1cc8, "PRIM_TEX_3_OFFSET_C"},
+    {0x1ccc, "PRIM_TEX_4_OFFSET_C"},
+    {0x1cd0, "PRIM_TEX_5_OFFSET_C"},
+    {0x1cd4, "PRIM_TEX_6_OFFSET_C"},
+    {0x1cd8, "PRIM_TEX_7_OFFSET_C"},
+    {0x1cdc, "PRIM_TEX_8_OFFSET_C"},
+    {0x1ce0, "PRIM_TEX_9_OFFSET_C"},
+    {0x1ce4, "PRIM_TEX_10_OFFSET_C"},
+    {0x1d00, "SEC_TEX_CNTL_C"},
+    {0x1d04, "SEC_TEX_COMBINE_CNTL_C"},
+    {0x1d08, "SEC_TEX_0_OFFSET_C"},
+    {0x1d0c, "SEC_TEX_1_OFFSET_C"},
+    {0x1d10, "SEC_TEX_2_OFFSET_C"},
+    {0x1d14, "SEC_TEX_3_OFFSET_C"},
+    {0x1d18, "SEC_TEX_4_OFFSET_C"},
+    {0x1d1c, "SEC_TEX_5_OFFSET_C"},
+    {0x1d20, "SEC_TEX_6_OFFSET_C"},
+    {0x1d24, "SEC_TEX_7_OFFSET_C"},
+    {0x1d28, "SEC_TEX_8_OFFSET_C"},
+    {0x1d2c, "SEC_TEX_9_OFFSET_C"},
+    {0x1d30, "SEC_TEX_10_OFFSET_C"},
     {0x1d34, "CONSTANT_COLOR_C"},
+    {0x1d38, "PRIM_TEXTURE_BORDER_COLOR_C"},
+    {0x1d3c, "SEC_TEXTURE_BORDER_COLOR_C"},
+    {0x1d40, "STEN_REF_MASK_C"},
     {0x1d44, "PLANE_3D_MASK_C"},
 };
 
@@ -483,6 +522,7 @@ static constexpr u32 kPcGuiCtlstat = 0x1748;
 // entries free", which is the opposite of idle.
 static constexpr u32 kPm4Stat = 0x07B8;
 static constexpr u32 kScTopLeftC = 0x1C88, kScBottomRightC = 0x1C8C;
+static constexpr u32 kDstPitchOffsetC = 0x1C80, kDpGuiMasterCntlC = 0x1C84;
 // GUI_STAT: GUI_FIFOCNT is bits 11:0 and its RESET DEFAULT IS 0x40 — the
 // number of free CMDFIFO entries. Every busy bit (16..29) and GUI_ACTIVE
 // (31, the OR of them) reads clear here, which is the truth for an engine
@@ -575,6 +615,9 @@ void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
 }
 
 const R128EngStats& r128EngStats() { return gEng; }
+// The 3D unit (r128_3d.cpp) counts into the same table, so the report stays
+// one table. Not in the header: the mutable view is the engine's own.
+R128EngStats& r128EngStatsMut() { return gEng; }
 const std::map<u32, u64>& r128RopUnimplemented() { return gRopUnimpl; }
 
 // ── The CCE's PIO packet path ──────────────────────────────────────────────
@@ -639,6 +682,7 @@ void r128CceReset()
     gCceHead = 0;
     gCceDepth = 0;
     gCcePendingInd.clear();
+    r128Cce3dReset();
 }
 
 static void cceRegWrite(R128Cell& c, u32 off, u32 native)
@@ -725,6 +769,14 @@ static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
                gartBase);
     }
     return false;
+}
+
+// The exported walk, for the 3D unit's vertex and texture fetches — the same
+// translation, the same miss counter, the same first-eight log.
+bool r128CceGartRead(const CceMem& m, u32 agp, u32& out)
+{
+    return cceGartRead(m.ram, m.ramSize, m.gartBase, m.aperBase, agp, out,
+                       m.snoop);
 }
 
 // ── The 2D operation packets (SDK App F.7) ────────────────────────────────
@@ -1285,6 +1337,18 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
             done = cceOpNextChar(c, body, n);
         else if (op == 0x1Eu) // SET_SCISSORS — SDK F.22
             done = cceOpSetScissors(c, body, n);
+        else if (op == 0x25u || op == 0x23u || op == 0x2Eu ||
+                 op == 0x2Cu) // the 3D packets — SDK F.24/F.26/F.27/F.21
+            done = r128Cce3dOp(c, op, body, n,
+                               CceMem{ram, ramSize, gartBase, aperBase,
+                                      snoop});
+        else if (op == 0x2Du) {
+            // PURGE — flush and purge the pixel cache. Every operation here
+            // is resident in VRAM the moment its packet executes, so the
+            // purge is complete when asked for, same as PC_GUI_CTLSTAT.
+            ++gEng.cacheFlushes;
+            done = true;
+        }
         if (!done)
             ++gCceP3[op];
         gCceHead += 1u + n;
@@ -1323,6 +1387,76 @@ size_t r128CceStaged(u32& headWord)
     const size_t staged = gCceFifo.size() - gCceHead;
     headWord = staged ? gCceFifo[gCceHead] : 0;
     return staged;
+}
+
+// ── The CCE ring (SDK §5.3) ───────────────────────────────────────────────
+//
+// In the bus-mastered-packet modes the driver builds packets in a ring in
+// AGP space, advances PM4_BUFFER_DL_WPTR, and the card fetches and executes
+// everything between DL_RPTR and DL_WPTR on its own. The ring size is log2
+// QUADWORDS in PM4_BUFFER_CNTL's low bits (the SDK's worked example writes
+// 0x…0A and calls it "8 K"), the pointers are DWORD indices, and after a
+// fetch the card BUS-MASTERS the new read pointer into system memory at
+// PM4_BUFFER_DL_RPTR_ADDR — the documented hardware-writes-to-RAM
+// completion mechanism, and the one register no open-source driver ever
+// programmed. The 2D queue measured on this machine is PIO mode 7, so this
+// path stays cold until a 3D-era driver arms it; it exists so that arming
+// it is an execution, not a hang.
+void r128CceRingKick(R128Cell& c, u8* ram, u32 ramSize, u32 gartBase,
+                     u32 aperBase, SnoopSink* snoop)
+{
+    if (!gEng2dOn || !ram)
+        return;
+    const u32 cntl = c.peek(0x0704u);
+    const u32 mode = cntl >> 28;
+    // Packet fetch out of the ring exists only in the modes whose CCE
+    // packet source is bus-mastered (192BM, 128BM+64IND, 64BM+128IND,
+    // 64BM+64VC+64IND). The PIO modes feed PM4_FIFO_DATA and leave the
+    // ring registers inert.
+    if (mode != 2u && mode != 4u && mode != 6u && mode != 8u)
+        return;
+    if (!(c.peek(0x07FCu) & 0x40000000u)) // PM4_MICRO_CNTL FREERUN off:
+        return;                           // the microengine is not running
+    const u32 l2qw = cntl & 0x3Fu;
+    if (l2qw > 20u) // 8 MB of ring is already absurd; refuse to index wilder
+        return;
+    const u32 sizeDw = 2u << l2qw;
+    const u32 base = c.peek(0x0700u); // PM4_BUFFER_OFFSET, AGP space
+    u32 rptr = c.peek(0x0710u) & (sizeDw - 1u);
+    const u32 wptr = c.peek(0x0714u) & (sizeDw - 1u);
+    if (rptr == wptr)
+        return;
+    ++gEng.cceRingKicks;
+    gCceDepth = 64; // indirect budget, per guest-visible entry
+    while (rptr != wptr) {
+        u32 w = 0;
+        if (!cceGartRead(ram, ramSize, gartBase, aperBase,
+                         base + 4u * rptr, w, snoop)) {
+            // A miss mid-ring: abandon the kick with the pointer parked at
+            // the failure, so the report shows a stalled ring instead of a
+            // stream spliced around a hole.
+            ++gEng.cceRingStall;
+            break;
+        }
+        gCceFifo.push_back(w);
+        ++gEng.cceRingWords;
+        rptr = (rptr + 1u) & (sizeDw - 1u);
+    }
+    c.setReg(0x0710u, rptr);
+    cceParse(c, ram, ramSize, gartBase, aperBase, snoop);
+    // The read-pointer write-back. Snooped: a status word landing under a
+    // live stale cache line is invisible to the driver polling it —
+    // session 30's DBDMA lesson, applied to the one mechanism the SDK
+    // documents for exactly this purpose.
+    const u32 rpa = c.peek(0x070Cu) & ~3u;
+    if (rpa && static_cast<u64>(rpa) + 4u <= ramSize) {
+        if (snoop)
+            snoop->snoopWrite(rpa, 4);
+        ram[rpa] = static_cast<u8>(rptr);
+        ram[rpa + 1] = static_cast<u8>(rptr >> 8);
+        ram[rpa + 2] = static_cast<u8>(rptr >> 16);
+        ram[rpa + 3] = static_cast<u8>(rptr >> 24);
+    }
 }
 
 
@@ -1744,6 +1878,10 @@ void R128Cell::engBlit()
 // fully handled and must not also fall through to the plain register store.
 bool R128Cell::engWrite(u32 off, u32 v)
 {
+    // The 3D unit's registers first: the fog-table pair and the write-gated
+    // context block live with the rasterizer in r128_3d.cpp.
+    if (off >= 0x1A00u && r128Eng3dWrite(*this, off, v))
+        return true;
     switch (off) {
     // --- composite registers: normalise into the canonical pair ---------
     //
@@ -1751,6 +1889,10 @@ bool R128Cell::engWrite(u32 off, u32 v)
     // write-only aliases, so nothing is lost by decomposing them, and
     // decomposing is what lets the blit read ONE canonical set.
     case kDstPitchOffset:
+    case kDstPitchOffsetC: // the CCE context name for the same state — the
+                           // DRI's 3D path programs the destination through
+                           // this offset and the 2D path through 0x142C;
+                           // one engine, one canonical pair.
         regs_[kDstOffset] = (v & 0x1FFFFFu) << 5;
         regs_[kDstPitch] = (v >> 21) & 0x3FFu;
         return true;
@@ -1794,6 +1936,7 @@ bool R128Cell::engWrite(u32 off, u32 v)
         return true;
 
     // --- the master control, and its side effects -----------------------
+    case kDpGuiMasterCntlC: // CCE context alias: same control, same effects
     case kDpGuiMasterCntl: {
         regs_[kDpGuiMasterCntl] = v;
         // The GMC word CARRIES the datapath fields; writing it is how a

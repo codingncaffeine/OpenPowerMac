@@ -631,6 +631,36 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  (unsigned long long)e.fills, (unsigned long long)e.pixels,
                  (unsigned long long)e.hostData, (unsigned long long)e.badBpp);
         s += b;
+        if (e.cceRingKicks || e.cceRingStall) {
+            snprintf(b, sizeof b,
+                     "--   ring: %llu kicks, %llu words, %llu STALLS\n",
+                     (unsigned long long)e.cceRingKicks,
+                     (unsigned long long)e.cceRingWords,
+                     (unsigned long long)e.cceRingStall);
+            s += b;
+        }
+        if (e.tris || e.lines3d || e.points3d || e.prim3dDecline ||
+            e.gated3d || e.vtxFetched) {
+            snprintf(b, sizeof b,
+                     "--   3d: %llu tris (%llu culled, %llu degen), %llu "
+                     "lines, %llu points, %llu px; vtx %llu (%llu miss); "
+                     "tex %llu (%llu unimpl, %llu miss); declined %llu, "
+                     "gated %llu\n",
+                     (unsigned long long)e.tris,
+                     (unsigned long long)e.triCulled,
+                     (unsigned long long)e.triDegen,
+                     (unsigned long long)e.lines3d,
+                     (unsigned long long)e.points3d,
+                     (unsigned long long)e.triPixels,
+                     (unsigned long long)e.vtxFetched,
+                     (unsigned long long)e.vtxGartMiss,
+                     (unsigned long long)e.texSamples,
+                     (unsigned long long)e.texUnimpl,
+                     (unsigned long long)e.texGartMiss,
+                     (unsigned long long)e.prim3dDecline,
+                     (unsigned long long)e.gated3d);
+            s += b;
+        }
         for (const auto& [op, n] : r128CceP3Skipped()) {
             snprintf(b, sizeof b, "--   pkt3 opcode 0x%02x SKIPPED x%llu\n",
                      op, (unsigned long long)n);

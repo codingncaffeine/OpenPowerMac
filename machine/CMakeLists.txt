@@ -11,6 +11,7 @@ set(OPM_MACHINE_SRC
   src/openpic.cpp
   src/ohci.cpp
   src/r128.cpp
+  src/r128_3d.cpp
   src/dbdma.cpp
   src/snapshot.cpp
   src/hostclock.cpp

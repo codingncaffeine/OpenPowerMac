@@ -1340,6 +1340,16 @@ private:
                 r128CceIndirect(ati_, ati_.peek(0x073Cu), ram_.data(),
                                 static_cast<u32>(ram_.size()), agpGartBase(),
                                 agpAperBase(), snoop);
+            // The ring doorbell: advancing PM4_BUFFER_DL_WPTR — or starting
+            // the microengine with work already queued — hands the card a
+            // span of ring DWORDs to fetch out of AGP space and execute
+            // (SDK §5.3). Bus-level for the same reason as the rest: the
+            // fetch walks the GART and the read-pointer write-back lands in
+            // system RAM, snooped.
+            else if ((off & ~3u) == 0x0714u || (off & ~3u) == 0x07FCu)
+                r128CceRingKick(ati_, ram_.data(),
+                                static_cast<u32>(ram_.size()), agpGartBase(),
+                                agpAperBase(), snoop);
             return;
         }
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {

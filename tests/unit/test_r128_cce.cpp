@@ -58,10 +58,11 @@ struct CceRig {
         }
     }
     u32 aperBase = 0;
+    u32 gartBase = kGartBase;
     void fifo(u32 word)
     {
         r128CceFifoWord(c, be(word), 4, ram.data(),
-                        static_cast<u32>(ram.size()), kGartBase, aperBase,
+                        static_cast<u32>(ram.size()), gartBase, aperBase,
                         nullptr);
     }
 };
@@ -90,6 +91,38 @@ TEST_CASE("cce: a machine's stream survives a predecessor that died "
     CHECK(r128EngStats().ccePkt0 - before.ccePkt0 == 1);
     CHECK(r.c.peek(0x15E0u) == 0xCAFEBABEu);
     CHECK(r.c.peek(0x15E4u) == 0x0000CAFEu);
+}
+
+TEST_CASE("cce: the GART base register's low bits are flags, not address")
+{
+    // Observed live: the driver programs 0x03105D00 (64 MB) and 0x00B77008
+    // (1.5 GB) — the table itself is page-aligned. The old raw-base-first
+    // probe read entries offset by those low bits, landed on NEIGHBOURING
+    // valid entries, walked the wrong physical pages with ZERO recorded
+    // misses, and fed fill-pattern garbage into the parser — the 1.5 GB
+    // desktop froze mid-redraw behind a 0xDDDDDD00 "header". This decoy
+    // reproduces that exactly: if the walk ever consults the raw base
+    // again, it fetches poison and the filler count comes out wrong.
+    r128CceReset();
+    CceRig r;
+    r.gartBase = CceRig::kGartBase | 0x8u; // flag bits set, table aligned
+    // The raw-base read for idx 0x101 lands two entries over (idx 0x103):
+    // plant a VALID decoy there pointing at a poison page.
+    r.put32(CceRig::kGartBase + 0x103u * 4u, 0x00204001u);
+    for (u32 i = 0; i < 4; ++i)
+        r.put32(0x00204000u + 4u * i, 0xDDDDDD00u); // absurd Type-3s
+    for (u32 i = 0; i < 4; ++i)
+        r.put32(CceRig::kBodyPa + 4u * i, 0x80000000u); // the real body
+    const auto before = r128EngStats();
+    r.fifo(0x000101CEu);
+    r.fifo(0x00101000u);
+    r.fifo(0x00000004u);
+    const auto& e = r128EngStats();
+    CHECK(e.cceIndWords - before.cceIndWords == 4);
+    CHECK(e.ccePkt2 - before.ccePkt2 == 4); // the REAL page's fillers
+    CHECK(e.cceGartMiss == before.cceGartMiss);
+    u32 head = 0;
+    CHECK(r128CceStaged(head) == 0); // nothing wedged behind poison
 }
 
 TEST_CASE("cce: the GART indexes aperture-relative pages")

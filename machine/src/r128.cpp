@@ -655,11 +655,19 @@ static void cceRegWrite(R128Cell& c, u32 off, u32 native)
 // One GART-translated LE32 read out of AGP space. The Uni-N GART table is in
 // system RAM where the .AGP driver built it (base = 106b:0020 config +0x8C);
 // entries are little-endian, bit 0 valid, 31:12 the physical page — the
-// layout Linux's uninorth-agp documents. ⚠ The base register's low bits are
-// not yet established (the driver was seen writing 0x03105D00, which is not
-// page-aligned), so the walk tries the raw base first and the page-masked
-// base second, and the first eight walks are printed with which one
-// answered — the instrument decides, not an assumption.
+// layout Linux's uninorth-agp documents.
+//
+// ⚠⚠ THE BASE REGISTER'S LOW BITS ARE FLAGS, NOT ADDRESS — the table is
+// PAGE-ALIGNED, always. Observed values: 0x03105D00 (64 MB machine) and
+// 0x00B77008 (1.5 GB). An earlier version probed the RAW base first and
+// let a valid bit decide; at 1.5 GB the off-by-8 read landed on the
+// NEIGHBOURING entries, whose valid bits are legitimately set, so every
+// walk "succeeded" onto the wrong physical pages and fed 0xDDDDDD00 fill
+// garbage into the parser as packets — one absurd Type-3 header then
+// swallowed 3,895 real words and the desktop froze mid-redraw with zero
+// recorded misses. A self-deciding probe whose discriminator can be
+// satisfied by garbage is not an instrument; the diag capture that showed
+// STAGED words behind a garbage header is what named this.
 static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
                         u32 aperBase, u32 agp, u32& out, SnoopSink* snoop)
 {
@@ -689,30 +697,26 @@ static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
         agp -= aper;
     }
     const u32 idx = agp >> 12;
-    const u32 bases[2] = {gartBase, gartBase & ~0xFFFu};
-    for (int b = 0; b < 2; ++b) {
-        const u64 ea = static_cast<u64>(bases[b]) + static_cast<u64>(idx) * 4u;
-        if (!bases[b] || ea + 4u > ramSize)
-            continue;
+    const u32 base = gartBase & ~0xFFFu;
+    const u64 ea = static_cast<u64>(base) + static_cast<u64>(idx) * 4u;
+    if (base && ea + 4u <= ramSize) {
         if (snoop)
             snoop->snoopRead(static_cast<u32>(ea), 4);
         const u32 entry = le32(static_cast<u32>(ea));
-        if (!(entry & 1u))
-            continue;
         const u32 pa = (entry & 0xFFFFF000u) | (agp & 0xFFFu);
-        if (static_cast<u64>(pa) + 4u > ramSize)
-            continue;
-        if (walkLog < 8) {
-            ++walkLog;
-            printf("-- cce gart: agp=%08x idx=%x entry@%08llx=%08x -> "
-                   "pa=%08x (%s base)\n",
-                   agp, idx, static_cast<unsigned long long>(ea), entry, pa,
-                   b ? "masked" : "raw");
+        if ((entry & 1u) && static_cast<u64>(pa) + 4u <= ramSize) {
+            if (walkLog < 8) {
+                ++walkLog;
+                printf("-- cce gart: agp=%08x idx=%x entry@%08llx=%08x -> "
+                       "pa=%08x\n",
+                       agp, idx, static_cast<unsigned long long>(ea), entry,
+                       pa);
+            }
+            if (snoop)
+                snoop->snoopRead(pa, 4);
+            out = le32(pa);
+            return true;
         }
-        if (snoop)
-            snoop->snoopRead(pa, 4);
-        out = le32(pa);
-        return true;
     }
     ++gEng.cceGartMiss;
     if (walkLog < 8) {

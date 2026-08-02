@@ -103,3 +103,62 @@ TEST_CASE("the mouse cell ignores key events")
     mouse.keyEvent(4, true);
     CHECK(reports(mouse).empty());
 }
+
+// ⭐ THE MODIFIER GOES DOWN IN ITS OWN REPORT, BEFORE THE KEY.
+//
+// This is the shape of a real keyboard, and it is load-bearing rather than
+// cosmetic: with Command and the letter introduced in the SAME report, the
+// Mac's HID driver translated the keystroke before the modifier state had
+// been updated, so Command-O reached the Finder as a plain "o" — a
+// type-select instead of Open. Three scripted game launches died there with
+// every report delivered and counted, which is why "reports delivered" is
+// not evidence that a chord arrived as a chord.
+TEST_CASE("a command chord reports the modifier before the key")
+{
+    OhciCell kb;
+    kb.setHid(OhciCell::Hid::Keyboard);
+    kb.typeChord(0x08, "o"); // Command-O
+    const auto r = reports(kb);
+    REQUIRE(r.size() == 4);
+    CHECK(r[0][0] == 0x08); // Command alone, no key yet
+    CHECK(r[0][2] == 0);
+    CHECK(r[1][0] == 0x08); // ...then the key, modifier still held
+    CHECK(r[1][2] == 18);   // usage for 'o'
+    CHECK(r[2][0] == 0x08); // key up, Command STILL held
+    CHECK(r[2][2] == 0);
+    CHECK(r[3][0] == 0x00); // everything up
+}
+
+// Plain typing keeps its old shape exactly: down then all-zero release, no
+// stray modifier reports. The chord fix must not perturb type-select, which
+// is how a scripted run picks an icon by name.
+TEST_CASE("plain typing emits no modifier reports")
+{
+    OhciCell kb;
+    kb.setHid(OhciCell::Hid::Keyboard);
+    kb.typeAscii("ab");
+    const auto r = reports(kb);
+    REQUIRE(r.size() == 4);
+    CHECK(r[0][0] == 0x00);
+    CHECK(r[0][2] == 4); // 'a'
+    CHECK(r[1][2] == 0);
+    CHECK(r[2][2] == 5); // 'b'
+    CHECK(r[3][2] == 0);
+}
+
+// The trademark sign is Option-2 on a US layout, and typing it is the only
+// way to type-select "Nanosaur™" past "Nanosaur Instructions.pdf" (space
+// sorts ahead of ™). Same rule: Option is announced before the '2'.
+TEST_CASE("the trademark character types as Option-2")
+{
+    OhciCell kb;
+    kb.setHid(OhciCell::Hid::Keyboard);
+    kb.typeAscii(std::string("\xAA", 1));
+    const auto r = reports(kb);
+    REQUIRE(r.size() == 4);
+    CHECK(r[0][0] == 0x04); // left Option announced alone
+    CHECK(r[0][2] == 0);
+    CHECK(r[1][0] == 0x04);
+    CHECK(r[1][2] == 31); // usage for '2'
+    CHECK(r[3][0] == 0x00);
+}

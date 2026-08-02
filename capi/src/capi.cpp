@@ -638,10 +638,13 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         snprintf(b, sizeof b,
                  "-- ati crtc: gen_cntl=%08x fmt=%u (%s) %ux%u pitch8=%u "
                  "(rowBytes=%u) offset=%08x\n"
-                 "--   crtc_en=%d cursor_en=%d => scan-out %s\n",
+                 "--   crtc_en=%d cursor_en=%d%s => scan-out %s\n",
                  gen, sc.fmt, r128ScanFmtName(sc.fmt), sc.w, sc.h, sc.pitch8,
                  sc.rowBytes, sc.offset, sc.enabled ? 1 : 0,
                  (gen & 0x00010000u) ? 1 : 0,
+                 sc.tiled ? "  ⚠ TILED (scanned linearly: expect diagonal "
+                            "banding and scrambled colour)"
+                          : "",
                  (sc.enabled && sc.bypp && sc.w >= 64 && sc.w <= 2048 &&
                   sc.h >= 64 && sc.h <= 1536)
                      ? "RENDERABLE"

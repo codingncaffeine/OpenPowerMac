@@ -2457,6 +2457,7 @@ R128Scan r128ScanDecode(const R128Cell& c)
     s.h = ((c.peek(0x0208) >> 16) & 0xFFFu) + 1u;
     s.pitch8 = c.peek(0x022C) & 0xFFFFu;
     s.offset = c.peek(0x0224);
+    s.tiled = (c.peek(0x0228) & (1u << 15)) != 0; // CRTC_OFFSET_CNTL TILE_EN
     // CRTC_PIX_WIDTH (RRG-G04500 §CRTC_GEN_CNTL): 2 = 8 bpp CLUT, 3 = 15 bpp
     // ARGB1555, 4 = 16 bpp RGB565, 5 = 24 bpp RGB888, 6 = 32 bpp xRGB. The
     // others (4 bpp planar and friends) have never been seen from this

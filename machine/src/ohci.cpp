@@ -637,8 +637,32 @@ void OhciCell::typeAscii(const std::string& s) { typeChord(0, s); }
 // keyboard report is the modifier bitmap, and bit 3 is LeftGUI -- the Command
 // key. That is what makes the Finder drivable without a pointer: type a name to
 // select an icon, then Command-O to open it.
+// ⭐ A MODIFIER GOES DOWN IN ITS OWN REPORT, BEFORE THE KEY THAT RIDES IT.
+//
+// A real keyboard never introduces Command and the letter in the same
+// report: the modifier transition is its own event, and the Mac's HID
+// driver dispatches it as one before the keystroke is translated. Sending
+// {Command, 'o'} together let the keystroke be translated with the
+// modifier state not yet updated, so Command-O arrived at the Finder as a
+// plain "o" — a type-select instead of Open. Three scripted game launches
+// died exactly there, silently: every report was delivered and counted,
+// and nothing opened.
+//
+// `held` tracks what the modifier bitmap currently says, so a transition
+// is emitted only when it actually changes; this covers Shift (from
+// capitals and ':') and Option (from the ™ character) by the same rule.
 void OhciCell::typeChord(u8 extraMod, const std::string& s)
 {
+    u8 held = 0;
+    auto push8 = [&](u8 m, u8 usage) {
+        const u8 rep[8] = {m, 0, usage, 0, 0, 0, 0, 0};
+        for (u8 b : rep)
+            pending_.push_back(b);
+    };
+    if (extraMod) {
+        push8(extraMod, 0); // the modifier alone, first
+        held = extraMod;
+    }
     for (char c : s) {
         u8 usage = 0, mod = extraMod;
         if (c >= 'a' && c <= 'z')
@@ -669,16 +693,32 @@ void OhciCell::typeChord(u8 extraMod, const std::string& s)
         else if (c == ':') {
             usage = 51;
             mod |= 0x02;
+        } else if (c == '\t')
+            usage = 43; // Tab: the Finder's "next item alphabetically"
+        else if (static_cast<unsigned char>(c) == 0xAAu) {
+            // MacRoman ™ is Option-2 on a US layout, and typing it is the
+            // only way to type-select "Nanosaur™" — plain "nanosaur"
+            // matches "Nanosaur Instructions.pdf" first, which sorts ahead
+            // of it (space before ™), so three scripted launches opened a
+            // PDF nobody could read instead of the game.
+            usage = 31;  // '2'
+            mod |= 0x04; // left Option/Alt
         } else
             continue;
+        // The modifier transition first, if this character changes it.
+        if (mod != held) {
+            push8(mod, 0);
+            held = mod;
+        }
         // Press then release: a host that only ever sees the key down
-        // repeats it forever.
-        const u8 down[8] = {mod, 0, usage, 0, 0, 0, 0, 0};
-        for (u8 b : down)
-            pending_.push_back(b);
-        for (u32 k = 0; k < 8; ++k)
-            pending_.push_back(0);
+        // repeats it forever. The release keeps any held modifier down —
+        // releasing it per keystroke would retype the chord's modifier for
+        // every character of a multi-letter Command sequence.
+        push8(mod, usage);
+        push8(mod, 0);
     }
+    if (held)
+        push8(0, 0); // everything up
 }
 
 // One key going down or coming up. See the header for why this exists

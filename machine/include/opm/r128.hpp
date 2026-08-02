@@ -247,6 +247,12 @@ struct R128Scan {
     u32 offset = 0;       // CRTC_OFFSET: byte address of the top-left pixel
     u32 bypp = 0;         // bytes per pixel; 0 = a format this cannot scan
     u32 rowBytes = 0;     // pitch8 * 8 * bypp
+    // CRTC_OFFSET_CNTL bit 15 (CRTC_TILE_EN): the scan-out is reading a
+    // TILED surface. This model walks VRAM linearly, so a tiled framebuffer
+    // comes out sheared into diagonal bands with scrambled colour — a
+    // symptom that is otherwise indistinguishable from a stride bug.
+    // Reported rather than silently mis-rendered.
+    bool tiled = false;
 };
 R128Scan r128ScanDecode(const R128Cell& c);
 // A short name for the format, for reports: "8bpp CLUT", "15bpp 1555", ...

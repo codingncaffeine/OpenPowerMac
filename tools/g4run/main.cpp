@@ -332,6 +332,48 @@ void parseMouseAt(const char* v, std::vector<MouseBeat>& out)
                v);
 }
 
+// --type-beat AT:text / --cmd-beat AT:text (repeatable) — the single-shot
+// --type/--cmd can open ONE thing, and launching a game from a CD takes
+// two: select the volume icon and open its window, then select the title
+// inside and open that. Repeatable beats make the whole launch
+// keyboard-driven — the Finder's type-select needs no coordinates at all.
+struct KeyBeat {
+    u64 at = 0;
+    std::string text;
+};
+void parseKeyBeat(const char* v, std::vector<KeyBeat>& out)
+{
+    KeyBeat kb;
+    char* p = nullptr;
+    kb.at = strtoull(v, &p, 0);
+    if (!p || *p != ':' || !p[1]) {
+        printf("-- --type-beat/--cmd-beat %s malformed (want AT:text); "
+               "IGNORED\n",
+               v);
+        return;
+    }
+    // \xNN and \t, because the characters that matter here cannot be typed
+    // on a command line: the Finder needs a literal MacRoman ™ (\xaa) to
+    // type-select "Nanosaur™", and Tab to step to the next item.
+    auto hex = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+    };
+    for (const char* q = p + 1; *q; ++q) {
+        if (*q == '\\' && q[1] == 'x' && hex(q[2]) >= 0 && hex(q[3]) >= 0) {
+            kb.text.push_back(static_cast<char>(hex(q[2]) * 16 + hex(q[3])));
+            q += 3;
+        } else if (*q == '\\' && q[1] == 't') {
+            kb.text.push_back('\t');
+            ++q;
+        } else
+            kb.text.push_back(*q);
+    }
+    out.push_back(kb);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -451,6 +493,11 @@ int main(int argc, char** argv)
     // of the run loop for how absolute positions are reached with a
     // delta-only pointer. Struct + parser are file-scope (C1061).
     std::vector<MouseBeat> mouseBeats;
+    // --type-beat/--cmd-beat AT:text (repeatable): scripted keystrokes,
+    // plain or with Command held. Two pairs launch a CD title with no
+    // coordinates at all: type the volume name (desktop type-select),
+    // Cmd-O, type the title, Cmd-O.
+    std::vector<KeyBeat> typeBeats, cmdBeats;
     // --bench: run the loop THE APP RUNS. g4run's own loop carries the whole
     // instrument set — including a std::map probe per instruction for the
     // first-visit census — so its MIPS figure is the harness's speed, not the
@@ -667,6 +714,8 @@ int main(int argc, char** argv)
         // --mouse-beat, NOT --mouse-at: that name was already taken by the
         // motion-cadence diagnostic below, and this ladder cannot grow.
         if (!strcmp(a, "--mouse-beat")) { parseMouseAt(next(), mouseBeats); continue; }
+        if (!strcmp(a, "--type-beat")) { parseKeyBeat(next(), typeBeats); continue; }
+        if (!strcmp(a, "--cmd-beat")) { parseKeyBeat(next(), cmdBeats); continue; }
         if (!strcmp(a, "--wav-out") && i + 1 < argc) {
             wavOut = argv[++i];
             continue;
@@ -994,7 +1043,11 @@ int main(int argc, char** argv)
                     "       mouse: --mouse-beat N:X,Y[:click|:dbl] "
                     "(repeatable; beat in instructions,\n"
                     "              absolute px from top-left; dumps "
-                    "ati_mouse_bK.ppm at each aim)\n");
+                    "ati_mouse_bK.ppm at each aim)\n"
+                    "       keys:  --type-beat N:text --cmd-beat N:text "
+                    "(repeatable; type-select and\n"
+                    "              Command-chords at beats; no trailing "
+                    "Return)\n");
             return 2;
         }
     }
@@ -1884,7 +1937,25 @@ int main(int argc, char** argv)
                "instruction (%llu)\n",
                static_cast<unsigned long long>(mouseBeats[mbIdx].at),
                static_cast<unsigned long long>(executed));
+    // The scripted keystrokes ride the same discipline: sorted, fired at
+    // exact instruction beats, stale ones named rather than fired blind.
+    std::sort(typeBeats.begin(), typeBeats.end(),
+              [](const KeyBeat& a, const KeyBeat& b) { return a.at < b.at; });
+    std::sort(cmdBeats.begin(), cmdBeats.end(),
+              [](const KeyBeat& a, const KeyBeat& b) { return a.at < b.at; });
+    size_t tbIdx = 0, cbIdx = 0;
+    for (; tbIdx < typeBeats.size() && typeBeats[tbIdx].at < executed; ++tbIdx)
+        printf("-- type-beat @%llu SKIPPED: before this run's first "
+               "instruction (%llu)\n",
+               static_cast<unsigned long long>(typeBeats[tbIdx].at),
+               static_cast<unsigned long long>(executed));
+    for (; cbIdx < cmdBeats.size() && cmdBeats[cbIdx].at < executed; ++cbIdx)
+        printf("-- cmd-beat @%llu SKIPPED: before this run's first "
+               "instruction (%llu)\n",
+               static_cast<unsigned long long>(cmdBeats[cbIdx].at),
+               static_cast<unsigned long long>(executed));
     int mbStage = 0;
+    int mbHome = 0; // closed-loop correction rounds used this beat
     u64 mbInsn0 = 0, mbIdleVbl = 0;
     bool mbIdleSeen = false;
     constexpr u64 kMbStageTimeout = 60000000ull; // insns; a safety valve
@@ -1964,6 +2035,7 @@ int main(int argc, char** argv)
         fflush(stdout);
         ++mbIdx;
         mbStage = 0;
+        mbHome = 0;
     };
     // Beats run strictly in order; a beat whose time arrives while an
     // earlier sequence is mid-flight starts when that sequence completes.
@@ -1984,9 +2056,31 @@ int main(int argc, char** argv)
             mouseInject(mb.x, mb.y, 0, "move to target");
             mbStage = 2;
             break;
-        case 2: // on target: calibration dump, then the button work
+        case 2: { // walking onto the target: CLOSED LOOP on the cursor reg
             if (!mouseSettled(2))
                 return;
+            // The guest applies an acceleration curve to pointer deltas, so
+            // one big move OVERSHOOTS — measured on the first scripted run:
+            // commanded +590,+128 from the pinned corner, landed (638,156),
+            // and the double-click missed the icon. Home in instead: inject
+            // target-minus-actual, let it settle, read the cursor register
+            // again. Every correction is smaller than the last, the curve
+            // flattens toward 1:1, and a couple of rounds land it — steered
+            // entirely by the register, which is a number in the log.
+            const u32 posn = bus.ati().peek(0x0264);
+            const int cx = int((posn >> 16) & 0xFFFFu);
+            const int cy = int(posn & 0xFFFFu);
+            const int ex = mb.x - cx, ey = mb.y - cy;
+            if ((ex > 2 || ex < -2 || ey > 2 || ey < -2) && mbHome < 6) {
+                ++mbHome;
+                mouseInject(ex, ey, 0, "home toward target");
+                return; // stay in stage 2; the clocks were re-marked
+            }
+            if (mbHome >= 6)
+                printf("-- mouse beat %zu: homing gave up at (%d,%d), "
+                       "wanted (%d,%d); clicking anyway\n",
+                       mbIdx + 1, cx, cy, mb.x, mb.y);
+            mbHome = 0;
             {
                 char nm[64];
                 snprintf(nm, sizeof nm, "ati_mouse_b%zu.ppm", mbIdx + 1);
@@ -1999,6 +2093,7 @@ int main(int argc, char** argv)
             mouseInject(0, 0, 1, "button down");
             mbStage = 3;
             break;
+        }
         case 3:
             if (!mouseSettled(1))
                 return;
@@ -3887,6 +3982,28 @@ int main(int argc, char** argv)
             printf("-- typed with COMMAND on usb @%llu: %s\n",
                    static_cast<unsigned long long>(executed), cmdText);
             fflush(stdout);
+        }
+        while (tbIdx < typeBeats.size() && executed == typeBeats[tbIdx].at) {
+            // NO trailing Return, deliberately (unlike --type, whose \r is
+            // for the Open Firmware console): in the Finder a Return on a
+            // selected icon starts a RENAME, not an open. Type-select is
+            // the text alone; opening is Cmd-O's job (--cmd-beat).
+            bus.ohci(0).typeAscii(typeBeats[tbIdx].text);
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
+            printf("-- type-beat @%llu: %s\n",
+                   static_cast<unsigned long long>(executed),
+                   typeBeats[tbIdx].text.c_str());
+            fflush(stdout);
+            ++tbIdx;
+        }
+        while (cbIdx < cmdBeats.size() && executed == cmdBeats[cbIdx].at) {
+            bus.ohci(0).typeChord(0x08, cmdBeats[cbIdx].text);
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
+            printf("-- cmd-beat @%llu: %s\n",
+                   static_cast<unsigned long long>(executed),
+                   cmdBeats[cbIdx].text.c_str());
+            fflush(stdout);
+            ++cbIdx;
         }
         // Mouse motion, headless. "The pointer does not move" has two very
         // different causes -- the shell not delivering events, and the device
@@ -5816,8 +5933,12 @@ int main(int argc, char** argv)
         const u32 h = scan.h;
         const u32 fmt = scan.fmt;
         printf("-- ati crtc: gen=%08x %ux%u fmt=%u (%s) pitch8=%u "
-               "offset=%08x\n",
-               gen, w, h, fmt, r128ScanFmtName(fmt), pitch8, offset);
+               "rowBytes=%u offset=%08x offset_cntl=%08x%s\n",
+               gen, w, h, fmt, r128ScanFmtName(fmt), pitch8, scan.rowBytes,
+               offset, bus.ati().peek(0x0228),
+               scan.tiled ? "  <== TILED: scanned linearly, expect diagonal "
+                            "banding + scrambled colour"
+                          : "");
         // The hardware cursor as the guest left it. Mac OS draws its pointer
         // with the cursor engine rather than into the framebuffer, so this is
         // the only place a missing pointer shows up at all.

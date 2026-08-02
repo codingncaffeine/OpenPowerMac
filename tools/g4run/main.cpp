@@ -6116,6 +6116,37 @@ int main(int argc, char** argv)
                        static_cast<unsigned long long>(e.prim3dDecline),
                        static_cast<unsigned long long>(e.gated3d),
                        static_cast<unsigned long long>(e.zTile));
+            // 🧪 THE BOUND TEXTURE'S BYTES, for offline layout analysis.
+            //
+            // Every texture offset this guest programs carries tiling bits
+            // 31:30 = 3 ("stored in a tiled surface") while all four
+            // SURFACE range registers read zero. Whether that means the
+            // bytes are swizzled is not answerable from any document on
+            // the shelf — the RRG redacts the table — but it IS answerable
+            // from the DATA: a correctly-interpreted texture is spatially
+            // coherent, and a wrongly-interpreted one is not. Dump it and
+            // score the candidate layouts outside the emulator.
+            {
+                const u32 sp = bus.ati().peek(0x1CB8);
+                const u32 szl2 = (sp >> 4) & 0xFu;
+                const u32 slot = szl2 > 10u ? 10u : szl2;
+                const u32 raw = bus.ati().peek(0x1CBC + 4u * slot);
+                const u32 tbase = raw & 0x03FFFFF0u;
+                const u32 tw = 1u << szl2, th = 1u << ((sp >> 8) & 0xFu);
+                const size_t want = size_t(tw) * th * 2u; // 1555 = 2 B
+                if (tbase && want && tbase + want <= bus.ati().vram.size()) {
+                    FILE* tf = fopen("ati_tex0.bin", "wb");
+                    if (tf) {
+                        fwrite(&bus.ati().vram[tbase], 1, want, tf);
+                        fclose(tf);
+                        printf("-- ati tex0 dumped: ati_tex0.bin  base=%08x "
+                               "%ux%u fmt=%u (%zu bytes, tiling bits=%u)\n",
+                               tbase, tw, th,
+                               (bus.ati().peek(0x1CB0) >> 16) & 0xFu, want,
+                               (raw >> 30) & 3u);
+                    }
+                }
+            }
             // ⭐ The coordinate convention, per triangle. A triangle that
             // shows one whole texture spans 1.0 in normalised coordinates
             // and `w` in texel ones — 128x apart, so the histogram's mass

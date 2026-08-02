@@ -644,21 +644,21 @@ Rgba sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
     const u32 h = t.hTex >> l ? t.hTex >> l : 1u;
     const u32 clampS = (t.cntl >> 8) & 3u;
     const u32 clampT = (t.cntl >> 11) & 3u;
-    // ⭐⭐ S/T ARRIVE IN TEXEL UNITS, NOT [0,1] — measured, not assumed.
+    // ⚠⚠ S/T ARE NORMALISED [0,1] PER TILE — and the ST CENSUS DOES NOT
+    // SETTLE IT. Reading texel-space out of the census extrema (s up to
+    // 126.7 with a 128-texel texture bound) was wrong, and the user's eyes
+    // rejected it: the picture went blacker and flatter, so this reverted.
     //
-    // The SDK's FTLVERTEX table says only "the u-coordinate of the 1st
-    // texture"; the OEM register guide redacts the rest. The st census on
-    // live Nanosaur vertices settled it: s,t in [-15.2, 126.7] with a
-    // 128-texel texture bound, and in [-15.2, 34.2] when 64-texel textures
-    // were bound — texel-space both times, wrapped past the edges by the
-    // guest. This sampler used to multiply by the level size on top of
-    // that, tiling every texture ~w times across every polygon: the whole
-    // world rendered as its textures' average colours — "no details
-    // anywhere, just general colors" — while every individual fetch was
-    // valid. A base-level texel coordinate halves per mip level.
-    const float lvl = static_cast<float>(1u << l);
-    const float fx = s / lvl - (bilinear ? 0.5f : 0.0f);
-    const float fy = tt / lvl - (bilinear ? 0.5f : 0.0f);
+    // Why the census cannot decide: it reports GLOBAL extrema over every
+    // vertex in the session, not the span of any one triangle, and the two
+    // readings are each self-consistent with it. Normalised coordinates
+    // with tiling factors up to ~126 (a ground plane repeating its texture)
+    // produce exactly the same extrema as texel coordinates over a
+    // 128-texel map. The discriminator is the PER-TRIANGLE span against
+    // the bound size, which needs a snapshot to measure repeatably —
+    // see opm_snapshot_save.
+    const float fx = s * static_cast<float>(w) - (bilinear ? 0.5f : 0.0f);
+    const float fy = tt * static_cast<float>(h) - (bilinear ? 0.5f : 0.0f);
     const int x0 = static_cast<int>(std::floor(fx));
     const int y0 = static_cast<int>(std::floor(fy));
     if (!bilinear) {

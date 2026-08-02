@@ -365,11 +365,11 @@ TEST_CASE("3d: nearest-neighbour texturing maps the quadrants of a 2x2")
     };
     // A 16x16 quad mapped 0..1 in both axes.
     vtxSt(0, 0, 0, 0);
-    vtxSt(16, 0, 2, 0); // s,t in TEXELS: the 2x2 spans 0..2
-    vtxSt(0, 16, 0, 2);
-    vtxSt(16, 0, 2, 0);
-    vtxSt(16, 16, 2, 2);
-    vtxSt(0, 16, 0, 2);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(16, 16, 1, 1);
+    vtxSt(0, 16, 0, 1);
     r.prim(0x9u | 0x80u, 4u, 6u, v);
     CHECK(r.pix32(3, 3) == 0xFFFF0000u);   // red quadrant
     CHECK(r.pix32(12, 3) == 0xFF00FF00u);  // green (565 expands exactly)
@@ -402,13 +402,13 @@ TEST_CASE("3d: bilinear filtering blends adjacent texels")
         v.push_back(f2u(t));
     };
     vtxSt(0, 0, 0, 0);
-    vtxSt(8, 0, 2, 0); // s in TEXELS across the 2-texel span
+    vtxSt(8, 0, 1, 0);
     vtxSt(0, 8, 0, 1);
-    vtxSt(8, 0, 2, 0);
-    vtxSt(8, 8, 2, 1);
+    vtxSt(8, 0, 1, 0);
+    vtxSt(8, 8, 1, 1);
     vtxSt(0, 8, 0, 1);
     r.prim(0x9u | 0x80u, 4u, 6u, v);
-    // Pixel (3,y): s = 2·3.5/8 = 0.875 texels − 0.5 = 0.375
+    // Pixel (3,y): s = 3.5/8 = 0.4375 → texel space 0.875 − 0.5 = 0.375
     // between black and white → 95.6.
     const u32 p = r.pix32(3, 3);
     const int g = (p >> 8) & 0xFF;
@@ -449,11 +449,9 @@ TEST_CASE("3d: perspective correction divides by the interpolated rhw")
     // affine s would be 0.53 → texel 2 (blue); the perspective-correct s is
     // 0.22 → texel 0 (red). The colour names which path ran.
     vtxW(0, 0, 0, 1.0f);
-    vtxW(16, 0, 4, 0.25f); // s in TEXELS: 0..4 across the quad
+    vtxW(16, 0, 1, 0.25f);
     vtxW(0, 16, 0, 1.0f);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
-    // Affine s at (8,0) would be 2.13 → texel 2 (blue); perspective-correct
-    // is 0.886 → texel 0. The colour still names which path ran.
     CHECK(r.pix32(8, 0) == 0xFFFF0000u);
 }
 
@@ -488,8 +486,8 @@ TEST_CASE("3d: CI8 texels read through the palette LOAD_PALETTE filled")
         v.push_back(f2u(t));
     };
     vtxSt(0, 0, 0, 0);
-    vtxSt(16, 0, 2, 0); // s,t in TEXELS
-    vtxSt(0, 16, 0, 2);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
     CHECK(r.pix32(2, 2) == 0xFFFF0000u); // palette entry 7
 }
@@ -533,8 +531,8 @@ TEST_CASE("3d: the texture base is read from the size-indexed offset slot, "
         v.push_back(f2u(t));
     };
     vtxSt(0, 0, 0, 0);
-    vtxSt(16, 0, 4, 0); // s,t in TEXELS across the 4x4
-    vtxSt(0, 16, 0, 4);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
     CHECK(r.pix32(3, 3) == 0xFFFF0000u); // textured, NOT black-from-slot-0
 }
@@ -571,8 +569,8 @@ TEST_CASE("3d: tiling-mode bits with no live SURFACE range sample linear "
         v.push_back(f2u(t));
     };
     vtxSt(0, 0, 0, 0);
-    vtxSt(16, 0, 4, 0); // s,t in TEXELS
-    vtxSt(0, 16, 0, 4);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
     CHECK(r.pix32(3, 3) == 0xFFFF0000u);
     CHECK(r128EngStats().texUnimpl - before.texUnimpl == 0);

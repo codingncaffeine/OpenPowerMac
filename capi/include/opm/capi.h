@@ -152,6 +152,27 @@ OPM_API uint64_t opm_audio_played(const OpmMachine* m);
 OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
                            uint32_t* w, uint32_t* h);
 
+// 📸 SAVE THE WHOLE MACHINE TO A FILE, from the app, mid-run.
+//
+// ⭐ THIS IS THE HANDOFF FROM "the user reproduces it" TO "the harness
+// reproduces it". A rendering defect that only shows up inside a running
+// game costs one HUMAN launch per iteration — boot, mount, launch, play to
+// the right screen, capture — and no amount of instrumentation shortens
+// that loop, because the loop is a person. A snapshot taken once at the
+// broken frame turns every later iteration into a headless resume that
+// lands on that exact frame in seconds, with the fix under test.
+//
+// Returns 1 on success, 0 with a message in `err` when the file could not
+// be written. Called at an instruction boundary between run chunks — the
+// same place diagnostics are taken — so the resume re-enters the loop in
+// exactly the state the write saw.
+//
+// ⚠ A snapshot pairs with ITS OWN disk image and RAM size (see
+// snapshot.hpp): resuming against a different or mutated image is not
+// supported and the loader says so rather than guessing.
+OPM_API int32_t opm_snapshot_save(OpmMachine* m, const char* path, char* err,
+                                  uint32_t errCap);
+
 // Machine state peeks for the shell's status line.
 OPM_API uint64_t opm_executed(const OpmMachine* m);
 OPM_API uint32_t opm_pc(const OpmMachine* m);

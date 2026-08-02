@@ -5,6 +5,7 @@
 #include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
 #include "opm/hfs.hpp"
+#include "opm/snapshot.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1366,6 +1367,35 @@ OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
     // The hardware cursor, composited after the framebuffer walk — Mac OS
     // draws its pointer with the cursor engine, so VRAM alone shows none.
     r128ScanCursor(ati, sc, bgra);
+    return 1;
+}
+
+OPM_API int32_t opm_snapshot_save(OpmMachine* m, const char* path, char* err,
+                                  uint32_t errCap)
+{
+    auto fail = [&](const char* why) {
+        if (err && errCap) {
+            uint32_t n = 0;
+            while (why[n] && n + 1 < errCap) {
+                err[n] = why[n];
+                ++n;
+            }
+            err[n] = 0;
+        }
+        return 0;
+    };
+    if (!m || !path || !*path)
+        return fail("no machine or no path");
+    // The harness fields the loader expects. The app has no injection
+    // schedule and no diagnostic pokes, so those latches are false: a
+    // resume must not re-fire something that never fired here.
+    HarnessState h{m->executed, m->fastTb, ~0ull, 0, false, false, false};
+    SnapWriter w;
+    saveSnapshot(m->cpu, *m->bus, h, w);
+    if (!writeSnapshotFile(path, w.buf))
+        return fail("could not write the snapshot file (path writable?)");
+    if (err && errCap)
+        err[0] = 0;
     return 1;
 }
 

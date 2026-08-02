@@ -58,6 +58,14 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_diag(IntPtr m, byte[] buf, uint cap);
 
+    // Save the whole machine mid-run, so a defect that only appears inside a
+    // running game can be handed to the headless harness instead of being
+    // reproduced by hand on every iteration. See opm_snapshot_save.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_snapshot_save(
+        IntPtr m, [MarshalAs(UnmanagedType.LPStr)] string path, byte[] err,
+        uint errCap);
+
     // Nanoseconds spent off the host processor since the machine was created.
     // Over elapsed time it is the share of a core the emulator is NOT burning.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

@@ -546,6 +546,28 @@ public partial class MainWindow : Window
                             MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
+    // 📸 Save the whole machine at this instant, so a defect that only exists
+    // inside a running game can be reproduced headlessly from here on instead
+    // of being re-played by hand for every fix. Asked for on the machine's own
+    // thread — see MachineSession.RequestSnapshot.
+    private void OnSaveSnapshot(object sender, RoutedEventArgs e)
+    {
+        if (_session is not { Running: true } s)
+        {
+            MessageBox.Show(this, "The machine is not running.", "Snapshot",
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        var dlg = new SaveFileDialog
+        {
+            Title = "Save a snapshot of this exact moment",
+            Filter = "Machine snapshot (*.snap)|*.snap|All files (*.*)|*.*",
+            FileName = "moment.snap",
+        };
+        if (dlg.ShowDialog(this) == true)
+            s.RequestSnapshot(dlg.FileName);
+    }
+
     private void OnChooseAti(object sender, RoutedEventArgs e)
     {
         var dlg = new OpenFileDialog

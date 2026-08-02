@@ -76,6 +76,12 @@
                 <!-- For the machine that stopped doing anything. See opm_diag. -->
                 <MenuItem x:Name="miDiag" Header="_Diagnostics — why is it stuck?"
                           Click="OnDiagnostics" />
+                <!-- Hands a live reproduction to the headless harness, so a
+                     defect inside a running game stops costing one launch
+                     per iteration. See opm_snapshot_save. -->
+                <MenuItem x:Name="miSnap"
+                          Header="Save S_napshot — hand this moment to the harness"
+                          Click="OnSaveSnapshot" />
             </MenuItem>
         </Menu>
 

@@ -99,6 +99,18 @@ public sealed class MachineSession
     private uint _diagAPc;
     public void RequestDiagnostics() => _diagWanted = true;
 
+    // 📸 Save the machine, same request discipline and the same reason: the
+    // machine belongs to the run thread. Serialising it from the UI thread
+    // mid-chunk would race every device in it.
+    //
+    // ⭐ What this is FOR: a rendering defect that only exists inside a
+    // running game costs a human launch per iteration — boot, mount,
+    // launch, play to the broken frame. One snapshot at that frame hands
+    // the whole reproduction to the headless harness, and every later
+    // iteration is a resume measured in seconds.
+    private volatile string? _snapWanted;
+    public void RequestSnapshot(string path) => _snapWanted = path;
+
     private void Run(ShellSettings s)
     {
         Running = true;
@@ -252,6 +264,32 @@ public sealed class MachineSession
                 // bug — which each cost about ten minutes. So the first request
                 // takes sample A and arms a second; the next trip round the
                 // loop takes B, and the file carries both plus the delta.
+                // Between chunks, for the reason above: the snapshot walks
+                // every device in the machine.
+                if (_snapWanted is string snapPath)
+                {
+                    _snapWanted = null;
+                    var eb = new byte[512];
+                    int ok = Native.opm_snapshot_save(
+                        m, snapPath, eb, (uint)eb.Length);
+                    if (ok == 1)
+                    {
+                        long bytes = 0;
+                        try { bytes = new FileInfo(snapPath).Length; }
+                        catch { }
+                        ConsoleQ.Enqueue(
+                            $"\r\n[snapshot saved at {Native.opm_executed(m)}" +
+                            $" instructions: {snapPath} ({bytes / 1048576} MB)]\r\n");
+                    }
+                    else
+                    {
+                        int errLen = Array.IndexOf(eb, (byte)0);
+                        ConsoleQ.Enqueue("\r\n[snapshot FAILED: " +
+                            System.Text.Encoding.ASCII.GetString(
+                                eb, 0, errLen < 0 ? eb.Length : errLen) +
+                            "]\r\n");
+                    }
+                }
                 if (_diagWanted)
                 {
                     _diagWanted = false;

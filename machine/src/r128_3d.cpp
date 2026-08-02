@@ -10,11 +10,13 @@
 //
 // The pipeline, in the order a fragment travels it: FTLVERTEX decode (the
 // flexible screen-space vertex — the guest does T&L on the CPU, so there is
-// NO transform stage here) → triangle setup with the D3D top-left fill rule →
-// per-pixel interpolation (colors screen-linear, textures perspective-correct
-// through rhw) → two texture-combine units → texture lighting → specular add
-// → fog (vertex or table) → chroma key → alpha test → stencil → Z → alpha
-// blend → plane mask → destination format.
+// NO transform stage here; ⚠ its S,T arrive PREMULTIPLIED by rhw — see the
+// measurement at rasterTriangle's plane setup) → triangle setup with the D3D
+// top-left fill rule → per-pixel interpolation (colors screen-linear,
+// textures resolved by the per-pixel divide through rhw) → two
+// texture-combine units → texture lighting → specular add → fog (vertex or
+// table) → chroma key → alpha test → stencil → Z → alpha blend → plane mask
+// → destination format.
 //
 // ⚠ CONVENTIONS THIS FILE MUST AGREE WITH, all inherited from the 2D engine:
 // a pixel in VRAM is stored MOST SIGNIFICANT BYTE FIRST (the big-endian
@@ -117,6 +119,12 @@ struct WalkLatch {
     u32 vloff = 0, vsize = 0, fmt = 0, cntl = 0;
 } gWalk;
 int gLogBudget = 24; // first-N prints for declines, so a busy path cannot spam
+// --tri-dump: a print budget for real triangles, plus the VC_FORMAT/prim of
+// the packet currently being walked (rasterTriangle cannot see the packet
+// header, and the format says whether RHW was even in the stream).
+int gTriDump = 0;
+u32 gDumpFmt = 0, gDumpPrim = 0;
+u64 gTriSeq = 0; // triangles seen since reset, so dump lines are addressable
 
 R128EngStats& eng() { return r128EngStatsMut(); }
 
@@ -1156,8 +1164,9 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
 //
 // Screen-space edge functions, D3D top-left fill rule, pixel centers at
 // +0.5. Colours interpolate screen-linear (the era's hardware did not
-// perspective-correct Gouraud); textures interpolate s·rhw, t·rhw, rhw
-// linearly and divide per pixel unless the unit disables perspective.
+// perspective-correct Gouraud); texture S,T arrive as premultiplied
+// numerators, interpolate screen-linearly alongside rhw, and divide per
+// pixel unless the unit disables perspective.
 void rasterPoint(const Pipe& P, const Vtx& v);
 void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b);
 
@@ -1210,6 +1219,19 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
             e.triSpanTexW += P.tex[0].wTex;
             ++e.triSpanN;
         }
+    }
+    ++gTriSeq;
+    if (gTriDump > 0 && P.texAny) {
+        --gTriDump;
+        const TexUnit& t0 = P.tex[0];
+        printf("-- tri3d %llu fmt=%03x prim=%u t0 %ux%u p%u f=%u cn=%08x "
+               "of=%08x tc=%08x fpu=%08x misc=%08x\n",
+               static_cast<unsigned long long>(gTriSeq), gDumpFmt, gDumpPrim,
+               t0.wTex, t0.hTex, t0.pitchTex, t0.fmt, t0.cntl, t0.offs[0],
+               P.texCntl, P.fpu, P.misc);
+        for (const Vtx* v : {&v0, &v1, &v2})
+            printf("-- tv %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                   v->x, v->y, v->z, v->rhw, v->s1, v->t1, v->s2, v->t2);
     }
     const bool ccwFront = (P.fpu & 1u) != 0;
     bool front = (area2 > 0.0) != ccwFront; // area>0 = screen-CW
@@ -1278,9 +1300,10 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
     e[1] = mkEdge(x1, y1, x2, y2);
     e[2] = mkEdge(x2, y2, x0, y0);
     const double inv2a = 1.0 / area2;
-    // Attribute planes (screen-affine). Textures build s·rhw / t·rhw / rhw
-    // numerator planes for perspective; a unit with perspective disabled
-    // uses plain s,t planes instead.
+    // Attribute planes (screen-affine). The stream's S,T already ARE the
+    // s·rhw / t·rhw numerators (receipt below); rhw gets its own plane and
+    // the per-pixel divide resolves u,v unless the unit disables
+    // perspective.
     const Plane pz = planeOf(x0, y0, x1, y1, x2, y2, v0.z, v1.z, v2.z, inv2a);
     const Plane pa = planeOf(x0, y0, x1, y1, x2, y2, v0.ca, v1.ca, v2.ca, inv2a);
     const Plane pr = planeOf(x0, y0, x1, y1, x2, y2, v0.cr, v1.cr, v2.cr, inv2a);
@@ -1293,22 +1316,35 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
     const Plane pw = planeOf(x0, y0, x1, y1, x2, y2, v0.rhw, v1.rhw, v2.rhw, inv2a);
     const bool persp0 = P.tex[0].on && !((P.tex[0].cntl >> 14) & 1u);
     const bool persp1 = P.tex[1].on && !((P.tex[1].cntl >> 14) & 1u);
+    // ⭐⭐ THE VERTEX'S S,T ARE ALREADY PREMULTIPLIED BY RHW — they are the
+    // screen-linear NUMERATORS (u·rhw, v·rhw), not plain u,v, so the setup
+    // stage must NOT multiply by rhw again. Measured from a shipping RAVE
+    // title's live stream (--tri-dump, 900 triangles off a snapshot): raw
+    // s against the content's 0.2 UV lattice is random (mean distance
+    // 0.246 vs 0.25 chance) while s/rhw lands EXACTLY on it (0, 0.4, 0.6,
+    // 1.0; 41% of interior vertices within 1e-3, the rest being model UVs
+    // and screen-edge vertices the guest's own clipper interpolated) — and
+    // the stream's global max of s equals the global max of rhw to three
+    // decimals (126.7), which is what s = u·rhw with u ≤ ~1 looks like.
+    // This is RAVE's own vertex contract (uOverW/vOverW) passed through by
+    // the Mac driver. The SDK's F-45 calls the field "the u-coordinate"
+    // and documents no premultiply anywhere — the stream outranks the
+    // prose. A double multiply divided every coordinate by w once more,
+    // which under the title's clamp-to-edge modes smeared edge texels over
+    // the whole world: texture BYTES provably right, picture wrong
+    // everywhere.
+    //
+    // Iteration is therefore the same for both states of the perspective
+    // bit — the plane interpolates the stream value as given — and
+    // TEX_PERSPECTIVE_DISABLE only controls the per-pixel divide below.
     const Plane ps1 = planeOf(x0, y0, x1, y1, x2, y2,
-                              persp0 ? v0.s1 * v0.rhw : v0.s1,
-                              persp0 ? v1.s1 * v1.rhw : v1.s1,
-                              persp0 ? v2.s1 * v2.rhw : v2.s1, inv2a);
+                              v0.s1, v1.s1, v2.s1, inv2a);
     const Plane pt1 = planeOf(x0, y0, x1, y1, x2, y2,
-                              persp0 ? v0.t1 * v0.rhw : v0.t1,
-                              persp0 ? v1.t1 * v1.rhw : v1.t1,
-                              persp0 ? v2.t1 * v2.rhw : v2.t1, inv2a);
+                              v0.t1, v1.t1, v2.t1, inv2a);
     const Plane ps2 = planeOf(x0, y0, x1, y1, x2, y2,
-                              persp1 ? v0.s2 * v0.rhw : v0.s2,
-                              persp1 ? v1.s2 * v1.rhw : v1.s2,
-                              persp1 ? v2.s2 * v2.rhw : v2.s2, inv2a);
+                              v0.s2, v1.s2, v2.s2, inv2a);
     const Plane pt2 = planeOf(x0, y0, x1, y1, x2, y2,
-                              persp1 ? v0.t2 * v0.rhw : v0.t2,
-                              persp1 ? v1.t2 * v1.rhw : v1.t2,
-                              persp1 ? v2.t2 * v2.rhw : v2.t2, inv2a);
+                              v0.t2, v1.t2, v2.t2, inv2a);
     ++eng().tris;
     for (int py = minY; py <= maxY; ++py) {
         const double cy = py + 0.5;
@@ -1383,7 +1419,15 @@ void rasterPoint(const Pipe& P, const Vtx& v)
     fr.diffuse = {v.ca, v.cr, v.cg, v.cb};
     fr.spec = {255, v.sr, v.sg, v.sb};
     fr.fog = v.fog;
-    fr.s1 = v.s1; fr.t1 = v.t1; fr.s2 = v.s2; fr.t2 = v.t2;
+    // Stream S,T are premultiplied numerators (rasterTriangle's receipt);
+    // resolving a single vertex is one divide by its own rhw.
+    const float iw = v.rhw != 0.0f ? 1.0f / v.rhw : 1.0f;
+    const bool persp0 = P.tex[0].on && !((P.tex[0].cntl >> 14) & 1u);
+    const bool persp1 = P.tex[1].on && !((P.tex[1].cntl >> 14) & 1u);
+    fr.s1 = persp0 ? v.s1 * iw : v.s1;
+    fr.t1 = persp0 ? v.t1 * iw : v.t1;
+    fr.s2 = persp1 ? v.s2 * iw : v.s2;
+    fr.t2 = persp1 ? v.t2 * iw : v.t2;
     ++eng().points3d;
     shadeFragment(P, px, py, fr);
 }
@@ -1402,6 +1446,8 @@ void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b)
         rasterPoint(P, a);
         return;
     }
+    const bool persp0 = P.tex[0].on && !((P.tex[0].cntl >> 14) & 1u);
+    const bool persp1 = P.tex[1].on && !((P.tex[1].cntl >> 14) & 1u);
     for (int i = 0; i <= n; ++i) {
         const float f = static_cast<float>(i) / static_cast<float>(n);
         Vtx v;
@@ -1416,10 +1462,14 @@ void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b)
         v.sg = a.sg + (b.sg - a.sg) * f;
         v.sb = a.sb + (b.sb - a.sb) * f;
         v.fog = a.fog + (b.fog - a.fog) * f;
+        // Numerators and rhw interpolate screen-linearly along the line;
+        // the divide per step is what makes the texture perspective-true
+        // (stream S,T are premultiplied — rasterTriangle's receipt).
         v.s1 = a.s1 + (b.s1 - a.s1) * f;
         v.t1 = a.t1 + (b.t1 - a.t1) * f;
         v.s2 = a.s2 + (b.s2 - a.s2) * f;
         v.t2 = a.t2 + (b.t2 - a.t2) * f;
+        v.rhw = a.rhw + (b.rhw - a.rhw) * f;
         const int px = static_cast<int>(std::floor(v.x)) + P.winX;
         const int py = static_cast<int>(std::floor(v.y)) + P.winY;
         if (px < P.scL || px > P.scR || py < P.scT || py > P.scB ||
@@ -1430,7 +1480,11 @@ void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b)
         fr.diffuse = {v.ca, v.cr, v.cg, v.cb};
         fr.spec = {255, v.sr, v.sg, v.sb};
         fr.fog = v.fog;
-        fr.s1 = v.s1; fr.t1 = v.t1; fr.s2 = v.s2; fr.t2 = v.t2;
+        const float iw = v.rhw != 0.0f ? 1.0f / v.rhw : 1.0f;
+        fr.s1 = persp0 ? v.s1 * iw : v.s1;
+        fr.t1 = persp0 ? v.t1 * iw : v.t1;
+        fr.s2 = persp1 ? v.s2 * iw : v.s2;
+        fr.t2 = persp1 ? v.t2 * iw : v.t2;
         shadeFragment(P, px, py, fr);
     }
 }
@@ -1623,9 +1677,16 @@ void r128Cce3dReset()
     gWalk = WalkLatch{};
     gGate3d = -1;
     gLogBudget = 24;
+    gDumpFmt = 0;
+    gDumpPrim = 0;
+    gTriSeq = 0;
+    // gTriDump deliberately survives reset: the flag is armed before the
+    // machine boots and the machine resets on the way up.
 }
 
 int r128Gate3dState() { return gGate3d; }
+
+void r128Set3dTriDump(int n) { gTriDump = n; }
 
 bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v)
 {
@@ -1726,6 +1787,8 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
             ++eng().prim3dDecline;
             return false;
         }
+        gDumpFmt = fmt;
+        gDumpPrim = cntl & 0xFu;
         const u32 stride = vtxDwords(fmt);
         u32 count = cntl >> 16;
         const u32 avail = (n - 2u) / stride;
@@ -1771,6 +1834,8 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
         Pipe P;
         if (!pipeReady(c, m, P))
             return false;
+        gDumpFmt = fmt;
+        gDumpPrim = cntl & 0xFu;
         const u32 walk = (cntl >> 4) & 3u;
         const u32 stride = vtxDwords(fmt);
         if (stride > 20u || walk == 0u || walk == 3u ||

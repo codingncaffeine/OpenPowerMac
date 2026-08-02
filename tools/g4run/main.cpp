@@ -714,6 +714,13 @@ int main(int argc, char** argv)
         // --mouse-beat, NOT --mouse-at: that name was already taken by the
         // motion-cadence diagnostic below, and this ladder cannot grow.
         if (!strcmp(a, "--mouse-beat")) { parseMouseAt(next(), mouseBeats); continue; }
+        // --tri-dump N: print the next N textured triangles' raw vertices
+        // (see r128Set3dTriDump). Hoisted: the else-if ladder is at C1061.
+        if (!strcmp(a, "--tri-dump")) {
+            opm::r128Set3dTriDump(
+                static_cast<int>(strtol(next(), nullptr, 0)));
+            continue;
+        }
         if (!strcmp(a, "--type-beat")) { parseKeyBeat(next(), typeBeats); continue; }
         if (!strcmp(a, "--cmd-beat")) { parseKeyBeat(next(), cmdBeats); continue; }
         if (!strcmp(a, "--wav-out") && i + 1 < argc) {

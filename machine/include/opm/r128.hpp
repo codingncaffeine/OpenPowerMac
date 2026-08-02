@@ -360,11 +360,11 @@ struct R128EngStats {
     u64 texGartMiss = 0;  // an AGP texture fetch that missed the GART
     u64 zTile = 0;        // Z_PITCH_C had Z_TILE set — layout not modelled
     // The S/T range the guest actually sends, accumulated at vertex decode.
-    // The SDK never states the coordinate convention ([0,1] vs texel space)
-    // and the OEM register guide redacts the field that might say — so the
-    // stream itself testifies. [0,1]-ish extrema mean the sampler's
-    // multiply-by-size is right; extrema in the tens/hundreds mean the
-    // driver pre-scales and the model is tiling every texture into mush.
+    // ⭐ SETTLED (--tri-dump, 2026-08-02): stream S,T are u·rhw / v·rhw —
+    // premultiplied numerators, RAVE's own uOverW contract — which is why
+    // this census's historical max S (126.7) equals the stream's max rhw
+    // to three decimals. RAW stream values on purpose: this census records
+    // what the guest SENT, not what the sampler resolved.
     float stMinS = 1e30f, stMaxS = -1e30f;
     float stMinT = 1e30f, stMaxT = -1e30f;
     // ⭐ THE COORDINATE CONVENTION, SETTLED PER TRIANGLE.
@@ -479,6 +479,12 @@ void r128Cce3dReset();
 // closed gate means the pipeline is drawing with STALE state, which looks
 // like a rendering bug and is invisible without this.
 int r128Gate3dState();
+// The triangle dump (--tri-dump N): print the next N textured triangles as
+// they reach the rasterizer — raw vertex floats (x y z rhw s t s2 t2) plus
+// the live unit-0 state and the packet's VC_FORMAT — so coordinate-
+// convention questions are settled from the stream itself, offline, rather
+// than from a picture. File-static budget; snapshots unaffected.
+void r128Set3dTriDump(int n);
 // The CCE ring: a PM4_BUFFER_DL_WPTR or PM4_MICRO_CNTL write may hand the
 // engine a span of ring DWORDs to fetch through the GART and execute
 // (SDK §5.3). Runs only in the bus-mastered-packet modes with the

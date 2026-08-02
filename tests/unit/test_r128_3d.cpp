@@ -416,7 +416,7 @@ TEST_CASE("3d: bilinear filtering blends adjacent texels")
     CHECK(g <= 98);
 }
 
-TEST_CASE("3d: perspective correction divides by the interpolated rhw")
+TEST_CASE("3d: perspective correction divides premultiplied S by rhw")
 {
     Rig3d r;
     r.dst32();
@@ -428,7 +428,7 @@ TEST_CASE("3d: perspective correction divides by the interpolated rhw")
         r.c.vram[0x80000u + i * 2u + 1u] = static_cast<u8>(v);
     };
     t16(0, 0xF800u); // red
-    t16(1, 0x07E0u);
+    t16(1, 0x07E0u); // green
     t16(2, 0x001Fu);
     t16(3, 0xFFFFu);
     r.reg(0x1C9Cu, 1u << 4);
@@ -436,23 +436,26 @@ TEST_CASE("3d: perspective correction divides by the interpolated rhw")
     r.reg(0x1CB8u, (0u << 8) | (2u << 4) | 2u);          // pitch 4, w 4, h 1
     r.reg(0x1CC4u, 0x80000u); // slot 2: size-indexed (2^2 px wide)
     std::vector<u32> v;
-    auto vtxW = [&](float x, float y, float s, float rhw) {
+    auto vtxW = [&](float x, float y, float u, float rhw) {
         v.push_back(f2u(x));
         v.push_back(f2u(y));
         v.push_back(f2u(0.5f));
         v.push_back(f2u(rhw));
         v.push_back(0xFFFFFFFFu);
-        v.push_back(f2u(s));
-        v.push_back(f2u(0.0f));
+        v.push_back(f2u(u * rhw)); // the stream carries u·rhw (uOverW),
+        v.push_back(f2u(0.0f));    // the measured FTLVERTEX contract
     };
-    // Left edge at w=1, right vertex at w=4 (rhw 0.25). At pixel (8,0) the
-    // affine s would be 0.53 → texel 2 (blue); the perspective-correct s is
-    // 0.22 → texel 0 (red). The colour names which path ran.
+    // u runs 0→1 across the span; left edge at w=1, right vertex at w=4
+    // (rhw 0.25), so the stream numerators are 0 and 0.25. At pixel (12,0):
+    // numerator 0.195, rhw 0.414 → perspective-correct u = 0.47 → texel 1
+    // (green). Skipping the divide reads the numerator as u: 0.195 → texel
+    // 0 (red). Re-multiplying by rhw (the old double-multiply defect):
+    // 0.049/0.414 → texel 0 as well. The colour names the one right path.
     vtxW(0, 0, 0, 1.0f);
     vtxW(16, 0, 1, 0.25f);
     vtxW(0, 16, 0, 1.0f);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
-    CHECK(r.pix32(8, 0) == 0xFFFF0000u);
+    CHECK(r.pix32(12, 0) == 0xFF00FF00u);
 }
 
 TEST_CASE("3d: CI8 texels read through the palette LOAD_PALETTE filled")

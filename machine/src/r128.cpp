@@ -1382,6 +1382,7 @@ void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
         ++gEng.cceBadWidth;
         return;
     }
+    OPM_MARK(Cce); // staging is engine cost too, not the guest's store
     ++gEng.cceWords;
     gCceDepth = 64; // dispatch budget for this guest-visible entry
     gCceFifo.push_back(cceBswap(raw));
@@ -1432,6 +1433,7 @@ void r128CceRingKick(R128Cell& c, u8* ram, u32 ramSize, u32 gartBase,
     const u32 wptr = c.peek(0x0714u) & (sizeDw - 1u);
     if (rptr == wptr)
         return;
+    OPM_MARK(Cce); // ring fetch + execute: the engine's cost, named
     ++gEng.cceRingKicks;
     gCceDepth = 64; // indirect budget, per guest-visible entry
     while (rptr != wptr) {

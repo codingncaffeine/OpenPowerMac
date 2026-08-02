@@ -1357,8 +1357,41 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
     const Plane pt2 = planeOf(x0, y0, x1, y1, x2, y2,
                               v0.t2, v1.t2, v2.t2, inv2a);
     ++eng().tris;
+    // What this triangle's fragments actually consume, decided once. spec
+    // and fog planes feed nothing when their stage is off; the second set
+    // feeds nothing without a second unit; and the LOD derivative block —
+    // which carries a log2 per pixel — steers the sampler ONLY when mips
+    // are live or the min/mag filters disagree on bilinearity (sampleTex's
+    // no-mip path reads nothing else out of it). A shipping title runs
+    // mips-off with both filters bilinear, so the whole block is dead
+    // weight there.
+    const bool wantSpec = P.specEn;
+    const bool wantFog = P.fogEn && !P.fogTable;
+    const bool lodLive =
+        P.tex[0].on &&
+        ((!((P.tex[0].cntl >> 7) & 1u) && P.tex[0].maxLevel > 0) ||
+         (((P.tex[0].cntl >> 1) & 1u) != ((P.tex[0].cntl >> 4) & 1u)));
     for (int py = minY; py <= maxY; ++py) {
         const double cy = py + 0.5;
+        // Per-row bases: value at (cx,cy) = plane.a * cx + rowBase. One
+        // multiply-add per attribute per pixel instead of two multiplies
+        // and two adds. (The EDGE functions below keep their original
+        // form on purpose: reassociating them could flip an exactly-zero
+        // verdict and move rasterization coverage by a pixel.)
+        const double zRB = pz.b * cy + pz.c0;
+        const double aRB = pa.b * cy + pa.c0;
+        const double rRB = pr.b * cy + pr.c0;
+        const double gRB = pg.b * cy + pg.c0;
+        const double bRB = pb.b * cy + pb.c0;
+        const double srRB = psr.b * cy + psr.c0;
+        const double sgRB = psg.b * cy + psg.c0;
+        const double sbRB = psb.b * cy + psb.c0;
+        const double fogRB = pfog.b * cy + pfog.c0;
+        const double wRB = pw.b * cy + pw.c0;
+        const double s1RB = ps1.b * cy + ps1.c0;
+        const double t1RB = pt1.b * cy + pt1.c0;
+        const double s2RB = ps2.b * cy + ps2.c0;
+        const double t2RB = pt2.b * cy + pt2.c0;
         for (int px = minX; px <= maxX; ++px) {
             const double cx = px + 0.5;
             bool in = true;
@@ -1369,37 +1402,47 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
             if (!in)
                 continue;
             Frag fr;
-            fr.z = static_cast<float>(pz.at(cx, cy));
-            fr.diffuse.a = clamp255(static_cast<float>(pa.at(cx, cy)));
-            fr.diffuse.r = clamp255(static_cast<float>(pr.at(cx, cy)));
-            fr.diffuse.g = clamp255(static_cast<float>(pg.at(cx, cy)));
-            fr.diffuse.b = clamp255(static_cast<float>(pb.at(cx, cy)));
-            fr.spec.r = clamp255(static_cast<float>(psr.at(cx, cy)));
-            fr.spec.g = clamp255(static_cast<float>(psg.at(cx, cy)));
-            fr.spec.b = clamp255(static_cast<float>(psb.at(cx, cy)));
-            fr.fog = clamp255(static_cast<float>(pfog.at(cx, cy)));
-            const double w = pw.at(cx, cy);
+            fr.z = static_cast<float>(pz.a * cx + zRB);
+            fr.diffuse.a = clamp255(static_cast<float>(pa.a * cx + aRB));
+            fr.diffuse.r = clamp255(static_cast<float>(pr.a * cx + rRB));
+            fr.diffuse.g = clamp255(static_cast<float>(pg.a * cx + gRB));
+            fr.diffuse.b = clamp255(static_cast<float>(pb.a * cx + bRB));
+            if (wantSpec) {
+                fr.spec.r = clamp255(static_cast<float>(psr.a * cx + srRB));
+                fr.spec.g = clamp255(static_cast<float>(psg.a * cx + sgRB));
+                fr.spec.b = clamp255(static_cast<float>(psb.a * cx + sbRB));
+            }
+            if (wantFog)
+                fr.fog = clamp255(static_cast<float>(pfog.a * cx + fogRB));
+            const double w = pw.a * cx + wRB;
             const double invW = (persp0 || persp1) && w != 0.0 ? 1.0 / w : 1.0;
-            fr.s1 = static_cast<float>(persp0 ? ps1.at(cx, cy) * invW
-                                              : ps1.at(cx, cy));
-            fr.t1 = static_cast<float>(persp0 ? pt1.at(cx, cy) * invW
-                                              : pt1.at(cx, cy));
-            fr.s2 = static_cast<float>(persp1 ? ps2.at(cx, cy) * invW
-                                              : ps2.at(cx, cy));
-            fr.t2 = static_cast<float>(persp1 ? pt2.at(cx, cy) * invW
-                                              : pt2.at(cx, cy));
+            if (P.texAny) {
+                const double s1n = ps1.a * cx + s1RB;
+                const double t1n = pt1.a * cx + t1RB;
+                fr.s1 = static_cast<float>(persp0 ? s1n * invW : s1n);
+                fr.t1 = static_cast<float>(persp0 ? t1n * invW : t1n);
+                if (P.tex[1].on) {
+                    const double s2n = ps2.a * cx + s2RB;
+                    const double t2n = pt2.a * cx + t2RB;
+                    fr.s2 = static_cast<float>(persp1 ? s2n * invW : s2n);
+                    fr.t2 = static_cast<float>(persp1 ? t2n * invW : t2n);
+                }
+            }
             // Per-pixel LOD from the analytic derivatives of s,t: for
-            // S = Sn/W with Sn, W screen-affine, dS/dx = (Sn'x·W − Sn·W'x)/W².
-            if (P.tex[0].on) {
+            // S = Sn/W with Sn, W screen-affine,
+            // dS/dx = (Sn'x·W − Sn·W'x)/W².
+            if (lodLive) {
                 const double sw = static_cast<double>(P.tex[0].wTex);
                 const double sh = static_cast<double>(P.tex[0].hTex);
                 double dsx, dsy, dtx, dty;
                 if (persp0 && w != 0.0) {
                     const double w2 = 1.0 / (w * w);
-                    dsx = (ps1.a * w - ps1.at(cx, cy) * pw.a) * w2;
-                    dsy = (ps1.b * w - ps1.at(cx, cy) * pw.b) * w2;
-                    dtx = (pt1.a * w - pt1.at(cx, cy) * pw.a) * w2;
-                    dty = (pt1.b * w - pt1.at(cx, cy) * pw.b) * w2;
+                    const double s1n = ps1.a * cx + s1RB;
+                    const double t1n = pt1.a * cx + t1RB;
+                    dsx = (ps1.a * w - s1n * pw.a) * w2;
+                    dsy = (ps1.b * w - s1n * pw.b) * w2;
+                    dtx = (pt1.a * w - t1n * pw.a) * w2;
+                    dty = (pt1.b * w - t1n * pw.b) * w2;
                 } else {
                     dsx = ps1.a; dsy = ps1.b; dtx = pt1.a; dty = pt1.b;
                 }
@@ -1409,9 +1452,9 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
                 fr.lod1 = rho2 > 0.0
                               ? static_cast<float>(0.5 * std::log2(rho2))
                               : 0.0f;
+                if (P.tex[1].on)
+                    fr.lod2 = fr.lod1; // second set: same footprint model
             }
-            if (P.tex[1].on)
-                fr.lod2 = fr.lod1; // second set: same footprint model
             shadeFragment(P, px, py, fr);
         }
     }

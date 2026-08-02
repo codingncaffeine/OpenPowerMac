@@ -152,7 +152,23 @@ private:
     u64 nowTb_ = 0;
     u64 played_ = 0, recorded_ = 0, underruns_ = 0;
     std::vector<u8> ring_;
-    static constexpr size_t kRingCap = 1u << 20; // ~6 s at 44.1 kHz stereo
+    // ⭐⭐ THE CAP IS A LATENCY BOUND, NOT A STORAGE BUDGET — 186 ms, not
+    // six seconds. The queue's depth is a ONE-WAY RATCHET: the guest
+    // produces at exactly the sample rate (the codec's credit paces it) and
+    // the app's sink drains at exactly the sample rate (that is what
+    // playback is), so consumption can never exceed production and backlog
+    // NEVER DRAINS BACK DOWN. Every real-time hiccup and every starvation
+    // cushion adds to it permanently. At the old ~6-second cap a continuous
+    // game stream ratcheted to the top within the first heavy minute and
+    // then dropped-oldest on EVERY descriptor — ~45 splices a second,
+    // forever: six-second-late audio shredded beyond recognition, immune to
+    // any speedup, while the one-shot chime (which never accumulates
+    // backlog) stayed perfectly clean. A cap sized to absorb chunk jitter
+    // keeps worst-case added latency inaudible and turns a >186 ms stall
+    // into a brief splice the stream recovers from, instead of a permanent
+    // wreck. Drops here remain frame-aligned by construction (every give
+    // and the cap are multiples of kFrameBytes).
+    static constexpr size_t kRingCap = 0x8000; // 186 ms at 44.1 kHz stereo
 };
 
 } // namespace opm

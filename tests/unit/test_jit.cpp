@@ -514,7 +514,12 @@ TEST_CASE("jit: instrument-style flush keeps compiled lines (refill parity)")
     ji.run(64);
     in.run(64);
     CHECK_TWINS(ji, in);
-    REQUIRE(ji.cpu.jit != nullptr);
-    CHECK(ji.cpu.jit->refillKeeps > 0);
-    CHECK(ji.cpu.jit->insns > 0);
+    // The cache and its counters only exist where the JIT does (the emitter
+    // targets the Win64 ABI, so other hosts interpret and never create it).
+    // The behavioural half above — flush, refill, identical machines — holds
+    // on every platform; the keep-counter claim is host-specific.
+    if (ji.cpu.jit) {
+        CHECK(ji.cpu.jit->refillKeeps > 0);
+        CHECK(ji.cpu.jit->insns > 0);
+    }
 }

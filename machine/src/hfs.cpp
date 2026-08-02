@@ -506,6 +506,19 @@ BTree buildCatalogTree(std::vector<Rec>& recs, u32 fileNodes)
     return t;
 }
 
+// "712 MB" / "3.81 GB" — sizes in messages a user has to act on.
+std::string sizeText(u64 bytes)
+{
+    char buf[32];
+    if (bytes >= 1000ull * 1000 * 1000)
+        std::snprintf(buf, sizeof buf, "%.2f GB",
+                      static_cast<double>(bytes) / 1e9);
+    else
+        std::snprintf(buf, sizeof buf, "%.0f MB",
+                      static_cast<double>(bytes) / 1e6);
+    return buf;
+}
+
 std::vector<u8> emptyExtentsTree(u32 fileNodes)
 {
     std::vector<u8> hdr(512, 0);
@@ -526,7 +539,8 @@ std::vector<u8> emptyExtentsTree(u32 fileNodes)
 } // namespace
 
 bool hfsBuildImage(const std::string& folder, const std::string& outPath,
-                   const std::string& volName, std::string& err) try {
+                   const std::string& volName, std::string& err,
+                   std::string* warn, const HfsLimits& limits) try {
     err.clear();
     const fs::path root = pathFromUtf8(folder);
     std::error_code ec;
@@ -607,6 +621,18 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
                         item.type = ost("APPL");
                     }
                 }
+                // An HFS fork length is a signed 32-bit field: a file this
+                // big cannot exist on the volume at all — its record would
+                // carry a negative size. Left out loudly; the share still
+                // builds and mounts without it.
+                if (item.dataLen > limits.maxForkBytes ||
+                    item.rsrcLen > limits.maxForkBytes) {
+                    if (warn)
+                        *warn += "left out \"" + host8 + "\" (" +
+                                 sizeText(item.dataLen + item.rsrcLen) +
+                                 ") — an HFS fork tops out at 2 GB\n";
+                    continue;
+                }
                 totalBytes += item.dataLen + item.rsrcLen;
             } else {
                 continue; // symlinks and oddities
@@ -623,8 +649,9 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
             items.push_back(std::move(item));
         }
     }
-    if (nextCnid == 16 && items.empty()) {
-        err = "the folder is empty — nothing to share";
+    if (items.empty()) {
+        err = warn && !warn->empty() ? "nothing was shareable: " + *warn
+                                     : "the folder is empty — nothing to share";
         return false;
     }
     // ── Volume geometry ──────────────────────────────────────────────────
@@ -812,11 +839,35 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
     u64 imageSectors = kPartBase + volSectors;
     imageSectors = (imageSectors + 3u) & ~3ull;
     const u64 freeSectors = imageSectors - kPartBase - volSectors;
+    // ⚠ The guest is the ceiling here, not HFS. Classic Mac OS positions
+    // block I/O with SIGNED 32-BIT BYTE OFFSETS, so nothing past the 2 GB
+    // line of a volume is reachable — measured on a 10.8 GB share, which
+    // MOUNTED and BROWSED perfectly (the catalog sits at the front) and
+    // then answered every Finder copy with an error, because every fork
+    // the user wanted lay past the line. The worst failure shape: visible
+    // success hiding certain failure. Refused here, before gigabytes get
+    // written to the host's disk.
+    if (imageSectors * 512u > limits.maxImageBytes) {
+        err = "the folder needs a " + sizeText(imageSectors * 512u) +
+              " volume and the guest's classic CD path can only address " +
+              sizeText(limits.maxImageBytes) +
+              " — share a subfolder, or a few titles at a time";
+        return false;
+    }
     std::ofstream out(pathFromUtf8(outPath), std::ios::binary | std::ios::trunc);
     if (!out) {
         err = "cannot write " + outPath;
         return false;
     }
+    // A failure past this point leaves a partial image; remove it so a
+    // caller (or the CD slot) can never mount half a volume.
+    auto failOut = [&](std::string msg) {
+        out.close();
+        std::error_code rc;
+        fs::remove(pathFromUtf8(outPath), rc);
+        err = std::move(msg);
+        return false;
+    };
     auto seekAbs = [&](u64 s) {
         out.seekp(static_cast<std::streamoff>(s * 512u));
     };
@@ -951,26 +1002,20 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
     };
     for (const Item* f : files) {
         if (!streamFork(f->host, f->macBinary ? f->dataOff : 0, f->dataLen,
-                        f->dataStart, false)) {
-            err = "read failed: " + utf8Of(f->host);
-            return false;
-        }
+                        f->dataStart, false))
+            return failOut("read failed: " + utf8Of(f->host));
         if (f->rsrcLen) {
             if (!streamFork(f->host, f->macBinary ? f->rsrcOff : 0,
                             f->rsrcLen, f->rsrcStart,
-                            !f->macBinary && f->adsRsrc)) {
-                err = "resource fork read failed: " + utf8Of(f->host);
-                return false;
-            }
+                            !f->macBinary && f->adsRsrc))
+                return failOut("resource fork read failed: " + utf8Of(f->host));
         }
     }
     // The image is already a 2048 multiple by construction (imageSectors is
     // rounded to fours), so the ATAPI slot serves it as-is.
     out.flush();
-    if (!out) {
-        err = "write failed: " + outPath;
-        return false;
-    }
+    if (!out)
+        return failOut("write failed: " + outPath);
     return true;
 } catch (const std::exception& e) {
     // The path layer throws on things like ill-encoded names; a build

@@ -47,10 +47,14 @@ int main(int argc, char** argv)
         return 2;
     }
     const std::string name = a.size() > 3 ? a[3] : "Shared";
-    std::string err;
-    if (!opm::hfsBuildImage(a[1], a[2], name, err)) {
+    std::string err, warn;
+    const bool ok = opm::hfsBuildImage(a[1], a[2], name, err, &warn);
+    if (!ok)
         std::fprintf(stderr, "mkhfs: %s\n", err.c_str());
-        return 1;
-    }
-    return 0;
+    // Files the share had to leave out (oversized forks): on success,
+    // silence would read as "everything is in"; on failure, the refusal's
+    // arithmetic only adds up next to what was already left out.
+    if (!warn.empty())
+        std::fprintf(stderr, "mkhfs: %s", warn.c_str());
+    return ok ? 0 : 1;
 }

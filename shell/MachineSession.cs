@@ -104,6 +104,9 @@ public sealed class MachineSession
         Running = true;
         IntPtr m = IntPtr.Zero;
         string reason = "stopped";
+        // The packed shared-folder image, when this Start built one — a full
+        // copy of the folder's content, so it is deleted again at stop.
+        string? sharedImg = null;
         try
         {
             // 📁 The shared folder rides the CD slot: packed fresh into a
@@ -134,14 +137,26 @@ public sealed class MachineSession
                                              volName, err, 512) != 0)
                     {
                         cdPath = img;
+                        sharedImg = img;
+                        long mb = 0;
+                        try { mb = new FileInfo(img).Length >> 20; }
+                        catch { }
                         ConsoleQ.Enqueue(
                             $"[shell] shared folder mounted read-only as "
-                            + $"“{volName}”: {s.SharedFolderPath}\n");
+                            + $"“{volName}” ({mb} MB image): "
+                            + $"{s.SharedFolderPath}\n");
+                        // On success the buffer carries warnings — files
+                        // the share had to leave out.
+                        if (err.Length > 0)
+                            ConsoleQ.Enqueue($"[shell] shared folder: {err}\n");
                     }
                     else
                     {
                         ConsoleQ.Enqueue("[shell] shared folder NOT mounted: "
                                          + $"{err}\n");
+                        // A refused build must not leave an earlier run's
+                        // image behind to be mistaken for this folder.
+                        try { File.Delete(img); } catch { }
                     }
                 }
             }
@@ -389,6 +404,12 @@ public sealed class MachineSession
             _capture = null;
             if (m != IntPtr.Zero)
                 Native.opm_destroy(m);
+            // The image is rebuilt at every Start, so deleting it loses
+            // nothing — and a temp file the size of the shared folder
+            // should not outlive the machine that was reading it. After
+            // opm_destroy: the ATAPI cell holds the file open until then.
+            if (sharedImg != null)
+                try { File.Delete(sharedImg); } catch { }
             Running = false;
             StatAudioRate = 0;
             _thread = null;

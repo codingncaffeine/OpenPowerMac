@@ -315,3 +315,68 @@ TEST_CASE("hfs: an empty folder is refused rather than shared as nothing")
     CHECK(!err.empty());
     fs::remove_all(d);
 }
+
+// The ceilings are exercised through injected limits — the RULES are what
+// need proving, and a test must not write two gigabytes to find out.
+
+TEST_CASE("hfs: a fork past the HFS ceiling is left out loudly, not written")
+{
+    const fs::path d = scratchDir();
+    writeFile(d / "small.txt", {'h', 'i'});
+    writeFile(d / "huge.dat", std::vector<u8>(64 * 1024, 7));
+    const fs::path img = d / "out.img";
+    std::string err, warn;
+    HfsLimits lim;
+    lim.maxForkBytes = 32 * 1024;
+    REQUIRE(hfsBuildImage(d.string(), img.string(), "Shared", err, &warn,
+                          lim));
+    CHECK(warn.find("huge.dat") != std::string::npos);
+    const Vol v = load(img);
+    CHECK(g32(v.sector(2), 84) == 1); // one file made it
+    for (const auto& r : walkCatalog(v))
+        CHECK(r.name != "huge.dat");
+    fs::remove_all(d);
+}
+
+TEST_CASE("hfs: a share whose every file is oversized refuses with the reason")
+{
+    const fs::path d = scratchDir();
+    writeFile(d / "huge.dat", std::vector<u8>(64 * 1024, 7));
+    const fs::path img = d / "out.img";
+    std::string err, warn;
+    HfsLimits lim;
+    lim.maxForkBytes = 32 * 1024;
+    CHECK(!hfsBuildImage(d.string(), img.string(), "Shared", err, &warn,
+                         lim));
+    CHECK(err.find("huge.dat") != std::string::npos);
+    fs::remove_all(d);
+}
+
+TEST_CASE("hfs: a share bigger than the guest can address is refused unwritten")
+{
+    const fs::path d = scratchDir();
+    writeFile(d / "content.dat", std::vector<u8>(512 * 1024, 3));
+    const fs::path img = d / "out.img";
+    std::string err, warn;
+    HfsLimits lim;
+    lim.maxImageBytes = 256 * 1024;
+    CHECK(!hfsBuildImage(d.string(), img.string(), "Shared", err, &warn,
+                         lim));
+    CHECK(err.find("address") != std::string::npos);
+    CHECK(!fs::exists(img)); // refused BEFORE anything was written
+    // The same share under the production ceiling builds.
+    err.clear();
+    CHECK(hfsBuildImage(d.string(), img.string(), "Shared", err));
+    fs::remove_all(d);
+}
+
+TEST_CASE("hfs: the production ceilings are the classic signed-32 lines")
+{
+    // The image line is the guest's block addressing; the fork line sits one
+    // 64 KB allocation-block round-up under it. Measured, not chosen: a
+    // 10.8 GB share mounted and browsed and then failed every Finder copy,
+    // because the catalog lives at the front and every fork lay past 2 GB.
+    const HfsLimits lim;
+    CHECK(lim.maxImageBytes == 0x7FFFFFFFull);
+    CHECK(lim.maxForkBytes == 0x7FFF0000ull);
+}

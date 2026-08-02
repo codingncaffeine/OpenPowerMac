@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 
 namespace opm {
@@ -35,9 +36,30 @@ namespace opm {
 // archive expanded in the guest — StuffIt carries the forks internally and
 // the guest's own Expander restores them bit-exact.
 //
+// ⚠ The size ceilings are the GUEST's, not this builder's, and they are the
+// difference between a share that works and one that mounts, browses, and
+// then fails every single copy. Measured on a 10.8 GB share: the catalog
+// sits at the front of the volume, so the Finder shows every file — and
+// classic Mac OS positions block I/O with SIGNED 32-BIT BYTE OFFSETS, so
+// any fork past the 2 GB line answers every read with an error. The volume
+// is therefore refused above `maxImageBytes`, and a single file whose fork
+// cannot be represented in HFS's signed 32-bit length field is left out
+// with a warning rather than written as a record with a negative size.
+struct HfsLimits {
+    // Whole-image ceiling: the classic signed-32 byte-addressing line.
+    std::uint64_t maxImageBytes = 0x7FFFFFFFull;
+    // Per-fork ceiling, held under maxImageBytes by one allocation block's
+    // round-up (block size never exceeds 64 KB under the image ceiling).
+    std::uint64_t maxForkBytes = 0x7FFF0000ull;
+};
+
 // Returns true and writes `outPath` (padded to a 2048 multiple, ready for
 // the ATAPI slot); false with `err` naming the first thing that refused.
+// `warn`, when given, collects the files the share left out (oversized
+// forks) — the share still builds, and the caller surfaces the lines.
 bool hfsBuildImage(const std::string& folder, const std::string& outPath,
-                   const std::string& volName, std::string& err);
+                   const std::string& volName, std::string& err,
+                   std::string* warn = nullptr,
+                   const HfsLimits& limits = {});
 
 } // namespace opm

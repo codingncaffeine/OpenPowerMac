@@ -237,18 +237,29 @@ OPM_API uint64_t opm_tb(const OpmMachine* m) { return m->cpu.st.tb; }
 OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
                           const char* volName, char* err, uint32_t errCap)
 {
-    std::string e;
+    std::string e, w;
     const bool ok =
         folderUtf8 && outPathUtf8 &&
         hfsBuildImage(folderUtf8, outPathUtf8,
-                      volName && *volName ? volName : "Shared", e);
-    if (!ok && err && errCap) {
-        if (e.empty())
-            e = "hfs build failed";
+                      volName && *volName ? volName : "Shared", e, &w);
+    // One buffer, two meanings: on failure it names what refused; on
+    // success it carries the builder's warnings (files the share left
+    // out), empty when the pack was clean. The shell prints either. A
+    // failure keeps its warnings too — "needs a 6.98 GB volume" for a
+    // 10.8 GB folder only adds up next to the 3.8 GB file that was
+    // already left out.
+    std::string msg = ok ? std::move(w)
+                         : (e.empty() ? std::string("hfs build failed")
+                                      : std::move(e));
+    if (!ok && !w.empty())
+        msg += "\n" + w;
+    while (!msg.empty() && msg.back() == '\n')
+        msg.pop_back();
+    if (err && errCap) {
         const uint32_t n =
-            e.size() < errCap - 1 ? static_cast<uint32_t>(e.size())
-                                  : errCap - 1;
-        memcpy(err, e.data(), n);
+            msg.size() < errCap - 1 ? static_cast<uint32_t>(msg.size())
+                                    : errCap - 1;
+        memcpy(err, msg.data(), n);
         err[n] = 0;
     }
     return ok ? 1 : 0;

@@ -6116,6 +6116,24 @@ int main(int argc, char** argv)
                        static_cast<unsigned long long>(e.prim3dDecline),
                        static_cast<unsigned long long>(e.gated3d),
                        static_cast<unsigned long long>(e.zTile));
+            // ⭐ The coordinate convention, per triangle. A triangle that
+            // shows one whole texture spans 1.0 in normalised coordinates
+            // and `w` in texel ones — 128x apart, so the histogram's mass
+            // names the convention outright.
+            if (e.triSpanN) {
+                printf("-- ati st span (per triangle, max of S/T extent; "
+                       "mean bound texture width %llu):\n",
+                       (unsigned long long)(e.triSpanTexW / e.triSpanN));
+                static const char* kLbl[12] = {
+                    "<2^-5", "2^-5", "2^-4", "2^-3", "2^-2", "2^-1",
+                    "1..2",  "2..4", "4..8", "8..16", "16..64", ">=64"};
+                for (u32 b = 0; b < 12u; ++b)
+                    if (e.triSpanBucket[b])
+                        printf("--   %-6s %8llu (%.1f%%)\n", kLbl[b],
+                               (unsigned long long)e.triSpanBucket[b],
+                               100.0 * double(e.triSpanBucket[b]) /
+                                   double(e.triSpanN));
+            }
             const auto& ru = r128RopUnimplemented();
             if (!ru.empty()) {
                 printf("--   raster ops not implemented (rop3:count):");

@@ -367,6 +367,18 @@ struct R128EngStats {
     // driver pre-scales and the model is tiling every texture into mush.
     float stMinS = 1e30f, stMaxS = -1e30f;
     float stMinT = 1e30f, stMaxT = -1e30f;
+    // ⭐ THE COORDINATE CONVENTION, SETTLED PER TRIANGLE.
+    //
+    // The extrema above CANNOT decide it: global maxima of ~127 fit
+    // normalised-with-tiling and texel-space over a 128-map equally well,
+    // and reading one story out of that ambiguity shipped a regression.
+    // What discriminates is the span of ONE triangle against the size of
+    // the texture bound to it — a triangle showing a whole texture spans
+    // 1.0 normalised or `w` in texel space, and those differ by 128x.
+    // Bucketed by log2 so no assumption about the answer is baked in.
+    u64 triSpanBucket[12] = {}; // span < 2^-4, 2^-3 ... >= 2^6
+    u64 triSpanTexW = 0;        // sum of bound widths over counted triangles
+    u64 triSpanN = 0;
 };
 
 

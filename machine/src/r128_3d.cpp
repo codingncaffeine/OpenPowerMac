@@ -1188,6 +1188,29 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
         ++eng().triDegen;
         return;
     }
+    // The per-triangle S/T span against the bound texture size — the
+    // measurement that tells normalised coordinates from texel ones. Taken
+    // before any culling so the sample is of what the guest SENT.
+    if (P.texAny && P.tex[0].wTex) {
+        const float sMin = std::min(v0.s1, std::min(v1.s1, v2.s1));
+        const float sMax = std::max(v0.s1, std::max(v1.s1, v2.s1));
+        const float tMin = std::min(v0.t1, std::min(v1.t1, v2.t1));
+        const float tMax = std::max(v0.t1, std::max(v1.t1, v2.t1));
+        const float span = std::max(sMax - sMin, tMax - tMin);
+        if (span >= 0.0f && span < 1e6f) {
+            auto& e = eng();
+            int b = 0;
+            if (span > 0.0f) {
+                const float l2 = std::log2(span);
+                b = static_cast<int>(std::floor(l2)) + 5; // 2^-5 -> 0
+                if (b < 0) b = 0;
+                if (b > 11) b = 11;
+            }
+            ++e.triSpanBucket[b];
+            e.triSpanTexW += P.tex[0].wTex;
+            ++e.triSpanN;
+        }
+    }
     const bool ccwFront = (P.fpu & 1u) != 0;
     bool front = (area2 > 0.0) != ccwFront; // area>0 = screen-CW
     if (flipFacing)

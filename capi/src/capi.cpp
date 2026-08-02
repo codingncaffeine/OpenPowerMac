@@ -656,6 +656,235 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  m->bus->ati().peek(0x0260) & 0x07FFFFFFu);
         s += b;
     }
+    // 🎨🎨 THE REGISTERS THAT DECIDE COLOUR.
+    //
+    // "The triangles all arrive, the textures all decode, and the picture is
+    // still wrong" is a question about pipeline STATE, and not one byte of
+    // it appeared in any capture — so the first real 3D session could say
+    // what the engine DID and not what it was told to do. Every register
+    // the rasteriser reads is printed here, decoded where the field layout
+    // is known, because a wrong blend function and a wrong texture base
+    // produce the same black screen.
+    {
+        R128Cell& a = m->bus->ati();
+        const R128EngStats& e3 = r128EngStats();
+        if (e3.tris || e3.vtxFetched || e3.gated3d || e3.prim3dDecline) {
+            const u32 misc = a.peek(0x1CA0), texc = a.peek(0x1C9C);
+            const u32 fn = (misc >> 8) & 3u;
+            const int gate = r128Gate3dState();
+            snprintf(b, sizeof b,
+                     "-- 3d state: dp_datatype=%08x (dst fmt %u) "
+                     "dst_offset=%08x dst_pitch=%08x window_xy=%08x\n",
+                     a.peek(0x16C4), a.peek(0x16C4) & 0xFu, a.peek(0x1404),
+                     a.peek(0x1408), a.peek(0x1BCC));
+            s += b;
+            // ⭐ The gate. A CLOSED gate means context writes are being
+            // DROPPED and every primitive after them used stale state.
+            snprintf(b, sizeof b,
+                     "--   scale_3d_cntl=%08x misc_3d=%08x SCALE_3D_FN=%u "
+                     "(%s); gate %s, %llu context writes DROPPED%s\n",
+                     a.peek(0x1A00), misc, fn,
+                     fn == 2u ? "TEXMAP_SHADE" : "NOT 3d",
+                     gate < 0 ? "untouched" : gate ? "OPEN" : "CLOSED",
+                     (unsigned long long)e3.gated3d,
+                     e3.gated3d ? "  <== stale pipeline state" : "");
+            s += b;
+            snprintf(b, sizeof b,
+                     "--   blend: src=%u dst=%u alpha_comb=%u alpha_test=%u "
+                     "ref_alpha=%u fog_table=%u fog_colour=%06x\n",
+                     (misc >> 16) & 0xFu, (misc >> 20) & 0xFu,
+                     (misc >> 12) & 3u, (misc >> 24) & 7u, misc & 0xFFu,
+                     (misc >> 14) & 1u, a.peek(0x1CAC) & 0xFFFFFFu);
+            s += b;
+            snprintf(b, sizeof b,
+                     "--   tex_cntl=%08x: z_en=%u z_wr=%u sten=%u "
+                     "combine_fn=%u combine_fnA=%u\n",
+                     texc, texc & 1u, (texc >> 1) & 1u, (texc >> 3) & 1u,
+                     (texc >> 14) & 0xFu, (texc >> 18) & 7u);
+            s += b;
+            // Slots are SIZE-indexed (slot k = a 2^k-texel level), so print
+            // the whole bank — which slots hold addresses IS the story.
+            s += "--   prim tex offset slots 0-10:";
+            for (u32 sl = 0; sl < 11u; ++sl) {
+                snprintf(b, sizeof b, " %x", a.peek(0x1CBC + 4u * sl));
+                s += b;
+            }
+            s += "\n";
+            snprintf(b, sizeof b,
+                     "--   prim tex: cntl=%08x combine=%08x size_pitch=%08x "
+                     "border=%08x\n",
+                     a.peek(0x1CB0), a.peek(0x1CB4), a.peek(0x1CB8),
+                     a.peek(0x1D38));
+            s += b;
+            snprintf(b, sizeof b,
+                     "--   sec tex:  cntl=%08x combine=%08x slot0=%08x "
+                     "border=%08x; const_colour=%08x plane_mask=%08x\n",
+                     a.peek(0x1D00), a.peek(0x1D04), a.peek(0x1D08),
+                     a.peek(0x1D3C), a.peek(0x1D34), a.peek(0x1D44));
+            s += b;
+            snprintf(b, sizeof b,
+                     "--   z: offset=%08x pitch=%08x sten_cntl=%08x; "
+                     "scissor L%d R%d T%d B%d\n",
+                     a.peek(0x1C90), a.peek(0x1C94), a.peek(0x1C98),
+                     static_cast<int>(a.peek(0x1640) & 0x3FFFu),
+                     static_cast<int>(a.peek(0x1644) & 0x3FFFu),
+                     static_cast<int>(a.peek(0x1648) & 0x3FFFu),
+                     static_cast<int>(a.peek(0x164C) & 0x3FFFu));
+            s += b;
+            // ⭐ IS THERE A TEXTURE AT THE ADDRESS WE SAMPLE FROM?
+            //
+            // 62 million texel fetches with zero unimplemented formats and
+            // zero GART misses still says nothing about whether the BYTES
+            // are the game's texture: a wrong base address reads perfectly
+            // valid, perfectly zero VRAM, samples black, and trips no
+            // counter at all. Every surface would render black with the
+            // occasional bright speck where something else lives — which
+            // is the reported symptom exactly. So look at the memory —
+            // at the SIZE-INDEXED slot the sampler reads (slot = log2 of
+            // the texture size; slot 0 is a 1×1 level and reading it here
+            // once made a fixed sampler look broken).
+            const u32 spReg = a.peek(0x1CB8);
+            for (u32 u = 0; u < 2; ++u) {
+                const u32 szl2 =
+                    ((u ? (spReg >> 16) : spReg) >> 4) & 0xFu;
+                const u32 slot = szl2 > 10u ? 10u : szl2;
+                const u32 raw =
+                    a.peek((u ? 0x1D08 : 0x1CBC) + 4u * slot);
+                const u32 base = raw & 0x03FFFFF0u;
+                const bool agp = base >= 0x02000000u;
+                u32 nz = 0, probe = 0;
+                for (u32 k = 0; k < 4096u; ++k) {
+                    const size_t at = size_t(base) + k;
+                    if (at >= a.vram.size())
+                        break;
+                    ++probe;
+                    if (a.vram[at])
+                        ++nz;
+                }
+                snprintf(b, sizeof b,
+                         "--   tex%u slot%u base=%08x (raw %08x, %s), "
+                         "tiling bits=%u: %u/%u probed bytes non-zero%s\n",
+                         u, slot, base, raw, agp ? "AGP via GART" : "VRAM",
+                         (raw >> 30) & 3u, nz, probe,
+                         (probe && nz * 20u < probe)
+                             ? "  <== essentially EMPTY: sampling the wrong "
+                               "memory would render black"
+                             : "");
+                s += b;
+            }
+        }
+    }
+    // 📇 WHICH DRAWING REGISTERS THE GUEST ACTUALLY WRITES.
+    //
+    // The texture base reads 0 and 156 million texels came from VRAM offset
+    // 0, which is not a texture. "The write was dropped", "the write never
+    // happened" and "the write landed somewhere else" are three different
+    // findings with three different fixes, and the CURRENT VALUE cannot tell
+    // them apart — only a write count can. A Type-0 packet names a base
+    // register and a length, so a decoding error puts real writes at wrong
+    // offsets, and those show up here as traffic where none belongs.
+    {
+        R128Cell& a = m->bus->ati();
+        const R128EngStats& e4 = r128EngStats();
+        if (e4.tris || e4.vtxFetched) {
+            s += "-- drawing-block register writes (offset name count = "
+                 "current value; 0700-1DFF, so the CCE/PM4 block is in "
+                 "frame too):\n";
+            u32 shown = 0;
+            for (const auto& [off, n] : a.writeCount) {
+                if (off < 0x0700u || off > 0x1DFFu)
+                    continue;
+                if (++shown > 192u) {
+                    s += "--   ...(truncated)\n";
+                    break;
+                }
+                const char* nm = r128RegName(off);
+                snprintf(b, sizeof b, "--   %04x %-28s %8llu = %08x\n", off,
+                         nm ? nm : "(unnamed)",
+                         static_cast<unsigned long long>(n), a.peek(off));
+                s += b;
+            }
+            // Said plainly, because this is the one question the capture
+            // exists to answer.
+            const auto it = a.writeCount.find(0x1CBCu);
+            snprintf(b, sizeof b,
+                     "--   => PRIM_TEX_0_OFFSET_C written %llu times; "
+                     "%s\n",
+                     static_cast<unsigned long long>(
+                         it == a.writeCount.end() ? 0ull : it->second),
+                     it == a.writeCount.end()
+                         ? "NEVER WRITTEN: the guest sets the texture base "
+                           "somewhere this model is not looking"
+                         : "written: the value is being lost or overwritten");
+            s += b;
+        }
+    }
+    // 📊 WHAT IS ACTUALLY ON THE SCREEN, AS NUMBERS.
+    //
+    // "Mostly black with white specks" is the user's eyes doing work a
+    // counter should do: this measures the visible framebuffer so the same
+    // observation arrives as a percentage, and so a later capture can be
+    // compared against this one without anyone opening an image. The 8x6
+    // luminance grid is coarse on purpose — it says WHERE the picture is
+    // (a centred GUI, a black field with a bright band) in twelve numbers.
+    {
+        R128Cell& a = m->bus->ati();
+        const R128Scan sc = r128ScanDecode(a);
+        if (sc.enabled && sc.bypp && sc.w >= 64 && sc.w <= 2048 &&
+            sc.h >= 64 && sc.h <= 1536) {
+            std::vector<uint8_t> row(size_t(sc.w) * 4u);
+            uint64_t black = 0, total = 0, sumL = 0, cellL[6][8] = {};
+            uint64_t cellN[6][8] = {};
+            uint32_t mn = 255, mx = 0;
+            // Distinct colours, capped: a full histogram of a 32-bpp screen
+            // is a megabyte of set nodes and the question only needs "a few
+            // or many".
+            std::vector<uint8_t> seen(1u << 15, 0);
+            uint32_t distinct = 0;
+            for (u32 y = 0; y < sc.h; ++y) {
+                r128ScanRow(a, sc, y, row.data());
+                for (u32 x = 0; x < sc.w; ++x) {
+                    const u32 bb = row[x * 4], gg = row[x * 4 + 1],
+                              rr = row[x * 4 + 2];
+                    const u32 lum = (rr * 77u + gg * 151u + bb * 28u) >> 8;
+                    if (!rr && !gg && !bb)
+                        ++black;
+                    ++total;
+                    sumL += lum;
+                    if (lum < mn) mn = lum;
+                    if (lum > mx) mx = lum;
+                    const u32 key = ((rr >> 3) << 10) | ((gg >> 3) << 5) |
+                                    (bb >> 3);
+                    if (!seen[key]) { seen[key] = 1; ++distinct; }
+                    const u32 gy = y * 6u / sc.h, gx = x * 8u / sc.w;
+                    cellL[gy][gx] += lum;
+                    ++cellN[gy][gx];
+                }
+            }
+            snprintf(b, sizeof b,
+                     "-- screen content: %ux%u fmt %u; %.1f%% pure black, "
+                     "%u distinct colours (5-5-5 buckets), luminance "
+                     "min %u mean %u max %u\n",
+                     sc.w, sc.h, sc.fmt,
+                     total ? 100.0 * double(black) / double(total) : 0.0,
+                     distinct, mn,
+                     static_cast<unsigned>(total ? sumL / total : 0), mx);
+            s += b;
+            s += "--   mean luminance, 8x6 grid (0-255):\n";
+            for (u32 gy = 0; gy < 6; ++gy) {
+                s += "--    ";
+                for (u32 gx = 0; gx < 8; ++gx) {
+                    snprintf(b, sizeof b, "%5llu",
+                             (unsigned long long)(cellN[gy][gx]
+                                                      ? cellL[gy][gx] /
+                                                            cellN[gy][gx]
+                                                      : 0));
+                    s += b;
+                }
+                s += "\n";
+            }
+        }
+    }
     // 🎨 THE COMMAND ENGINE, because "the desktop froze mid-redraw" is a
     // question about the packet stream: a healthy stream has zero (or a
     // packet's worth of) staged words; a large backlog behind one absurd

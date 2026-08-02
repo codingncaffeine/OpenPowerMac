@@ -348,9 +348,26 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
         if (t.maxLevel > 10u)
             t.maxLevel = 10u;
         t.fmt = (t.cntl >> 16) & 0xFu;
-        for (u32 l = 0; l < 11u; ++l)
-            t.offs[l] =
-                c.peek((u ? kSecTex0OffsetC : kPrimTex0OffsetC) + 4u * l);
+        // ⭐⭐ THE OFFSET SLOTS ARE INDEXED BY LEVEL SIZE, NOT BY MIP NUMBER.
+        //
+        // Measured from Nanosaur's own traffic (the diag register census):
+        // TEX_SIZE_PITCH_C cycles 0x666/0x777/0x888 while the driver writes
+        // ONLY PRIM_TEX_6/7/8_OFFSET_C — one slot per texture, the slot
+        // number equal to log2 of the texture's size. So the base of a
+        // 2^k-texel texture lives in slot k, its first mip in slot k-1, and
+        // slot 0 holds a 1×1 level. A model that read the base from slot 0
+        // sampled VRAM address zero for every texel of every surface: the
+        // whole 3D world rendered black with junk flecks, 156 million
+        // fetches per capture, no counter tripped. The SDK's "base texture
+        // in TEX_0_OFFSET" prose reads like mip-indexing and is not.
+        //
+        // offs[] stays mip-indexed for the sampler; the remap happens here:
+        // level l of a base-size-2^szl2 texture reads slot szl2 - l.
+        for (u32 l = 0; l < 11u; ++l) {
+            const u32 slot = szl2 >= l ? szl2 - l : 0u;
+            t.offs[l] = c.peek(
+                (u ? kSecTex0OffsetC : kPrimTex0OffsetC) + 4u * slot);
+        }
         t.border = c.peek(u ? kSecTexBorderColorC : kPrimTexBorderColorC);
         t.useSecondSt = u && (t.cntl & 1u);
     }
@@ -408,11 +425,27 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
 {
     const u32 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
     const u32 base = t.offs[l] & 0x07FFFFFFu; // 31:30 are tiling flags
-    if ((t.offs[l] >> 30) & 3u) {
-        // Tiled layouts are not modelled; reading them linear scrambles the
-        // texture in a way a screenshot shows immediately. Counted once per
-        // sample so the report names the cause.
+    // 31:30 texture mapping mode (SDK F.13): 0 linear, 1 tiled by the host
+    // application, 2/3 "stored in a tiled surface" — i.e. swizzled only
+    // where a SURFACE0-3 range register says so. Nanosaur sets mode 3 with
+    // every SURFACE register zeroed, so its textures are linear in fact;
+    // counting every such sample as unimplemented would have buried the
+    // real signal under 60 M false positives per capture. Mode 1, and mode
+    // 2/3 with a LIVE surface range covering the address, remain honestly
+    // counted: reading those linear scrambles the texture.
+    const u32 tmode = (t.offs[l] >> 30) & 3u;
+    if (tmode == 1u) {
         ++eng().texUnimpl;
+    } else if (tmode >= 2u) {
+        for (u32 sfc = 0; sfc < 4u; ++sfc) {
+            const u32 info = P.c->peek(0x0B0Cu + sfc * 0x10u);
+            const u32 lo = P.c->peek(0x0B04u + sfc * 0x10u);
+            const u32 hi = P.c->peek(0x0B08u + sfc * 0x10u);
+            if (info && hi > lo && base >= lo && base < hi) {
+                ++eng().texUnimpl;
+                break;
+            }
+        }
     }
     ++eng().texSamples;
     auto b8 = [&](u32 at, u8& v) { return texByte(P, at, v); };
@@ -1542,6 +1575,8 @@ void r128Cce3dReset()
     gLogBudget = 24;
 }
 
+int r128Gate3dState() { return gGate3d; }
+
 bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v)
 {
     if (off == kFogTableIndex) {
@@ -1558,8 +1593,40 @@ bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v)
     if (off == kMisc3dStateCntl || off == kScale3dCntl) {
         // Both carry SCALE_3D_FN (9:8 in MISC, 7:6 in SCALE_3D_CNTL); the
         // last write steers the gate. Stored normally by the caller.
-        const u32 fn = off == kMisc3dStateCntl ? (v >> 8) & 3u : (v >> 6) & 3u;
-        gGate3d = fn == 2u ? 1 : 0;
+        //
+        // ⭐ THE GATE CLOSES ON ZERO, NOT ON "NOT 2". The RRG's
+        // MISC_3D_STATE_CNTL table is explicit: "if this field is set to 0,
+        // many 3D/Front-End Scalar/Setup Engine registers are NOT writeable.
+        // Hence this field should be written to a NON-ZERO value prior to
+        // trying to write any other 3D/Front-End Scalar registers." So
+        // 1 = Scaling leaves the block writeable exactly as 2 does.
+        //
+        // This model closed the gate whenever the function was not 2, which
+        // silently DROPPED every context write a driver made while the pipe
+        // sat in Scaling — 4,392 of them in the first real Nanosaur session,
+        // the only refusal in the whole capture. Dropped state does not
+        // announce itself: the primitives still draw, using whatever the
+        // registers held before.
+        // ⭐⭐ AND IT IS STEERED BY BOTH REGISTERS TOGETHER, NOT BY WHICHEVER
+        // WAS WRITTEN LAST. Measured from Nanosaur: the driver runs with
+        // MISC_3D_STATE_CNTL = 00510200 (SCALE_3D_FN = 2, TEXMAP_SHADE — it
+        // is plainly doing 3D, 314k triangles of it) while SCALE_3D_CNTL
+        // reads 80000000, whose 7:6 field is 0. Under "last write wins" that
+        // zero slammed the gate shut, and the block it guards holds
+        // PRIM_TEX_0_OFFSET and its secondary — so the TEXTURE BASE
+        // ADDRESSES never landed and stayed at 0. Every texel then came from
+        // VRAM offset 0, which is 87% zero bytes: black surfaces with bright
+        // flecks where something else happens to live, over correctly
+        // shaped, correctly wound, fully textured geometry. 21,980 writes
+        // went in the bin in one session.
+        //
+        // The lock releases once the pipe has been given a function at all,
+        // which is the same "either register" convention the primitive gate
+        // below already uses.
+        const u32 miscV = off == kMisc3dStateCntl ? v : c.peek(kMisc3dStateCntl);
+        const u32 scaleV = off == kScale3dCntl ? v : c.peek(kScale3dCntl);
+        const u32 fnMisc = (miscV >> 8) & 3u, fnScale = (scaleV >> 6) & 3u;
+        gGate3d = (fnMisc != 0u || fnScale != 0u) ? 1 : 0;
         return false; // fall through to the plain store
     }
     // The write-gated 3D context block. MISC itself stays writable — it IS

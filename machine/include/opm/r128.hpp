@@ -454,6 +454,11 @@ bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v);
 // CCE palettes and the fog table — same contract and caller as
 // r128CceReset, which invokes this itself.
 void r128Cce3dReset();
+// The SCALE_3D_FN write gate's live position: -1 no guest has steered it
+// (writes pass), 0 CLOSED (context writes are being dropped), 1 open. A
+// closed gate means the pipeline is drawing with STALE state, which looks
+// like a rendering bug and is invisible without this.
+int r128Gate3dState();
 // The CCE ring: a PM4_BUFFER_DL_WPTR or PM4_MICRO_CNTL write may hand the
 // engine a span of ring DWORDs to fetch through the GART and execute
 // (SDK §5.3). Runs only in the bus-mastered-packet modes with the

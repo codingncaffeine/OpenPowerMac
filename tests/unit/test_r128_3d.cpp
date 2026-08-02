@@ -352,7 +352,7 @@ TEST_CASE("3d: nearest-neighbour texturing maps the quadrants of a 2x2")
     r.reg(0x1C9Cu, 1u << 4);              // TEXMAP_ENABLE, light fn disable
     r.reg(0x1CB0u, 4u << 16);             // 565, nearest, wrap
     r.reg(0x1CB8u, 0x111u);               // pitch 2, size 2, height 2
-    r.reg(0x1CBCu, 0x80000u);
+    r.reg(0x1CC0u, 0x80000u); // slot 1: offsets are size-indexed (2^1 px)
     std::vector<u32> v;
     auto vtxSt = [&](float x, float y, float s, float t) {
         v.push_back(f2u(x));
@@ -390,7 +390,7 @@ TEST_CASE("3d: bilinear filtering blends adjacent texels")
     // Y8 (fmt 8), mag bilinear, clamp S+T so the sample cannot wrap.
     r.reg(0x1CB0u, (8u << 16) | (1u << 4) | (2u << 8) | (2u << 11));
     r.reg(0x1CB8u, (0u << 8) | (1u << 4) | 1u); // pitch 2, w 2, h 1
-    r.reg(0x1CBCu, 0x80000u);
+    r.reg(0x1CC0u, 0x80000u); // slot 1: size-indexed (2^1 px wide)
     std::vector<u32> v;
     auto vtxSt = [&](float x, float y, float s, float t) {
         v.push_back(f2u(x));
@@ -434,7 +434,7 @@ TEST_CASE("3d: perspective correction divides by the interpolated rhw")
     r.reg(0x1C9Cu, 1u << 4);
     r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11)); // 565 nearest clamp
     r.reg(0x1CB8u, (0u << 8) | (2u << 4) | 2u);          // pitch 4, w 4, h 1
-    r.reg(0x1CBCu, 0x80000u);
+    r.reg(0x1CC4u, 0x80000u); // slot 2: size-indexed (2^2 px wide)
     std::vector<u32> v;
     auto vtxW = [&](float x, float y, float s, float rhw) {
         v.push_back(f2u(x));
@@ -474,7 +474,7 @@ TEST_CASE("3d: CI8 texels read through the palette LOAD_PALETTE filled")
     r.reg(0x1C9Cu, 1u << 4);
     r.reg(0x1CB0u, 2u << 16); // CI8, nearest, wrap
     r.reg(0x1CB8u, 0x111u);
-    r.reg(0x1CBCu, 0x80000u);
+    r.reg(0x1CC0u, 0x80000u); // slot 1: size-indexed (2^1 px)
     std::vector<u32> v;
     auto vtxSt = [&](float x, float y, float s, float t) {
         v.push_back(f2u(x));
@@ -490,6 +490,90 @@ TEST_CASE("3d: CI8 texels read through the palette LOAD_PALETTE filled")
     vtxSt(0, 16, 0, 1);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
     CHECK(r.pix32(2, 2) == 0xFFFF0000u); // palette entry 7
+}
+
+// ⭐⭐ THE OFFSET SLOTS ARE INDEXED BY LEVEL SIZE, NOT BY MIP NUMBER.
+//
+// Measured from Nanosaur's own register traffic: TEX_SIZE_PITCH_C cycled
+// 0x666/0x777/0x888 while the driver wrote ONLY PRIM_TEX_6/7/8_OFFSET_C —
+// one slot per texture, the slot number equal to log2 of the texture's
+// size, PRIM_TEX_0_OFFSET_C never once. The model used to read the base
+// level from slot 0, so every texel of every surface came from VRAM
+// address zero: the whole 3D world drew black with junk flecks and not
+// one counter tripped (the fetches were all "valid"). This case is shaped
+// exactly like that evidence: slot-log2(size) holds the texture, slot 0
+// holds ZERO, and the pixel must come out textured anyway.
+TEST_CASE("3d: the texture base is read from the size-indexed offset slot, "
+          "not slot 0")
+{
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
+    // 4x4 solid-red 565 texture at VRAM 512 KB.
+    for (u32 i = 0; i < 16u; ++i) {
+        r.c.vram[0x80000u + i * 2u] = 0xF8;
+        r.c.vram[0x80000u + i * 2u + 1u] = 0x00;
+    }
+    r.reg(0x1C9Cu, 1u << 4);
+    r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11)); // 565 nearest clamp
+    r.reg(0x1CB8u, 0x222u); // pitch 4, w 4, h 4 → log2 size 2
+    r.reg(0x1CBCu, 0u);        // slot 0: EMPTY, as in the live capture
+    r.reg(0x1CC4u, 0x80000u);  // slot 2 = log2(4): the actual texture
+    std::vector<u32> v;
+    auto vtxSt = [&](float x, float y, float s, float t) {
+        v.push_back(f2u(x));
+        v.push_back(f2u(y));
+        v.push_back(f2u(0.5f));
+        v.push_back(f2u(1.0f));
+        v.push_back(0xFFFFFFFFu);
+        v.push_back(f2u(s));
+        v.push_back(f2u(t));
+    };
+    vtxSt(0, 0, 0, 0);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
+    r.prim(0x9u | 0x80u, 4u, 3u, v);
+    CHECK(r.pix32(3, 3) == 0xFFFF0000u); // textured, NOT black-from-slot-0
+}
+
+// The tiling-mode bits ride the offset's top two bits (SDK F.13: 0 linear,
+// 1 host-tiled, 2/3 via a SURFACE range). Nanosaur sets mode 3 with every
+// SURFACE register zeroed — linear in fact — and 62 M samples per capture
+// must not each count as "unimplemented". A LIVE surface range covering
+// the address is the only honest trigger.
+TEST_CASE("3d: tiling-mode bits with no live SURFACE range sample linear "
+          "and count nothing")
+{
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
+    for (u32 i = 0; i < 16u; ++i) {
+        r.c.vram[0x80000u + i * 2u] = 0xF8;
+        r.c.vram[0x80000u + i * 2u + 1u] = 0x00;
+    }
+    r.reg(0x1C9Cu, 1u << 4);
+    r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11));
+    r.reg(0x1CB8u, 0x222u);
+    r.reg(0x1CC4u, 0xC0000000u | 0x80000u); // mode 3, as Nanosaur programs
+    const auto before = r128EngStats();
+    std::vector<u32> v;
+    auto vtxSt = [&](float x, float y, float s, float t) {
+        v.push_back(f2u(x));
+        v.push_back(f2u(y));
+        v.push_back(f2u(0.5f));
+        v.push_back(f2u(1.0f));
+        v.push_back(0xFFFFFFFFu);
+        v.push_back(f2u(s));
+        v.push_back(f2u(t));
+    };
+    vtxSt(0, 0, 0, 0);
+    vtxSt(16, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
+    r.prim(0x9u | 0x80u, 4u, 3u, v);
+    CHECK(r.pix32(3, 3) == 0xFFFF0000u);
+    CHECK(r128EngStats().texUnimpl - before.texUnimpl == 0);
 }
 
 TEST_CASE("3d: an AGP-resident texture is fetched through the GART")
@@ -632,6 +716,61 @@ TEST_CASE("3d: the SCALE_3D_FN write gate drops context writes when steered "
     CHECK(r.c.peek(0x1C98u) == 0xDEADu);
     r.prim(0x9u, 4u, 3u, v);
     CHECK(r.pix32(4, 4) == 0xFF0000FFu);
+}
+
+// ⭐ THE WRITE GATE CLOSES ON ZERO, NOT ON "ANYTHING BUT TEXMAP_SHADE".
+//
+// RRG, MISC_3D_STATE_CNTL: "if this field is set to 0, many 3D/Front-End
+// Scalar/Setup Engine registers are NOT writeable. Hence this field should
+// be written to a NON-ZERO value prior to trying to write any other
+// 3D/Front-End Scalar registers." So SCALE_3D_FN = 1 (Scaling) leaves the
+// context block writeable exactly as 2 does.
+//
+// This model used to close the gate for every function except 2, so every
+// context register a driver programmed while the pipe sat in Scaling was
+// dropped on the floor — 4,392 of them in the first real Nanosaur session,
+// and the primitives afterwards drew with whatever state happened to be
+// left. Nothing announced it: the writes were counted, not reported.
+//
+// ⚠ Drawing still requires TEXMAP_SHADE — that is a separate gate on the
+// primitive path, and the case above pins it. Writeable ≠ renderable.
+TEST_CASE("3d: SCALE_3D_FN = Scaling leaves the context block writeable")
+{
+    Rig3d r;
+    const auto before = r128EngStats();
+    r.reg(0x1CA0u, 1u << 8); // 1 = Scaling: non-zero, so writes must land
+    r.reg(0x1C98u, 0xBEEFu);
+    CHECK(r.c.peek(0x1C98u) == 0xBEEFu);
+    CHECK(r128EngStats().gated3d - before.gated3d == 0); // nothing dropped
+
+    // ...and zero in BOTH registers still closes it, so the documented lock
+    // is not lost.
+    r.reg(0x1A00u, 0u);
+    r.reg(0x1CA0u, 0u << 8);
+    r.reg(0x1C98u, 0x1234u);
+    CHECK(r.c.peek(0x1C98u) == 0xBEEFu); // unchanged: the write was dropped
+    CHECK(r128EngStats().gated3d - before.gated3d == 1);
+}
+
+// ⭐ THE REAL SHAPE OF THE NANOSAUR BUG: two registers disagreeing.
+//
+// The driver ran with MISC_3D_STATE_CNTL = 00510200 (SCALE_3D_FN = 2,
+// TEXMAP_SHADE) and SCALE_3D_CNTL = 80000000, whose 7:6 field is 0. With
+// the gate steered by whichever register was written last, that zero closed
+// it — and the block it guards holds PRIM_TEX_0_OFFSET_C, so the texture
+// base addresses never landed. Every texel came from VRAM offset 0 and
+// every surface rendered black with scattered bright flecks.
+TEST_CASE("3d: a zero function in one register does not close the gate the "
+          "other one opened")
+{
+    Rig3d r;
+    const auto before = r128EngStats();
+    r.reg(0x1CA0u, 2u << 8);   // MISC: TEXMAP_SHADE — the guest means 3D
+    r.reg(0x1A00u, 0x80000000u); // SCALE_3D_CNTL: 7:6 reads 0
+    // The texture base must still land, which is the whole point.
+    r.reg(0x1CBCu, 0x00123450u); // PRIM_TEX_0_OFFSET_C
+    CHECK(r.c.peek(0x1CBCu) == 0x00123450u);
+    CHECK(r128EngStats().gated3d - before.gated3d == 0);
 }
 
 TEST_CASE("3d: a 565 destination quantises and stores big-endian pixels")

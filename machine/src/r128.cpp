@@ -2,6 +2,7 @@
 
 #include <cstdio> // the CRTC mode-change report; MSVC pulls this in, gcc does not
 #include "opm/bus.hpp" // SnoopSink: the bus-master fetch answers to it
+#include "opm/prof.hpp" // OPM_MARK(Cce): the engine's own profile bucket
 #include <cstring> // memmove, for the blitter's row copies
 
 namespace opm {
@@ -1276,6 +1277,11 @@ void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
 static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
                      u32 aperBase, SnoopSink* snoop)
 {
+    // Every CCE packet — 2D blits and the whole 3D rasterizer — executes
+    // inside this loop, which itself runs inside the guest's MMIO store.
+    // The marker gives that host time its own profile bucket instead of
+    // billing a software-rasterized triangle to "mem write".
+    OPM_MARK(Cce);
     for (;;) {
         cceDrainPending(c, ram, ramSize, gartBase, aperBase, snoop);
         const size_t avail = gCceFifo.size() - gCceHead;
@@ -2333,6 +2339,21 @@ u8 R128Cell::edidByte(u8 at) const
     case 23: return 0x78;                       // gamma 2.2
     case 24: return 0x0D;                       // RGB, preferred timing
     case 35: return 0x21;  // established: 640x480@60, 800x600@60
+    // The mode ceiling used to be HERE, not in the card: the ndrv carries
+    // 49 modes up to 1920x1440 but offers only what the monitor claims,
+    // and this EDID claimed two. Established II + the standard-timing
+    // block below raise the claim; the boot default stays 640x480 (the
+    // established/preferred story is unchanged) so every boot gate holds.
+    case 36: return 0x08;  // established II: 1024x768@60
+    case 37: return 0x80;  // manufacturer band: 1152x870@75 (Apple 21")
+    // Standard timings: (X/8 - 31), then aspect<<6 | (refresh - 60).
+    case 38: return 0x61; case 39: return 0x40; // 1024x768@60  (4:3)
+    case 40: return 0x81; case 41: return 0x40; // 1280x960@60  (4:3)
+    case 42: return 0x81; case 43: return 0x80; // 1280x1024@60 (5:4)
+    case 44: return 0xC9; case 45: return 0x40; // 1600x1200@60 (4:3)
+    case 46: return 0xD1; case 47: return 0xC0; // 1920x1080@60 (16:9)
+    case 48: return 0xD1; case 49: return 0x40; // 1920x1440@60 (4:3)
+    case 50: case 51: case 52: case 53: return 0x01; // unused slots
     case 54: return 0x31; case 55: return 0x40; // pixel clock 16.4 MHz
     case 56: return 0x80; case 57: return 0xE0; // 640 x 480 active
     case 58: return 0x00; case 59: return 0x18;

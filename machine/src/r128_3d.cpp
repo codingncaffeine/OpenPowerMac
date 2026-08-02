@@ -230,6 +230,12 @@ struct TexUnit {
     u32 wTex = 0, hTex = 0, pitchTex = 0; // base-level texels
     u32 maxLevel = 0;
     u32 offs[11] = {};
+    // Per level: does the tiling mode make this level's reads honest-count
+    // material (mode 1, or mode 2/3 with a LIVE surface range covering the
+    // base)? Decided ONCE here — the old per-fetch surface scan was twelve
+    // register-map lookups per texel, and the profiler billed a third of
+    // the machine's whole in-game host time to this engine.
+    bool tileCount[11] = {};
     u32 border = 0;           // ARGB
     bool useSecondSt = false; // SEC_SRC_SEL_ST
 };
@@ -389,6 +395,23 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
             const u32 slot = szl2 >= l ? szl2 - l : 0u;
             t.offs[l] = c.peek(
                 (u ? kSecTex0OffsetC : kPrimTex0OffsetC) + 4u * slot);
+            // Tiling-mode census, hoisted from the texel fetch (see the
+            // TexUnit note): mode 1 always counts; mode 2/3 counts only
+            // when a live SURFACE0-3 range covers the level's base.
+            const u32 tmode = (t.offs[l] >> 30) & 3u;
+            t.tileCount[l] = tmode == 1u;
+            if (tmode >= 2u) {
+                const u32 lvBase = t.offs[l] & 0x07FFFFFFu;
+                for (u32 sfc = 0; sfc < 4u; ++sfc) {
+                    const u32 info = c.peek(0x0B0Cu + sfc * 0x10u);
+                    const u32 lo = c.peek(0x0B04u + sfc * 0x10u);
+                    const u32 hi = c.peek(0x0B08u + sfc * 0x10u);
+                    if (info && hi > lo && lvBase >= lo && lvBase < hi) {
+                        t.tileCount[l] = true;
+                        break;
+                    }
+                }
+            }
         }
         t.border = c.peek(u ? kSecTexBorderColorC : kPrimTexBorderColorC);
         t.useSecondSt = u && (t.cntl & 1u);
@@ -449,27 +472,15 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     const u32 base = t.offs[l] & 0x07FFFFFFu; // 31:30 are tiling flags
     // 31:30 texture mapping mode (SDK F.13): 0 linear, 1 tiled by the host
     // application, 2/3 "stored in a tiled surface" — i.e. swizzled only
-    // where a SURFACE0-3 range register says so. Nanosaur sets mode 3 with
-    // every SURFACE register zeroed, so its textures are linear in fact;
-    // counting every such sample as unimplemented would have buried the
-    // real signal under 60 M false positives per capture. Mode 1, and mode
-    // 2/3 with a LIVE surface range covering the address, remain honestly
-    // counted: reading those linear scrambles the texture.
-    const u32 tmode = (t.offs[l] >> 30) & 3u;
-    if (tmode == 1u) {
-        ++eng().texUnimpl;
-    } else if (tmode >= 2u) {
-        for (u32 sfc = 0; sfc < 4u; ++sfc) {
-            const u32 info = P.c->peek(0x0B0Cu + sfc * 0x10u);
-            const u32 lo = P.c->peek(0x0B04u + sfc * 0x10u);
-            const u32 hi = P.c->peek(0x0B08u + sfc * 0x10u);
-            if (info && hi > lo && base >= lo && base < hi) {
-                ++eng().texUnimpl;
-                break;
-            }
-        }
-    }
-    ++eng().texSamples;
+    // where a SURFACE0-3 range register says so. A mode-3 offset with every
+    // SURFACE register zeroed is linear in fact (measured); counting every
+    // such sample as unimplemented would bury the real signal under tens of
+    // millions of false positives per capture. The live-surface decision is
+    // made once per packet in gatherPipe; here it is one flag.
+    auto& es = eng();
+    if (t.tileCount[l])
+        ++es.texUnimpl;
+    ++es.texSamples;
     auto b8 = [&](u32 at, u8& v) { return texByte(P, at, v); };
     u8 b0, b1, b2, b3;
     switch (t.fmt) {

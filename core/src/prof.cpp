@@ -96,6 +96,7 @@ const char* name(Ph p)
     case Ph::Instr: return "instrumentation";
     case Ph::Exc: return "exception";
     case Ph::Loop: return "run loop";
+    case Ph::Cce: return "cce engine";
     default: return "?";
     }
 }

@@ -61,6 +61,13 @@ enum class Ph : unsigned char {
     // to pass. Naming it is the difference between "the interpreter is slow"
     // and "the loop around it is".
     Loop,      // batch sizing, the nap question, the line executor's own tests
+    // ⚠ ADDED 2026-08-02 FOR THE IN-GAME SPEED QUESTION. The CCE executes
+    // inside the guest's MMIO store — a PAINT of half a megapixel or a
+    // 3D packet's software rasterization all billed to Write — so "the
+    // interpreter is slow in games" and "the engine is expensive" were one
+    // indistinguishable bucket. Naming it is the prerequisite for deciding
+    // whether the game-speed work goes to the interpreter or the raster.
+    Cce,       // the card's command engine: 2D blits and the 3D rasterizer
     N
 };
 

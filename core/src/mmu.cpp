@@ -532,6 +532,11 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
             const InsnDesc* d = decode(v);
             fl.row[k] = d ? static_cast<u16>(d - kIsa) : kNoRow;
         }
+        // The refill is the JIT's invalidation edge: the drop alone cannot
+        // be, because a dropped line refills under the SAME base and the
+        // compiled block would match it again with stale words. Identical
+        // content keeps the block — see jitNoteRefill.
+        jitNoteRefill(*this, fetchSlot(pa), base, fl.w);
         insn = fl.w[word];
         row = fl.row[word];
         return true;

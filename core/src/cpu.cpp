@@ -367,6 +367,23 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
                 break;
             continue;
         }
+        // ⭐ THE JIT. Same window, same hoists, same exits as the inner loop
+        // below — see opm/jit.hpp. Only when a whole line's worth of budget
+        // remains: a block never checks the budget per instruction, so it
+        // must be unable to overrun `until` (fpClamp exactness rides on
+        // that), and the interpreter finishes any sub-line tail. LE mode is
+        // excluded because a block bakes big-endian next-pc immediates.
+        if (jitOn && until - i >= 8u && !(st.msr & msr::LE)) {
+            OPM_PH(Exec);
+            const bool ran =
+                jitRunLine(*this, static_cast<u32>(fl - fetchLine), word, i);
+            OPM_PH(Loop);
+            if (ran) {
+                if (batchBreak || halted)
+                    break;
+                continue;
+            }
+        }
         OPM_COUNT(lineEntries);
         const u32 base = fl->base;
         for (;;) {

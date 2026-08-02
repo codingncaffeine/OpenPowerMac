@@ -11,6 +11,7 @@ set(OPM_CORE_SRC
   src/fpu.cpp
   src/altivec.cpp
   src/prof.cpp
+  src/jit.cpp
 )
 
 find_package(Threads REQUIRED)

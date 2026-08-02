@@ -2,6 +2,7 @@
 #include "types.hpp"
 #include "bus.hpp"
 #include "insn.hpp"
+#include "jit.hpp"  // compiled-line cache; pure derived state, see the header
 #include "prof.hpp" // markers on the inline execution path; compiled away
 #include <map>
 #include <string>
@@ -402,6 +403,8 @@ struct Cpu {
         pendCycles = 0;
         batchBreak = true;
         fetchDrop();
+        if (jit)
+            jit->dropAll(); // compiled lines are derived from dropped lines
         tlbFlushAll();
     }
     void halt(std::string reason)
@@ -797,6 +800,16 @@ struct Cpu {
     // run loop, the way the machine did before whole blocks were executed in
     // one go. The control for runSteps' inner loop.
     bool lineExecOff = false;
+    // ⭐ THE JIT (opm/jit.hpp, core/src/jit.cpp): each fetch line compiles to
+    // one native block and runSteps enters it instead of the line executor's
+    // inner loop. Heap-owned and created on first use, so a Cpu that never
+    // runs batched code pays a pointer; --no-jit is the control, exactly as
+    // --no-line-exec is for the line executor. Pure derived state: never
+    // snapshotted, dropped on reset, re-keyed by the refill hook.
+    std::unique_ptr<JitCache> jit;
+    bool jitOn = true;
+    static_assert(JitCache::kLines == kFetchLines,
+                  "the JIT cache is slot-parallel to the fetch lines");
     void fetchDrop()
     {
         for (FetchLine& e : fetchLine)

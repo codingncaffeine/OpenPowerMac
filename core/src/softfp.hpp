@@ -62,4 +62,10 @@ R rsqrte(u64 b, const Env& e);                      // frsqrte (deterministic)
 u64 loadSingle(u32 w);   // PEM D.6 (exact format conversion)
 u32 storeSingle(u64 f);  // PEM D.7 (truncating conversion)
 
+// The single-target host fast path's off switch (see softfp.cpp). Exists for
+// the differential test, which runs every case both ways and demands the
+// same {bits, flags}; the machine never touches it.
+extern bool gHostFastOff;
+extern u64 gFastHits, gFastMiss; // taken vs bailed; g4run reports them
+
 } // namespace opm::sf

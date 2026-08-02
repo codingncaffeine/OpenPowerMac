@@ -12,6 +12,7 @@
 #include "opm/pace.hpp"
 #include "opm/sawtooth.hpp"
 #include "opm/snapshot.hpp"
+#include "../../core/src/softfp.hpp" // fast-path counters in the report
 
 #include <algorithm>
 #include <chrono>
@@ -522,6 +523,8 @@ int main(int argc, char** argv)
     // --no-line-exec: never run a whole resident block in one go. The control
     // for Cpu::runSteps' inner loop.
     bool lineExecOff = false;
+    // --no-jit: interpret every line. The control for the compiled blocks.
+    bool jitOff = false;
     // 🔬 --fingerprint-every N: THE STATE DIFFERENTIAL.
     //
     // Every claim in this tree that some new machinery is transparent has been
@@ -709,6 +712,9 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--no-nap-skip")) { napSkipOn = false; continue; }
         if (!strcmp(a, "--no-batch")) { batchOn = false; continue; }
         if (!strcmp(a, "--no-line-exec")) { lineExecOff = true; continue; }
+        // The control for the JIT (opm/jit.hpp), same rule as every cache
+        // and gate here: the claim ships with the switch that turns it off.
+        if (!strcmp(a, "--no-jit")) { jitOff = true; continue; }
         // Up here for the same reason as the speed flags: the else-if ladder
         // below is already at MSVC's nesting limit (C1061).
         if (!strcmp(a, "--sound")) { soundOn = true; continue; }
@@ -1369,6 +1375,7 @@ int main(int argc, char** argv)
     cpu.fetchCacheOff = !icache;
     cpu.dxlCacheOff = !dxlate;
     cpu.lineExecOff = lineExecOff;
+    cpu.jitOn = !jitOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);
     bus.ohci(1).setLivePortPower(ohciPortPower);
     if (ohciNdpSet) {
@@ -1625,7 +1632,8 @@ int main(int argc, char** argv)
     //    than a constant carried by step(), so a batch of k instructions
     //    would be charged one instruction's worth of it;
     //  - and under --realtime the batch stops at the next clock sample, so
-    //    the host-paced top-up still lands every 1024 instructions.
+    //    the host-paced advance still lands every kBatchInsns (4096)
+    //    instructions — see HostPacer::kBatchInsns, which capi shares.
     // Stop exactly on the next fingerprint mark, or the two runs being
     // compared are photographed at different instructions and every line
     // differs. Applies to the nap skip as well as to the batch — both charge
@@ -5184,6 +5192,68 @@ int main(int argc, char** argv)
                breaks ? static_cast<double>(ranInsns) /
                             static_cast<double>(breaks)
                       : 0.0);
+        // What the compiled blocks actually carried. `insns` against the
+        // run's total is the JIT's coverage; `bails` are lines it declined
+        // (arena pressure); resets are wholesale arena recycles. refill
+        // keep/drop says whether invalidation is churning on instrument
+        // flushes (keeps) or on real self-modifying code (drops).
+        if (cpu.jit)
+            printf("--   jit: %.1f%% of instructions native (%llu of %llu), "
+                   "%llu compiles, %llu enters, %llu refill-keeps, "
+                   "%llu refill-drops, %llu bails, %llu arena resets\n",
+                   ranInsns ? 100.0 * static_cast<double>(cpu.jit->insns) /
+                                  static_cast<double>(ranInsns)
+                            : 0.0,
+                   static_cast<unsigned long long>(cpu.jit->insns),
+                   static_cast<unsigned long long>(ranInsns),
+                   static_cast<unsigned long long>(cpu.jit->compiles),
+                   static_cast<unsigned long long>(cpu.jit->enters),
+                   static_cast<unsigned long long>(cpu.jit->refillKeeps),
+                   static_cast<unsigned long long>(cpu.jit->refillDrops),
+                   static_cast<unsigned long long>(cpu.jit->bails),
+                   static_cast<unsigned long long>(cpu.jit->resets));
+        if (cpu.jit && (cpu.jit->fallbacks || cpu.jit->memOps))
+            printf("--   jit mix: %llu mem ops (%.1f%% of native insns), "
+                   "%llu fallback insns (%.1f%%)\n",
+                   static_cast<unsigned long long>(cpu.jit->memOps),
+                   cpu.jit->insns ? 100.0 * static_cast<double>(cpu.jit->memOps) /
+                                        static_cast<double>(cpu.jit->insns)
+                                  : 0.0,
+                   static_cast<unsigned long long>(cpu.jit->fallbacks),
+                   cpu.jit->insns
+                       ? 100.0 * static_cast<double>(cpu.jit->fallbacks) /
+                             static_cast<double>(cpu.jit->insns)
+                       : 0.0);
+        if (cpu.jit && cpu.jit->fallbacks) {
+            std::vector<std::pair<u64, u32>> fb;
+            for (u32 k = 0; k < 1024; ++k)
+                if (cpu.jit->fbByRow[k])
+                    fb.push_back({cpu.jit->fbByRow[k], k});
+            std::sort(fb.rbegin(), fb.rend());
+            printf("--   jit fallback census (top 12 of %zu rows):\n",
+                   fb.size());
+            for (size_t k = 0; k < fb.size() && k < 12; ++k)
+                printf("       %-10s %llu\n",
+                       fb[k].second < kIsaCount ? kIsa[fb[k].second].mnem
+                                                : "?",
+                       static_cast<unsigned long long>(fb[k].first));
+        }
+        if (sf::gFastHits || sf::gFastMiss)
+            printf("--   softfp fast path: %llu taken, %llu bailed (%.1f%%)\n",
+                   static_cast<unsigned long long>(sf::gFastHits),
+                   static_cast<unsigned long long>(sf::gFastMiss),
+                   100.0 * static_cast<double>(sf::gFastHits) /
+                       static_cast<double>(sf::gFastHits + sf::gFastMiss));
+        if (cpu.jit && cpu.jit->tscProbe) // populated only by the diagnostic
+            printf("--   jit tsc: probe %.1f/enter, native %.1f/enter "
+                   "(%.1f per native insn)\n",
+                   static_cast<double>(cpu.jit->tscProbe) /
+                       static_cast<double>(cpu.jit->enters),
+                   static_cast<double>(cpu.jit->tscNative) /
+                       static_cast<double>(cpu.jit->enters),
+                   cpu.jit->insns ? static_cast<double>(cpu.jit->tscNative) /
+                                        static_cast<double>(cpu.jit->insns)
+                                  : 0.0);
 #if OPM_PROFILING
         // ⭐ HOW MUCH STRAIGHT-LINE CODE THIS MACHINE ACTUALLY RUNS. The line
         // executor's whole saving is the fetch work it does once per LINE

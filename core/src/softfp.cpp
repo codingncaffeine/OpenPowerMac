@@ -22,8 +22,49 @@
 
 #include "softfp.hpp"
 #include <bit>
+#include <cmath>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#define OPM_SF_X64 1
+#include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#else
+#define OPM_SF_X64 0
+#endif
 
 namespace opm::sf {
+
+bool gHostFastOff = false;
+u64 gFastHits = 0, gFastMiss = 0;
+
+#if OPM_SF_X64
+// The fused path of the fast case wants a HARDWARE fma: the C runtime's
+// fmaf is a correctly-rounded software routine on MSVC's default arch, and
+// paying a libcall per fmadds is how the fast path measured no faster than
+// the model it bypassed. FMA3 is checked once; a host without it simply
+// leaves the madd family to the model (adds and muls need no fma at all).
+static bool haveFma3()
+{
+#if defined(_MSC_VER)
+    int info[4] = {};
+    __cpuid(info, 1);
+    return (info[2] & (1 << 12)) != 0;
+#else
+    return __builtin_cpu_supports("fma");
+#endif
+}
+static const bool kHaveFma = haveFma3();
+#if defined(__GNUC__)
+__attribute__((target("fma")))
+#endif
+static float hwFmaf(float a, float b, float c)
+{
+    return _mm_cvtss_f32(
+        _mm_fmadd_ss(_mm_set_ss(a), _mm_set_ss(b), _mm_set_ss(c)));
+}
+#endif
 
 namespace {
 
@@ -238,11 +279,126 @@ inline U128 add128(U128 a, U128 b, bool& carry)
 // The one generic path: rounded( (a*c) [+/- b] ), optionally negated.
 // Handles fadd/fsub (c = 1.0), fmul (no addend), and the fmadd family.
 // NaN precedence is frA, frB, frC (PEM 3.3.4); only frsp truncates payloads.
+// ⭐ THE SINGLE-TARGET HOST FAST PATH. Measured in-game (s40): the JIT left
+// ~27% of the window in softfp arithmetic, and the census top was all
+// single-precision (fmadds/fmuls/fadds/fnmsubs/fsubs). For SINGLE ops with
+// single-valued operands the host can produce the model's exact answer:
+//
+//   result   float add / float mul-of-exact-double-product / fmaf are each
+//            the correct rounding of the exact value — for the pure product,
+//            (float)(double(sa)*double(sc)) has NO double-rounding hazard
+//            because the 24x24-bit product is EXACT in a double.
+//   flags    FI ("this op was inexact") and FR ("the fraction was
+//            incremented") need sign-exact knowledge of exact - result.
+//            With S,T = 2Sum(pd, db) (exact by the 2Sum lemma; no double
+//            over/underflow is possible with single-range inputs), and
+//            d = S - r0d (EXACT: S and r0d are 53- and 24-bit roundings of
+//            the same value, so they agree to a factor [1-2^-23, 1+2^-23]
+//            and Sterbenz applies; the S==0 and r0==0 corners are handled
+//            separately): when d != 0, |d| >= ulp53(S) > ulp53(S)/2 >= |T|,
+//            so sign(exact - r0) = sign(d) and it cannot cancel to zero;
+//            when d == 0, exact - r0 = T exactly. No fenv, no MXCSR.
+//
+// Everything else — NaN/Inf/denormal operands, non-nearest rounding,
+// enabled-exception scaling, NI, overflow, denormal-or-underflowed results,
+// operands that are not single-valued (whose Sgl result the model defines) —
+// bails into the model below, which remains the single source of truth.
+bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
+                 R& out)
+{
+    const auto nzD = [](u64 x) {
+        const u32 e = static_cast<u32>(x >> 52) & 0x7FFu;
+        return e ? e != 0x7FFu : (x & ~kSignBit) == 0;
+    };
+    if (!nzD(fa) || !nzD(fc) || (hasAddend && !nzD(fb)))
+        return false;
+    const double da = std::bit_cast<double>(fa);
+    const double dc = std::bit_cast<double>(fc);
+    const double db = hasAddend ? std::bit_cast<double>(fb) : 0.0;
+    const float sa = static_cast<float>(da);
+    const float sc = static_cast<float>(dc);
+    const float sb = static_cast<float>(db);
+    if (static_cast<double>(sa) != da || static_cast<double>(sc) != dc ||
+        (hasAddend && static_cast<double>(sb) != db))
+        return false; // not single-valued: the model's territory
+    const double pd = static_cast<double>(sa) * static_cast<double>(sc);
+    float r0;
+    double S, T;
+    if (hasAddend) {
+        // Correctly rounded single of the exact a*c+b. A true multiplier of
+        // one (every add/sub arrives as a*1+b) needs no fma — float add is
+        // native and correctly rounded; the genuine madd family takes the
+        // FMA3 unit, and a host without FMA3 leaves it to the model.
+        if (sc == 1.0f) {
+            r0 = sa + sb;
+        } else {
+#if OPM_SF_X64
+            if (!kHaveFma)
+                return false;
+            r0 = hwFmaf(sa, sc, sb);
+#else
+            r0 = std::fmaf(sa, sc, sb);
+#endif
+        }
+        S = pd + db; // 2Sum: S + T == pd + db exactly
+        const double bv = S - pd;
+        T = (pd - (S - bv)) + (db - bv);
+    } else {
+        r0 = static_cast<float>(pd); // exact product: one rounding only
+        S = pd;
+        T = 0.0;
+    }
+    const u32 rbits = std::bit_cast<u32>(r0);
+    const u32 rexp = (rbits >> 23) & 0xFFu;
+    if (rexp == 0xFFu)
+        return false; // overflowed: the model owns OX and the defaults
+    if (rexp == 0u && (rbits & 0x007FFFFFu))
+        return false; // denormal result: tininess is the model's business
+    // ⚠ ANY 2Sum RESIDUE BAILS. T != 0 means the addend reaches below the
+    // 53-bit window of the sum — jam territory in the model's aligned-add,
+    // where BOTH deliverables leave ideal arithmetic behind: the jam is an
+    // unsigned sticky, so a far-below addend breaks a product tie upward
+    // where true fused rounding (fmaf) breaks it by the addend's sign
+    // (result bits differ by one ulp), and FR follows the window's own
+    // increment, not the magnitude. Measured, not theorized: the
+    // differential produced both families on its first runs. With T == 0
+    // the exact value IS the double S, the model's 106-bit accumulator
+    // holds it entirely, and model == ideal — provably.
+    if (T != 0.0)
+        return false;
+    const double r0d = static_cast<double>(r0); // exact widening
+    const double resid = S - r0d; // exact: Sterbenz (S, r0d agree to 2^-23)
+    if (r0 == 0.0f && resid != 0.0)
+        return false; // underflowed to zero: UX belongs to the model
+    u32 fl = 0;
+    if (resid != 0.0) {
+        fl |= kXx;
+        if ((resid < 0.0) != ((rbits >> 31) != 0))
+            fl |= kFr; // rounded away from zero
+    }
+    u64 bits = std::bit_cast<u64>(static_cast<double>(r0));
+    if (negResult)
+        bits ^= kSignBit;
+    out = {bits, fl};
+    return true;
+}
+
 R fmaCore(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negAdd, bool negResult,
           const Env& env, Tgt t)
 {
     if (hasAddend && negAdd)
         fb ^= kSignBit;
+
+    if (t == Tgt::Sgl && env.rn == 0 && !env.oe && !env.ue && !env.ni &&
+        !gHostFastOff) {
+        R fast;
+        if (hostSglFast(fa, fc, fb, hasAddend, negResult, fast))
+        {
+            ++gFastHits;
+            return fast;
+        }
+        ++gFastMiss;
+    }
 
     const Un a = unpack(fa), c = unpack(fc), b = unpack(fb);
     u32 fl = 0;

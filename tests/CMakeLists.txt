@@ -15,6 +15,8 @@ add_executable(opm_unit
   unit/test_snapshot.cpp
   unit/test_ata.cpp
   unit/test_ohci.cpp
+  unit/test_jit.cpp
+  unit/test_softfp_fast.cpp
 )
 target_link_libraries(opm_unit PRIVATE opmcore opmmachine)
 target_include_directories(opm_unit SYSTEM PRIVATE vendor)

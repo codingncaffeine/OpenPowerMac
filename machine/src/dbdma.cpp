@@ -9,6 +9,37 @@ namespace opm {
 static constexpr u32 kRun = 0x8000, kPause = 0x4000, kFlush = 0x2000,
                      kWake = 0x1000, kDead = 0x0800, kActive = 0x0400;
 
+// File-static so sizeof(DbdmaChannel) — which is in the snapshot layout
+// digest — does not move. Only the two audio channels are watched.
+static const DbdmaChannel* g_irqWatch[2] = {nullptr, nullptr};
+static DbdmaIrqStats g_irqStats[2];
+
+static int irqSlot(const DbdmaChannel* c)
+{
+    if (c == g_irqWatch[0])
+        return 0;
+    if (c == g_irqWatch[1])
+        return 1;
+    return -1;
+}
+
+void dbdmaWatchIrq(const DbdmaChannel* out, const DbdmaChannel* in)
+{
+    g_irqWatch[0] = out;
+    g_irqWatch[1] = in;
+    g_irqStats[0] = {};
+    g_irqStats[1] = {};
+}
+
+const DbdmaIrqStats& dbdmaIrqStats(u32 slot) { return g_irqStats[slot & 1u]; }
+
+void dbdmaNotePulse(const DbdmaChannel* ch)
+{
+    const int s = irqSlot(ch);
+    if (s >= 0)
+        ++g_irqStats[s].pulsed;
+}
+
 void DbdmaChannel::note(u32 kind, u32 a, u32 b)
 {
     if (stamp && *stamp < logFrom)
@@ -68,6 +99,11 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
         // does, and why this could stay wrong for as long as ATA was the
         // only user (its driver reads the condition from the cell's +0x300
         // latch instead).
+        if (irq_) {
+            const int s = irqSlot(this);
+            if (s >= 0)
+                ++g_irqStats[s].dropCtl;
+        }
         irq_ = false;
         if (status_ & kFlush) {
             status_ &= ~kFlush;
@@ -278,7 +314,40 @@ void DbdmaChannel::run()
             wr32le(cmdPtr_ + 12, (0x8400u << 16) | 0u);
             break;
         }
-        case 5: // LOAD_QUAD: absorbed
+        case 5: { // LOAD_QUAD: read the quadlet at `address` — a DEVICE
+            // REGISTER is a legal target — and deposit it in the
+            // descriptor's OWN cmdDep word, where the driver reads it.
+            //
+            // ⭐ THIS OP IS THE MAC OS SOUND DRIVER'S CLOCK. Its interrupt
+            // handler ZEROES the codec's Frame Count register, arms a
+            // two-slice program with a LOAD_QUAD of that register before
+            // each OUTPUT, and sizes its next mix by the count the engine
+            // wrote back — a hardware timestamp of playback progress
+            // embedded in the command stream. Absorbing the op answered
+            // every cycle with "0 frames have played": the mixer produced
+            // one 512-frame slice per fallback kick against ~60 of silence,
+            // which the ear knows as sputtering rough garbage in every
+            // title while the ROM's polled chime stayed perfect.
+            //
+            // The copy is BYTE-ORDER-BLIND on purpose: read32/write32 both
+            // carry the bus's byte image, so the register's little-endian
+            // image lands in the little-endian descriptor exactly as the
+            // real engine's quadlet transfer does.
+            const u32 size = (req & 4u) ? 4u : (req & 2u) ? 2u : 1u;
+            dmaBus->snoopBeforeDmaRead(addr, size);
+            u32 img = 0;
+            if (size == 4)
+                img = dmaBus->read32(addr);
+            else if (size == 2)
+                img = (dmaBus->read8(addr) << 24) |
+                      (dmaBus->read8(addr + 1) << 16);
+            else
+                img = dmaBus->read8(addr) << 24;
+            dmaBus->write32(cmdPtr_ + 8, img);
+            note(8, addr, img);
+            wr32le(cmdPtr_ + 12, (0x8400u << 16) | 0u);
+            break;
+        }
         case 6: // NOP
             wr32le(cmdPtr_ + 12, (0x8400u << 16) | 0u);
             break;
@@ -307,8 +376,12 @@ void DbdmaChannel::run()
         // It applies to every command, not only the _LAST forms.
         // (01/10 are conditional on the channel's s0-s7 against intSelect;
         // no list in this machine uses them, so they read as "always".)
-        if (((w0 >> 20) & 3u) != 0)
+        if (((w0 >> 20) & 3u) != 0) {
             irq_ = true;
+            const int s = irqSlot(this);
+            if (s >= 0)
+                ++g_irqStats[s].set;
+        }
         // Branch, at word bits 19:18 by the same arithmetic. It is what
         // turns a list into a RING, which is what a continuous audio stream
         // needs and what no ATA list has ever used — the branch target is

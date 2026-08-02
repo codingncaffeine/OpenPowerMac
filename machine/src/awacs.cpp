@@ -9,6 +9,30 @@ namespace opm {
 static constexpr u32 kRates[8] = {44100, 29400, 22050, 17640,
                                   14700, 11025, 8820,  7350};
 
+// File-static register-traffic log — sizeof(AwacsCell) is in the snapshot
+// layout digest, so the cell itself must not grow. Ring capped the way the
+// channel event logs are: the TAIL is the story, not the first boot.
+static std::vector<AwacsRegEv> g_regLog;
+static const u64* g_regInsn = nullptr;
+static const u32* g_regPc = nullptr;
+
+const std::vector<AwacsRegEv>& awacsRegLog() { return g_regLog; }
+void awacsRegLogRefs(const u64* insn, const u32* pc)
+{
+    g_regInsn = insn;
+    g_regPc = pc;
+}
+
+static void rlog(u64 tb, u32 off, u32 native, u32 len, bool wr)
+{
+    if (g_regLog.size() >= 8192)
+        g_regLog.erase(g_regLog.begin(), g_regLog.begin() + 4096);
+    g_regLog.push_back({g_regInsn ? *g_regInsn : 0, tb,
+                        g_regPc ? *g_regPc : 0, native,
+                        static_cast<u16>(off), static_cast<u8>(len),
+                        static_cast<u8>(wr)});
+}
+
 u32 AwacsCell::rateHz() const { return kRates[(soundCtl_ >> 8) & 7u]; }
 
 u64 AwacsCell::frameCount() const
@@ -46,6 +70,7 @@ u32 AwacsCell::read(u32 off, u32 len) const
     case kFrameCount: native = static_cast<u32>(frameCount()); break;
     default: break;
     }
+    rlog(nowTb_, off, native, len, false);
     // Little-endian register file behind a big-endian bus: the guest reads
     // these with lwbrx, so the bus has to carry the reversed image.
     if (len == 4)
@@ -92,8 +117,19 @@ void AwacsCell::write(u32 off, u32 v, u32 len)
         break;
     case kClipCount: clipCount_ = native; break;
     case kByteSwap: byteSwap_ = native; break;
-    default: break; // Codec Status and Frame Count are read-only
+    case kFrameCount:
+        // WRITABLE, and the Mac OS sound driver depends on it: its interrupt
+        // handler zeroes this counter every cycle and reads elapsed playback
+        // back through a LOAD_QUAD of this register in its DBDMA program.
+        // While the write was ignored the counter never re-based, the
+        // driver's delta was garbage, and the mixer starved. The epoch
+        // re-anchors here exactly as a rate change re-anchors it.
+        frameVal_ = native;
+        frameTb_ = nowTb_;
+        break;
+    default: break; // Codec Status is read-only
     }
+    rlog(nowTb_, off, native, len, true);
 }
 
 // How many whole frames may be handed to the codec right now: everything the

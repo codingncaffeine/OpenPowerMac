@@ -1332,6 +1332,8 @@ int main(int argc, char** argv)
         bus.hd().latchTrace = true;
         bus.cd().latchTrace = true;
     }
+    // Audio interrupt accounting: set vs swallowed vs pulsed, per channel.
+    dbdmaWatchIrq(&bus.sndOut(), &bus.sndIn());
     if (wmapTo) {
         bus.wmapFrom = wmapFrom;
         bus.wmapTo = wmapTo;
@@ -5838,11 +5840,54 @@ int main(int argc, char** argv)
         for (u32 c = 0; c < 2; ++c) {
             const auto& dl = c ? bus.sndIn().log : bus.sndOut().log;
             printf("--   %s dbdma events (%zu; 0=ctl 1=desc 2=data 3=stop "
-                   "4=dead 5=storequad 7=branch):\n",
+                   "4=dead 5=storequad 7=branch 8=loadquad):\n",
                    c ? "audio-in" : "audio-out", dl.size());
             for (size_t k = 0; k < dl.size() && k < 24; ++k)
                 printf("     %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
                        dl[k].b, static_cast<unsigned long long>(dl[k].at));
+            if (dl.size() > 24) {
+                printf("     ... tail ...\n");
+                for (size_t k = dl.size() > 124 ? dl.size() - 100 : 24;
+                     k < dl.size(); ++k)
+                    printf("     %u %08x %08x @%llu\n", dl[k].kind, dl[k].a,
+                           dl[k].b, static_cast<unsigned long long>(dl[k].at));
+            }
+            const auto& st = dbdmaIrqStats(c);
+            printf("--   %s irq: set %llu, swallowed-by-ctl-write %llu, "
+                   "pulsed %llu\n",
+                   c ? "audio-in" : "audio-out",
+                   static_cast<unsigned long long>(st.set),
+                   static_cast<unsigned long long>(st.dropCtl),
+                   static_cast<unsigned long long>(st.pulsed));
+        }
+        printf("--   codec regs:");
+        for (u32 i = 0; i < 8; ++i)
+            printf(" %u=%03x", i, sc.codecReg(i));
+        printf("\n");
+        // The guest's own traffic on the codec's register window. The Frame
+        // Count reads are the ones that matter: the value the driver saw is
+        // what its next mix size was computed from.
+        const auto& rl = awacsRegLog();
+        static const char* kRegName[] = {"SoundCtl", "CodecCtl", "CodecStat",
+                                         "ClipCnt",  "ByteSwap", "FrameCnt"};
+        u64 perReg[6][2] = {};
+        for (const auto& e : rl)
+            if (e.off < 0x60)
+                ++perReg[e.off >> 4][e.wr ? 1 : 0];
+        printf("--   codec reg traffic (%zu):", rl.size());
+        for (u32 i = 0; i < 6; ++i)
+            if (perReg[i][0] || perReg[i][1])
+                printf("  %s r=%llu w=%llu", kRegName[i],
+                       static_cast<unsigned long long>(perReg[i][0]),
+                       static_cast<unsigned long long>(perReg[i][1]));
+        printf("\n");
+        for (size_t k = rl.size() > 80 ? rl.size() - 80 : 0; k < rl.size(); ++k) {
+            const auto& e = rl[k];
+            printf("--     %c %-8s len=%u %08x pc=%08x tb=%llu @%llu\n",
+                   e.wr ? 'w' : 'r',
+                   e.off < 0x60 ? kRegName[e.off >> 4] : "?", e.len, e.val,
+                   e.pc, static_cast<unsigned long long>(e.tb),
+                   static_cast<unsigned long long>(e.insn));
         }
     }
     if (wavOut) {
@@ -5886,6 +5931,26 @@ int main(int argc, char** argv)
         printf("-- wav: %zu bytes, roughness BE %.0f / LE %.0f -> samples "
                "read as %s-endian, peak %d\n",
                wavPcm.size(), rBe, rLe, srcBe ? "BIG" : "little", peak);
+        // The mix-starvation meter: 512-frame (2048-byte) slices with any
+        // sound in them, against all slices. A healthy continuous stream is
+        // ~all content; the session-39 fault read 15 of 861.
+        {
+            size_t content = 0, total = 0, gap = 0, maxGap = 0;
+            for (size_t at = 0; at + 2048 <= wavPcm.size(); at += 2048) {
+                ++total;
+                bool nz = false;
+                for (size_t k = 0; k < 2048; ++k)
+                    if (wavPcm[at + k]) { nz = true; break; }
+                if (nz) {
+                    ++content;
+                    gap = 0;
+                } else if (++gap > maxGap)
+                    maxGap = gap;
+            }
+            printf("-- wav: content slices %zu of %zu, longest silent gap "
+                   "%zu slices\n",
+                   content, total, maxGap);
+        }
         FILE* f = fopen(wavOut, "wb");
         if (!f) {
             printf("-- wav: cannot write %s\n", wavOut);

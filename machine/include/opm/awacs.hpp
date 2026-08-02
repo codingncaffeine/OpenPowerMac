@@ -75,9 +75,22 @@ public:
     // "did you return zero" left the ROM's chime spinning on a list that
     // nothing ever resumed. See SawtoothBus::soundDueTb.
     //
-    // The deadline is a HALF-EMPTY FIFO rather than a byte of room, because
-    // a wake per byte is a wake per service call: refilling from half to
-    // full moves 4 KB, which is 23 ms of guest audio.
+    // ⭐ THE DEADLINE IS ONE DESCRIPTOR'S WORTH OF ROOM, NOT HALF THE FIFO —
+    // and the difference is whether Mac OS sound works at all. The OS
+    // driver's program is a self-modifying ping-pong: 2 KB slice, STORE_QUAD
+    // flag + interrupt, 2 KB slice, flag + interrupt, STOP — and the mix
+    // path PULLS THE STOP (rewrites it to a NOP) when the slice-A interrupt
+    // arrives, which on hardware is 11.6 ms before the engine reaches it,
+    // with the channel still RUN|ACTIVE inside slice B. A half-FIFO wake
+    // handed the engine 4 KB = the WHOLE program in one instant: both flag
+    // writes (the second overwrote the first), STOP reached, channel idle —
+    // so every interrupt showed the driver a dead stream and it took its
+    // restart path instead of refilling: one 512-frame slice of music per
+    // ~30 of silence, in every title, at any speed, while the ROM's polled
+    // chime stayed perfect. Waking at descriptor granularity spreads
+    // completions the way the FIFO actually drains, and the driver wins the
+    // race the way it does on silicon. (Session 39; the measured program is
+    // the receipt, wp/tri logs in scratch.)
     u64 outDueTb() const { return dueTb(playTb_); }
     u64 inDueTb() const { return dueTb(recTb_); }
 
@@ -130,8 +143,12 @@ private:
     u32 credit(u64& cursorTb);
     u64 dueTb(u64 cursorTb) const
     {
-        const u64 halfTb = tbForBytes(kFifoBytes / 2);
-        return cursorTb > halfTb ? cursorTb - halfTb : 0ull;
+        // Wake when kFifoBytes/4 = 0x800 of room exists — the size of the
+        // OS driver's streaming descriptor. Queued bytes at the wake are
+        // FIFO − room, so the margin is denominated in what is still
+        // QUEUED, not in the room itself.
+        const u64 margin = tbForBytes(kFifoBytes - kFifoBytes / 4);
+        return cursorTb > margin ? cursorTb - margin : 0ull;
     }
 
     u32 soundCtl_ = 0, codecCtl_ = 0, clipCount_ = 0, byteSwap_ = 0;
@@ -170,5 +187,18 @@ private:
     // and the cap are multiples of kFrameBytes).
     static constexpr size_t kRingCap = 0x8000; // 186 ms at 44.1 kHz stereo
 };
+
+// Guest traffic on the codec's six registers, kept OUTSIDE the class —
+// sizeof(AwacsCell) is in the snapshot layout digest. `val` is the NATIVE
+// (little-endian-image) register value: for reads, what the guest was
+// answered; for writes, the post-lane-merge image the register took.
+struct AwacsRegEv {
+    u64 insn, tb;
+    u32 pc, val;
+    u16 off;
+    u8 len, wr;
+};
+const std::vector<AwacsRegEv>& awacsRegLog();
+void awacsRegLogRefs(const u64* insn, const u32* pc); // wired with the bus
 
 } // namespace opm

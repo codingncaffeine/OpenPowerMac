@@ -605,6 +605,7 @@ public:
             return;
         pic_.setLine(src, true);
         pic_.setLine(src, false);
+        dbdmaNotePulse(&ch);
         ch.clearIrq();
     }
 
@@ -890,6 +891,7 @@ public:
         sndOut_.stamp = sndIn_.stamp = s;
         for (DbdmaChannel& ch : dmaGen_)
             ch.stamp = s;
+        awacsRegLogRefs(s, pcRef);
     }
     void setPcRef(const u32* p)
     {
@@ -901,6 +903,7 @@ public:
         sndOut_.pcRef = sndIn_.pcRef = p;
         for (DbdmaChannel& ch : dmaGen_)
             ch.pcRef = p;
+        awacsRegLogRefs(stamp, p);
     }
 
     size_t ramBytes() const { return ram_.size(); }

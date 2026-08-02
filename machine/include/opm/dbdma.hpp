@@ -109,4 +109,17 @@ private:
     bool irq_ = false;
 };
 
+// Interrupt bookkeeping for the two audio channels, kept OUTSIDE the class:
+// sizeof(DbdmaChannel) is in the snapshot layout digest, so a member would
+// orphan every snapshot. Slot 0 = audio out, slot 1 = audio in.
+struct DbdmaIrqStats {
+    u64 set = 0;     // completions whose i-bits latched irq_
+    u64 dropCtl = 0; // a ChannelControl write cleared irq_ while it was
+                     // PENDING — a completion the PIC never saw
+    u64 pulsed = 0;  // times the machine's edge actually reached the PIC
+};
+void dbdmaWatchIrq(const DbdmaChannel* out, const DbdmaChannel* in);
+const DbdmaIrqStats& dbdmaIrqStats(u32 slot);
+void dbdmaNotePulse(const DbdmaChannel* ch);
+
 } // namespace opm

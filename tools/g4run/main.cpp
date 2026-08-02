@@ -511,6 +511,7 @@ int main(int argc, char** argv)
     // --no-icache: bypass the fetch block cache, the cached decode and the
     // instruction translation cache (the control for all three).
     bool icache = true;
+    bool dxlate = true;
     // --no-nap-skip: step an asleep processor one instruction at a time (the
     // control for machine/include/opm/pace.hpp).
     bool napSkipOn = true;
@@ -701,6 +702,7 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--bench")) { bench = true; continue; }
         if (!strcmp(a, "--no-dev-gate")) { devGate = false; continue; }
         if (!strcmp(a, "--no-icache")) { icache = false; continue; }
+        if (!strcmp(a, "--no-dxlate")) { dxlate = false; continue; }
         // The control for the nap skip. Every other cache and gate in here
         // ships with the switch that turns it off, because that is the only
         // way a claim about one gets settled.
@@ -1363,6 +1365,7 @@ int main(int argc, char** argv)
     // the default, --no-ohci-port-power must be able to put the old state back.
     bus.devGateOff = !devGate;
     cpu.fetchCacheOff = !icache;
+    cpu.dxlCacheOff = !dxlate;
     cpu.lineExecOff = lineExecOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);
     bus.ohci(1).setLivePortPower(ohciPortPower);

@@ -323,6 +323,40 @@ bool Cpu::leAlignCheck(u32 ea, u32 len)
     return false;
 }
 
+// The data path's translation front: one page per direction, validated the
+// way the fetch cache in fetchDecoded is (MSR data bits + segment register
+// compared per access, everything else carried by mmuGen). The direction
+// split is load-bearing — see the field comment in cpu.hpp: only a store's
+// own walk sets the page table's C bit, so a store must never ride a
+// translation a load filled. The marker matters for the same reason the
+// fetch path's does: on a hit translate() never runs, and unmarked compare
+// work would bill itself to the caller's bucket.
+bool Cpu::xlateData(u32 ea, bool write, u32& pa, u32& wimg)
+{
+    OPM_MARK(Xlate);
+    if (dxlCacheOff)
+        return translate(ea, write, false, pa, &wimg);
+    const u32 page = ea >> 12;
+    const u32 msrKey = st.msr & (msr::DR | msr::PR | msr::LE);
+    const u32 srKey = st.sr[ea >> 28];
+    const int d = write ? 1 : 0;
+    if (dxlGen[d] == mmuGen && dxlPage[d] == page && dxlMsr[d] == msrKey &&
+        dxlSr[d] == srKey) {
+        pa = dxlPa[d] | (ea & 0xFFFu);
+        wimg = dxlWimg[d];
+        return true;
+    }
+    if (!translate(ea, write, false, pa, &wimg))
+        return false;
+    dxlGen[d] = mmuGen;
+    dxlPage[d] = page;
+    dxlMsr[d] = msrKey;
+    dxlSr[d] = srKey;
+    dxlPa[d] = pa & ~0xFFFu;
+    dxlWimg[d] = wimg;
+    return true;
+}
+
 bool Cpu::readV(u32 ea, u32 len, u64& out)
 {
     out = 0;
@@ -351,7 +385,7 @@ bool Cpu::readV(u32 ea, u32 len, u64& out)
         ea ^= len == 1 ? 7u : (len == 2 ? 6u : 4u);
     }
     if (((ea ^ (ea + len - 1)) & ~0xFFFu) == 0) {
-        if (!translate(ea, false, false, pa, &wimg))
+        if (!xlateData(ea, false, pa, wimg))
             return false;
         out = memRead(pa, len, wimg);
         return true;
@@ -389,7 +423,7 @@ bool Cpu::writeV(u32 ea, u32 len, u64 v)
         ea ^= len == 1 ? 7u : (len == 2 ? 6u : 4u);
     }
     if (((ea ^ (ea + len - 1)) & ~0xFFFu) == 0) {
-        if (!translate(ea, true, false, pa, &wimg))
+        if (!xlateData(ea, true, pa, wimg))
             return false;
         memWrite(pa, len, v, wimg);
         return true;

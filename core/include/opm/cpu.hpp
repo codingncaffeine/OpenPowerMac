@@ -708,10 +708,31 @@ struct Cpu {
     u64 mmuGen = 0, xlGen = ~0ull;
     u32 xlPage = 0, xlPa = 0, xlMsr = 0, xlSr = 0;
     void xlDrop() { xlGen = ~0ull; }
+    // ---- data translation caches, one page per DIRECTION ------------------
+    //
+    // The data twins of the instruction cache above, and the reason they are
+    // split by direction is the page table's C bit: the walk for a STORE
+    // sets it and the walk for a load does not, so a store served from a
+    // translation a load filled would leave a dirty page looking clean to
+    // the OS's pager. Each entry fills only from its own direction's
+    // successful walk; failures never fill. WIMG rides along so a cached
+    // hit routes MMIO exactly as the walk would. Validity is the fetch
+    // cache's contract item for item: MSR's data bits and the segment
+    // register compared per access, the BATs / SDR1 / page table / TLB
+    // carried by mmuGen (SPRs 25 and 528-543 bump it; so do tlbie/tlbia).
+    // Lives out here with the other caches: no snapshot cost, and a resumed
+    // machine simply misses once per direction.
+    u64 dxlGen[2] = {~0ull, ~0ull};
+    u32 dxlPage[2] = {}, dxlPa[2] = {}, dxlMsr[2] = {}, dxlSr[2] = {};
+    u32 dxlWimg[2] = {};
     // DIAGNOSTIC (--no-icache): bypass the fetch block cache, the cached
     // decode and this translation cache all at once, restoring the fetch path
     // byte for byte as it was before they existed. See Cpu::fetchDecoded.
     bool fetchCacheOff = false;
+    // DIAGNOSTIC (--no-dxlate): bypass the data translation caches, walking
+    // every data access as before they existed. Same rule as --no-icache: a
+    // cache is a claim, and the claim's control run needs a switch.
+    bool dxlCacheOff = false;
     // Census, counted only in the profiling build. A cache is a bet on
     // locality and a bet has to be settled with a number.
     u64 fetchHits = 0, fetchFillsL1 = 0, fetchFillsL2 = 0, fetchFillsMem = 0,
@@ -877,6 +898,10 @@ struct Cpu {
     // requested, receives the access's WIMG nibble (W=8,I=4,M=2,G=1; real
     // mode reads as 0b0011 per PEM 7.2).
     bool translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg = nullptr);
+    // translate() through the one-page data caches (see dxlGen above): the
+    // data path's equivalent of the fetch cache in fetchDecoded. Guest data
+    // accesses only — instruments and probes keep calling translate().
+    bool xlateData(u32 ea, bool write, u32& pa, u32& wimg);
     bool readV(u32 ea, u32 len, u64& out);
     bool writeV(u32 ea, u32 len, u64 v);
     bool fetch32(u32 ea, u32& insn);

@@ -295,6 +295,43 @@ struct SymTab {
     }
 };
 
+// --mouse-beat BEAT:X,Y[:click|:dbl] — the struct and its parser live OUT
+// HERE because the option ladder in main sits at MSVC's block-nesting
+// ceiling (C1061): one more braced arm with its own ifs inside does not
+// compile. The option is matched ahead of the ladder with the other
+// hoisted flags, and it is called --mouse-beat because --mouse-at was
+// already taken by the motion-cadence diagnostic.
+struct MouseBeat {
+    u64 at = 0;
+    int x = 0, y = 0;
+    int clicks = 0; // 0 = move only, 1 = click, 2 = double click
+};
+void parseMouseAt(const char* v, std::vector<MouseBeat>& out)
+{
+    MouseBeat mb;
+    char* p = nullptr;
+    mb.at = strtoull(v, &p, 0);
+    bool ok = p && *p == ':';
+    if (ok) {
+        mb.x = static_cast<int>(strtol(p + 1, &p, 0));
+        ok = *p == ',';
+    }
+    if (ok)
+        mb.y = static_cast<int>(strtol(p + 1, &p, 0));
+    if (ok && *p == ':') {
+        if (!strcmp(p + 1, "click")) mb.clicks = 1;
+        else if (!strcmp(p + 1, "dbl")) mb.clicks = 2;
+        else ok = false;
+    } else if (ok && *p)
+        ok = false;
+    if (ok)
+        out.push_back(mb);
+    else
+        printf("-- --mouse-beat %s malformed (want BEAT:X,Y[:click|:dbl]); "
+               "IGNORED\n",
+               v);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -407,6 +444,13 @@ int main(int argc, char** argv)
     u64 snapAt = 0;                    // --snapshot-at N
     const char* snapOut = nullptr;     // --snapshot-out FILE
     const char* resumeFrom = nullptr;  // --resume-from FILE
+    // --mouse-beat BEAT:X,Y[:click|:dbl] (repeatable): scripted pointer
+    // work, beats in instructions like --snapshot-at, coordinates absolute
+    // from the top-left. The P7 loop needs a run to double-click a CD icon
+    // and then a game without the user's hands; see the state machine ahead
+    // of the run loop for how absolute positions are reached with a
+    // delta-only pointer. Struct + parser are file-scope (C1061).
+    std::vector<MouseBeat> mouseBeats;
     // --bench: run the loop THE APP RUNS. g4run's own loop carries the whole
     // instrument set — including a std::map probe per instruction for the
     // first-visit census — so its MIPS figure is the harness's speed, not the
@@ -620,6 +664,9 @@ int main(int argc, char** argv)
         // below is already at MSVC's nesting limit (C1061).
         if (!strcmp(a, "--sound")) { soundOn = true; continue; }
         if (!strcmp(a, "--no-sound")) { soundOn = false; continue; }
+        // --mouse-beat, NOT --mouse-at: that name was already taken by the
+        // motion-cadence diagnostic below, and this ladder cannot grow.
+        if (!strcmp(a, "--mouse-beat")) { parseMouseAt(next(), mouseBeats); continue; }
         if (!strcmp(a, "--wav-out") && i + 1 < argc) {
             wavOut = argv[++i];
             continue;
@@ -943,7 +990,11 @@ int main(int argc, char** argv)
                     "       speed: --bench (the loop the app runs, no "
                     "instrumentation)\n"
                     "              --profile HZ (g4prof only: sample where "
-                    "the host time goes)\n");
+                    "the host time goes)\n"
+                    "       mouse: --mouse-beat N:X,Y[:click|:dbl] "
+                    "(repeatable; beat in instructions,\n"
+                    "              absolute px from top-left; dumps "
+                    "ati_mouse_bK.ppm at each aim)\n");
             return 2;
         }
     }
@@ -1806,6 +1857,180 @@ int main(int argc, char** argv)
     std::map<u32, u64> pc68Hist; // 68K-pc (r24) census inside the
                                  // emulator: names the 68K busy loop
 
+    // --- The scripted pointer (--mouse-beat) -------------------------------
+    //
+    // The guest's cursor is positioned by DELTAS: USB reports feed the
+    // Cursor Device Manager's accumulators and JCrsrTask drains them into
+    // the pointer once per vblank. An absolute coordinate is therefore
+    // reached in two moves — pin the pointer into the top-left corner with
+    // a delta no screen can absorb, let the drain clamp it at (0,0), then
+    // walk out to the target. Every stage advances on the machine's OWN
+    // signals (OHCI reports the injection delivered, then a couple of
+    // vblanks for the guest-side drain), with an instruction timeout so a
+    // stalled guest cannot stall the script; fixed waits are how a script
+    // works at one --fast-tb setting and silently misses at another.
+    //
+    // Progress is stated as NUMBERS (the cursor-position register at each
+    // stage) — the per-beat ppm dumps are calibration artifacts for the
+    // user's eyes, never this script's input.
+    std::sort(mouseBeats.begin(), mouseBeats.end(),
+              [](const MouseBeat& a, const MouseBeat& b) {
+                  return a.at < b.at;
+              });
+    size_t mbIdx = 0;
+    for (; mbIdx < mouseBeats.size() && mouseBeats[mbIdx].at < executed;
+         ++mbIdx)
+        printf("-- mouse beat @%llu SKIPPED: before this run's first "
+               "instruction (%llu)\n",
+               static_cast<unsigned long long>(mouseBeats[mbIdx].at),
+               static_cast<unsigned long long>(executed));
+    int mbStage = 0;
+    u64 mbInsn0 = 0, mbIdleVbl = 0;
+    bool mbIdleSeen = false;
+    constexpr u64 kMbStageTimeout = 60000000ull; // insns; a safety valve
+    // A screen dump for the user at any beat (the final report keeps its
+    // own, with the scanline census). Cursor composited: these exist to
+    // calibrate pointer coordinates, and the pointer lives in the cursor
+    // engine, not in VRAM.
+    auto dumpScreen = [&](const char* path) {
+        const R128Scan sc = r128ScanDecode(bus.ati());
+        if (!sc.enabled || !sc.bypp || sc.w < 64 || sc.w > 2048 ||
+            sc.h < 64 || sc.h > 1536) {
+            printf("-- screen dump %s SKIPPED: fmt %u (%s) not renderable\n",
+                   path, sc.fmt, r128ScanFmtName(sc.fmt));
+            return;
+        }
+        std::vector<u8> frame(size_t(sc.w) * sc.h * 4u);
+        for (u32 y = 0; y < sc.h; ++y)
+            r128ScanRow(bus.ati(), sc, y,
+                        frame.data() + size_t(y) * sc.w * 4u);
+        r128ScanCursor(bus.ati(), sc, frame.data());
+        FILE* pf = fopen(path, "wb");
+        if (!pf)
+            return;
+        fprintf(pf, "P6\n%u %u\n255\n", sc.w, sc.h);
+        for (size_t k = 0; k < size_t(sc.w) * sc.h; ++k) {
+            const u8 rgb[3] = {frame[k * 4 + 2], frame[k * 4 + 1],
+                               frame[k * 4 + 0]};
+            fwrite(rgb, 1, 3, pf);
+        }
+        fclose(pf);
+        printf("-- screen dumped: %s (%ux%u fmt %u %s)\n", path, sc.w,
+               sc.h, sc.fmt, r128ScanFmtName(sc.fmt));
+    };
+    auto mouseMark = [&]() {
+        mbInsn0 = executed;
+        mbIdleSeen = false;
+        mbIdleVbl = 0;
+    };
+    // Delivered-and-drained: the OHCI accumulators are empty (every injected
+    // report is on the wire), and settleVbls vblanks have passed since —
+    // JCrsrTask has had its turns at the guest-side accumulators.
+    auto mouseSettled = [&](u64 settleVbls) {
+        if (executed - mbInsn0 >= kMbStageTimeout) {
+            printf("-- mouse beat %zu stage %d TIMED OUT after %llu insns "
+                   "(vbl %llu, mouseIdle=%d); advancing anyway\n",
+                   mbIdx + 1, mbStage,
+                   static_cast<unsigned long long>(kMbStageTimeout),
+                   static_cast<unsigned long long>(bus.ati().vblanks),
+                   bus.ohci(1).mouseIdle() ? 1 : 0);
+            return true;
+        }
+        if (!mbIdleSeen) {
+            if (!bus.ohci(1).mouseIdle())
+                return false;
+            mbIdleSeen = true;
+            mbIdleVbl = bus.ati().vblanks;
+        }
+        return bus.ati().vblanks >= mbIdleVbl + settleVbls;
+    };
+    auto mouseInject = [&](int dx, int dy, u8 btn, const char* what) {
+        bus.ohci(1).moveMouse(dx, dy, btn);
+        bus.deviceStateChanged();
+        const u32 posn = bus.ati().peek(0x0264);
+        printf("-- mouse beat %zu: %s @%llu (cursor reg %u,%u  vbl %llu)\n",
+               mbIdx + 1, what, static_cast<unsigned long long>(executed),
+               (posn >> 16) & 0xFFFFu, posn & 0xFFFFu,
+               static_cast<unsigned long long>(bus.ati().vblanks));
+        fflush(stdout);
+        mouseMark();
+    };
+    auto mouseDone = [&]() {
+        const u32 posn = bus.ati().peek(0x0264);
+        printf("-- mouse beat %zu/%zu COMPLETE @%llu (cursor reg %u,%u)\n",
+               mbIdx + 1, mouseBeats.size(),
+               static_cast<unsigned long long>(executed),
+               (posn >> 16) & 0xFFFFu, posn & 0xFFFFu);
+        fflush(stdout);
+        ++mbIdx;
+        mbStage = 0;
+    };
+    // Beats run strictly in order; a beat whose time arrives while an
+    // earlier sequence is mid-flight starts when that sequence completes.
+    auto mouseStep = [&]() {
+        if (mbIdx >= mouseBeats.size())
+            return;
+        const auto& mb = mouseBeats[mbIdx];
+        switch (mbStage) {
+        case 0: // waiting for the beat
+            if (executed < mb.at)
+                return;
+            mouseInject(-4096, -4096, 0, "pin to top-left");
+            mbStage = 1;
+            break;
+        case 1: // pinned and drained: walk out to the target
+            if (!mouseSettled(3))
+                return;
+            mouseInject(mb.x, mb.y, 0, "move to target");
+            mbStage = 2;
+            break;
+        case 2: // on target: calibration dump, then the button work
+            if (!mouseSettled(2))
+                return;
+            {
+                char nm[64];
+                snprintf(nm, sizeof nm, "ati_mouse_b%zu.ppm", mbIdx + 1);
+                dumpScreen(nm);
+            }
+            if (mb.clicks == 0) {
+                mouseDone();
+                return;
+            }
+            mouseInject(0, 0, 1, "button down");
+            mbStage = 3;
+            break;
+        case 3:
+            if (!mouseSettled(1))
+                return;
+            mouseInject(0, 0, 0, "button up");
+            mbStage = 4;
+            break;
+        case 4:
+            if (!mouseSettled(1))
+                return;
+            if (mb.clicks == 2) {
+                // Two downs inside the guest's DoubleTime (default 12
+                // ticks): one vblank of separation keeps the pair well
+                // under it while still giving each transition its poll.
+                mouseInject(0, 0, 1, "button down (2nd)");
+                mbStage = 5;
+            } else
+                mouseDone();
+            break;
+        case 5:
+            if (!mouseSettled(1))
+                return;
+            mouseInject(0, 0, 0, "button up (2nd)");
+            mbStage = 6;
+            break;
+        case 6:
+            if (!mouseSettled(1))
+                return;
+            mouseDone();
+            break;
+        }
+    };
+
     if (profHz) {
 #if OPM_PROFILING
         if (prof::start(profHz, &cpu.st.pc))
@@ -1822,6 +2047,11 @@ int main(int argc, char** argv)
     // number that includes the measurement is a number about g4run.
     if (bench)
         while (executed < maxInsns && !cpu.halted) {
+            // The scripted pointer advances between batches: a batch is
+            // bounded by the next device deadline (the vblank at the
+            // longest), so stage latency stays under a frame.
+            if (mbIdx < mouseBeats.size())
+                mouseStep();
             // ⏳ NOTHING TO DO, AND THE CLOCK COMES FROM OUTSIDE — so wait for
             // the guest's next deadline instead of spinning through asleep
             // steps to discover the same thing. The previous trip round the
@@ -1919,6 +2149,8 @@ int main(int argc, char** argv)
                        "nothing written\n");
             fflush(stdout);
         }
+        if (mbIdx < mouseBeats.size())
+            mouseStep();
         fingerprint(executed);
         cpu.step();
         OPM_PH(Instr);
@@ -5572,18 +5804,20 @@ int main(int argc, char** argv)
     if (bus.atiPresent()) {
         // CRTC-aware screen dump: geometry straight from the live CRTC
         // registers, palette from the DAC; the PPM is the machine's
-        // first light (user-verified — never self-judged).
+        // first light (user-verified — never self-judged). Decode and
+        // pixel conversion come from the machine lib (r128ScanDecode /
+        // r128ScanRow) — ONE truth table with capi's opm_screen, because
+        // the two copies drifted twice (olive desktop; refused 15/16 bpp).
+        const R128Scan scan = r128ScanDecode(bus.ati());
         const u32 gen = bus.ati().peek(0x0050);
-        const u32 ht = bus.ati().peek(0x0200);
-        const u32 vt = bus.ati().peek(0x0208);
-        const u32 pitch8 = bus.ati().peek(0x022C) & 0xFFFFu;
-        const u32 offset = bus.ati().peek(0x0224);
-        const u32 w = (((ht >> 16) & 0x3FFu) + 1u) * 8u;
-        const u32 h = ((vt >> 16) & 0xFFFu) + 1u;
-        const u32 fmt = (gen >> 8) & 0xFu;
-        printf("-- ati crtc: gen=%08x %ux%u fmt=%u pitch8=%u "
+        const u32 pitch8 = scan.pitch8;
+        const u32 offset = scan.offset;
+        const u32 w = scan.w;
+        const u32 h = scan.h;
+        const u32 fmt = scan.fmt;
+        printf("-- ati crtc: gen=%08x %ux%u fmt=%u (%s) pitch8=%u "
                "offset=%08x\n",
-               gen, w, h, fmt, pitch8, offset);
+               gen, w, h, fmt, r128ScanFmtName(fmt), pitch8, offset);
         // The hardware cursor as the guest left it. Mac OS draws its pointer
         // with the cursor engine rather than into the framebuffer, so this is
         // the only place a missing pointer shows up at all.
@@ -5873,8 +6107,8 @@ int main(int argc, char** argv)
                    "w*h*4=%u\n",
                    span, w * h, w * h * 2u, w * h * 4u);
             printf("--   row-stride probe (lower = more likely):\n");
-            for (u32 stride : {w, w * 2u, w * 3u, w * 4u,
-                               pitch8 * 8u, pitch8 * 16u, pitch8 * 32u}) {
+            for (u32 stride : {w, w * 2u, w * 3u, w * 4u, pitch8 * 8u,
+                               pitch8 * 16u, pitch8 * 24u, pitch8 * 32u}) {
                 if (!stride || lo + 2 * size_t(stride) > vr.size())
                     continue;
                 u64 sum = 0, n = 0;
@@ -5901,38 +6135,24 @@ int main(int argc, char** argv)
             printf("--   distinct values per byte lane: %u %u %u %u\n",
                    laneN[0], laneN[1], laneN[2], laneN[3]);
         }
-        if ((gen & 0x02000000u) && w >= 64 && w <= 2048 && h >= 64 &&
-            h <= 1536 && (fmt == 2u || fmt == 6u)) {
-            const u32 bypp = fmt == 2u ? 1u : 4u;
-            const u32 rowBytes = pitch8 * 8u * bypp;
+        if (scan.enabled && scan.bypp && w >= 64 && w <= 2048 && h >= 64 &&
+            h <= 1536) {
+            const u32 bypp = scan.bypp;
+            const u32 rowBytes = scan.rowBytes;
             FILE* pf = fopen("ati_screen.ppm", "wb");
             if (pf) {
                 fprintf(pf, "P6\n%u %u\n255\n", w, h);
                 const auto& vr = bus.ati().vram;
-                for (u32 y = 0; y < h; ++y)
+                std::vector<u8> rowBgra(size_t(w) * 4u);
+                for (u32 y = 0; y < h; ++y) {
+                    r128ScanRow(bus.ati(), scan, y, rowBgra.data());
                     for (u32 x = 0; x < w; ++x) {
-                        const size_t o = offset + size_t(y) * rowBytes +
-                                         size_t(x) * bypp;
-                        u8 rgb[3] = {0, 0, 0};
-                        if (o + bypp <= vr.size()) {
-                            if (fmt == 2u) {
-                                const u32 c = bus.ati().pal(vr[o]);
-                                rgb[0] = static_cast<u8>(c >> 16);
-                                rgb[1] = static_cast<u8>(c >> 8);
-                                rgb[2] = static_cast<u8>(c);
-                            } else {
-                                // Big-endian xRGB: byte 0 is the unused lane.
-                                // This read 0,1,2 as B,G,R and rendered a grey
-                                // desktop olive -- the same defect the C API
-                                // scanout had, and the reason the two must be
-                                // kept saying the same thing.
-                                rgb[0] = vr[o + 1];
-                                rgb[1] = vr[o + 2];
-                                rgb[2] = vr[o + 3];
-                            }
-                        }
+                        const u8 rgb[3] = {rowBgra[x * 4 + 2],
+                                           rowBgra[x * 4 + 1],
+                                           rowBgra[x * 4 + 0]};
                         fwrite(rgb, 1, 3, pf);
                     }
+                }
                 fclose(pf);
                 // ⚠⚠ WHETHER THE SCREEN HAS ANYTHING ON IT, stated as a
                 // number. `ati paint` counts bytes ever written and SATURATES

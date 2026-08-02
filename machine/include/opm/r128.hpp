@@ -226,6 +226,40 @@ private:
 // See the census in r128.cpp for why this is separate from readCount.
 const std::map<u32, u64>& r128RegReadsUnbacked();
 
+// --- The scan-out: what the CRTC is displaying, decoded ONCE ---------------
+//
+// Two harnesses read the framebuffer — capi's opm_screen for the app and
+// g4run's ppm dump for the gates — and each carried its own copy of the CRTC
+// decode and the pixel conversion. They drifted once already (the olive
+// desktop: 32 bpp read as little-endian in one of them), and they agreed on a
+// second defect: both refused every pixel format except 8 and 32 bpp, so a
+// game that switched the display to 15/16 bpp played to a harness that
+// rendered nothing at all — while the machine underneath was alive and
+// beeping. One decode, one conversion table, both callers.
+//
+// Free functions, deliberately: a member would change sizeof(R128Cell) and
+// therefore sizeof(SawtoothBus), which the snapshot layout digest hashes.
+struct R128Scan {
+    bool enabled = false; // CRTC_GEN_CNTL bit 25: CRTC_EN
+    u32 fmt = 0;          // CRTC_GEN_CNTL[11:8]: CRTC_PIX_WIDTH
+    u32 w = 0, h = 0;     // display size in pixels, from H/V_TOTAL_DISP
+    u32 pitch8 = 0;       // CRTC_PITCH: row stride in 8-pixel units
+    u32 offset = 0;       // CRTC_OFFSET: byte address of the top-left pixel
+    u32 bypp = 0;         // bytes per pixel; 0 = a format this cannot scan
+    u32 rowBytes = 0;     // pitch8 * 8 * bypp
+};
+R128Scan r128ScanDecode(const R128Cell& c);
+// A short name for the format, for reports: "8bpp CLUT", "15bpp 1555", ...
+const char* r128ScanFmtName(u32 fmt);
+// One display row, VRAM to host BGRA (B,G,R,X=FF per pixel; `out` holds
+// s.w * 4 bytes). Pixels past the end of VRAM render black.
+void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out);
+// The hardware cursor, composited over a full s.w × s.h BGRA frame. Mac OS
+// draws its pointer with the card's cursor engine, not into the framebuffer,
+// so a scan-out that reads VRAM alone shows no pointer at all. No-op unless
+// CRTC_GEN_CNTL bit 16 (cursor enable) is set.
+void r128ScanCursor(const R128Cell& c, const R128Scan& s, u8* bgra);
+
 // --- The engine command stream, in order ---------------------------------
 //
 // The register census says WHICH engine registers the guest touches, and the

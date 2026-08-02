@@ -627,6 +627,32 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
         }
     }
+    // 🖥 WHAT MODE THE SCREEN IS IN, as numbers. The Nanosaur black screen
+    // was undiagnosable live because nothing printed the CRTC state: the
+    // game had switched the display to a format the scan-out refused, and
+    // the only symptom was an app window with nothing in it. This line
+    // makes "what is the display doing" a click instead of a build.
+    {
+        const R128Scan sc = r128ScanDecode(m->bus->ati());
+        const u32 gen = m->bus->ati().peek(0x0050);
+        snprintf(b, sizeof b,
+                 "-- ati crtc: gen_cntl=%08x fmt=%u (%s) %ux%u pitch8=%u "
+                 "(rowBytes=%u) offset=%08x\n"
+                 "--   crtc_en=%d cursor_en=%d => scan-out %s\n",
+                 gen, sc.fmt, r128ScanFmtName(sc.fmt), sc.w, sc.h, sc.pitch8,
+                 sc.rowBytes, sc.offset, sc.enabled ? 1 : 0,
+                 (gen & 0x00010000u) ? 1 : 0,
+                 (sc.enabled && sc.bypp && sc.w >= 64 && sc.w <= 2048 &&
+                  sc.h >= 64 && sc.h <= 1536)
+                     ? "RENDERABLE"
+                     : "REFUSED (the app window shows nothing in this mode)");
+        s += b;
+        const u32 posn = m->bus->ati().peek(0x0264);
+        snprintf(b, sizeof b, "--   cursor at (%u,%u) offset=%08x\n",
+                 (posn >> 16) & 0xFFFFu, posn & 0xFFFFu,
+                 m->bus->ati().peek(0x0260) & 0x07FFFFFFu);
+        s += b;
+    }
     // 🎨 THE COMMAND ENGINE, because "the desktop froze mid-redraw" is a
     // question about the packet stream: a healthy stream has zero (or a
     // packet's worth of) staged words; a large backlog behind one absurd
@@ -1081,113 +1107,27 @@ OPM_API uint64_t opm_audio_played(const OpmMachine* m)
 OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
                            uint32_t* w, uint32_t* h)
 {
+    // Decode and conversion live in the machine lib (r128ScanDecode /
+    // r128ScanRow / r128ScanCursor) so this and g4run's ppm dump cannot
+    // drift — the olive-desktop byte-order bug and the refused-15/16-bpp
+    // black screen were both two-copies defects. bypp == 0 is the one
+    // refusal left: a format the shared table cannot scan.
     R128Cell& ati = m->bus->ati();
-    const u32 gen = ati.peek(0x0050);
-    if (!(gen & 0x02000000u))
-        return -1;
-    const u32 ht = ati.peek(0x0200);
-    const u32 vt = ati.peek(0x0208);
-    const u32 pitch8 = ati.peek(0x022C) & 0xFFFFu;
-    const u32 offset = ati.peek(0x0224);
-    const u32 fmt = (gen >> 8) & 0xFu;
-    const u32 sw = (((ht >> 16) & 0x3FFu) + 1u) * 8u;
-    const u32 sh = ((vt >> 16) & 0xFFFu) + 1u;
-    if (sw < 64 || sw > 2048 || sh < 64 || sh > 1536 ||
-        (fmt != 2u && fmt != 6u))
+    const R128Scan sc = r128ScanDecode(ati);
+    if (!sc.enabled || !sc.bypp || sc.w < 64 || sc.w > 2048 || sc.h < 64 ||
+        sc.h > 1536)
         return -1;
     if (w)
-        *w = sw;
+        *w = sc.w;
     if (h)
-        *h = sh;
-    if (!bgra || cap < sw * sh * 4u)
+        *h = sc.h;
+    if (!bgra || cap < sc.w * sc.h * 4u)
         return 0;
-    const u32 bypp = fmt == 2u ? 1u : 4u;
-    const u32 rowBytes = pitch8 * 8u * bypp;
-    const auto& vr = ati.vram;
-    for (u32 y = 0; y < sh; ++y) {
-        uint8_t* out = bgra + size_t(y) * sw * 4u;
-        const size_t row = offset + size_t(y) * rowBytes;
-        for (u32 x = 0; x < sw; ++x) {
-            uint8_t b = 0, g = 0, r = 0;
-            const size_t o = row + size_t(x) * bypp;
-            if (o + bypp <= vr.size()) {
-                if (fmt == 2u) {
-                    const u32 c = ati.pal(vr[o]);
-                    r = static_cast<uint8_t>(c >> 16);
-                    g = static_cast<uint8_t>(c >> 8);
-                    b = static_cast<uint8_t>(c);
-                } else {
-                    // A Mac 32-bpp pixel is big-endian xRGB: byte 0 is the
-                    // unused/alpha lane and R, G, B follow. Reading bytes
-                    // 0,1,2 as B,G,R put the unused lane in blue and shifted
-                    // the other two, so a 50% grey desktop (00 80 80 80) came
-                    // out as r=80 g=80 b=00 -- olive. The whole screen was
-                    // yellow, which is what named the bug.
-                    r = vr[o + 1];
-                    g = vr[o + 2];
-                    b = vr[o + 3];
-                }
-            }
-            out[x * 4 + 0] = b;
-            out[x * 4 + 1] = g;
-            out[x * 4 + 2] = r;
-            out[x * 4 + 3] = 0xFF;
-        }
-    }
-
-    // The hardware cursor. Mac OS draws its pointer with the card's cursor
-    // engine, not into the framebuffer, so a scanout that reads VRAM alone
-    // shows no pointer at all however well the USB side works -- which is
-    // exactly what it looked like from the outside.
-    //
-    // 64x64 at two bits per pixel, 16 bytes per row: eight bytes of AND bits
-    // then eight of XOR bits, each big-endian with the most significant bit
-    // leftmost. AND=0 selects colour 0 or 1 from XOR; AND=1 with XOR=0 is
-    // transparent, and with XOR=1 complements what is underneath -- which is
-    // how the classic arrow keeps its black outline over any background.
-    // CUR_HORZ_VERT_OFF is how many cursor rows/columns to skip, which is how
-    // the driver clips the pointer against the top and left edges.
-    if (ati.peek(0x0050) & 0x00010000u) { // CRTC_GEN_CNTL: cursor enable
-        const u32 curOff = ati.peek(0x0260) & 0x07FFFFFFu;
-        const u32 posn = ati.peek(0x0264);
-        const u32 hvoff = ati.peek(0x0268);
-        const u32 clr[2] = {ati.peek(0x026C), ati.peek(0x0270)};
-        const u32 cx = (posn >> 16) & 0xFFFFu, cy = posn & 0xFFFFu;
-        const u32 ox = (hvoff >> 16) & 0x3Fu, oy = hvoff & 0x3Fu;
-        for (u32 row = oy; row < 64u; ++row) {
-            const u32 sy = cy + (row - oy);
-            if (sy >= sh)
-                break;
-            const size_t so = size_t(curOff) + size_t(row) * 16u;
-            if (so + 16u > vr.size())
-                break;
-            uint64_t abits = 0, xbits = 0;
-            for (u32 k = 0; k < 8; ++k) {
-                abits = (abits << 8) | vr[so + k];
-                xbits = (xbits << 8) | vr[so + 8u + k];
-            }
-            for (u32 col = ox; col < 64u; ++col) {
-                const u32 sx = cx + (col - ox);
-                if (sx >= sw)
-                    break;
-                const uint64_t bit = uint64_t(1) << (63u - col);
-                uint8_t* px = bgra + (size_t(sy) * sw + sx) * 4u;
-                if (abits & bit) {
-                    if (!(xbits & bit))
-                        continue; // transparent
-                    px[0] = static_cast<uint8_t>(~px[0]);
-                    px[1] = static_cast<uint8_t>(~px[1]);
-                    px[2] = static_cast<uint8_t>(~px[2]);
-                } else {
-                    const u32 c = clr[(xbits & bit) ? 1 : 0];
-                    px[0] = static_cast<uint8_t>(c);
-                    px[1] = static_cast<uint8_t>(c >> 8);
-                    px[2] = static_cast<uint8_t>(c >> 16);
-                }
-                px[3] = 0xFF;
-            }
-        }
-    }
+    for (u32 y = 0; y < sc.h; ++y)
+        r128ScanRow(ati, sc, y, bgra + size_t(y) * sc.w * 4u);
+    // The hardware cursor, composited after the framebuffer walk — Mac OS
+    // draws its pointer with the cursor engine, so VRAM alone shows none.
+    r128ScanCursor(ati, sc, bgra);
     return 1;
 }
 

@@ -2445,4 +2445,169 @@ void R128Cell::ddcStep(bool scl, bool sda)
     ddc_.lastSda = sda;
 }
 
+// --- The scan-out (see the header for why this is the ONE copy) ------------
+
+R128Scan r128ScanDecode(const R128Cell& c)
+{
+    R128Scan s;
+    const u32 gen = c.peek(0x0050);
+    s.enabled = (gen & 0x02000000u) != 0;
+    s.fmt = (gen >> 8) & 0xFu;
+    s.w = (((c.peek(0x0200) >> 16) & 0x3FFu) + 1u) * 8u;
+    s.h = ((c.peek(0x0208) >> 16) & 0xFFFu) + 1u;
+    s.pitch8 = c.peek(0x022C) & 0xFFFFu;
+    s.offset = c.peek(0x0224);
+    // CRTC_PIX_WIDTH (RRG-G04500 §CRTC_GEN_CNTL): 2 = 8 bpp CLUT, 3 = 15 bpp
+    // ARGB1555, 4 = 16 bpp RGB565, 5 = 24 bpp RGB888, 6 = 32 bpp xRGB. The
+    // others (4 bpp planar and friends) have never been seen from this
+    // guest; bypp = 0 keeps them a visible refusal rather than a garbled
+    // picture.
+    switch (s.fmt) {
+    case 2u: s.bypp = 1; break;
+    case 3u: case 4u: s.bypp = 2; break;
+    case 5u: s.bypp = 3; break;
+    case 6u: s.bypp = 4; break;
+    default: s.bypp = 0; break;
+    }
+    s.rowBytes = s.pitch8 * 8u * s.bypp;
+    return s;
+}
+
+const char* r128ScanFmtName(u32 fmt)
+{
+    switch (fmt) {
+    case 2u: return "8bpp CLUT";
+    case 3u: return "15bpp 1555";
+    case 4u: return "16bpp 565";
+    case 5u: return "24bpp 888";
+    case 6u: return "32bpp xRGB";
+    default: return "UNSCANNABLE";
+    }
+}
+
+void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
+{
+    const auto& vr = c.vram;
+    const size_t row = s.offset + size_t(y) * s.rowBytes;
+    for (u32 x = 0; x < s.w; ++x) {
+        u8 b = 0, g = 0, r = 0;
+        const size_t o = row + size_t(x) * s.bypp;
+        if (s.bypp && o + s.bypp <= vr.size()) {
+            switch (s.fmt) {
+            case 2u: {
+                const u32 p = c.pal(vr[o]);
+                r = static_cast<u8>(p >> 16);
+                g = static_cast<u8>(p >> 8);
+                b = static_cast<u8>(p);
+                break;
+            }
+            // ⭐ THE BYTE ORDER IS A LESSON ALREADY PAID FOR. A Mac 32-bpp
+            // pixel is big-endian xRGB: byte 0 is the unused/alpha lane and
+            // R, G, B follow. Reading bytes 0,1,2 as B,G,R put the unused
+            // lane in blue and shifted the other two, so a 50% grey desktop
+            // (00 80 80 80) came out as r=80 g=80 b=00 — olive. The whole
+            // screen was yellow, which is what named the bug. The 15/16-bpp
+            // pixel is therefore the BIG-ENDIAN halfword (vr[o] << 8) |
+            // vr[o+1] before any field is extracted, and 24 bpp drops the
+            // unused lane: R,G,B in bytes 0,1,2.
+            //
+            // ⚠ If colours ever come out wrong in these modes, check
+            // SURFACE_CNTL / DAC swap state before inventing a new table —
+            // the card has per-aperture byte swappers and the guest may
+            // program them.
+            case 3u: { // ARGB1555, QuickDraw's 16-bit (555 + unused bit)
+                const u32 v = (u32(vr[o]) << 8) | vr[o + 1];
+                r = static_cast<u8>(((v >> 10) & 0x1Fu) << 3);
+                g = static_cast<u8>(((v >> 5) & 0x1Fu) << 3);
+                b = static_cast<u8>((v & 0x1Fu) << 3);
+                // Replicate the top bits into the low ones so full-scale
+                // 0x1F reads 0xFF, not 0xF8 — otherwise white is dim grey.
+                r |= r >> 5;
+                g |= g >> 5;
+                b |= b >> 5;
+                break;
+            }
+            case 4u: { // RGB565
+                const u32 v = (u32(vr[o]) << 8) | vr[o + 1];
+                r = static_cast<u8>(((v >> 11) & 0x1Fu) << 3);
+                g = static_cast<u8>(((v >> 5) & 0x3Fu) << 2);
+                b = static_cast<u8>((v & 0x1Fu) << 3);
+                r |= r >> 5;
+                g |= g >> 6;
+                b |= b >> 5;
+                break;
+            }
+            case 5u: // RGB888, big-endian: R,G,B
+                r = vr[o];
+                g = vr[o + 1];
+                b = vr[o + 2];
+                break;
+            case 6u: // xRGB8888, big-endian: byte 0 is the unused lane
+                r = vr[o + 1];
+                g = vr[o + 2];
+                b = vr[o + 3];
+                break;
+            default: break;
+            }
+        }
+        out[x * 4 + 0] = b;
+        out[x * 4 + 1] = g;
+        out[x * 4 + 2] = r;
+        out[x * 4 + 3] = 0xFF;
+    }
+}
+
+// 64x64 at two bits per pixel, 16 bytes per row: eight bytes of AND bits
+// then eight of XOR bits, each big-endian with the most significant bit
+// leftmost. AND=0 selects colour 0 or 1 from XOR; AND=1 with XOR=0 is
+// transparent, and with XOR=1 complements what is underneath — which is
+// how the classic arrow keeps its black outline over any background.
+// CUR_HORZ_VERT_OFF is how many cursor rows/columns to skip, which is how
+// the driver clips the pointer against the top and left edges.
+void r128ScanCursor(const R128Cell& c, const R128Scan& s, u8* bgra)
+{
+    if (!(c.peek(0x0050) & 0x00010000u)) // CRTC_GEN_CNTL: cursor enable
+        return;
+    const auto& vr = c.vram;
+    const u32 curOff = c.peek(0x0260) & 0x07FFFFFFu;
+    const u32 posn = c.peek(0x0264);
+    const u32 hvoff = c.peek(0x0268);
+    const u32 clr[2] = {c.peek(0x026C), c.peek(0x0270)};
+    const u32 cx = (posn >> 16) & 0xFFFFu, cy = posn & 0xFFFFu;
+    const u32 ox = (hvoff >> 16) & 0x3Fu, oy = hvoff & 0x3Fu;
+    for (u32 row = oy; row < 64u; ++row) {
+        const u32 sy = cy + (row - oy);
+        if (sy >= s.h)
+            break;
+        const size_t so = size_t(curOff) + size_t(row) * 16u;
+        if (so + 16u > vr.size())
+            break;
+        u64 abits = 0, xbits = 0;
+        for (u32 k = 0; k < 8; ++k) {
+            abits = (abits << 8) | vr[so + k];
+            xbits = (xbits << 8) | vr[so + 8u + k];
+        }
+        for (u32 col = ox; col < 64u; ++col) {
+            const u32 sx = cx + (col - ox);
+            if (sx >= s.w)
+                break;
+            const u64 bit = u64(1) << (63u - col);
+            u8* px = bgra + (size_t(sy) * s.w + sx) * 4u;
+            if (abits & bit) {
+                if (!(xbits & bit))
+                    continue; // transparent
+                px[0] = static_cast<u8>(~px[0]);
+                px[1] = static_cast<u8>(~px[1]);
+                px[2] = static_cast<u8>(~px[2]);
+            } else {
+                const u32 p = clr[(xbits & bit) ? 1 : 0];
+                px[0] = static_cast<u8>(p);
+                px[1] = static_cast<u8>(p >> 8);
+                px[2] = static_cast<u8>(p >> 16);
+            }
+            px[3] = 0xFF;
+        }
+    }
+}
+
 } // namespace opm

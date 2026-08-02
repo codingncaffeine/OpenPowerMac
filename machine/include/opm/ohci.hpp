@@ -266,6 +266,15 @@ public:
     Hid hid() const { return hid_; }
     // Boot-protocol mouse report: buttons, then signed X and Y deltas.
     void moveMouse(int dx, int dy, u8 buttons);
+    // Everything injected is ON THE WIRE: the motion accumulators are empty
+    // and the last button state has been reported. g4run's scripted pointer
+    // (--mouse-beat) gates its stages on this — "delivered" is a fact this
+    // cell owns, and guessing it with a fixed wait is how a script works at
+    // one --fast-tb setting and silently misses at another.
+    bool mouseIdle() const
+    {
+        return accDx_ == 0 && accDy_ == 0 && buttons_ == sentButtons_;
+    }
 
 private:
     // Control-transfer state for the single attached device.

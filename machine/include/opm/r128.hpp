@@ -359,6 +359,14 @@ struct R128EngStats {
     u64 texUnimpl = 0;    // texture datatype this engine cannot decode
     u64 texGartMiss = 0;  // an AGP texture fetch that missed the GART
     u64 zTile = 0;        // Z_PITCH_C had Z_TILE set — layout not modelled
+    // The S/T range the guest actually sends, accumulated at vertex decode.
+    // The SDK never states the coordinate convention ([0,1] vs texel space)
+    // and the OEM register guide redacts the field that might say — so the
+    // stream itself testifies. [0,1]-ish extrema mean the sampler's
+    // multiply-by-size is right; extrema in the tens/hundreds mean the
+    // driver pre-scales and the model is tiling every texture into mush.
+    float stMinS = 1e30f, stMaxS = -1e30f;
+    float stMinT = 1e30f, stMaxT = -1e30f;
 };
 
 

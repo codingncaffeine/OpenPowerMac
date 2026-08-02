@@ -198,6 +198,20 @@ void decodeVtx(const u32* w, u32 fmt, Vtx& v)
         v.t2 = asF32(w[i++]);
     }
     // RHW2 consumed by the caller via vtxDwords; nothing here reads it.
+    if (fmt & 0x080u) {
+        // The coordinate-convention census — see R128EngStats. Guarded
+        // against NaN/garbage floats so one bad vertex cannot poison the
+        // extrema forever.
+        auto& e = eng();
+        if (v.s1 > -1e6f && v.s1 < 1e6f) {
+            if (v.s1 < e.stMinS) e.stMinS = v.s1;
+            if (v.s1 > e.stMaxS) e.stMaxS = v.s1;
+        }
+        if (v.t1 > -1e6f && v.t1 < 1e6f) {
+            if (v.t1 < e.stMinT) e.stMinT = v.t1;
+            if (v.t1 > e.stMaxT) e.stMaxT = v.t1;
+        }
+    }
 }
 
 // ── Per-packet pipeline state, gathered once ──────────────────────────────
@@ -630,8 +644,21 @@ Rgba sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
     const u32 h = t.hTex >> l ? t.hTex >> l : 1u;
     const u32 clampS = (t.cntl >> 8) & 3u;
     const u32 clampT = (t.cntl >> 11) & 3u;
-    const float fx = s * static_cast<float>(w) - (bilinear ? 0.5f : 0.0f);
-    const float fy = tt * static_cast<float>(h) - (bilinear ? 0.5f : 0.0f);
+    // ⭐⭐ S/T ARRIVE IN TEXEL UNITS, NOT [0,1] — measured, not assumed.
+    //
+    // The SDK's FTLVERTEX table says only "the u-coordinate of the 1st
+    // texture"; the OEM register guide redacts the rest. The st census on
+    // live Nanosaur vertices settled it: s,t in [-15.2, 126.7] with a
+    // 128-texel texture bound, and in [-15.2, 34.2] when 64-texel textures
+    // were bound — texel-space both times, wrapped past the edges by the
+    // guest. This sampler used to multiply by the level size on top of
+    // that, tiling every texture ~w times across every polygon: the whole
+    // world rendered as its textures' average colours — "no details
+    // anywhere, just general colors" — while every individual fetch was
+    // valid. A base-level texel coordinate halves per mip level.
+    const float lvl = static_cast<float>(1u << l);
+    const float fx = s / lvl - (bilinear ? 0.5f : 0.0f);
+    const float fy = tt / lvl - (bilinear ? 0.5f : 0.0f);
     const int x0 = static_cast<int>(std::floor(fx));
     const int y0 = static_cast<int>(std::floor(fy));
     if (!bilinear) {

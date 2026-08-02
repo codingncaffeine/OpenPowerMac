@@ -702,6 +702,12 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                      texc, texc & 1u, (texc >> 1) & 1u, (texc >> 3) & 1u,
                      (texc >> 14) & 0xFu, (texc >> 18) & 7u);
             s += b;
+            snprintf(b, sizeof b,
+                     "--   st census: s in [%.3f, %.3f]  t in [%.3f, %.3f]"
+                     "  (extrema near 0..1 = normalised, sampler correct; "
+                     "tens+ = pre-scaled, sampler tiling into mush)\n",
+                     e3.stMinS, e3.stMaxS, e3.stMinT, e3.stMaxT);
+            s += b;
             // Slots are SIZE-indexed (slot k = a 2^k-texel level), so print
             // the whole bank — which slots hold addresses IS the story.
             s += "--   prim tex offset slots 0-10:";

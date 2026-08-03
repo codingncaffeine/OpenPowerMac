@@ -525,6 +525,14 @@ int main(int argc, char** argv)
     bool lineExecOff = false;
     // --no-jit: interpret every line. The control for the compiled blocks.
     bool jitOff = false;
+    // --no-jit-chain: compile blocks without chain sites, so every exit
+    // returns to the dispatcher as v1 did. The control for Stage B.
+    bool jitChainOff = false;
+    // --jit-tsc: rdtsc the shims and the block entries (opm/jit.hpp).
+    bool jitTsc = false;
+    // --no-jit-direct: fallbacks go through the execRow shim, as before the
+    // direct-call lowering. Its control.
+    bool jitDirectOff = false;
     // 🔬 --fingerprint-every N: THE STATE DIFFERENTIAL.
     //
     // Every claim in this tree that some new machinery is transparent has been
@@ -715,6 +723,12 @@ int main(int argc, char** argv)
         // The control for the JIT (opm/jit.hpp), same rule as every cache
         // and gate here: the claim ships with the switch that turns it off.
         if (!strcmp(a, "--no-jit")) { jitOff = true; continue; }
+        if (!strcmp(a, "--no-jit-chain")) { jitChainOff = true; continue; }
+        // 🔬 The host-cycle split inside compiled blocks. Perturbs the run
+        // (an rdtsc pair per shim call), so read it for SHARES and per-call
+        // costs — never quote its MIPS.
+        if (!strcmp(a, "--jit-tsc")) { jitTsc = true; continue; }
+        if (!strcmp(a, "--no-jit-direct")) { jitDirectOff = true; continue; }
         // Up here for the same reason as the speed flags: the else-if ladder
         // below is already at MSVC's nesting limit (C1061).
         if (!strcmp(a, "--sound")) { soundOn = true; continue; }
@@ -1376,6 +1390,9 @@ int main(int argc, char** argv)
     cpu.dxlCacheOff = !dxlate;
     cpu.lineExecOff = lineExecOff;
     cpu.jitOn = !jitOff;
+    cpu.jitChainOff = jitChainOff;
+    cpu.jitTscOn = jitTsc; // JitCache is created lazily; carried on the Cpu
+    cpu.jitDirectOff = jitDirectOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);
     bus.ohci(1).setLivePortPower(ohciPortPower);
     if (ohciNdpSet) {
@@ -5212,13 +5229,40 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(cpu.jit->refillDrops),
                    static_cast<unsigned long long>(cpu.jit->bails),
                    static_cast<unsigned long long>(cpu.jit->resets));
+        // Stage B: hops are dispatcher round trips the chained exits saved.
+        // insns per (enter + hop) is the true scaffold amortization — the
+        // number that was 4.3 when every block exit paid the full round trip.
+        if (cpu.jit && (cpu.jitChainHops || cpu.jit->chainResolves))
+            printf("--   jit chain: %llu hops, %llu links, %llu severs, "
+                   "%llu resolves (%llu misses, %llu giveups); "
+                   "%.1f insns/dispatch-enter, %.1f insns/native-entry\n",
+                   static_cast<unsigned long long>(cpu.jitChainHops),
+                   static_cast<unsigned long long>(cpu.jit->chainLinks),
+                   static_cast<unsigned long long>(cpu.jit->chainSevers),
+                   static_cast<unsigned long long>(cpu.jit->chainResolves),
+                   static_cast<unsigned long long>(cpu.jit->chainMisses),
+                   static_cast<unsigned long long>(cpu.jit->chainGiveups),
+                   cpu.jit->enters
+                       ? static_cast<double>(cpu.jit->insns) /
+                             static_cast<double>(cpu.jit->enters)
+                       : 0.0,
+                   cpu.jit->enters + cpu.jitChainHops
+                       ? static_cast<double>(cpu.jit->insns) /
+                             static_cast<double>(cpu.jit->enters +
+                                                 cpu.jitChainHops)
+                       : 0.0);
         if (cpu.jit && (cpu.jit->fallbacks || cpu.jit->memOps))
-            printf("--   jit mix: %llu mem ops (%.1f%% of native insns), "
-                   "%llu fallback insns (%.1f%%)\n",
+            printf("--   jit mix: %llu mem ops (%.1f%% of native insns) "
+                   "+ %llu fp mem ops (%.1f%%), %llu fallback insns (%.1f%%)\n",
                    static_cast<unsigned long long>(cpu.jit->memOps),
                    cpu.jit->insns ? 100.0 * static_cast<double>(cpu.jit->memOps) /
                                         static_cast<double>(cpu.jit->insns)
                                   : 0.0,
+                   static_cast<unsigned long long>(cpu.jit->fpMemOps),
+                   cpu.jit->insns
+                       ? 100.0 * static_cast<double>(cpu.jit->fpMemOps) /
+                             static_cast<double>(cpu.jit->insns)
+                       : 0.0,
                    static_cast<unsigned long long>(cpu.jit->fallbacks),
                    cpu.jit->insns
                        ? 100.0 * static_cast<double>(cpu.jit->fallbacks) /
@@ -5230,13 +5274,39 @@ int main(int argc, char** argv)
                 if (cpu.jit->fbByRow[k])
                     fb.push_back({cpu.jit->fbByRow[k], k});
             std::sort(fb.rbegin(), fb.rend());
-            printf("--   jit fallback census (top 12 of %zu rows):\n",
-                   fb.size());
-            for (size_t k = 0; k < fb.size() && k < 12; ++k)
-                printf("       %-10s %llu\n",
-                       fb[k].second < kIsaCount ? kIsa[fb[k].second].mnem
-                                                : "?",
-                       static_cast<unsigned long long>(fb[k].first));
+            // With --jit-tsc the census sorts by HOST CYCLES, not by calls:
+            // the frequent row and the expensive row are different questions
+            // and lowering work should follow the second one.
+            const bool byTsc = cpu.jit->tscFb != 0;
+            if (byTsc) {
+                fb.clear();
+                for (u32 k = 0; k < 1024; ++k)
+                    if (cpu.jit->tscByRow[k])
+                        fb.push_back({cpu.jit->tscByRow[k], k});
+                std::sort(fb.rbegin(), fb.rend());
+            }
+            printf("--   jit fallback census (top 12 of %zu rows, by %s):\n",
+                   fb.size(), byTsc ? "host cycles" : "calls");
+            for (size_t k = 0; k < fb.size() && k < 12; ++k) {
+                const u32 row = fb[k].second;
+                const char* mn = row < kIsaCount ? kIsa[row].mnem : "?";
+                if (byTsc)
+                    printf("       %-10s %llu cycles (%.1f%% of fallback, "
+                           "%llu calls, %.0f/call)\n",
+                           mn,
+                           static_cast<unsigned long long>(fb[k].first),
+                           100.0 * static_cast<double>(fb[k].first) /
+                               static_cast<double>(cpu.jit->tscFb),
+                           static_cast<unsigned long long>(
+                               cpu.jit->fbByRow[row]),
+                           cpu.jit->fbByRow[row]
+                               ? static_cast<double>(fb[k].first) /
+                                     static_cast<double>(cpu.jit->fbByRow[row])
+                               : 0.0);
+                else
+                    printf("       %-10s %llu\n", mn,
+                           static_cast<unsigned long long>(fb[k].first));
+            }
         }
         if (sf::gFastHits || sf::gFastMiss)
             printf("--   softfp fast path: %llu taken, %llu bailed (%.1f%%)\n",
@@ -5244,16 +5314,43 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(sf::gFastMiss),
                    100.0 * static_cast<double>(sf::gFastHits) /
                        static_cast<double>(sf::gFastHits + sf::gFastMiss));
-        if (cpu.jit && cpu.jit->tscProbe) // populated only by the diagnostic
+        if (cpu.jit && cpu.jit->tscProbe) { // populated only by --jit-tsc
+            const JitCache& J = *cpu.jit;
             printf("--   jit tsc: probe %.1f/enter, native %.1f/enter "
                    "(%.1f per native insn)\n",
-                   static_cast<double>(cpu.jit->tscProbe) /
-                       static_cast<double>(cpu.jit->enters),
-                   static_cast<double>(cpu.jit->tscNative) /
-                       static_cast<double>(cpu.jit->enters),
-                   cpu.jit->insns ? static_cast<double>(cpu.jit->tscNative) /
-                                        static_cast<double>(cpu.jit->insns)
-                                  : 0.0);
+                   static_cast<double>(J.tscProbe) /
+                       static_cast<double>(J.enters),
+                   static_cast<double>(J.tscNative) /
+                       static_cast<double>(J.enters),
+                   J.insns ? static_cast<double>(J.tscNative) /
+                                 static_cast<double>(J.insns)
+                           : 0.0);
+            // ⭐ WHERE THE BLOCKS' TIME GOES — the aim point for the next
+            // lowering round. Shares are of tscNative (the emitted code
+            // itself, dispatcher overhead excluded); "emitted" is what is
+            // left after the two call-shaped costs are taken out, i.e. the
+            // inlined instructions plus the chain gates.
+            const u64 mem = J.tscMem, fbk = J.tscFb;
+            const u64 calls = J.memOps + J.fpMemOps;
+            const double nat = static_cast<double>(J.tscNative);
+            printf("--   jit tsc split: mem %llu (%.1f%%, %.0f/op over %llu "
+                   "ops), fallback %llu (%.1f%%, %.0f/op over %llu ops), "
+                   "emitted+gates %.1f%%\n",
+                   static_cast<unsigned long long>(mem),
+                   nat ? 100.0 * static_cast<double>(mem) / nat : 0.0,
+                   calls ? static_cast<double>(mem) /
+                               static_cast<double>(calls)
+                         : 0.0,
+                   static_cast<unsigned long long>(calls),
+                   static_cast<unsigned long long>(fbk),
+                   nat ? 100.0 * static_cast<double>(fbk) / nat : 0.0,
+                   J.fallbacks ? static_cast<double>(fbk) /
+                                     static_cast<double>(J.fallbacks)
+                               : 0.0,
+                   static_cast<unsigned long long>(J.fallbacks),
+                   nat ? 100.0 * (nat - static_cast<double>(mem + fbk)) / nat
+                       : 0.0);
+        }
 #if OPM_PROFILING
         // ⭐ HOW MUCH STRAIGHT-LINE CODE THIS MACHINE ACTUALLY RUNS. The line
         // executor's whole saving is the fetch work it does once per LINE

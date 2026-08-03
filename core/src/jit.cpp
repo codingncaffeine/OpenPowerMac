@@ -61,6 +61,18 @@
 #endif
 
 namespace opm {
+
+// A chain site's rel32 states (Stage B). The site is `jmp rel32`; relative to
+// its end sit, in fixed layout, a 12-byte parking block (dec hops + jmp
+// epilogue) and then the resolver thunk. So rel32 = 0 parks the site on the
+// dispatcher exit (backref capacity exhausted — permanent until the block
+// recompiles), rel32 = 12 lands on the thunk (initial state, and the severed
+// state: re-resolve on next traversal), and anything else is a live link to
+// the successor's segment. The emitter, the resolver and sever() all speak
+// this encoding, so it lives here, once.
+inline constexpr i32 kChainRelPark = 0;
+inline constexpr i32 kChainRelThunk = 12;
+
 namespace {
 
 #if OPM_JIT_HOST
@@ -175,17 +187,131 @@ const u8* loTable()
 // exit. That is the interpreter's own order: execFast charges after a
 // faulting handler too, and the destination register is left unwritten.
 
-i64 shimRead8(Cpu* c, u32 ea)  { ++c->jit->memOps; u32 v; return c->readV8(ea, v)  ? static_cast<i64>(v) : -1; }
-i64 shimRead16(Cpu* c, u32 ea) { ++c->jit->memOps; u32 v; return c->readV16(ea, v) ? static_cast<i64>(v) : -1; }
-i64 shimRead32(Cpu* c, u32 ea) { ++c->jit->memOps; u32 v; return c->readV32(ea, v) ? static_cast<i64>(v) : -1; }
-i64 shimWrite8(Cpu* c, u32 ea, u32 v)  { ++c->jit->memOps; return c->writeV8(ea, v)  ? 0 : -1; }
-i64 shimWrite16(Cpu* c, u32 ea, u32 v) { ++c->jit->memOps; return c->writeV16(ea, v) ? 0 : -1; }
-i64 shimWrite32(Cpu* c, u32 ea, u32 v) { ++c->jit->memOps; return c->writeV32(ea, v) ? 0 : -1; }
+// The --jit-tsc timer, in the shape the shims can use without duplicating
+// their bodies: construct at entry, destruct at return, charge nothing when
+// the flag is off.
+struct ShimTsc {
+    JitCache& j;
+    u64* bin;
+    u64 t0;
+    ShimTsc(Cpu* c, u64* b)
+        : j(*c->jit), bin(b), t0(j.tscOn ? __rdtsc() : 0)
+    {
+    }
+    ~ShimTsc()
+    {
+        if (j.tscOn)
+            *bin += __rdtsc() - t0;
+    }
+};
+
+i64 shimRead8(Cpu* c, u32 ea)  { ++c->jit->memOps; ShimTsc t(c, &c->jit->tscMem); u32 v; return c->readV8(ea, v)  ? static_cast<i64>(v) : -1; }
+i64 shimRead16(Cpu* c, u32 ea) { ++c->jit->memOps; ShimTsc t(c, &c->jit->tscMem); u32 v; return c->readV16(ea, v) ? static_cast<i64>(v) : -1; }
+i64 shimRead32(Cpu* c, u32 ea) { ++c->jit->memOps; ShimTsc t(c, &c->jit->tscMem); u32 v; return c->readV32(ea, v) ? static_cast<i64>(v) : -1; }
+i64 shimWrite8(Cpu* c, u32 ea, u32 v)  { ++c->jit->memOps; ShimTsc t(c, &c->jit->tscMem); return c->writeV8(ea, v)  ? 0 : -1; }
+i64 shimWrite16(Cpu* c, u32 ea, u32 v) { ++c->jit->memOps; ShimTsc t(c, &c->jit->tscMem); return c->writeV16(ea, v) ? 0 : -1; }
+i64 shimWrite32(Cpu* c, u32 ea, u32 v) { ++c->jit->memOps; ShimTsc t(c, &c->jit->tscMem); return c->writeV32(ea, v) ? 0 : -1; }
+// execRow's TAIL, for the direct-call path below: the two rare pieces of
+// per-instruction bookkeeping that follow a handler. Reached only when the
+// emitted code's own tests say one of them is live (mmcr0 selecting an event,
+// or MSR[SE|BE] tracing), so on the machine's actual path this is never
+// called — but when it is, it does exactly what cpu.cpp does, in order.
+void shimFbTail(Cpu* c, u32 insn, u32 row, u32 fallThrough)
+{
+    if (c->st.mmcr0 && !(c->st.mmcr0 & 0x80000000u)) { // FC
+        const u32 sel1 = (c->st.mmcr0 >> 6) & 0x7Fu;
+        const u32 sel2 = c->st.mmcr0 & 0x3Fu;
+        const u32 pmxe = c->st.mmcr0 & 0x04000000u;
+        if (sel1 == 1 || sel1 == 2) {
+            const u32 old = c->st.pmc[0];
+            c->st.pmc[0] += 1;
+            if (!(old & 0x80000000u) && (c->st.pmc[0] & 0x80000000u) && pmxe &&
+                (c->st.mmcr0 & 0x00008000u))
+                c->pmPending = true;
+        }
+        if (sel2 == 1 || sel2 == 2) {
+            const u32 old = c->st.pmc[1];
+            c->st.pmc[1] += 1;
+            if (!(old & 0x80000000u) && (c->st.pmc[1] & 0x80000000u) && pmxe &&
+                (c->st.mmcr0 & 0x00004000u))
+                c->pmPending = true;
+        }
+    }
+    if (c->halted || c->raisedThisStep)
+        return;
+    if (c->st.msr & (msr::SE | msr::BE)) {
+        const InsnDesc& d = kIsa[row];
+        const bool isRfi = d.kind == Xk::X19 && d.xo == 50;
+        const bool isIsync = d.kind == Xk::X19 && d.xo == 150;
+        const bool branchTaken =
+            (d.pat == Pat::B || d.pat == Pat::BC || d.pat == Pat::BCLR ||
+             d.pat == Pat::BCCTR) &&
+            c->st.pc != fallThrough;
+        if (!isRfi && !isIsync &&
+            ((c->st.msr & msr::SE) ||
+             ((c->st.msr & msr::BE) && branchTaken)))
+            c->raiseExc(Exc::Trace, c->st.pc, 0);
+    }
+    (void)insn;
+}
+
 void shimExecRow(Cpu* c, u32 insn, u32 row)
 {
-    ++c->jit->fallbacks; // the census: which rows still cost an execRow call
-    ++c->jit->fbByRow[row < 1024u ? row : 1023u];
+    JitCache& J = *c->jit;
+    ++J.fallbacks; // the census: which rows still cost an execRow call
+    const u32 slot = row < 1024u ? row : 1023u;
+    ++J.fbByRow[slot];
+    if (!J.tscOn) {
+        c->execRow(insn, row);
+        return;
+    }
+    const u64 t0 = __rdtsc();
     c->execRow(insn, row);
+    const u64 d = __rdtsc() - t0;
+    J.tscFb += d;
+    J.tscByRow[slot] += d;
+}
+
+// The chain resolver (JIT_PLAN §7 Stage B), called from a site's thunk the
+// first time an unlinked site is traversed: find the successor's compiled
+// block, patch the site's rel32 to its entry, and record the backref so
+// invalidation can sever the link. The traversal that called this still
+// exits to the dispatcher — the link pays from the NEXT one — so a resolve
+// is never a hop (the thunk decrements the hop counter the site charged).
+// A miss (successor not compiled yet) retries next traversal; the
+// dispatcher compiles the successor in between, so a site links on its
+// second traversal in the common case. Patching its own block's bytes here
+// is safe: the rel32 was consumed by the jump that brought us in, and no
+// other block's code is touched.
+void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
+{
+    JitCache& J = *c->jit;
+    ++J.chainResolves;
+    const u32 slot = Cpu::fetchSlot(tgtPaLine);
+    JitLine* ways = &J.line[slot * JitCache::kWays];
+    const u32 vaLine = tgtVa & ~31u;
+    for (u32 k = 0; k < JitCache::kWays; ++k) {
+        JitLine& jl = ways[k];
+        if (jl.base != tgtPaLine || jl.va != vaLine)
+            continue;
+        if (jl.nBref >= JitLine::kBrefs) {
+            // No room to record the unlink — and a link that cannot be
+            // severed is a use-after-invalidate waiting to happen. Park the
+            // site on the dispatcher exit instead, permanently (until the
+            // SITE's own block recompiles): a parked traversal costs what
+            // v1 cost, and the counter names how often it happens.
+            ++J.chainGiveups;
+            const i32 rel = kChainRelPark;
+            std::memcpy(J.arena_ + siteOff, &rel, 4);
+            return;
+        }
+        jl.bref[jl.nBref++] = siteOff;
+        const i32 rel = i32(jl.off[(tgtVa >> 2) & 7u]) - i32(siteOff + 4u);
+        std::memcpy(J.arena_ + siteOff, &rel, 4);
+        ++J.chainLinks;
+        return;
+    }
+    ++J.chainMisses;
 }
 
 // FP memory shims — transcriptions of exec_int.cpp's FLOAD/FSTORE bodies:
@@ -201,6 +327,8 @@ i64 shimAlignF(Cpu* c, u32 ea, u32 insn)
 }
 i64 shimLfs(Cpu* c, u32 ea, u32 insn)
 {
+    ++c->jit->fpMemOps;
+    ShimTsc t(c, &c->jit->tscMem);
     if (ea & 3u)
         return shimAlignF(c, ea, insn);
     u64 v;
@@ -211,6 +339,8 @@ i64 shimLfs(Cpu* c, u32 ea, u32 insn)
 }
 i64 shimLfd(Cpu* c, u32 ea, u32 insn)
 {
+    ++c->jit->fpMemOps;
+    ShimTsc t(c, &c->jit->tscMem);
     if (ea & 3u)
         return shimAlignF(c, ea, insn);
     u64 v;
@@ -221,12 +351,16 @@ i64 shimLfd(Cpu* c, u32 ea, u32 insn)
 }
 i64 shimStfs(Cpu* c, u32 ea, u32 insn)
 {
+    ++c->jit->fpMemOps;
+    ShimTsc t(c, &c->jit->tscMem);
     if (ea & 3u)
         return shimAlignF(c, ea, insn);
     return c->writeV(ea, 4, sf::storeSingle(c->st.fpr[f_rt(insn)])) ? 0 : -1;
 }
 i64 shimStfd(Cpu* c, u32 ea, u32 insn)
 {
+    ++c->jit->fpMemOps;
+    ShimTsc t(c, &c->jit->tscMem);
     if (ea & 3u)
         return shimAlignF(c, ea, insn);
     return c->writeV(ea, 8, c->st.fpr[f_rt(insn)]) ? 0 : -1;
@@ -235,7 +369,7 @@ i64 shimStfd(Cpu* c, u32 ea, u32 insn)
 // ---- byte emitter ----------------------------------------------------------
 
 enum : u32 { RAX = 0, RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R12 = 12 };
-enum : u8 { CC_E = 4, CC_NE = 5, CC_Z = 4, CC_NZ = 5 };
+enum : u8 { CC_B = 2, CC_E = 4, CC_NE = 5, CC_Z = 4, CC_NZ = 5 };
 
 struct Emit {
     u8* base;
@@ -340,6 +474,19 @@ struct Emit {
             base[pos + 3] = u8(rel >> 24);
         }
     }
+    // Patch a stored rel32 to land on arena offset dstOff — the compile-time
+    // fixup for forward intra-line chains (runtime patching belongs to the
+    // resolver, not the emitter).
+    void patchRel32To(size_t pos, u32 dstOff)
+    {
+        const i64 rel = i64(dstOff) - i64(pos + 4);
+        if (pos + 4 <= cap) {
+            base[pos] = u8(rel);
+            base[pos + 1] = u8(rel >> 8);
+            base[pos + 2] = u8(rel >> 16);
+            base[pos + 3] = u8(rel >> 24);
+        }
+    }
     // 64-bit op reg, [r13+disp] — the FPR file lives past disp8 range.
     void mem13W(u8 op, u32 reg, i32 disp)
     {
@@ -389,7 +536,15 @@ struct Compiler {
     u32 epi;
     u32 paBase;
     u32 vaBase;
-    i32 flBase; // r13-relative disp of fetchLine[slot].base
+    i32 flBase;         // r13-relative disp of fetchLine[slot].base
+    const u32* segOff;  // jl.off — valid for words already emitted
+    bool chain;         // Stage B on (compile chain sites at eligible exits)
+    bool direct;        // call bound handlers directly (else the execRow shim)
+    JitCache* jc;       // for the census counters' absolute addresses
+    // Forward intra-line chain jumps: the target segment's offset is not
+    // known until its word is emitted, so compileLine patches these after
+    // the loop. {position of the rel32, target word}.
+    std::vector<std::pair<size_t, u32>> fixes;
 
     i32 gpr(u32 r) const { return o.gpr0 + i32(r * 4u); }
     i32 fpr(u32 r) const { return o.fpr0 + i32(r * 8u); }
@@ -498,6 +653,162 @@ struct Compiler {
         e.storeR(o.xer, R9);         // mov [r13+xer], r9d
     }
 
+    // -- Stage B: chain points (JIT_PLAN §7) ---------------------------------
+    //
+    // A chain point replaces one dispatcher round trip: it is emitted at
+    // every exit whose successor is known at compile time AND lies in the
+    // same 4K page (taken direct b/bc; the line-end fallthrough). The gate
+    // below is a transcription of everything the dispatcher would have
+    // checked between this exit and re-entering compiled code — any failure
+    // exits to the epilogue, which is always safe (the dispatcher re-derives
+    // the same answers).
+    //
+    // ⚠ WHY SAME-PAGE IS THE WHOLE MAPPING ARGUMENT. This block was entered
+    // through the dispatcher, whose fetchBlockFast proved the one-page fetch
+    // translation CURRENT for this page (xlGen==mmuGen, xlMsr, xlSr, and
+    // xlPa == this block's PA page). The xl* cache itself cannot change
+    // during a chained run — only the fetch path writes it, and blocks never
+    // fetch — and every writer of the mapping's inputs either breaks the
+    // batch (mtsr/mtsrin, SDR1, the BATs, tlbie/tlbia — verified setters,
+    // tested after every instruction that can set them) or leaves the block
+    // by pc (rfi), EXCEPT a plain mtmsr, which the interpreter only catches
+    // at its next fetchBlockFast via the xlMsr compare. That one hole is
+    // closed here the same way: msr & (IR|PR|LE) against xlMsr, per hop. So
+    // within one unbroken batch, a same-page target's PA line is the
+    // compile-time constant (own PA page | target's page offset), and a
+    // cross-page target — which would need the full xlate check re-emitted —
+    // is simply not chained.
+    //
+    // ⚠ THE BUDGET BOUND RIDES IN RBP (Cpu::jitUntil, loaded by the
+    // trampoline): a hop requires until - stamp >= 8, the dispatcher's own
+    // JIT-entry condition, and a block runs at most 8 instructions between
+    // checks — so a chained run can never overrun the batch, which is what
+    // fpClamp exactness rides on. Preconditions at every chain point: pc
+    // stored (immediate), counters flushed (rbx == 0) — every caller sits
+    // right after flushPc/flushNoPc.
+
+    void hopInc()
+    {
+        e.bytes({0x49, 0xFF, 0x85}); // inc qword [r13+chainHops]
+        e.i32le(u32(o.chainHops));
+    }
+    void hopDec() // the cold arms of a site take back the hop it charged
+    {
+        e.bytes({0x49, 0xFF, 0x8D}); // dec qword [r13+chainHops]
+        e.i32le(u32(o.chainHops));
+    }
+
+    void chainChecks() // the dispatcher's own gate, in test form
+    {
+        byteCheck(o.halted);      // post-run break test
+        byteCheck(o.batchBreak);  // (provably false here, checked anyway)
+        byteCheck(o.lineExecOff); // `slow`, term by term
+        byteCheck(o.napping);
+        e.mem13(0x83, 7, o.mmcr0); // cmp dword [r13+mmcr0], 0
+        e.b(0);
+        e.jccTo(CC_NE, epi);
+        e.mem13(0xF6, 0, o.iabr);  // test byte [r13+iabr], 2
+        e.b(2);
+        e.jccTo(CC_NE, epi);
+        e.loadR(RAX, o.msr);
+        e.b(0xA9);                 // test eax, SE|BE
+        e.i32le(msr::SE | msr::BE);
+        e.jccTo(CC_NE, epi);
+        e.bytes({0x89, 0xC2});     // mov edx, eax
+        e.bytes({0x81, 0xE2});     // and edx, IR|PR|LE
+        e.i32le(msr::IR | msr::PR | msr::LE);
+        e.mem13(0x3B, RDX, o.xlMsr); // cmp edx, [r13+xlMsr] — the mtmsr hole
+        e.jccTo(CC_NE, epi);
+        e.b(0xA9);                 // test eax, EE
+        e.i32le(msr::EE);
+        const size_t noEe = e.j8(CC_Z);
+        if (o.pend4Ok) {           // the four pending bools, one dword
+            e.mem13(0x83, 7, o.pend4);
+            e.b(0);
+            e.jccTo(CC_NE, epi);
+        } else {
+            byteCheck(o.extIrq);
+            byteCheck(o.smi);
+            byteCheck(o.decP);
+            byteCheck(o.pmP);
+        }
+        e.patch8(noEe);
+        e.bytes({0x48, 0x89, 0xE8});       // mov rax, rbp (until)
+        e.bytes({0x49, 0x2B, 0x06});       // sub rax, [r14]
+        e.bytes({0x48, 0x83, 0xF8, 0x08}); // cmp rax, 8
+        e.jccTo(CC_B, epi);                // budget < a line: dispatcher
+    }
+
+    // Intra-line hop: target segment in this same block. No residency or
+    // linking machinery — the block's own validity covers it (mem ops and
+    // fallbacks re-check fl.base at their own tails) — but the FULL gate
+    // runs, because the interpreter passes through the dispatcher on every
+    // taken branch, intra-line included.
+    void chainIntra(u32 tgtWord, u32 curWord)
+    {
+        chainChecks();
+        hopInc();
+        if (tgtWord <= curWord) { // emitted already (self-loop included)
+            e.jmpTo(segOff[tgtWord]);
+        } else {
+            e.b(0xE9);
+            fixes.push_back({e.at, tgtWord});
+            e.i32le(0);
+        }
+    }
+
+    // Cross-line hop, same page: successor residency check + the patchable
+    // site. Layout after the site's rel32 is fixed (kChainRel*): a parking
+    // block, then the resolver thunk. Initial rel32 = thunk.
+    void chainCross(u32 tgtVa)
+    {
+        const u32 tgtPaLine = (paBase & ~0xFFFu) | (tgtVa & 0xFE0u);
+        const u32 slot = (tgtPaLine >> 5) & (JitCache::kLines - 1u);
+        const i32 flD = i32(i64(o.fetchLine0) + i64(slot) * o.flStride);
+        chainChecks();
+        e.mem13(0x81, 7, flD); // cmp dword [fl'], paLine' — resident + same
+        e.i32le(tgtPaLine);
+        e.jccTo(CC_NE, epi);
+        hopInc();
+        e.b(0xE9); // the site
+        const u32 siteOff = u32(e.at);
+        e.i32le(u32(kChainRelThunk));
+        const size_t parkAt = e.at;
+        hopDec();      // parking block: not a hop after all
+        e.jmpTo(epi);
+        // ⚠ THE PARKING BLOCK'S LENGTH *IS* kChainRelThunk. The site's three
+        // states are encoded as rel32 values (0 = park, 12 = thunk, anything
+        // else = a live link), so the thunk only sits at +12 while these two
+        // instructions are exactly twelve bytes. Nothing else would notice if
+        // an emitter helper changed size — the site would simply jump into
+        // the middle of an instruction — so it is checked, not assumed.
+        if (e.at - parkAt != size_t(kChainRelThunk))
+            e.ok = false;
+        hopDec();      // thunk: a resolve is not a hop either
+        e.movEdxI(siteOff);
+        e.bytes({0x41, 0xB8}); // mov r8d, paLine'
+        e.i32le(tgtPaLine);
+        e.bytes({0x41, 0xB9}); // mov r9d, tgtVa
+        e.i32le(tgtVa);
+        e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
+        e.callAbs(reinterpret_cast<const void*>(&opmJitChainResolve));
+        e.jmpTo(epi);
+    }
+
+    // The one door: chain if eligible, else the v1 exit. Same-line targets
+    // are intra (a line never spans pages); same-page targets cross-chain;
+    // anything else — and everything under --no-jit-chain — exits to the
+    // dispatcher exactly as v1 did.
+    void chainOrExit(u32 target, u32 curWord)
+    {
+        if (chain && (target & ~31u) == vaBase)
+            chainIntra((target >> 2) & 7u, curWord);
+        else if (chain && (target >> 12) == (vaBase >> 12))
+            chainCross(target);
+        else
+            e.jmpTo(epi);
+    }
+
     // -- per-instruction tails ----------------------------------------------
 
     void aluTail(bool rc)
@@ -529,6 +840,111 @@ struct Compiler {
         byteCheck(o.batchBreak);
         pcCheck(nextVa);
         flCheck();
+    }
+
+    // ⭐⭐ THE DIRECT-CALL FALLBACK — execRow, specialized to the row.
+    //
+    // MEASURED (--jit-tsc): fallbacks are 45.9% of the in-game window's block
+    // time and the top eleven rows are ALL floating-point arithmetic, at
+    // 110-158 host cycles each even though 96% of them take the softfp host
+    // fast path. The arithmetic is not what costs that. execRow's PER-CALL
+    // SCAFFOLD is: a load of dispPre[row] and its gate ladder, a load of
+    // dispFn[row] and an INDIRECT CALL through it (79 live fallback rows in
+    // this window — the indirect predictor cannot hold them), charge(), the
+    // perfmon test and the trace test. Every one of those is either known
+    // when the block is compiled or already batched in rbx.
+    //
+    // So: call the bound handler DIRECTLY, with execRow's own work
+    // transcribed around it in execRow's own order. Nothing is skipped —
+    // the two rare tails (perfmon, trace) keep their exact code in
+    // shimFbTail behind the same tests execRow makes, and the gate ladder
+    // is re-emitted for the one gate this path admits.
+    //
+    // Admitted rows (checked by the caller): a bound handler, and either no
+    // pre-dispatch gate at all or the FP gate alone — the same predicate
+    // that lets the FP loads inline, with the same cold arm (the generic
+    // fallback, which raises FpUnavailable exactly as execRow would).
+    //
+    // ⚠ `keepBatch` SKIPS THE COUNTER FLUSH, and that is a claim about the
+    // handler, not a general one. It is passed only for the FP compute rows,
+    // whose handlers live entirely in fpu.cpp: that file touches st.fpr,
+    // st.fpscr, the CR and (in trapIfEnabled) st.pc, and NOTHING else —
+    // no readV/writeV, no bus, no device clock, no pendCycles, no tbNow. So
+    // nothing there can observe the instruction count or the charged cycles,
+    // and leaving both in rbx across the call is invisible. The one clock
+    // thing an FP handler can reach, raiseExc's exception-ring record of
+    // st.tb, reads the RAW timebase — which the interpreter leaves equally
+    // un-advanced mid-batch — so both machines record the same value.
+    void fallbackDirect(u32 insn, u32 row, u32 nextVa, const void* fn,
+                        bool fpGate, bool keepBatch)
+    {
+        size_t coldJ = size_t(-1);
+        if (fpGate) { // execRow's kPreFp arm, tested before anything is written
+            e.loadR(RAX, o.msr);
+            e.b(0xA9); // test eax, msr::FP
+            e.i32le(0x2000u);
+            coldJ = e.j32(CC_Z);
+        }
+        // The census the shim used to keep. It is what named this cost in the
+        // first place, so it survives the lowering: two absolute increments,
+        // ~4 uops against the ~50 the direct call saves.
+        e.bytes({0x48, 0xB8}); // mov rax, imm64 &fallbacks
+        e.i64le(reinterpret_cast<u64>(&jc->fallbacks));
+        e.bytes({0x48, 0xFF, 0x00}); // inc qword [rax]
+        e.bytes({0x48, 0xB8});       // mov rax, imm64 &fbByRow[row]
+        e.i64le(reinterpret_cast<u64>(&jc->fbByRow[row < 1024u ? row : 1023u]));
+        e.bytes({0x48, 0xFF, 0x00});
+        // execRow's own preamble, in its order.
+        e.mem13(0xC6, 0, o.raisedThis); // mov byte [r13+raisedThisStep], 0
+        e.b(0);
+        e.storeI(o.curInsn, insn);
+        if (keepBatch)
+            e.storeI(o.pc, nextVa); // execRow's `st.pc += 4`, counters batched
+        else
+            flushPc(nextVa);
+        e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
+        e.movEdxI(insn);
+        e.bytes({0x49, 0xB8});       // mov r8, imm64 &kIsa[row]
+        e.i64le(reinterpret_cast<u64>(&kIsa[row]));
+        e.callAbs(fn);               // DIRECT: no dispFn indirection
+        if (keepBatch)
+            bump();      // execRow's charge(), batched like every inlined op
+        else
+            chargeInc(); // …or settled now, for a handler that could observe
+        // The two rare tails, behind execRow's own conditions.
+        e.mem13(0x83, 7, o.mmcr0); // cmp dword [r13+mmcr0], 0
+        e.b(0);
+        const size_t tailJ = e.j32(CC_NE);
+        e.loadR(RAX, o.msr);
+        e.b(0xA9); // test eax, SE|BE
+        e.i32le(msr::SE | msr::BE);
+        const size_t tail2J = e.j32(CC_NE);
+        const size_t doneJ = e.jmp32f();
+        e.patch32(tailJ);
+        e.patch32(tail2J);
+        if (keepBatch)
+            flushNoPc(); // the tail can raise: settle before it observes
+        e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
+        e.movEdxI(insn);
+        e.bytes({0x41, 0xB8});       // mov r8d, row
+        e.i32le(row);
+        e.bytes({0x41, 0xB9});       // mov r9d, fallThrough (== nextVa)
+        e.i32le(nextVa);
+        e.callAbs(reinterpret_cast<const void*>(&shimFbTail));
+        e.patch32(doneJ);
+        // The line executor's exit tests, exactly as the generic path runs
+        // them. (The instruction count is already carried: bump/chargeInc
+        // above did what the generic path's `inc [r14]` does after execRow.)
+        byteCheck(o.halted);
+        byteCheck(o.batchBreak);
+        pcCheck(nextVa);
+        flCheck();
+        if (coldJ != size_t(-1)) {
+            const size_t joinJ = e.jmp32f();
+            e.patch32(coldJ);
+            fallback(insn, row, nextVa); // FP unavailable: the generic path
+            e.patch32(joinJ);
+        }
     }
 
     // -- loads / stores ------------------------------------------------------
@@ -733,7 +1149,10 @@ struct Compiler {
             return kTestCl;
         return kAlways;
     }
-    size_t condJump(int v) // emit the final test; SIZE_MAX = always taken
+    // Emit the final test; SIZE_MAX = always taken. `wide` (⚠ not `far`:
+    // windows.h #defines that away) widens the not-taken jump to rel32 — a
+    // chained taken arm (checks + site + thunk) is far past rel8 range.
+    size_t condJump(int v, bool wide = false)
     {
         if (v == kAlways)
             return size_t(-1);
@@ -745,7 +1164,7 @@ struct Compiler {
         } else {
             e.bytes({0x84, 0xC9}); // test cl, cl
         }
-        return e.j8(CC_Z);
+        return wide ? e.j32(CC_Z) : e.j8(CC_Z);
     }
 
     // -- the driver ----------------------------------------------------------
@@ -776,8 +1195,35 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         fallback(insn, row, nextVa);
         return;
     }
+    // From here the row has a bound handler and at most the FP gate, so any
+    // path that ends in execRow can go through the direct call instead. The
+    // batch may ride across the call only for the FP COMPUTE patterns — see
+    // fallbackDirect's note; the four FP memory patterns are excluded because
+    // their handlers do touch memory (and are inlined anyway).
+    const bool fpCompute =
+        isFpInsn(d) &&
+        (d.pat == Pat::FP2 || d.pat == Pat::FP3 || d.pat == Pat::FP3C ||
+         d.pat == Pat::FP4 || d.pat == Pat::FCMP || d.pat == Pat::MTFSF ||
+         d.pat == Pat::MTFSFI || d.pat == Pat::MTFSB || d.pat == Pat::MCRFS ||
+         d.pat == Pat::MFFS);
+    // ⚠ --jit-tsc COMPILES THE SHIM PATH. The rdtsc split brackets the shim
+    // call; the direct path has no call to bracket, and emitting rdtsc inline
+    // would measure a shape that is not the one shipping either. So the
+    // instrument keeps measuring what a fallback costs THROUGH execRow —
+    // still the right diagnostic for "what would lowering this row buy" —
+    // and the lowering's own win is settled by the same-binary MIPS A/B
+    // against --no-jit-direct, like every other speed claim here.
+    const auto fallbackBest = [&] {
+        if (!direct || jc->tscOn) {
+            fallback(insn, row, nextVa);
+            return;
+        }
+        fallbackDirect(insn, row, nextVa,
+                       reinterpret_cast<const void*>(c.dispFn[row]),
+                       c.dispPre[row] != 0, fpCompute);
+    };
     if ((d.flags & FL_OE) && f_oebit(insn)) {
-        fallback(insn, row, nextVa);
+        fallbackBest();
         return;
     }
     const Lo lo = static_cast<Lo>(loTable()[row]);
@@ -787,7 +1233,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     switch (lo) {
     default:
     case Lo::None:
-        fallback(insn, row, nextVa);
+        fallbackBest();
         return;
 
     // ---- D-form arithmetic (h_addi family) --------------------------------
@@ -1085,7 +1531,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         if (target != nextVa) {
             e.storeI(o.pc, target);
             flushNoPc();
-            e.jmpTo(epi);
+            chainOrExit(target, k);
         }
         return; // b .+4 falls through to the next segment, pc deferred
     }
@@ -1096,13 +1542,21 @@ void Compiler::word(u32 k, u32 insn, u32 row)
                                true);
         if (f_lkbit(insn))
             e.storeI(o.lr, nextVa); // written whether or not taken
-        const size_t nt = condJump(v);
+        const bool chained = chain && target != nextVa &&
+                             (target >> 12) == (vaBase >> 12);
+        const size_t nt = condJump(v, chained);
         bump();
         e.storeI(o.pc, target);
         flushNoPc();
-        e.jmpTo(epi);
+        if (chained)
+            chainOrExit(target, k);
+        else
+            e.jmpTo(epi);
         if (nt != size_t(-1)) {
-            e.patch8(nt);
+            if (chained)
+                e.patch32(nt);
+            else
+                e.patch8(nt);
             bump(); // not taken: fall through, pc deferred
         }
         return;
@@ -1180,7 +1634,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     case Lo::Stfdux: fpMem(insn, row, nextVa, true, false, true, true); return;
     case Lo::Fmr: { // h_fmr: fpr[frt] = fpr[frb]; Rc (CR1 from FPSCR) falls back
         if (f_rcbit(insn)) {
-            fallback(insn, row, nextVa);
+            fallbackBest();
             return;
         }
         e.loadR(RAX, o.msr);
@@ -1201,7 +1655,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     case Lo::Mfspr: {
         const u32 spr = f_spr(insn);
         if (spr != 8 && spr != 9) {
-            fallback(insn, row, nextVa);
+            fallbackBest();
             return;
         }
         e.loadR(RAX, spr == 8 ? o.lr : o.ctr);
@@ -1212,7 +1666,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     case Lo::Mtspr: {
         const u32 spr = f_spr(insn);
         if (spr != 8 && spr != 9) {
-            fallback(insn, row, nextVa);
+            fallbackBest();
             return;
         }
         e.loadR(RAX, gpr(rt));
@@ -1249,9 +1703,31 @@ JitCache::~JitCache()
 
 void JitCache::dropAll()
 {
-    for (JitLine& l : line)
+    for (JitLine& l : line) {
         l.base = 1;
+        // Links die with the population: after a wholesale drop no block can
+        // be entered (the dispatcher probes ways and finds none), so chained
+        // jumps between the dead blocks are unreachable and need no arena
+        // rewrites — but the backref lists must not survive into the lines'
+        // next lives, where the offsets would point at unrelated code.
+        l.nBref = 0;
+    }
     std::memset(rr, 0, sizeof rr);
+}
+
+void JitCache::sever(JitLine& jl)
+{
+#if OPM_JIT_HOST
+    for (u32 k = 0; k < jl.nBref; ++k) {
+        const u32 s = jl.bref[k];
+        if (size_t(s) + 4 <= cap_) {
+            const i32 rel = kChainRelThunk; // back to "resolve me"
+            std::memcpy(arena_ + s, &rel, 4);
+            ++chainSevers;
+        }
+    }
+#endif
+    jl.nBref = 0;
 }
 
 void JitCache::bind(Cpu& c)
@@ -1280,6 +1756,26 @@ void JitCache::bind(Cpu& c)
     offs.fpr0 = d32(&c.st.fpr[0]);
     offs.fetchLine0 = d32(&c.fetchLine[0].base);
     offs.flStride = i32(sizeof(Cpu::FetchLine));
+    // Chain-gate fields (Stage B). The four pending bools are declared
+    // adjacently; when the measured offsets confirm it, one dword compare
+    // covers them all — measured, not assumed, so a reordered declaration
+    // degrades to four byte tests instead of a wrong gate.
+    offs.lineExecOff = d32(&c.lineExecOff);
+    offs.napping = d32(&c.napping);
+    offs.mmcr0 = d32(&c.st.mmcr0);
+    offs.iabr = d32(&c.st.iabr);
+    offs.xlMsr = d32(&c.xlMsr);
+    offs.raisedThis = d32(&c.raisedThisStep);
+    offs.extIrq = d32(&c.extIrqLine);
+    offs.smi = d32(&c.smiPending);
+    offs.decP = d32(&c.decPending);
+    offs.pmP = d32(&c.pmPending);
+    offs.pend4 = offs.extIrq;
+    offs.pend4Ok = offs.smi == offs.extIrq + 1 &&
+                   offs.decP == offs.extIrq + 2 &&
+                   offs.pmP == offs.extIrq + 3;
+    offs.until = d32(&c.jitUntil);
+    offs.chainHops = d32(&c.jitChainHops);
 
     // The trampoline and the shared epilogue, emitted like everything else.
     // enter(entry=rcx, cpu=rdx, stamp=r8, cyc=r9). Eight callee-saved pushes
@@ -1293,6 +1789,8 @@ void JitCache::bind(Cpu& c)
     e.bytes({0x49, 0x89, 0xD5});                           // mov r13, rdx
     e.bytes({0x4D, 0x89, 0xC6});                           // mov r14, r8
     e.bytes({0x4D, 0x89, 0xCF});                           // mov r15, r9
+    e.bytes({0x48, 0x8B, 0xAA});                           // mov rbp, [rdx+until]
+    e.i32le(u32(offs.until));                              // (the budget bound)
     e.bytes({0x31, 0xDB});                                 // xor ebx, ebx
     e.bytes({0xFF, 0xE1});                                 // jmp rcx
     epilogue_ = u32(e.at);
@@ -1335,6 +1833,7 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
         rr[slot] = u8((rr[slot] + 1u) % kWays);
     }
     JitLine& jl = ways[way];
+    sever(jl); // way reuse: chains into the OLD block must re-resolve
     jl.base = 1;
     Compiler cp{Emit{arena_, cap_, at_},
                 c,
@@ -1342,16 +1841,25 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
                 epilogue_,
                 paBase,
                 vaBase,
-                i32(i64(offs.fetchLine0) + i64(slot) * offs.flStride)};
+                i32(i64(offs.fetchLine0) + i64(slot) * offs.flStride),
+                jl.off,
+                !c.jitChainOff,
+                !c.jitDirectOff,
+                this,
+                {}}; // fixes: named, because gcc requires every member here
     for (u32 k = 0; k < 8; ++k) {
         jl.off[k] = u32(cp.e.at);
         cp.word(k, w[k], rows[k]);
     }
     // Word 7's fallthrough is the line end: settle the deferred pc (the word
-    // after the line) and the batched counters, then leave. Every other path
-    // out of the block flushed at its own exit.
+    // after the line) and the batched counters, then chain to the next line
+    // — the other half of every dispatcher round trip — or leave. Every
+    // other path out of the block flushed at its own exit.
     cp.flushPc(vaBase + 32u);
-    cp.e.jmpTo(epilogue_);
+    cp.chainOrExit(vaBase + 32u, 7u);
+    // Forward intra-line chain targets, now that every segment has a home.
+    for (const auto& f : cp.fixes)
+        cp.e.patchRel32To(f.first, jl.off[f.second]);
     if (!cp.e.ok)
         return false; // ran out mid-compile; the next touch retries fresh
     at_ = cp.e.at;
@@ -1368,18 +1876,20 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
 
 // ---- the two doors ---------------------------------------------------------
 
-bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp)
+bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
 {
 #if OPM_JIT_HOST
     if (!c.jit) {
         c.jit = std::make_unique<JitCache>();
         c.jit->bind(c);
+        c.jit->tscOn = c.jitTscOn;
         if (!c.jit->ready()) {
             c.jitOn = false; // no executable memory: interpreter it is
             return false;
         }
     }
     JitCache& J = *c.jit;
+    const u64 tsc0 = J.tscOn ? __rdtsc() : 0;
     const Cpu::FetchLine& fl = c.fetchLine[slot];
     const u32 vaBase = c.st.pc & ~31u;
     JitLine* ways = &J.line[slot * JitCache::kWays];
@@ -1405,13 +1915,25 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp)
         }
     }
     ++J.enters;
+    c.jitUntil = until; // the trampoline pins it in rbp for the chain hops
     const u64 before = stamp;
-    J.enterFn(J.arena_ + jl->off[word], &c, &stamp,
-              u64(c.insnCycles) + c.extraCycles);
+    if (J.tscOn) {
+        // The split the report's "cycles per …" lines are built from:
+        // tscProbe is everything this function did to find the block (the
+        // dispatcher's own overhead), tscNative is the emitted code itself.
+        const u64 t1 = __rdtsc();
+        J.tscProbe += t1 - tsc0;
+        J.enterFn(J.arena_ + jl->off[word], &c, &stamp,
+                  u64(c.insnCycles) + c.extraCycles);
+        J.tscNative += __rdtsc() - t1;
+    } else {
+        J.enterFn(J.arena_ + jl->off[word], &c, &stamp,
+                  u64(c.insnCycles) + c.extraCycles);
+    }
     J.insns += stamp - before;
     return true;
 #else
-    (void)c; (void)slot; (void)word; (void)stamp;
+    (void)c; (void)slot; (void)word; (void)stamp; (void)until;
     return false;
 #endif
 }
@@ -1434,9 +1956,10 @@ void jitNoteRefill(Cpu& c, u32 slot, u32 base, const u32* w)
         if (jl.base != base || jl.base == 1u)
             continue;
         if (std::memcmp(jl.srcW, w, 32) == 0) {
-            ++c.jit->refillKeeps;
+            ++c.jit->refillKeeps; // identical bytes: block AND its links live
         } else {
-            jl.base = 1u;
+            c.jit->sever(jl); // unlink chains into it BEFORE it stops being
+            jl.base = 1u;     // the block for these bytes
             ++c.jit->refillDrops;
         }
     }

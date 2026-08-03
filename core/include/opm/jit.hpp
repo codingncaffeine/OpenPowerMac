@@ -45,6 +45,16 @@ struct JitLine {
                      // content KEEPS the block (instrument-era flushes would
                      // otherwise recompile the world)
     u32 off[8]{};    // arena offset of each word's segment
+    // Chain backrefs: arena offsets of the rel32 words in OTHER blocks that
+    // jump into this one (JIT_PLAN §7 Stage B). Severed — rewritten so the
+    // site re-resolves — the moment this JitLine stops describing its line
+    // (refill with different content, way eviction, dropAll), which is the
+    // whole of what makes a chained entry equivalent to the dispatcher's
+    // ways probe. Fixed capacity: a site that finds the list full parks
+    // itself on the dispatcher exit permanently (counted, chainGiveups).
+    static constexpr u32 kBrefs = 8;
+    u32 bref[kBrefs]{};
+    u8 nBref = 0;
 };
 
 class JitCache {
@@ -79,6 +89,10 @@ class JitCache {
     // Counters, always on: they are how the report says what the JIT did.
     u64 compiles = 0, enters = 0, insns = 0, resets = 0, refillKeeps = 0,
         refillDrops = 0, bails = 0;
+    // Chain lifecycle (Stage B). Hops themselves are counted by emitted code
+    // into Cpu::jitChainHops (r13-addressable); everything here is C++-side.
+    u64 chainLinks = 0, chainSevers = 0, chainResolves = 0, chainMisses = 0,
+        chainGiveups = 0;
     // The mix census. What the blocks actually executed is the aim point
     // for the next lowering round: memOps counts shim round trips, fallbacks
     // counts execRow calls from inside blocks, and fbByRow names the rows —
@@ -90,6 +104,22 @@ class JitCache {
     u64 fallbacks = 0;
     u64 memOps = 0;
     u64 fbByRow[1024] = {};
+    // 🔬 --jit-tsc: THE HOST-CYCLE SPLIT. Counting calls says which rows are
+    // frequent; it cannot say where the time is, and this JIT's remaining
+    // cost is concentrated in a few call-shaped things (the memory shims, the
+    // execRow fallbacks) whose per-call price is the whole question for what
+    // to lower next. Guarded by a bool so the flag is always available
+    // without a second build: off, it is one perfectly-predicted branch per
+    // shim; on, it costs an rdtsc pair per call and inflates the run, so the
+    // numbers it produces are SHARES and per-call costs, never MIPS.
+    bool tscOn = false;
+    u64 tscMem = 0, tscFb = 0, tscByRow[1024] = {};
+    // FP loads/stores are memory ops too, and they were invisible: `memOps`
+    // counts only the integer shims, so the s40 "mem ops 15.9%" line omitted
+    // the lfs/stfs/lfd/stfd traffic entirely — and the census had already
+    // named lfs the single hottest row in the game. Counted apart so the
+    // historical number stays comparable to the sessions that quoted it.
+    u64 fpMemOps = 0;
 
     // r13-relative displacements into Cpu, measured off the live object at
     // bind() rather than via offsetof: Cpu holds std::map members, so it is
@@ -101,6 +131,15 @@ class JitCache {
         i32 msr = 0, fpr0 = 0;
         i32 fetchLine0 = 0; // fetchLine[0].base; slot k at +k*sizeof(FetchLine)
         i32 flStride = 0;
+        // Chain-gate fields (Stage B): the dispatcher's own `slow` inputs,
+        // the fetch-translation MSR word, the budget bound and the hop
+        // counter. pend4 covers the four adjacent pending bools with one
+        // dword compare when bind() confirms adjacency (pend4Ok).
+        i32 lineExecOff = 0, napping = 0, mmcr0 = 0, iabr = 0, xlMsr = 0;
+        i32 raisedThis = 0; // execRow clears it before every handler
+        i32 pend4 = 0, extIrq = 0, smi = 0, decP = 0, pmP = 0;
+        i32 until = 0, chainHops = 0;
+        bool pend4Ok = false;
     } offs;
 
     using EnterFn = void (*)(const void* entry, Cpu*, u64* stamp, u64 cyc);
@@ -109,6 +148,11 @@ class JitCache {
     // Wire the cache to one Cpu: measure offsets, emit trampoline/epilogue.
     void bind(Cpu& c);
     void dropAll();
+    // Unlink every chain site that jumps into this block: each recorded
+    // rel32 goes back to 0, which re-targets the site at its own resolver
+    // thunk. Must run before the JitLine stops describing its (base, va) —
+    // see the field comment on JitLine::bref.
+    void sever(JitLine& jl);
     bool compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
                      const u16* rows, u32 vaBase);
 
@@ -124,8 +168,10 @@ class JitCache {
 // arch, arena exhausted mid-compile) and the caller falls back to the
 // interpreter for this line. `stamp` is the caller's instruction counter —
 // advanced per instruction by the emitted code, exactly as the line executor
-// advances it.
-bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp);
+// advances it. `until` is the batch's budget bound (runSteps' own local):
+// chained hops re-check `until - stamp >= 8` exactly where the dispatcher
+// would have, so a chained run can never overrun the batch.
+bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until);
 
 // fetchDecoded's refill hook: a line was just (re)filled. Identical content
 // keeps the compiled block; anything else invalidates the slot.

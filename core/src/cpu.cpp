@@ -376,7 +376,8 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
         if (jitOn && until - i >= 8u && !(st.msr & msr::LE)) {
             OPM_PH(Exec);
             const bool ran =
-                jitRunLine(*this, static_cast<u32>(fl - fetchLine), word, i);
+                jitRunLine(*this, static_cast<u32>(fl - fetchLine), word, i,
+                           until);
             OPM_PH(Loop);
             if (ran) {
                 if (batchBreak || halted)

@@ -523,3 +523,361 @@ TEST_CASE("jit: instrument-style flush keeps compiled lines (refill parity)")
         CHECK(ji.cpu.jit->insns > 0);
     }
 }
+
+// ---- Stage B: block-to-block chaining (JIT_PLAN §7) ------------------------
+
+TEST_CASE("jit chain: cross-line branches and fallthrough match the interpreter")
+{
+    // Line 0 counts to 20 via a taken forward bc into line 1, line 1 loops
+    // back with a backward b — both cross-line, same-page, so both exits
+    // chain. The spin at the end is an intra-line self-loop. Chains link on
+    // the second traversal and carry every iteration after; the twins must
+    // not be able to tell.
+    std::vector<u32> prog = {
+        dform(14, 3, 3, 1),      // w0: addi r3, r3, 1
+        cmpi(0, 3, 20),          // w1: cmp r3, 20
+        bc(12, 0, 24),           // w2: blt -> line 1 word 0 (kBase+32)
+        dform(14, 4, 4, 1),      // w3: r3 == 20: fall out of the loop
+        dform(14, 5, 5, 1),      // w4
+        b(0),                    // w5: spin (intra-line self-chain)
+        dform(14, 6, 6, 1),      // w6: (dead)
+        dform(14, 6, 6, 1),      // w7: (dead)
+        dform(14, 7, 7, 1),      // line 1 w0 (kBase+32)
+        b(-36),                  // line 1 w1: back to line 0 word 0
+    };
+    Twin ji(true), in(false);
+    ji.poke(prog);
+    in.poke(prog);
+    ji.run(160);
+    in.run(160);
+    CHECK_TWINS(ji, in);
+    CHECK(ji.cpu.st.gpr[3] == 20u);
+    CHECK(ji.cpu.st.gpr[7] == 19u);
+    if (ji.cpu.jit) { // host-specific half: the chains actually engaged
+        CHECK(ji.cpu.jitChainHops > 0);
+        CHECK(ji.cpu.jit->chainLinks > 0);
+    }
+}
+
+TEST_CASE("jit chain: intra-line backward loop keeps the budget exact")
+{
+    // bdnz to its own line: the cheap chain flavor, and the one that could
+    // overrun a batch if a hop ever skipped the budget check. Every stop
+    // count from 1 to 100 must land exactly, twins identical.
+    std::vector<u32> prog = {
+        dform(14, 9, 0, 40),     // w0: r9 = 40
+        mtspr(9, 9),             // w1: mtctr r9
+        dform(14, 3, 3, 1),      // w2: addi r3, r3, 1
+        bc(16, 0, -4),           // w3: bdnz w2 (backward, same line)
+        b(0),                    // w4: spin
+        dform(14, 6, 6, 1),      // w5..w7: (dead)
+        dform(14, 6, 6, 1),
+        dform(14, 6, 6, 1),
+    };
+    for (u64 n : {1ull, 7ull, 8ull, 9ull, 15ull, 16ull, 17ull, 33ull, 50ull,
+                  81ull, 82ull, 83ull, 100ull}) {
+        Twin ji(true), in(false);
+        ji.poke(prog);
+        in.poke(prog);
+        ji.run(n);
+        in.run(n);
+        CHECK_TWINS(ji, in);
+        CHECK(ji.stamp == n);
+    }
+}
+
+TEST_CASE("jit chain: SMC in the successor severs and relinks the chain")
+{
+    // Line 0 stores a DIFFERENT instruction into line 1 word 0 on every
+    // iteration (r11 increments first), so every refill of line 1 mismatches:
+    // the block drops, any chain into it severs, the next traversal
+    // re-resolves against the recompiled block. The interpreter must see the
+    // same stream of freshly-stored instructions — addi r7, r7, k on
+    // iteration k — and the accumulators prove which stream actually ran.
+    const u32 insn0 = dform(14, 7, 7, 0); // addi r7, r7, 0 (stored as +1, +2…)
+    std::vector<u32> prog = {
+        dform(14, 10, 0, i32(kBase + 32)),         // w0: r10 = &line1
+        dform(15, 11, 0, i32(insn0 >> 16)),        // w1: lis r11, hi
+        dform(24, 11, 11, i32(insn0 & 0xFFFFu)),   // w2: ori r11, r11, lo
+        dform(14, 11, 11, 1),                      // w3: r11 += 1 (each pass)
+        dform(36, 11, 10, 0),                      // w4: stw r11, 0(r10)
+        dform(14, 3, 3, 1),                        // w5
+        dform(14, 4, 4, 1),                        // w6
+        dform(14, 5, 5, 1),                        // w7 -> falls into line 1
+        dform(14, 7, 7, 1),                        // line1 w0: overwritten
+        b(-36),                                    // line1 w1: back to w0
+    };
+    // Loop back to w3, not w0: w1/w2 would rebuild r11 from scratch and the
+    // stored word would stop changing after the first pass — one sever
+    // instead of a stream of them.
+    prog[9] = b(-24); // line1 w1: back to w3 (skip the r10/r11 seeding)
+    Twin ji(true), in(false);
+    ji.poke(prog);
+    in.poke(prog);
+    ji.run(140); // ~19 iterations of the 7-insn loop after the 3-insn seed
+    in.run(140);
+    CHECK_TWINS(ji, in);
+    CHECK(std::memcmp(ji.bus.m.data(), in.bus.m.data(), ji.bus.m.size()) == 0);
+    if (ji.cpu.jit) {
+        // No hop ever completes here, BY CONSTRUCTION: line 1 recompiles
+        // every iteration (its bytes changed), so each incarnation's b(-24)
+        // site links on its first-and-only traversal and the block dies
+        // before the link is taken; the fallthrough site never even resolves
+        // (its target's line is always freshly dropped at the check). What
+        // the storm proves is the sever/relink lifecycle under maximum churn
+        // — links keep forming and dying with the twins bit-identical.
+        CHECK(ji.cpu.jit->refillDrops > 0); // the stored word really changed
+        CHECK(ji.cpu.jit->chainLinks > 0);  // each incarnation re-linked
+        CHECK(ji.cpu.jit->chainResolves > 0);
+    }
+}
+
+TEST_CASE("jit chain: severing a LIVE link — modify a successor after it linked")
+{
+    // Nine quiet iterations first, so the fallthrough into line 1 and the
+    // backward b out of it both LINK. On iteration 10 the guest overwrites
+    // line 1's first word: the refill must sever the live link into line 1,
+    // the old block must never be entered again, and the site must re-resolve
+    // against the recompiled block. r7 counts +1 for nine passes and +2 from
+    // then on — only the correct stream of blocks produces it.
+    const u32 newInsn = dform(14, 7, 7, 2); // addi r7, r7, 2
+    std::vector<u32> prog = {
+        dform(14, 3, 3, 1),      // w0: addi r3, r3, 1 (iteration counter)
+        cmpi(0, 3, 10),          // w1
+        bc(4, 2, 8),             // w2: bne +8 -> w4 (intra-line forward chain)
+        dform(36, 11, 10, 0),    // w3: stw r11, 0(r10) — iteration 10 only
+        dform(14, 4, 4, 1),      // w4
+        dform(14, 5, 5, 1),      // w5
+        dform(14, 5, 5, 1),      // w6
+        dform(14, 5, 5, 1),      // w7 -> falls into line 1
+        dform(14, 7, 7, 1),      // line1 w0: becomes addi r7, r7, 2
+        b(-36),                  // line1 w1: back to w0
+    };
+    Twin ji(true), in(false);
+    ji.poke(prog);
+    in.poke(prog);
+    ji.cpu.st.gpr[10] = in.cpu.st.gpr[10] = kBase + 32; // &line1
+    ji.cpu.st.gpr[11] = in.cpu.st.gpr[11] = newInsn;
+    ji.run(200); // ~20 iterations of the 9/10-insn loop
+    in.run(200);
+    CHECK_TWINS(ji, in);
+    CHECK(std::memcmp(ji.bus.m.data(), in.bus.m.data(), ji.bus.m.size()) == 0);
+    if (ji.cpu.jit) {
+        CHECK(ji.cpu.jitChainHops > 0);
+        CHECK(ji.cpu.jit->chainLinks >= 2);  // linked, severed, relinked
+        CHECK(ji.cpu.jit->chainSevers >= 1); // the live link was cut
+        CHECK(ji.cpu.jit->refillDrops >= 1);
+    }
+}
+
+TEST_CASE("jit chain: msr changes stop a chained run where the dispatcher would")
+{
+    // mtmsr does NOT break the batch (only its nap path does), so the
+    // dispatcher only notices a changed MSR at its next fetchBlockFast — and
+    // a chained hop must notice at the same boundary, through the same
+    // comparison (msr fetch bits vs xlMsr; EE against the pending lines).
+    // Case A: EE goes live with an external line already asserted — the hop
+    // must hand the line back so the interrupt delivers on the dispatcher's
+    // schedule, not a line late.
+    {
+        std::vector<u32> prog = {
+            dform(14, 3, 3, 1),         // w0
+            dform(14, 9, 0, 0),         // w1: r9 = 0
+            dform(24, 9, 9, 0x8000),    // w2: ori r9, r9, EE
+            31u << 26 | 9u << 21 | 146u << 1, // w3: mtmsr r9
+            dform(14, 3, 3, 1),         // w4: still in the line after mtmsr
+            dform(14, 3, 3, 1),         // w5
+            dform(14, 3, 3, 1),         // w6
+            dform(14, 3, 3, 1),         // w7 -> falls into line 1
+            dform(14, 4, 4, 1),         // line1 w0
+            b(-36),                     // line1 w1: loop
+        };
+        Twin ji(true), in(false);
+        ji.poke(prog);
+        in.poke(prog);
+        ji.cpu.setExternalIrq(true);
+        in.cpu.setExternalIrq(true);
+        ji.run(48);
+        in.run(48);
+        CHECK_TWINS(ji, in);
+    }
+    // Case B: PR flips (user mode). Real-mode fetch is unchanged by PR, but
+    // xlMsr includes it, so the interpreter's next fetchBlockFast misses and
+    // refills — and the chained hop must fall back to the dispatcher through
+    // the same compare, after which the now-privileged mtmsr faults
+    // identically on both machines.
+    {
+        std::vector<u32> prog = {
+            dform(14, 3, 3, 1),         // w0
+            dform(14, 9, 0, 0),         // w1
+            dform(24, 9, 9, 0x4000),    // w2: ori r9, r9, PR
+            31u << 26 | 9u << 21 | 146u << 1, // w3: mtmsr r9
+            dform(14, 3, 3, 1),         // w4
+            dform(14, 3, 3, 1),         // w5
+            dform(14, 3, 3, 1),         // w6
+            dform(14, 3, 3, 1),         // w7 -> falls into line 1
+            dform(14, 4, 4, 1),         // line1 w0
+            b(-36),                     // line1 w1: loop
+        };
+        Twin ji(true), in(false);
+        ji.poke(prog);
+        in.poke(prog);
+        ji.run(48);
+        in.run(48);
+        CHECK_TWINS(ji, in);
+    }
+}
+
+// ---- the direct-call fallback ---------------------------------------------
+
+TEST_CASE("jit direct: FP arithmetic through the direct call matches execRow")
+{
+    // fmadds/fmuls/fadds/fsubs and their double siblings are the rows the
+    // --jit-tsc split named as 45.9% of the in-game window, and they are the
+    // rows the direct call was built for. Every one of them writes an FPR and
+    // the FPSCR, so the twins are compared on those too — the register
+    // comparison in CHECK_TWINS covers the GPRs, and RAM covers the rest via
+    // the stores below.
+    auto fp = [](u32 op, u32 frt, u32 fra, u32 frb, u32 frc, u32 xo,
+                 bool rc = false) {
+        return op << 26 | frt << 21 | fra << 16 | frb << 11 | frc << 6 |
+               xo << 1 | (rc ? 1u : 0u);
+    };
+    for (u32 iter = 0; iter < 40; ++iter) {
+        Rng r{0x5150F000ull + iter};
+        std::vector<u32> prog;
+        // Seed three FPRs from memory so both machines start FP-identical.
+        prog.push_back(dform(14, 10, 0, i32(kData)));   // r10 = &data
+        prog.push_back(dform(50, 1, 10, 0));            // lfd f1, 0(r10)
+        prog.push_back(dform(50, 2, 10, 8));            // lfd f2, 8(r10)
+        prog.push_back(dform(50, 3, 10, 16));           // lfd f3, 16(r10)
+        for (u32 k = 0; k < 3; ++k) {
+            const bool sgl = (r.next() & 1u) != 0;
+            switch (r.next() % 6u) {
+            case 0: prog.push_back(fp(sgl ? 59 : 63, 4, 1, 2, 0, 21)); break; // fadd(s)
+            case 1: prog.push_back(fp(sgl ? 59 : 63, 4, 1, 2, 0, 20)); break; // fsub(s)
+            case 2: prog.push_back(fp(sgl ? 59 : 63, 4, 1, 0, 3, 25)); break; // fmul(s)
+            case 3: prog.push_back(fp(sgl ? 59 : 63, 4, 1, 2, 3, 29)); break; // fmadd(s)
+            case 4: prog.push_back(fp(sgl ? 59 : 63, 4, 1, 2, 3, 28)); break; // fmsub(s)
+            case 5: prog.push_back(fp(63, 4, 0, 2, 0, 12)); break;            // frsp
+            }
+            prog.push_back(dform(54, 4, 10, i32(64 + k * 8))); // stfd f4, N(r10)
+        }
+        prog.push_back(b(0));
+        Twin ji(true), in(false);
+        ji.poke(prog);
+        in.poke(prog);
+        // Real double bit patterns, not the byte ramp: the ramp is a
+        // denormal/NaN soup and would exercise only the model's cold paths.
+        static const double vals[] = {1.5, -2.25, 3.0e7, 1.0e-8,
+                                      0.1, 12345.678, -7.5e-3, 2.0};
+        for (u32 k = 0; k < 8; ++k) {
+            u64 bits;
+            const double d = vals[(iter + k) % 8];
+            std::memcpy(&bits, &d, 8);
+            for (u32 j = 0; j < 8; ++j) {
+                const u8 by = u8(bits >> (56 - 8 * j));
+                ji.bus.write8(kData + k * 8 + j, by);
+                in.bus.write8(kData + k * 8 + j, by);
+            }
+        }
+        ji.cpu.st.msr |= msr::FP;
+        in.cpu.st.msr |= msr::FP;
+        ji.run(40);
+        in.run(40);
+        CHECK_TWINS(ji, in);
+        for (u32 k = 0; k < 32; ++k)
+            CHECK(ji.cpu.st.fpr[k] == in.cpu.st.fpr[k]);
+        CHECK(ji.cpu.st.fpscr == in.cpu.st.fpscr);
+        CHECK(std::memcmp(ji.bus.m.data(), in.bus.m.data(),
+                          ji.bus.m.size()) == 0);
+    }
+}
+
+TEST_CASE("jit direct: MSR[FP] clear takes the cold arm and raises")
+{
+    // The direct path's gate is execRow's kPreFp arm. With MSR[FP] clear the
+    // block must reach the generic fallback, which raises FpUnavailable —
+    // and the vector, SRR0/SRR1 and the untouched FPR must match a machine
+    // that never compiled anything.
+    const u32 fadds = 59u << 26 | 4u << 21 | 1u << 16 | 2u << 11 | 21u << 1;
+    std::vector<u32> prog = {
+        dform(14, 3, 3, 1), fadds, dform(14, 4, 4, 1), b(0),
+        dform(14, 5, 5, 1), dform(14, 5, 5, 1),
+        dform(14, 5, 5, 1), dform(14, 5, 5, 1),
+    };
+    Twin ji(true), in(false);
+    ji.poke(prog);
+    in.poke(prog);
+    ji.run(12); // MSR[FP] is clear out of reset
+    in.run(12);
+    CHECK_TWINS(ji, in);
+    CHECK(ji.cpu.st.srr0 == in.cpu.st.srr0);
+    CHECK(ji.cpu.st.srr1 == in.cpu.st.srr1);
+    CHECK(ji.cpu.st.fpr[4] == in.cpu.st.fpr[4]);
+}
+
+TEST_CASE("jit direct: non-FP fallback rows (divide, traps, mtspr) still match")
+{
+    // The direct call admits every ungated row with a bound handler, not
+    // just the FP ones, and those handlers DO touch the clock and memory —
+    // so they run with the counters settled (keepBatch false). divwu covers
+    // arithmetic, mtspr/mfspr the SPR file, and lmw/stmw a multi-word memory
+    // handler whose RAM effects the twins compare byte for byte.
+    for (u32 iter = 0; iter < 40; ++iter) {
+        Rng r{0xD1BE0000ull + iter};
+        std::vector<u32> prog = {
+            dform(14, 10, 0, i32(kData)),
+            xo31(4, 3, 5, 459, false, (r.next() & 1) != 0), // divwu
+            xo31(6, 3, 5, 491, false, false),               // divw
+            mtspr(9, 7),                                    // mtctr r7
+            mfspr(9, 8),                                    // mfctr r8
+            dform(46, 28, 10, 0),                           // lmw r28, 0(r10)
+            dform(47, 28, 10, 32),                          // stmw r28, 32(r10)
+            b(0),
+        };
+        differential(prog, 24, Rng{0xD1BE8000ull + iter}, true);
+    }
+}
+
+TEST_CASE("jit direct: --no-jit-direct is the shim path (control, twins match)")
+{
+    const u32 fadds = 59u << 26 | 4u << 21 | 1u << 16 | 2u << 11 | 21u << 1;
+    std::vector<u32> prog = {
+        dform(14, 10, 0, i32(kData)), dform(50, 1, 10, 0),
+        dform(50, 2, 10, 8),          fadds,
+        dform(54, 4, 10, 64),         dform(14, 3, 3, 1),
+        dform(14, 4, 4, 1),           b(0),
+    };
+    Twin ji(true), in(false);
+    ji.cpu.jitDirectOff = true; // compiled, but fallbacks go through execRow
+    ji.poke(prog);
+    in.poke(prog);
+    ji.cpu.st.msr |= msr::FP;
+    in.cpu.st.msr |= msr::FP;
+    ji.run(24);
+    in.run(24);
+    CHECK_TWINS(ji, in);
+    CHECK(ji.cpu.st.fpr[4] == in.cpu.st.fpr[4]);
+    CHECK(ji.cpu.st.fpscr == in.cpu.st.fpscr);
+}
+
+TEST_CASE("jit chain: --no-jit-chain is v1 (control run, twins still match)")
+{
+    std::vector<u32> prog = {
+        dform(14, 3, 3, 1),  cmpi(0, 3, 12),
+        bc(12, 0, 24),       dform(14, 4, 4, 1),
+        dform(14, 5, 5, 1),  b(0),
+        dform(14, 6, 6, 1),  dform(14, 6, 6, 1),
+        dform(14, 7, 7, 1),  b(-36),
+    };
+    Twin ji(true), in(false);
+    ji.cpu.jitChainOff = true; // compiled, but every exit takes the dispatcher
+    ji.poke(prog);
+    in.poke(prog);
+    ji.run(120);
+    in.run(120);
+    CHECK_TWINS(ji, in);
+    if (ji.cpu.jit)
+        CHECK(ji.cpu.jitChainHops == 0);
+}

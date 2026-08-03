@@ -56,13 +56,24 @@ inline constexpr u32 fVxAll = fVXSNAN | fVXISI | fVXIDI | fVXZDZ | fVXIMZ |
 inline constexpr u32 fExcAll = fFX | fOX | fUX | fZX | fXX | fVxAll;
 
 // Derived bits: VX = OR of the invalid bits; FEX = OR of enabled exceptions.
+//
+// ⭐ FEX IN ONE AND, BECAUSE THE ARCHITECTURE ALIGNED IT FOR US. Each of the
+// five exception bits sits exactly 22 places above its own enable —
+// VX 0x20000000 >> 22 == VE 0x80, and likewise OX/OE, UX/UE, ZX/ZE, XX/XE —
+// so `(f >> 22) & f`, masked to the enable field, has a bit set precisely
+// where an exception and its enable are both on. That replaces five
+// short-circuiting AND pairs, and this runs once per floating-point
+// operation on a path that is 45.9% of the in-game window (--jit-tsc, s41).
+// The sibling short-circuit in mapFlags, whose eleven data-dependent
+// branches were mispredicting, was worth 6% of the whole machine on its own.
 void refresh(u32& f)
 {
-    f = (f & ~fVX) | ((f & fVxAll) ? fVX : 0);
-    const bool fex = ((f & fVX) && (f & fVE)) || ((f & fOX) && (f & fOE)) ||
-                     ((f & fUX) && (f & fUE)) || ((f & fZX) && (f & fZE)) ||
-                     ((f & fXX) && (f & fXE));
-    f = (f & ~fFEX) | (fex ? fFEX : 0);
+    u32 v = f & ~(fVX | fFEX);
+    if (f & fVxAll)
+        v |= fVX; // VX is computed from f, then feeds FEX below — as before
+    if (((v >> 22) & v) & (fVE | fOE | fUE | fZE | fXE))
+        v |= fFEX;
+    f = v;
 }
 
 sf::Env env(const Cpu& c)
@@ -109,6 +120,17 @@ void trapIfEnabled(Cpu& c)
 
 u32 mapFlags(u32 sfl)
 {
+    // ⭐ THE ORDINARY RESULT, IN TWO TESTS. Every floating-point operation
+    // this machine executes passes its softfp flags through here, and the
+    // ladder below is eleven of them — for a value that, on any result which
+    // did not raise, holds at most inexact (kXx) and fraction-incremented
+    // (kFr, which maps to no FPSCR exception bit at all). The FP path is
+    // 45.9% of the in-game window's block time (--jit-tsc, s41), so eleven
+    // tests to answer "fXX or nothing" is worth short-circuiting. Identical
+    // by inspection: with no bit outside {kXx, kFr} set, every arm below
+    // except the kXx one is false.
+    if (!(sfl & ~(sf::kXx | sf::kFr)))
+        return (sfl & sf::kXx) ? fXX : 0u;
     u32 exc = 0;
     if (sfl & sf::kOx) exc |= fOX;
     if (sfl & sf::kUx) exc |= fUX;

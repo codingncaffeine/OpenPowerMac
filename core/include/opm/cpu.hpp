@@ -808,6 +808,27 @@ struct Cpu {
     // snapshotted, dropped on reset, re-keyed by the refill hook.
     std::unique_ptr<JitCache> jit;
     bool jitOn = true;
+    // DIAGNOSTIC (--no-jit-chain): compile blocks without chain sites, so
+    // every block exit returns to the dispatcher as v1 did. The control for
+    // Stage B, exactly as --no-jit is for the JIT itself.
+    bool jitChainOff = false;
+    // --jit-tsc, carried here because the cache is created on first use and
+    // the harness sets its flags before the machine runs.
+    bool jitTscOn = false;
+    // DIAGNOSTIC (--no-jit-direct): compile fallbacks as the execRow shim
+    // call instead of a direct call to the bound handler. The control for the
+    // direct-call lowering, which is the only way its speed claim can be
+    // settled same-binary.
+    bool jitDirectOff = false;
+    // The running batch's budget bound (runSteps' `until`), published here so
+    // the trampoline can pin it in a register: a chained hop re-checks
+    // `until - stamp >= 8` without returning to C++. Written by jitRunLine on
+    // every enter; meaningless between enters.
+    u64 jitUntil = 0;
+    // Block-to-block transfers that skipped the dispatcher (emitted code
+    // increments this at every successful chain hop). The measure of Stage B:
+    // insns / (enters + hops) is the true scaffold amortization.
+    u64 jitChainHops = 0;
     static_assert(JitCache::kLines == kFetchLines,
                   "the JIT cache is slot-parallel to the fetch lines");
     void fetchDrop()

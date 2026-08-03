@@ -89,14 +89,18 @@ u32 classify(u64 v, bool sgl)
 {
     const bool s = (v >> 63) != 0;
     const u32 e = static_cast<u32>(v >> 52) & 0x7FFu;
+    // The normal-number arm first, and reached in ONE test: everything else
+    // is an exponent at one of the two ends. (The ladder used to ask three
+    // questions to get here, and this runs on every arithmetic result.)
+    const u32 lo = sgl ? 897u : 1u;
+    if (e - lo < 0x7FFu - lo)
+        return s ? 0x08u : 0x04u;
     const u64 m = v & 0x000FFFFFFFFFFFFFull;
     if (e == 0x7FF)
         return m ? 0x11u : (s ? 0x09u : 0x05u);
     if (e == 0 && m == 0)
         return s ? 0x12u : 0x02u;
-    if (e < (sgl ? 897u : 1u))
-        return s ? 0x18u : 0x14u;
-    return s ? 0x08u : 0x04u;
+    return s ? 0x18u : 0x14u; // ±denormalized (single: below 2^-126)
 }
 
 enum class Fprf { None, Dbl, Sgl };
@@ -118,19 +122,11 @@ void trapIfEnabled(Cpu& c)
         c.raiseExc(Exc::Program, c.st.pc - 4, kSrr1ProgFpEnabled);
 }
 
+// The exceptional results only: s41 short-circuited the "inexact or nothing"
+// case out of this ladder, and s42 moved that case out of `commit` entirely,
+// so nothing reaches here without a bit outside {kXx, kFr} set.
 u32 mapFlags(u32 sfl)
 {
-    // ⭐ THE ORDINARY RESULT, IN TWO TESTS. Every floating-point operation
-    // this machine executes passes its softfp flags through here, and the
-    // ladder below is eleven of them — for a value that, on any result which
-    // did not raise, holds at most inexact (kXx) and fraction-incremented
-    // (kFr, which maps to no FPSCR exception bit at all). The FP path is
-    // 45.9% of the in-game window's block time (--jit-tsc, s41), so eleven
-    // tests to answer "fXX or nothing" is worth short-circuiting. Identical
-    // by inspection: with no bit outside {kXx, kFr} set, every arm below
-    // except the kXx one is false.
-    if (!(sfl & ~(sf::kXx | sf::kFr)))
-        return (sfl & sf::kXx) ? fXX : 0u;
     u32 exc = 0;
     if (sfl & sf::kOx) exc |= fOX;
     if (sfl & sf::kUx) exc |= fUX;
@@ -147,9 +143,41 @@ u32 mapFlags(u32 sfl)
 }
 
 // Common tail for arithmetic/rounding/conversion ops.
+//
+// ⭐ THE ORDINARY RESULT AGAIN, ONE BRANCH IN. s41 short-circuited mapFlags
+// and made refresh branchless; s42 measured what was left and the tail itself
+// was most of it — every floating-point instruction the machine executes
+// arrives here, and on a result that raised nothing but inexact the general
+// path below still asks about suppression, walks the whole FPSCR update, and
+// recomputes VX and FEX from scratch. None of that can move:
+//   VX   is an OR of the invalid bits, and none of them changed.
+//   FEX  is an OR of enabled exceptions; XX is the only one that can have
+//        transitioned, so `XX && XE` is the entire recomputation — and FEX
+//        never needs CLEARING here, because nothing was cleared.
+//   FR/FI feed neither.
+// What remains is a straight line: write the register, set FI/FX/XX, classify.
 void commit(Cpu& c, u32 i, const sf::R& r, Fprf fprf)
 {
     u32& f = c.st.fpscr;
+    if (!(r.fl & ~(sf::kXx | sf::kFr))) {
+        u32 nf = f & ~(fFR | fFI);
+        if (r.fl & sf::kXx) {
+            if (!(f & fXX))
+                nf |= fFX; // XX transitions 0 -> 1
+            nf |= fXX | fFI;
+            if (nf & fXE)
+                nf |= fFEX;
+        }
+        if (r.fl & sf::kFr)
+            nf |= fFR;
+        c.st.fpr[f_rt(i)] = r.bits;
+        if (fprf != Fprf::None)
+            nf = (nf & ~fFPRF) | (classify(r.bits, fprf == Fprf::Sgl) << 12);
+        f = nf;
+        fpRc(c, i);
+        trapIfEnabled(c);
+        return;
+    }
     const u32 exc = mapFlags(r.fl);
     const bool suppress = ((exc & fVxAll) && (f & fVE)) ||
                           ((exc & fZX) && (f & fZE));

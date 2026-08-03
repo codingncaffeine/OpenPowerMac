@@ -16,7 +16,12 @@
 #include "opm/cpu.hpp"
 #include "opm/prof.hpp"
 
+#include <bit>
 #include <cstring>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace opm {
 
@@ -117,10 +122,52 @@ static void busWriteLine(Cpu& c, u32 base, const u8* b)
     c.bus->writeLine32(base, b); // burst write: chipset caches may allocate
 }
 
-// L1 castout on replacement: allocates into an enabled L2, else memory.
-static void lineCastout(Cpu& c, Cpu::DLine& e, u32 set)
+// ---- the L1 index ----------------------------------------------------------
+//
+// One entry per way: (tag << 1) | valid, so "is this the block and is it
+// live" is a single compare, and all eight sit in one host cache line with
+// their ages. See the DIdx comment in cpu.hpp for why.
+inline u32 tvOf(u32 pa) { return (tagOf(pa) << 1) | 1u; }
+
+// The set's ways, searched. Returns the way or -1. Two forms because the
+// distinction was already load-bearing and used to be spelled out three
+// times: an instruction-fetch peek must NOT touch the age, or the instrument
+// reorders the replacement policy it is there to observe.
+static int lineWayQuiet(const Cpu& c, u32 pa)
 {
-    const u32 base = (e.tag << 12) | (set << 5);
+    const Cpu::DIdx& x = c.l1x[setOf(pa)];
+    const u32 want = tvOf(pa);
+#if defined(_M_X64) || defined(__x86_64__)
+    const __m128i k = _mm_set1_epi32(static_cast<int>(want));
+    const u32 m =
+        u32(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+            _mm_load_si128(reinterpret_cast<const __m128i*>(&x.tv[0])), k)))) |
+        (u32(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+             _mm_load_si128(reinterpret_cast<const __m128i*>(&x.tv[4])), k))))
+         << 4);
+    // A block is installed into one way only, so at most one bit is set; the
+    // lowest is the way the old first-match loop would have returned anyway.
+    return m ? static_cast<int>(std::countr_zero(m)) : -1;
+#else
+    for (u32 w = 0; w < 8; ++w)
+        if (x.tv[w] == want)
+            return static_cast<int>(w);
+    return -1;
+#endif
+}
+
+static int lineWay(Cpu& c, u32 pa)
+{
+    const int w = lineWayQuiet(c, pa);
+    if (w >= 0)
+        c.l1x[setOf(pa)].age[w] = ++c.l1dClock;
+    return w;
+}
+
+// L1 castout on replacement: allocates into an enabled L2, else memory.
+static void lineCastout(Cpu& c, Cpu::DLine& e, u32 set, u32 tag)
+{
+    const u32 base = (tag << 12) | (set << 5);
     if (c.l2On())
         c.l2Install(base, e.b, true);
     else
@@ -131,9 +178,9 @@ static void lineCastout(Cpu& c, Cpu::DLine& e, u32 set)
 // Explicit dcbf/dcbst push. With L2CR[L2TS] the block is written only into
 // the L2 and marked valid (UM: the dcbz/dcbf L2-as-RAM idiom); otherwise it
 // goes to memory and any L2 copy is invalidated.
-static void linePush(Cpu& c, Cpu::DLine& e, u32 set)
+static void linePush(Cpu& c, Cpu::DLine& e, u32 set, u32 tag)
 {
-    const u32 base = (e.tag << 12) | (set << 5);
+    const u32 base = (tag << 12) | (set << 5);
     if (c.l2On() && (c.st.l2cr & 0x00040000u)) {
         c.l2Install(base, e.b, true);
     } else {
@@ -143,47 +190,37 @@ static void linePush(Cpu& c, Cpu::DLine& e, u32 set)
     e.d = false;
 }
 
-static void lineFill(Cpu& c, Cpu::DLine& e, u32 pa)
+static void lineFill(Cpu& c, u32 set, u32 way, u32 pa)
 {
+    Cpu::DLine& e = c.l1d[set][way];
     const u32 base = pa & ~31u;
     if (!c.l2ReadLine(base, e.b)) {
         c.bus->readLine32(base, e.b); // burst read
         if (c.l2On())
             c.l2Install(base, e.b, false); // reloads allocate clean
     }
-    e.tag = tagOf(pa);
-    e.v = true;
+    c.l1x[set].tv[way] = tvOf(pa);
     e.d = false;
 }
 
-static Cpu::DLine* lineFind(Cpu& c, u32 pa)
-{
-    const u32 set = setOf(pa), tag = tagOf(pa);
-    for (u32 w = 0; w < 8; ++w) {
-        Cpu::DLine& e = c.l1d[set][w];
-        if (e.v && e.tag == tag) {
-            e.age = ++c.l1dClock;
-            return &e;
-        }
-    }
-    return nullptr;
-}
-
-static Cpu::DLine& lineVictim(Cpu& c, u32 pa)
+// The way a fill should land in: the first invalid one, else the least
+// recently used, cast out if it is dirty. Same order and same choice the
+// eight-way walk made.
+static u32 lineVictim(Cpu& c, u32 pa)
 {
     const u32 set = setOf(pa);
-    Cpu::DLine* best = &c.l1d[set][0];
+    Cpu::DIdx& x = c.l1x[set];
+    u32 best = 0;
     for (u32 w = 0; w < 8; ++w) {
-        Cpu::DLine& e = c.l1d[set][w];
-        if (!e.v)
-            return e;
-        if (e.age < best->age)
-            best = &e;
+        if (!(x.tv[w] & 1u))
+            return w;
+        if (x.age[w] < x.age[best])
+            best = w;
     }
-    if (best->d)
-        lineCastout(c, *best, set);
-    best->v = false;
-    return *best;
+    if (c.l1d[set][best].d)
+        lineCastout(c, c.l1d[set][best], set, x.tv[best] >> 1);
+    x.tv[best] = 0;
+    return best;
 }
 
 // ---- backside L2 ----------------------------------------------------------
@@ -386,14 +423,14 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
             v = (v << 8) | memRead(pa + i, 1, wimg);
         return v;
     }
-    DLine* e = lineFind(*this, pa);
-    if (!e) {
-        DLine& n = lineVictim(*this, pa);
-        lineFill(*this, n, pa);
-        n.age = ++l1dClock;
-        e = &n;
+    const u32 set = setOf(pa);
+    int w = lineWay(*this, pa);
+    if (w < 0) {
+        w = static_cast<int>(lineVictim(*this, pa));
+        lineFill(*this, set, static_cast<u32>(w), pa);
+        l1x[set].age[w] = ++l1dClock;
     }
-    return lineLoadBE(&e->b[pa & 31u], len);
+    return lineLoadBE(&l1d[set][w].b[pa & 31u], len);
 }
 
 bool Cpu::wpNote(u32 pa, u32 len, u64 v)
@@ -438,11 +475,12 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
             memWrite(pa + i, 1, (v >> (8 * (len - 1 - i))) & 0xFFu, wimg);
         return;
     }
-    DLine* e = lineFind(*this, pa);
+    const u32 set = setOf(pa);
+    int w = lineWay(*this, pa);
     if (wimg & kWimgW) { // write-through: no allocation on a store miss
         noteL2Skew(pa, true);
-        if (e)
-            lineStoreBE(&e->b[pa & 31u], len, v);
+        if (w >= 0)
+            lineStoreBE(&l1d[set][w].b[pa & 31u], len, v);
         switch (len) {
         case 1: bus->write8(pa, static_cast<u8>(v)); return;
         case 2: bus->write16(pa, static_cast<u16>(v)); return;
@@ -450,14 +488,13 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
         default: bus->write64(pa, v); return;
         }
     }
-    if (!e) { // write-allocate
-        DLine& n = lineVictim(*this, pa);
-        lineFill(*this, n, pa);
-        n.age = ++l1dClock;
-        e = &n;
+    if (w < 0) { // write-allocate
+        w = static_cast<int>(lineVictim(*this, pa));
+        lineFill(*this, set, static_cast<u32>(w), pa);
+        l1x[set].age[w] = ++l1dClock;
     }
-    lineStoreBE(&e->b[pa & 31u], len, v);
-    e->d = true;
+    lineStoreBE(&l1d[set][w].b[pa & 31u], len, v);
+    l1d[set][w].d = true;
 }
 
 // Whole-block variant of l1dPeek32, for the instruction fetch buffer. Same
@@ -469,33 +506,27 @@ bool Cpu::l1dReadLine(u32 pa, u8* out)
 {
     if (!dceOn())
         return false;
-    const u32 set = setOf(pa), tag = tagOf(pa);
-    for (u32 k = 0; k < 8; ++k) {
-        const DLine& e = l1d[set][k];
-        if (e.v && e.tag == tag) {
-            for (u32 i = 0; i < 32; ++i)
-                out[i] = e.b[i];
-            return true;
-        }
-    }
-    return false;
+    const int w = lineWayQuiet(*this, pa);
+    if (w < 0)
+        return false;
+    const DLine& e = l1d[setOf(pa)][w];
+    for (u32 i = 0; i < 32; ++i)
+        out[i] = e.b[i];
+    return true;
 }
 
 bool Cpu::l1dPeek32(u32 pa, u32& w)
 {
     if (!dceOn())
         return false;
-    const u32 set = setOf(pa), tag = tagOf(pa);
-    for (u32 k = 0; k < 8; ++k) {
-        const DLine& e = l1d[set][k];
-        if (e.v && e.tag == tag) {
-            const u32 o = pa & 31u & ~3u;
-            w = (u32(e.b[o]) << 24) | (u32(e.b[o + 1]) << 16) |
-                (u32(e.b[o + 2]) << 8) | u32(e.b[o + 3]);
-            return true;
-        }
-    }
-    return false;
+    const int k = lineWayQuiet(*this, pa);
+    if (k < 0)
+        return false;
+    const DLine& e = l1d[setOf(pa)][k];
+    const u32 o = pa & 31u & ~3u;
+    w = (u32(e.b[o]) << 24) | (u32(e.b[o + 1]) << 16) |
+        (u32(e.b[o + 2]) << 8) | u32(e.b[o + 3]);
+    return true;
 }
 
 void Cpu::dcbzLine(u32 pa)
@@ -506,37 +537,38 @@ void Cpu::dcbzLine(u32 pa)
     // never written. That is this instrument's answer in its exact wrong
     // direction, and "why is this field zero" is the question being asked.
     if (wpEnd) wpNote(pa, 32u, 0);
-    DLine* e = lineFind(*this, pa);
-    if (!e) {
-        DLine& n = lineVictim(*this, pa);
-        n.tag = tagOf(pa);
-        n.v = true;
-        n.age = ++l1dClock;
-        e = &n;
+    const u32 set = setOf(pa);
+    int w = lineWay(*this, pa);
+    if (w < 0) { // conjured, not filled: no bus read, the zeros ARE the block
+        w = static_cast<int>(lineVictim(*this, pa));
+        l1x[set].tv[w] = tvOf(pa);
+        l1x[set].age[w] = ++l1dClock;
     }
-    for (u8& x : e->b)
+    DLine& e = l1d[set][w];
+    for (u8& x : e.b)
         x = 0;
-    e->d = true; // zeros exist only in the cache until written back
+    e.d = true; // zeros exist only in the cache until written back
 }
 
 void Cpu::dcbClean(u32 pa, bool invalidate)
 {
     fetchDropAt(pa);
-    DLine* e = lineFind(*this, pa);
-    if (!e)
+    const u32 set = setOf(pa);
+    const int w = lineWay(*this, pa);
+    if (w < 0)
         return;
-    if (e->d)
-        linePush(*this, *e, setOf(pa));
+    if (l1d[set][w].d)
+        linePush(*this, l1d[set][w], set, l1x[set].tv[w] >> 1);
     if (invalidate)
-        e->v = false;
+        l1x[set].tv[w] = 0;
 }
 
 void Cpu::dcbKill(u32 pa)
 {
     fetchDropAt(pa);
-    DLine* e = lineFind(*this, pa);
-    if (e)
-        e->v = false; // discarded, never written back
+    const int w = lineWay(*this, pa);
+    if (w >= 0)
+        l1x[setOf(pa)].tv[w] = 0; // discarded, never written back
     l2Invalidate(pa & ~31u);
 }
 
@@ -570,11 +602,11 @@ void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
         if (invalidate)
             fetchDropAt(a);
         if (dceOn()) {
-            const u32 set = setOf(a), tag = tagOf(a);
-            for (u32 w = 0; w < 8; ++w) {
-                DLine& e = l1d[set][w];
-                if (!e.v || e.tag != tag)
-                    continue;
+            // Quiet: a snoop is a bus master's business and must not reorder
+            // the processor's own replacement policy.
+            const int w = lineWayQuiet(*this, a);
+            if (w >= 0) {
+                DLine& e = l1d[setOf(a)][w];
                 if (e.d) {
                     busWriteLine(*this, a, e.b);
                     e.d = false;
@@ -582,8 +614,7 @@ void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
                     l2Invalidate(a);
                 }
                 if (invalidate)
-                    e.v = false;
-                break;
+                    l1x[setOf(a)].tv[w] = 0;
             }
         }
         if (L2Line* q = l2Find(a)) {
@@ -629,13 +660,14 @@ void Cpu::l1dFlushAll(bool writeback)
     for (u32 s = 0; s < 128; ++s)
         for (u32 w = 0; w < 8; ++w) {
             DLine& e = l1d[s][w];
-            if (e.v && e.d) {
-                const u32 base = (e.tag << 12) | (s << 5);
+            const u32 tv = l1x[s].tv[w];
+            if ((tv & 1u) && e.d) {
+                const u32 base = ((tv >> 1) << 12) | (s << 5);
                 if (writeback)
                     busWriteLine(*this, base, e.b);
                 l2Invalidate(base);
             }
-            e.v = false;
+            l1x[s].tv[w] = 0;
             e.d = false;
         }
     l2FlushAll(writeback);

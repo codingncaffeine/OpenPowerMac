@@ -36,8 +36,9 @@
 
 namespace opm::sf {
 
-bool gHostFastOff = false;
+u32 gHostFastOff = 0;
 u64 gFastHits = 0, gFastMiss = 0;
+u64 gFastHitsD = 0, gFastMissD = 0;
 
 #if OPM_SF_X64
 // The fused path of the fast case wants a HARDWARE fma: the C runtime's
@@ -64,7 +65,29 @@ static float hwFmaf(float a, float b, float c)
     return _mm_cvtss_f32(
         _mm_fmadd_ss(_mm_set_ss(a), _mm_set_ss(b), _mm_set_ss(c)));
 }
+#if defined(__GNUC__)
+__attribute__((target("fma")))
 #endif
+static double hwFmad(double a, double b, double c)
+{
+    return _mm_cvtsd_f64(
+        _mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c)));
+}
+#endif
+
+// One name for "a*b+c with a single rounding", whatever the host is. On x64
+// this is the FMA3 unit and the caller has already checked kHaveFma; anywhere
+// else it is the C runtime's correctly-rounded routine, which is right but
+// not fast — and the double fast path below is a speed measure, so a host
+// without FMA3 simply leaves those rows with the model.
+inline double fmaExact(double a, double b, double c)
+{
+#if OPM_SF_X64
+    return hwFmad(a, b, c);
+#else
+    return std::fma(a, b, c);
+#endif
+}
 
 namespace {
 
@@ -383,6 +406,197 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
     return true;
 }
 
+// ⭐ THE DOUBLE-TARGET HOST FAST PATH. s41's census sorted the fallback by
+// host CYCLES and the double rows were the top of what was left: fsub 216
+// cycles a call, fmsub 193, fmadd 190, fmul 184, against 114-130 for the
+// single rows the path above had already lowered. They had no fast path at
+// all, because the single path's admission does not generalize: it accepts
+// when the exact result FITS IN A DOUBLE, and a double product is 106 bits
+// and never does.
+//
+// So this one admits on THE MODEL'S OWN GEOMETRY instead. fmaCore below
+// accumulates into a 128-bit window with the product at the top and folds
+// whatever the alignment shift pushes past the bottom into `jam`, an
+// UNSIGNED sticky. While nothing falls off, that window holds the exact
+// value and rounds it exactly once — which is the definition of the host's
+// own add/mul/fma, so the bits agree by construction. Once something does
+// fall off, the model deliberately parts company with ideal arithmetic (s40
+// measured both families that produces), and we bail to it.
+//
+// Three admissions, all on raw fields:
+//   operands  ±0, or normal inside an exponent band chosen so that every
+//             residue this path computes is itself a NORMAL double — the
+//             product residue is a multiple of 2^(ea+ec-104), the 2Sum
+//             residues of 2^(e-52) — and so that the product cannot
+//             overflow. Anything else is the model's.
+//   window    the addend's lowest set bit and the product's lowest set bit
+//             must both survive the alignment shift. Counting each one's
+//             TRAILING ZEROS is what lets `a*1.0 + b` and single-valued
+//             operands keep the wide window they deserve instead of the
+//             106-bit worst case.
+//   result    normal, and at least one binade above the tininess boundary
+//             (the model detects tininess BEFORE rounding, so a result that
+//             only reached 2^-1022 by rounding up is underflow to it) — or
+//             an exact zero, which every zero-operand shape delivers.
+//
+// The flags come from the residue exactly as in the single path: FI is
+// "residue != 0", FR is "the residue disagrees in sign with the result",
+// i.e. the rounding went away from zero. Getting the residue EXACTLY is the
+// whole difficulty, and it is three different jobs:
+//   mul    err = fma(a,c,-r) — the classic 2Product residue, exact.
+//   add    the 2Sum residue (an add arrives here as a product by one, and
+//          the model's own accumulator makes it exactly that).
+//   fused  the error of an FMA needs two doubles in general. Their SUM is
+//          computed here as one double e1 = fl(g + a2) via the standard
+//          decomposition (Boldo & Muller, "Exact and Approximated Error of
+//          the FMA", 2011): the second double is bounded by half an ulp of
+//          the first, so it can move neither e1's sign nor its zeroness —
+//          and sign and zeroness are all FI and FR ever ask.
+inline constexpr u32 kDblELo = 564;  // 2^-459 : ea+ec >= -918, residues normal
+inline constexpr u32 kDblEHi = 1532; // 2^+509 : ea+ec <= 1022, no overflow
+
+// Admitted operand: a normal double inside the band, or an exact zero.
+inline bool admitD(u64 x)
+{
+    const u32 e = u32(x >> 52) & 0x7FFu;
+    return (e - kDblELo <= kDblEHi - kDblELo) || (x << 1) == 0;
+}
+
+// Lowest bit position the model's 128-bit accumulator can hold a nonzero
+// product bit in. mul64to128 puts the product of the two 53-bit significands
+// at bit 22 and up, and each factor's trailing zeros raise that floor one for
+// one; the normalization shift can only raise it further, so this is a lower
+// bound on where the product's information actually lives.
+inline u32 lowBitProd(u64 fa, u64 fc)
+{
+    const u64 ma = (fa & 0x000FFFFFFFFFFFFFull) | (1ull << 52);
+    const u64 mc = (fc & 0x000FFFFFFFFFFFFFull) | (1ull << 52);
+    return 22u + u32(std::countr_zero(ma)) + u32(std::countr_zero(mc));
+}
+
+// Lowest bit position the model's accumulator holds a nonzero bit of a
+// SINGLE operand in: its 53-bit significand starts at bit 75 and its
+// trailing zeros raise that floor one for one.
+inline u32 lowBitOne(u64 f)
+{
+    return 75u + u32(std::countr_zero((f & 0x000FFFFFFFFFFFFFull) | (1ull << 52)));
+}
+
+// The delivered result, admitted and flagged. Shared by all three shapes
+// because it is the same question for each: did the model own this result,
+// and what did the rounding do to it.
+inline bool finishD(double r0, double resid, bool negResult, R& out)
+{
+    const u64 rb = std::bit_cast<u64>(r0);
+    const u32 re = u32(rb >> 52) & 0x7FFu;
+    if (re < 2u || re == 0x7FFu) {
+        // Everything the model owns: overflow to infinity, a denormal or
+        // underflowed result, and the binade where tininess-before-rounding
+        // can disagree with the delivered exponent. An EXACT zero is ours —
+        // it is what every zero-operand shape produces and its sign already
+        // matches the model's rules.
+        if (!(re == 0u && (rb << 1) == 0 && resid == 0.0))
+            return false;
+    }
+    u32 fl = 0;
+    if (resid != 0.0) {
+        fl |= kXx;
+        if ((resid < 0.0) != ((rb >> 63) != 0))
+            fl |= kFr; // rounded away from zero
+    }
+    out = {negResult ? rb ^ kSignBit : rb, fl};
+    return true;
+}
+
+// ⚠ ONE FUNCTION PER SHAPE, and that is a speed decision with a measurement
+// behind it. The first cut of this was a single entry taking `hasAddend` and
+// testing `fc == 1.0` at run time — and fmul measured 82 host cycles a call
+// against fmuls' 58, for two floating-point instructions of actual work. The
+// callers below know their shape at compile time; handing that knowledge over
+// is what turns the admission into straight-line code.
+
+// a * c.
+bool dblMulFast(u64 fa, u64 fc, R& out)
+{
+#if OPM_SF_X64
+    if (!kHaveFma)
+        return false; // the residue needs a real fma; the model keeps the row
+#endif
+    if (!admitD(fa) || !admitD(fc))
+        return false;
+    const double da = std::bit_cast<double>(fa);
+    const double dc = std::bit_cast<double>(fc);
+    const double r0 = da * dc;
+    return finishD(r0, fmaExact(da, dc, -r0), false, out);
+}
+
+// a + b, which the model computes as a*1.0 + b: the product is exactly `a`,
+// so the whole operation is a 2Sum and its residue is the answer.
+bool dblAddFast(u64 fa, u64 fb, R& out)
+{
+    if (!admitD(fa) || !admitD(fb))
+        return false;
+    if ((fa << 1) != 0 && (fb << 1) != 0) {
+        const i32 d = i32(u32(fa >> 52) & 0x7FFu) - i32(u32(fb >> 52) & 0x7FFu);
+        if (d > i32(lowBitOne(fb)) || d < -i32(lowBitOne(fa)))
+            return false; // a bit would fall off the accumulator and be jammed
+    }
+    const double da = std::bit_cast<double>(fa);
+    const double db = std::bit_cast<double>(fb);
+    const double r0 = da + db;
+    const double bv = r0 - da;
+    return finishD(r0, (da - (r0 - bv)) + (db - bv), false, out);
+}
+
+// ±((a * c) + b).
+bool dblFmaFast(u64 fa, u64 fc, u64 fb, bool negResult, R& out)
+{
+#if OPM_SF_X64
+    if (!kHaveFma)
+        return false;
+#endif
+    if (!admitD(fa) || !admitD(fc) || !admitD(fb))
+        return false;
+    if ((fa << 1) != 0 && (fc << 1) != 0 && (fb << 1) != 0) {
+        // d = the model's product exponent minus the addend's. The product
+        // exponent is ea+ec or ea+ec+1 (the normalization shift), so both
+        // have to pass.
+        const i32 d = i32(u32(fa >> 52) & 0x7FFu) + i32(u32(fc >> 52) & 0x7FFu) -
+                      i32(u32(fb >> 52) & 0x7FFu) - 1023;
+        if (d + 1 > i32(lowBitOne(fb)) || d < -i32(lowBitProd(fa, fc)))
+            return false;
+    }
+    const double da = std::bit_cast<double>(fa);
+    const double dc = std::bit_cast<double>(fc);
+    const double db = std::bit_cast<double>(fb);
+    const double u1 = da * dc;              // the exact product as u1 + u2
+    const double u2 = fmaExact(da, dc, -u1);
+    if (u2 == 0.0) {
+        // An exact product turns the fused operation into a plain add — and
+        // this is the common case in a title whose operands came out of lfs,
+        // because a 24x24-bit product fits a double with room to spare.
+        const double r0 = u1 + db;
+        const double bv = r0 - u1;
+        return finishD(r0, (u1 - (r0 - bv)) + (db - bv), negResult, out);
+    }
+    const double r0 = fmaExact(da, dc, db);
+    // a*c + b == u1 + (a1 + a2) == (b1 + b2) + a2, so the residue is
+    // (b1 - r0) + b2 + a2 — and every step of that is exact.
+    const double a1 = db + u2, av = a1 - db;
+    const double a2 = (db - (a1 - av)) + (u2 - av);
+    const double b1 = u1 + a1, bv = b1 - u1;
+    const double b2 = (u1 - (b1 - bv)) + (a1 - bv);
+    return finishD(r0, ((b1 - r0) + b2) + a2, negResult, out);
+}
+
+// The gate every double fast path shares: round-to-nearest, no enabled
+// exception scaling, no flush-to-zero, and the control not thrown.
+inline bool plainD(const Env& e, Tgt t)
+{
+    return t == Tgt::Dbl && e.rn == 0 && !e.oe && !e.ue && !e.ni &&
+           !(gHostFastOff & kFastOffDbl);
+}
+
 R fmaCore(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negAdd, bool negResult,
           const Env& env, Tgt t)
 {
@@ -390,10 +604,9 @@ R fmaCore(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negAdd, bool negResult,
         fb ^= kSignBit;
 
     if (t == Tgt::Sgl && env.rn == 0 && !env.oe && !env.ue && !env.ni &&
-        !gHostFastOff) {
+        !(gHostFastOff & kFastOffSgl)) {
         R fast;
-        if (hostSglFast(fa, fc, fb, hasAddend, negResult, fast))
-        {
+        if (hostSglFast(fa, fc, fb, hasAddend, negResult, fast)) {
             ++gFastHits;
             return fast;
         }
@@ -529,18 +742,41 @@ R fmaCore(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negAdd, bool negResult,
 
 R add(u64 a, u64 b, const Env& e, Tgt t)
 {
+    if (plainD(e, t)) {
+        R f;
+        if (dblAddFast(a, b, f)) { ++gFastHitsD; return f; }
+        ++gFastMissD;
+    }
     return fmaCore(a, kOne, b, true, false, false, e, t);
 }
 R sub(u64 a, u64 b, const Env& e, Tgt t)
 {
+    if (plainD(e, t)) {
+        R f;
+        if (dblAddFast(a, b ^ kSignBit, f)) { ++gFastHitsD; return f; }
+        ++gFastMissD;
+    }
     return fmaCore(a, kOne, b, true, true, false, e, t);
 }
 R mul(u64 a, u64 c, const Env& e, Tgt t)
 {
+    if (plainD(e, t)) {
+        R f;
+        if (dblMulFast(a, c, f)) { ++gFastHitsD; return f; }
+        ++gFastMissD;
+    }
     return fmaCore(a, c, 0, false, false, false, e, t);
 }
 R madd(u64 a, u64 c, u64 b, const Env& e, Tgt t, bool negAdd, bool negResult)
 {
+    if (plainD(e, t)) {
+        R f;
+        if (dblFmaFast(a, c, negAdd ? b ^ kSignBit : b, negResult, f)) {
+            ++gFastHitsD;
+            return f;
+        }
+        ++gFastMissD;
+    }
     return fmaCore(a, c, b, true, negAdd, negResult, e, t);
 }
 
@@ -605,6 +841,37 @@ R div(u64 fa, u64 fb, const Env& env, Tgt t)
 
 R rsp(u64 fb, const Env& env)
 {
+    // frsp is 2.0M calls and 123 cycles each in-game (s41 --jit-tsc), and it
+    // is the cheapest of the three fast paths to justify: the host's own
+    // double->float narrowing IS the rounding the model performs, and the
+    // residue is exact by Sterbenz — the two agree to within 2^-24, so their
+    // difference is representable. Admitted only for a normal input landing
+    // on a normal single at least one binade above the tininess boundary;
+    // the model keeps NaNs, infinities, zeros, and everything that under- or
+    // overflows the single format.
+    if (env.rn == 0 && !env.oe && !env.ue && !env.ni &&
+        !(gHostFastOff & kFastOffDbl)) {
+        const u32 e = u32(fb >> 52) & 0x7FFu;
+        if (e - 1u < 0x7FEu) {
+            const double d = std::bit_cast<double>(fb);
+            const float s = static_cast<float>(d);
+            const u32 sb = std::bit_cast<u32>(s);
+            const u32 se = (sb >> 23) & 0xFFu;
+            if (se >= 2u && se != 0xFFu) {
+                const double sd = static_cast<double>(s);
+                const double resid = d - sd; // exact: Sterbenz
+                u32 fl = 0;
+                if (resid != 0.0) {
+                    fl |= kXx;
+                    if ((resid < 0.0) != ((sb >> 31) != 0))
+                        fl |= kFr;
+                }
+                ++gFastHitsD;
+                return {std::bit_cast<u64>(sd), fl};
+            }
+        }
+        ++gFastMissD;
+    }
     const Un b = unpack(fb);
     u32 fl = 0;
     if (b.c == cSNaN)

@@ -106,6 +106,11 @@ enum class Lo : u8 {
     Lfs, Lfsu, Lfsx, Lfsux, Lfd, Lfdu, Lfdx, Lfdux,
     Stfs, Stfsu, Stfsx, Stfsux, Stfd, Stfdu, Stfdx, Stfdux,
     Fmr,
+    // s42: with the softfp arithmetic lowered, the by-cycles census turned up
+    // four rows that are pure REGISTER work still paying a call out of the
+    // block — 7% of what was left of the fallback between them, for a sign
+    // bit and two condition-register field moves.
+    Fneg, Fabs, Fnabs, Mcrf, Mtcrf,
 };
 
 // Row -> lowering, keyed by the ISA table's own mnemonics so the mapping can
@@ -173,6 +178,9 @@ const u8* loTable()
         set("stfd", Lo::Stfd);     set("stfdu", Lo::Stfdu);
         set("stfdx", Lo::Stfdx);   set("stfdux", Lo::Stfdux);
         set("fmr", Lo::Fmr);
+        set("fneg", Lo::Fneg);   set("fabs", Lo::Fabs);
+        set("fnabs", Lo::Fnabs);
+        set("mcrf", Lo::Mcrf);   set("mtcrf", Lo::Mtcrf);
         return v;
     }();
     return t.data();
@@ -1632,7 +1640,13 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     case Lo::Stfdu: fpMem(insn, row, nextVa, true, false, false, true); return;
     case Lo::Stfdx: fpMem(insn, row, nextVa, true, false, true, false); return;
     case Lo::Stfdux: fpMem(insn, row, nextVa, true, false, true, true); return;
-    case Lo::Fmr: { // h_fmr: fpr[frt] = fpr[frb]; Rc (CR1 from FPSCR) falls back
+    case Lo::Fmr:
+    case Lo::Fneg:
+    case Lo::Fabs:
+    case Lo::Fnabs: {
+        // fpr[frt] = fpr[frb], with the sign bit moved or left alone. Rc
+        // (CR1 from the FPSCR) falls back; the MSR[FP] cold arm is execRow's,
+        // exactly as for the FP loads and stores.
         if (f_rcbit(insn)) {
             fallbackBest();
             return;
@@ -1642,12 +1656,53 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         e.i32le(0x2000u);
         const size_t fbJ = e.j32(CC_Z);
         e.mem13W(0x8B, RAX, fpr(f_rb(insn))); // mov rax, [fpr frb]
+        if (lo == Lo::Fneg)
+            e.bytes({0x48, 0x0F, 0xBA, 0xF8, 0x3F}); // btc rax, 63
+        else if (lo == Lo::Fabs)
+            e.bytes({0x48, 0x0F, 0xBA, 0xF0, 0x3F}); // btr rax, 63
+        else if (lo == Lo::Fnabs)
+            e.bytes({0x48, 0x0F, 0xBA, 0xE8, 0x3F}); // bts rax, 63
         e.mem13W(0x89, RAX, fpr(f_rt(insn))); // mov [fpr frt], rax
         bump();
         const size_t joinJ = e.jmp32f();
         e.patch32(fbJ);
         fallback(insn, row, nextVa);
         e.patch32(joinJ);
+        return;
+    }
+
+    // ---- condition-register field moves (h_mcrf, h_mtcrf) ------------------
+    case Lo::Mcrf: { // cr[crfD] = cr[crfS]
+        const u32 shD = (7u - f_crfd(insn)) * 4u;
+        const u32 shS = (7u - f_crfs(insn)) * 4u;
+        e.loadR(RAX, o.cr);
+        e.bytes({0x89, 0xC2}); // mov edx, eax
+        if (shS)
+            e.bytes({0xC1, 0xEA, u8(shS)}); // shr edx, shS
+        e.bytes({0x83, 0xE2, 0x0F});        // and edx, 15
+        if (shD)
+            e.bytes({0xC1, 0xE2, u8(shD)}); // shl edx, shD
+        e.andEaxI(~(0xFu << shD));
+        e.bytes({0x09, 0xD0}); // or eax, edx
+        e.storeR(o.cr, RAX);
+        bump();
+        return;
+    }
+    case Lo::Mtcrf: { // the masked fields of cr take rS's bits
+        u32 mask = 0;
+        for (u32 f = 0; f < 8; ++f)
+            if (f_crm(insn) & (0x80u >> f))
+                mask |= 0xFu << ((7u - f) * 4u);
+        if (mask) {
+            e.loadR(RAX, gpr(f_rt(insn)));
+            e.andEaxI(mask);
+            e.loadR(RDX, o.cr);
+            e.bytes({0x81, 0xE2}); // and edx, imm32
+            e.i32le(~mask);
+            e.bytes({0x09, 0xD0}); // or eax, edx
+            e.storeR(o.cr, RAX);
+        }
+        bump();
         return;
     }
 

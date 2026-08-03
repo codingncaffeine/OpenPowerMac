@@ -165,10 +165,11 @@ void driveCpu(Cpu& cpu, u32 seed)
     for (u32 set = 0; set < 128; ++set)
         for (u32 way = 0; way < 8; ++way) {
             Cpu::DLine& l = cpu.l1d[set][way];
-            l.v = ((set + way + seed) & 3u) != 0;
+            const bool v = ((set + way + seed) & 3u) != 0;
             l.d = ((set + way + seed) & 1u) != 0;
-            l.tag = 0x10u + set * 8u + way + seed;
-            l.age = set + way * seed;
+            cpu.l1x[set].tv[way] =
+                ((0x10u + set * 8u + way + seed) << 1) | (v ? 1u : 0u);
+            cpu.l1x[set].age[way] = set + way * seed;
             for (u32 b = 0; b < 32; ++b)
                 l.b[b] = static_cast<u8>(set + way * 8u + b + seed);
         }
@@ -280,7 +281,7 @@ std::vector<u32> probe(SawtoothBus& bus, const Cpu& cpu)
     v.push_back(cpu.st.gpr[5]);
     v.push_back(static_cast<u32>(cpu.st.tb));
     v.push_back(cpu.st.sr[3]);
-    v.push_back(cpu.l1d[7][2].tag);
+    v.push_back(cpu.l1x[7].tv[2] >> 1);
     v.push_back(cpu.l1d[7][2].b[9]);
     v.push_back(cpu.itlb[9][1].rpn);
     v.push_back(cpu.l2Sets);

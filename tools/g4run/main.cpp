@@ -729,6 +729,15 @@ int main(int argc, char** argv)
         // costs — never quote its MIPS.
         if (!strcmp(a, "--jit-tsc")) { jitTsc = true; continue; }
         if (!strcmp(a, "--no-jit-direct")) { jitDirectOff = true; continue; }
+        // The softfp host fast paths, separately switchable so a speed series
+        // can A/B either one inside ONE binary (s41's harness lesson: two
+        // builds compared across a disk copy is not a measurement).
+        if (!strcmp(a, "--no-fp-fast")) {
+            sf::gHostFastOff |= sf::kFastOffSgl | sf::kFastOffDbl;
+            continue;
+        }
+        if (!strcmp(a, "--no-fp-fast-sgl")) { sf::gHostFastOff |= sf::kFastOffSgl; continue; }
+        if (!strcmp(a, "--no-fp-fast-dbl")) { sf::gHostFastOff |= sf::kFastOffDbl; continue; }
         // Up here for the same reason as the speed flags: the else-if ladder
         // below is already at MSVC's nesting limit (C1061).
         if (!strcmp(a, "--sound")) { soundOn = true; continue; }
@@ -5285,9 +5294,9 @@ int main(int argc, char** argv)
                         fb.push_back({cpu.jit->tscByRow[k], k});
                 std::sort(fb.rbegin(), fb.rend());
             }
-            printf("--   jit fallback census (top 12 of %zu rows, by %s):\n",
+            printf("--   jit fallback census (top 20 of %zu rows, by %s):\n",
                    fb.size(), byTsc ? "host cycles" : "calls");
-            for (size_t k = 0; k < fb.size() && k < 12; ++k) {
+            for (size_t k = 0; k < fb.size() && k < 20; ++k) {
                 const u32 row = fb[k].second;
                 const char* mn = row < kIsaCount ? kIsa[row].mnem : "?";
                 if (byTsc)
@@ -5309,11 +5318,19 @@ int main(int argc, char** argv)
             }
         }
         if (sf::gFastHits || sf::gFastMiss)
-            printf("--   softfp fast path: %llu taken, %llu bailed (%.1f%%)\n",
+            printf("--   softfp fast path (single): %llu taken, %llu bailed "
+                   "(%.1f%%)\n",
                    static_cast<unsigned long long>(sf::gFastHits),
                    static_cast<unsigned long long>(sf::gFastMiss),
                    100.0 * static_cast<double>(sf::gFastHits) /
                        static_cast<double>(sf::gFastHits + sf::gFastMiss));
+        if (sf::gFastHitsD || sf::gFastMissD)
+            printf("--   softfp fast path (double): %llu taken, %llu bailed "
+                   "(%.1f%%)\n",
+                   static_cast<unsigned long long>(sf::gFastHitsD),
+                   static_cast<unsigned long long>(sf::gFastMissD),
+                   100.0 * static_cast<double>(sf::gFastHitsD) /
+                       static_cast<double>(sf::gFastHitsD + sf::gFastMissD));
         if (cpu.jit && cpu.jit->tscProbe) { // populated only by --jit-tsc
             const JitCache& J = *cpu.jit;
             printf("--   jit tsc: probe %.1f/enter, native %.1f/enter "

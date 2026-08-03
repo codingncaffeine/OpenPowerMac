@@ -535,12 +535,46 @@ struct Cpu {
     // the Gossamer ROM runs its early world out of dcbz-conjured cache
     // lines (cache-as-RAM) before the memory controller is enabled, so
     // those lines must live and hit without any bus fill.
+    //
+    // ⭐ THE LOOKUP AND THE DATA LIVE APART, and that is a measurement, not a
+    // preference. Every guest memory access searches a set, and s42 counted
+    // 65.8 M lookups examining 4.57 ways each over one 200 M-instruction
+    // in-game window. With the tag, the valid bit and the LRU age sitting
+    // INSIDE the 44-byte line, that search walked ~200 bytes across four host
+    // cache lines and dragged each way's 32 data bytes into L1 to read 12
+    // bytes of metadata. `DIdx` puts all eight ways' metadata in ONE 64-byte
+    // line, so a lookup touches one line and compares eight tags at once.
+    //
+    // ⚠⚠ sizeof(DLine) IS PINNED AT 44 AND THE static_assert IS THE GUARD.
+    // snapshot.cpp's layoutDigest() hashes it, so a different value refuses
+    // EVERY snapshot ever taken — including the in-game captures this project
+    // measures against, which cannot be regenerated without replaying the
+    // game. The L1D stream is written field by field and did not change here,
+    // so the digest must not change either: the reserved bytes hold the size
+    // while the fields move.
     struct DLine {
-        bool v = false, d = false;
-        u32 tag = 0; // pa >> 12
-        u32 age = 0;
         u8 b[32] = {};
+        bool d = false; // dirty; tag, valid and age are in DIdx below
+        u8 rsv[11] = {};
     };
+    static_assert(sizeof(DLine) == 44,
+                  "snapshot layoutDigest() hashes sizeof(DLine)");
+    // alignas is the whole point — an entry that straddled two host cache
+    // lines would cost the second line this change exists to stop touching.
+    // MSVC's C4324 just reports that it padded Cpu to honour it, which is
+    // what was asked for.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+    struct alignas(64) DIdx {
+        u32 tv[8] = {};  // (tag << 1) | valid, so one compare answers both
+        u32 age[8] = {}; // LRU stamp, u32 and allowed to wrap as before
+    };
+    DIdx l1x[128];
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     DLine l1d[128][8];
     u32 l1dClock = 0;
     bool dceOn() const { return (st.hid0 & 0x00004000u) != 0; }

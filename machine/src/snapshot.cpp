@@ -289,10 +289,11 @@ void saveCpu(SnapWriter& w, const Cpu& c)
     for (u32 set = 0; set < 128; ++set)
         for (u32 way = 0; way < 8; ++way) {
             const Cpu::DLine& l = c.l1d[set][way];
-            w.b(l.v);
+            const u32 tv = c.l1x[set].tv[way];
+            w.b((tv & 1u) != 0);
             w.b(l.d);
-            w.u32v(l.tag);
-            w.u32v(l.age);
+            w.u32v(tv >> 1);
+            w.u32v(c.l1x[set].age[way]);
             w.raw(l.b, 32);
         }
     w.end(l1);
@@ -345,13 +346,19 @@ void loadCpu(SnapReader& r, Cpu& c)
 
     e = r.beginSection("L1D ");
     c.l1dClock = r.u32v();
+    // ⚠ THE STREAM IS UNCHANGED and must stay so: valid, dirty, tag, age,
+    // bytes, in that order. s42 moved valid/tag/age out of DLine and into the
+    // per-set index (cpu.hpp DIdx) for lookup speed; this reads and writes the
+    // same five things in the same order from their new homes, which is why
+    // every snapshot taken before that change still loads.
     for (u32 set = 0; set < 128; ++set)
         for (u32 way = 0; way < 8; ++way) {
             Cpu::DLine& l = c.l1d[set][way];
-            l.v = r.b();
+            const bool v = r.b();
             l.d = r.b();
-            l.tag = r.u32v();
-            l.age = r.u32v();
+            const u32 tag = r.u32v();
+            c.l1x[set].age[way] = r.u32v();
+            c.l1x[set].tv[way] = (tag << 1) | (v ? 1u : 0u);
             r.raw(l.b, 32);
         }
     r.endSection("L1D ", e);

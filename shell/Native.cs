@@ -71,6 +71,16 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_idle_ns(IntPtr m);
 
+    // Whether a CD really made it into the drive, and if not, why the image
+    // was refused. opm_create attaches silently, so a cue sheet naming a
+    // missing .bin — or a .dmg compressed with a codec the core does not
+    // carry — would otherwise boot an EMPTY drive with nothing saying so.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_cd_present(IntPtr m);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_cd_error(IntPtr m, byte[] buf, uint cap);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);
 

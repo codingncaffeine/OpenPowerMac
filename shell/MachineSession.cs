@@ -193,6 +193,28 @@ public sealed class MachineSession
             if (s.Realtime)
                 Native.opm_set_realtime(m, 1);
 
+            // Report the CD from the DRIVE, not from the setting: attach can
+            // refuse the image (a cue sheet naming a missing .bin, a .dmg in
+            // a codec the core does not carry), and a status line keyed off
+            // the path would report a CD the machine never got.
+            string cdNote = "";
+            if (cdPath != null)
+            {
+                if (Native.opm_cd_present(m) != 0)
+                {
+                    cdNote = ", CD attached";
+                }
+                else
+                {
+                    var cdErr = new byte[512];
+                    uint cdErrLen = Native.opm_cd_error(m, cdErr, (uint)cdErr.Length);
+                    ConsoleQ.Enqueue("[shell] CD attach REFUSED: "
+                                     + System.Text.Encoding.UTF8.GetString(cdErr, 0, (int)cdErrLen)
+                                     + $"\n[shell]   image: {cdPath}\n");
+                    cdNote = ", CD REFUSED (empty drive)";
+                }
+            }
+
             // Report the hard disk too. Without it in this line there was no
             // way to tell a machine booting from disk apart from one that
             // never had a disk at all — and that is the whole question when
@@ -201,7 +223,7 @@ public sealed class MachineSession
                              (s.Realtime ? "clock paced from the host (25 MHz)"
                                          : $"fast-tb {s.FastTb}") +
                              (string.IsNullOrWhiteSpace(s.HdPath) ? ", NO HD" : ", HD attached") +
-                             (string.IsNullOrWhiteSpace(s.CdPath) ? "" : ", CD attached") +
+                             cdNote +
                              // AtiAt is the instruction at which the card
                              // becomes visible in PCI config space, and
                              // printing it in millions turned the shipping

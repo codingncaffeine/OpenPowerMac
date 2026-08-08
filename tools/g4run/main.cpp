@@ -1337,9 +1337,13 @@ int main(int argc, char** argv)
     }
     if (cdPath) {
         if (bus.attachCd(cdPath))
-            printf("-- cd attached: %s\n", cdPath);
+            printf("-- cd attached: %s [%s, %llu blocks, %zu track(s)]\n",
+                   cdPath, bus.cd().media().shape(),
+                   static_cast<unsigned long long>(bus.cd().media().blocks()),
+                   bus.cd().media().tracks().size());
         else
-            printf("-- cd attach FAILED: %s\n", cdPath);
+            printf("-- cd attach FAILED: %s — %s\n", cdPath,
+                   bus.cd().mediaError());
     }
 
     if (serialRate)

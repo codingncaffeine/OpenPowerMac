@@ -475,8 +475,10 @@ public partial class MainWindow : Window
     {
         var dlg = new OpenFileDialog
         {
-            Title = "Choose a CD image (Mac OS 9 install/restore ISO)",
-            Filter = "CD images (*.iso;*.toast;*.img)|*.iso;*.toast;*.img|All files (*.*)|*.*",
+            Title = "Choose a CD image (ISO/Toast/CDR, cue+bin, or UDIF dmg)",
+            Filter = "CD images (*.iso;*.toast;*.img;*.cdr;*.cue;*.bin;*.dmg;*.mdf)"
+                     + "|*.iso;*.toast;*.img;*.cdr;*.cue;*.bin;*.dmg;*.mdf"
+                     + "|All files (*.*)|*.*",
         };
         if (dlg.ShowDialog(this) != true)
             return;

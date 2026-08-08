@@ -57,13 +57,32 @@ u64 fnv1a(const void* p, size_t n, u64 h = 1469598103934665603ull)
 // A digest of every structure whose layout the stream depends on. A build
 // that shapes any of them differently reads a different machine, so it must
 // be refused up front rather than allowed to misparse the bytes.
+//
+// ⚠ AtaCell and SawtoothBus contribute HERITAGE CONSTANTS, not sizeof. The
+// CD media mapping (CdImage, s43) grew both objects with state that is
+// derived entirely from the attached file and never enters the stream —
+// the STREAM did not change, and hashing the object size would have
+// refused every snapshot taken before the member existed (moment1/moment2
+// cannot be re-taken without replaying the game; same reasoning as the
+// sizeof(DLine) pin, solved there with reserved bytes, which an owning
+// member does not allow). The constants are the values sizeof() returned
+// when this digest last changed, per compiler because the two compilers
+// never agreed about SawtoothBus in the first place — snapshots have never
+// been portable across compilers. A DELIBERATE stream change still bumps
+// kSnapVersion; these constants never change again.
+#ifdef _MSC_VER
+constexpr u64 kAtaCellLayout = 320, kBusLayout = 23944;
+#else
+constexpr u64 kAtaCellLayout = 320, kBusLayout = 24552;
+#endif
+
 u64 layoutDigest()
 {
     const u64 sizes[] = {
         sizeof(CpuState),        sizeof(Cpu::TlbEntry), sizeof(Cpu::DLine),
-        sizeof(Cpu::L2Line),     sizeof(AtaCell),       sizeof(OpenPic),
+        sizeof(Cpu::L2Line),     kAtaCellLayout,        sizeof(OpenPic),
         sizeof(OhciCell),        sizeof(DbdmaChannel),  sizeof(PmuVia),
-        sizeof(R128Cell),        sizeof(SawtoothBus),   sizeof(V128),
+        sizeof(R128Cell),        kBusLayout,            sizeof(V128),
         sizeof(HarnessState),    sizeof(AwacsCell),     kSnapVersion,
     };
     return fnv1a(sizes, sizeof sizes);
@@ -385,7 +404,7 @@ void loadCpu(SnapReader& r, Cpu& c)
 
 void AtaCell::snapSave(SnapWriter& w) const
 {
-    w.b(iso_ != nullptr);
+    w.b(present());
     w.u64v(isoBytes_);
     w.b(disk_);
     w.u64v(diskSectors_);
@@ -450,7 +469,7 @@ void AtaCell::snapLoad(SnapReader& r)
 {
     const bool wasPresent = r.b();
     const u64 bytes = r.u64v();
-    if (r.ok && wasPresent != (iso_ != nullptr)) {
+    if (r.ok && wasPresent != present()) {
         r.fail(wasPresent ? "snapshot has media attached to an ATA cell that "
                             "is empty in this run"
                           : "this run attaches media to an ATA cell that was "

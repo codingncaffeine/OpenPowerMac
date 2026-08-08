@@ -8,6 +8,7 @@ set(OPM_MACHINE_SRC
   src/pmu.cpp
   src/sawtooth.cpp
   src/ata.cpp
+  src/cdimage.cpp
   src/openpic.cpp
   src/ohci.cpp
   src/r128.cpp

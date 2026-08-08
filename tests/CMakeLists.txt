@@ -14,6 +14,7 @@ add_executable(opm_unit
   unit/test_awacs.cpp
   unit/test_snapshot.cpp
   unit/test_ata.cpp
+  unit/test_cdimage.cpp
   unit/test_ohci.cpp
   unit/test_jit.cpp
   unit/test_softfp_fast.cpp

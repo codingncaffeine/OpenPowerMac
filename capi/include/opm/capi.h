@@ -105,6 +105,16 @@ OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
                           const char* volName, char* err,
                           uint32_t errCap);
 
+// 💿 Whether a CD is actually in the drive, and if attach refused, why.
+// opm_create attaches the CD silently — a cdPath whose image cannot be
+// read (a cue naming a missing .bin, a compressed .dmg in a codec we do
+// not carry) previously left the machine booting with an EMPTY drive and
+// nothing saying so. Ask after create: 1 = media present. opm_cd_error
+// fills `buf` with the refusal reason (empty string when none) and
+// returns the bytes written.
+OPM_API int32_t opm_cd_present(const OpmMachine* m);
+OPM_API uint32_t opm_cd_error(const OpmMachine* m, char* buf, uint32_t cap);
+
 // Queue text for the serial console (CRs included by the caller).
 OPM_API void opm_serial(OpmMachine* m, const char* text);
 

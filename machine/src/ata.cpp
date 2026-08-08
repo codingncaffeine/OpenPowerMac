@@ -15,16 +15,14 @@ static constexpr u8 kCoD = 0x01, kIo = 0x02;
 
 bool AtaCell::attachIso(const char* path)
 {
-    iso_ = fopen(path, "rb");
-    if (!iso_)
+    if (!media_.open(path))
         return false;
-#ifdef _MSC_VER
-    _fseeki64(iso_, 0, SEEK_END);
-    isoBytes_ = static_cast<u64>(_ftelli64(iso_));
-#else
-    fseeko(iso_, 0, SEEK_END);
-    isoBytes_ = static_cast<u64>(ftello(iso_));
-#endif
+    // What snapLoad compares to decide "same image". For a plain image this
+    // is the exact file size it always was — snapshots taken before other
+    // formats existed recorded that, and a rounded value would refuse every
+    // one of them. The new shapes have no old snapshots and record their
+    // 2048-view size.
+    isoBytes_ = media_.snapBytes();
     return true;
 }
 
@@ -90,6 +88,14 @@ std::string AtaCell::describe(const char* who) const
              who, present() ? 1 : 0, disk_ ? 1 : 0, status_, error_, nsect_,
              bcHi_, bcLo_, lba0_, dev_, devctl_, irq_ ? 1 : 0);
     s += b;
+    if (!disk_ && media_.ok()) {
+        snprintf(b, sizeof b,
+                 "--   media: %s, %llu blocks, %zu track(s)\n",
+                 media_.shape(),
+                 static_cast<unsigned long long>(media_.blocks()),
+                 media_.tracks().size());
+        s += b;
+    }
     snprintf(b, sizeof b,
              "--   data phase: %zu bytes, %zu drained; readLba=%llu "
              "readLeft=%u wrLeft=%u pulled=%u\n",
@@ -802,7 +808,7 @@ void AtaCell::packet(const u8* cdb)
         complete();
         break;
     case 0x25: { // READ CAPACITY(10)
-        const u64 blocks = isoBytes_ / 2048;
+        const u64 blocks = media_.blocks();
         const u32 last = blocks ? static_cast<u32>(blocks - 1) : 0;
         data_.assign(8, 0);
         data_[0] = static_cast<u8>(last >> 24);
@@ -828,14 +834,15 @@ void AtaCell::packet(const u8* cdb)
         complete();
         break;
     case 0x43: { // READ TOC/PMA/ATIP
-        // One data track plus the lead-out. Two fields were ignored here
-        // and both are ones a real driver acts on: the MSF bit (cdb[1] bit
-        // 1) selects min/sec/frame addresses instead of LBA, and the
-        // allocation length (cdb[7..8]) caps the reply — a driver that asks
-        // for four bytes and is handed twenty has been lied to about the
-        // size of its own buffer.
+        // Every track the image really has, plus the lead-out — an audio
+        // track reports control 0 (two-channel audio), a data track 4, and
+        // a mixed-mode game that counts its audio tracks sees them. Two
+        // fields a real driver acts on: the MSF bit (cdb[1] bit 1) selects
+        // min/sec/frame addresses instead of LBA, and the allocation
+        // length (cdb[7..8]) caps the reply — a driver that asks for four
+        // bytes and is handed twenty has been lied to about the size of
+        // its own buffer.
         const bool msf = (cdb[1] & 0x02u) != 0;
-        const u64 blocks = isoBytes_ / 2048;
         auto addr = [&](size_t at, u64 lba) {
             if (!msf) {
                 data_[at] = static_cast<u8>(lba >> 24);
@@ -850,16 +857,28 @@ void AtaCell::packet(const u8* cdb)
             data_[at + 2] = static_cast<u8>((f / 75) % 60);
             data_[at + 3] = static_cast<u8>(f % 75);
         };
-        data_.assign(20, 0);
-        data_[1] = 18; // TOC data length, not counting these two bytes
-        data_[2] = 1;  // first track
-        data_[3] = 1;  // last track
-        data_[5] = 0x14; // ADR 1, control 4: a data track
-        data_[6] = 1;
-        addr(8, 0);
-        data_[13] = 0x14;
-        data_[14] = 0xAA; // lead-out
-        addr(16, blocks);
+        const auto& tks = media_.tracks();
+        // The starting-track field: report from there on. 0 means "all".
+        const u32 from = cdb[6] ? cdb[6] : 1u;
+        data_.assign(4, 0);
+        data_[2] = static_cast<u8>(tks.empty() ? 1 : tks.front().number);
+        data_[3] = static_cast<u8>(tks.empty() ? 1 : tks.back().number);
+        auto row = [&](u8 ctl, u8 trk, u64 lba) {
+            const size_t at = data_.size();
+            data_.resize(at + 8, 0);
+            data_[at + 1] = ctl;
+            data_[at + 2] = trk;
+            addr(at + 4, lba);
+        };
+        for (const CdTrack& t : tks)
+            if (t.number >= from)
+                row(t.audio ? 0x10 : 0x14, static_cast<u8>(t.number),
+                    t.startLba);
+        row(!tks.empty() && tks.back().audio ? 0x10 : 0x14, 0xAA,
+            media_.blocks());
+        const u16 tocLen = static_cast<u16>(data_.size() - 2);
+        data_[0] = static_cast<u8>(tocLen >> 8);
+        data_[1] = static_cast<u8>(tocLen);
         const u32 alloc = (u32(cdb[7]) << 8) | cdb[8];
         if (alloc && alloc < data_.size())
             data_.resize(alloc);
@@ -934,6 +953,19 @@ void AtaCell::finishPio(bool chunkDrained)
     }
     if (readLeft_ == 0)
         return;
+    // A READ(10) that reaches an audio sector is refused the way the drive
+    // refuses it: CHECK CONDITION, sense ILLEGAL REQUEST. Audio is read
+    // with READ CD, not READ(10), and serving zeros instead would tell a
+    // disc check the audio tracks are empty — a different disc.
+    if (media_.audioAt(readLba_)) {
+        readLeft_ = 0;
+        sense_ = 0x05;
+        error_ = 0x04 | (0x05 << 4);
+        nsect_ = kIo | kCoD;
+        status_ = kDrdy | kErr;
+        irq_ = true;
+        return;
+    }
     u32 limit = (u32(bcHi_) << 8) | bcLo_;
     if (limit == 0 || limit == 0xFFFFu)
         limit = 0xFE00;
@@ -942,14 +974,18 @@ void AtaCell::finishPio(bool chunkDrained)
         sectors = 1;
     if (sectors > readLeft_)
         sectors = readLeft_;
+    // Clamp the chunk at a data-to-audio boundary: the data sectors still
+    // arrive, and the NEXT chunk then begins on the audio sector and takes
+    // the refusal above — a partial transfer ending in CHECK CONDITION,
+    // which is what the hardware does.
+    for (u32 k = 1; k < sectors; ++k)
+        if (media_.audioAt(readLba_ + k)) {
+            sectors = k;
+            break;
+        }
     data_.assign(size_t(sectors) * 2048, 0);
-#ifdef _MSC_VER
-    _fseeki64(iso_, static_cast<long long>(readLba_ * 2048), SEEK_SET);
-#else
-    fseeko(iso_, static_cast<off_t>(readLba_ * 2048), SEEK_SET);
-#endif
-    const size_t got = fread(data_.data(), 1, data_.size(), iso_);
-    (void)got;
+    for (u32 k = 0; k < sectors; ++k)
+        media_.readBlock(readLba_ + k, data_.data() + size_t(k) * 2048);
     dataAt_ = 0;
     readLba_ += sectors;
     readLeft_ -= sectors;

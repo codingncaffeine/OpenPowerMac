@@ -1,4 +1,5 @@
 #pragma once
+#include "opm/cdimage.hpp"
 #include "opm/dbdma.hpp"
 #include "opm/types.hpp"
 
@@ -12,8 +13,10 @@ struct SnapWriter;
 struct SnapReader;
 
 // One mac-io ATA cell (Heathrow-lineage register file, stride 0x10)
-// carrying a single ATAPI CD/DVD device as device 0, backed by an ISO
-// image streamed from the host file. Built against the OF driver's own
+// carrying a single ATAPI CD/DVD device as device 0, backed by a disc
+// image streamed from the host file — plain 2048 (.iso/.cdr/.toast),
+// raw 2352 (.bin, with or without a .cue sheet), or UDIF .dmg; the
+// format mapping lives in CdImage. Built against the OF driver's own
 // observed device-detect sequence:
 //   +0x00 data (16-bit PIO) · +0x10 error/features · +0x20 int-reason
 //   (nsect) · +0x30 lba0 · +0x40 byte-count lo (lba1) · +0x50 byte-count
@@ -39,7 +42,10 @@ public:
     // not the rule. Read/write, LBA28, and the plain ATA power-on
     // signature (01 01 00 00) instead of the ATAPI 01 01 14 EB.
     bool attachDisk(const char* path);
-    bool present() const { return iso_ != nullptr; }
+    bool present() const { return iso_ != nullptr || media_.ok(); }
+    // Why the last attachIso refused, for whoever owns the console.
+    const char* mediaError() const { return media_.why().c_str(); }
+    const CdImage& media() const { return media_; }
     bool irqLine() const { return irq_; }
     void setDmaArmed(bool a) { dmaArmed_ = a; }
     // The channel's DBDMA engine raised its interrupt: latch it into the
@@ -200,8 +206,13 @@ private:
                (lba0_ ? u32(lba0_) - 1u : 0u);
     }
 
+    // The hard-disk path holds its file here; a CD lives in media_, which
+    // owns the format mapping (cue/raw/UDIF as well as plain). isoBytes_
+    // is the 2048-view size either way — it is what the snapshot stream
+    // records, so it must stay derivable from the attached image alone.
     FILE* iso_ = nullptr;
     u64 isoBytes_ = 0;
+    CdImage media_;
     bool disk_ = false;    // ATA hard disk rather than ATAPI CD
     u64 diskSectors_ = 0;  // 512-byte sectors
     u32 wrLeft_ = 0;       // sectors still to be written this command

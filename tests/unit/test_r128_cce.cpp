@@ -413,6 +413,44 @@ TEST_CASE("cce: BITBLT_MULTI (0x9B) copies through the engine's blit path")
     CHECK(r128CceP3Skipped().count(0x9Bu) == 0);
 }
 
+TEST_CASE("cce: BITBLT (0x92) walks an overlapping copy away from itself")
+{
+    // The window-drag op, measured live: src=(117,152) dst=(186,241),
+    // destination overlapping the source down-right, GMC direction bits
+    // plain forward. A forward walk reads rows it has already written and
+    // repeats the source every dy rows — three stacked window images on a
+    // real desktop. The op must choose the safe order itself, like the
+    // card's microcode: this copy shifts rows 1..4 down by 2, and every
+    // destination row must carry an ORIGINAL source row.
+    CceRig r;
+    const auto before = r128EngStats();
+    const size_t stride = 4u * 8u * 4u;
+    for (u32 yy = 0; yy < 4; ++yy)
+        for (u32 xx = 0; xx < 2; ++xx)
+            r.c.vram[(1 + yy) * stride + (2 + xx) * 4 + 1] =
+                static_cast<u8>(0xB1 + yy);
+    const u32 gc = 1u | 2u | 8u | (15u << 4) | (6u << 8) | (3u << 12) |
+                   (0xCCu << 16) | (2u << 24);
+    r.fifo(0xC0009200u | (7u << 16)); // 8-DWord body: settings 5 + rect 3
+    r.fifo(gc);
+    r.fifo(0x00800000u); // SRC_PITCH_OFFSET
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET
+    r.fifo(0x00000000u); // SC_TOP_LEFT
+    r.fifo(0x001F001Fu); // SC_BOT_RITE
+    r.fifo(0x00020001u); // SRC_X=2 | SRC_Y=1
+    r.fifo(0x00020003u); // DST_X=2 | DST_Y=3: two rows into the source
+    r.fifo(0x00020004u); // W=2 | H=4
+    const auto& e = r128EngStats();
+    CHECK(e.copies - before.copies == 1);
+    CHECK(e.pixels - before.pixels == 8);
+    // dst rows 3..6 = src rows 1..4, no recursion. A forward walk fails
+    // at row 5, which would repeat row 1's 0xB1 instead of row 3's 0xB3.
+    for (u32 k = 0; k < 4; ++k)
+        CHECK(r.c.vram[(3 + k) * stride + 2 * 4 + 1] ==
+              static_cast<u8>(0xB1 + k));
+    CHECK(r128CceP3Skipped().count(0x92u) == 0);
+}
+
 TEST_CASE("cce: SMALL_TEXT (0x93) draws transparent glyphs and NEXTCHAR "
           "(0x19) reuses its colour")
 {

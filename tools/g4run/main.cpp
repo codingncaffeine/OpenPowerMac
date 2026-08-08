@@ -305,7 +305,8 @@ struct SymTab {
 struct MouseBeat {
     u64 at = 0;
     int x = 0, y = 0;
-    int clicks = 0; // 0 = move only, 1 = click, 2 = double click
+    int clicks = 0; // 0 = move only, 1 = click, 2 = double click, 3 = drag
+    int dx = 0, dy = 0; // drag travel, applied with the button held
 };
 void parseMouseAt(const char* v, std::vector<MouseBeat>& out)
 {
@@ -322,14 +323,26 @@ void parseMouseAt(const char* v, std::vector<MouseBeat>& out)
     if (ok && *p == ':') {
         if (!strcmp(p + 1, "click")) mb.clicks = 1;
         else if (!strcmp(p + 1, "dbl")) mb.clicks = 2;
-        else ok = false;
+        else if (!strncmp(p + 1, "drag:", 5)) {
+            // BEAT:X,Y:drag:DX,DY — press at (X,Y), walk (DX,DY) with the
+            // button held, release. The window-move and scroll-thumb
+            // gestures, scripted.
+            mb.clicks = 3;
+            mb.dx = static_cast<int>(strtol(p + 6, &p, 0));
+            ok = *p == ',';
+            if (ok) {
+                mb.dy = static_cast<int>(strtol(p + 1, &p, 0));
+                ok = *p == 0;
+            }
+        } else
+            ok = false;
     } else if (ok && *p)
         ok = false;
     if (ok)
         out.push_back(mb);
     else
-        printf("-- --mouse-beat %s malformed (want BEAT:X,Y[:click|:dbl]); "
-               "IGNORED\n",
+        printf("-- --mouse-beat %s malformed (want "
+               "BEAT:X,Y[:click|:dbl|:drag:DX,DY]); IGNORED\n",
                v);
 }
 
@@ -2120,13 +2133,24 @@ int main(int argc, char** argv)
             const u32 posn = bus.ati().peek(0x0264);
             const int cx = int((posn >> 16) & 0xFFFFu);
             const int cy = int(posn & 0xFFFFu);
+            // ⚠ CLAMP EVERY CORRECTION BELOW THE ACCELERATION KNEE. A big
+            // correction is amplified ~2x by the guest's curve and lands on
+            // the OTHER side of the target at similar distance — measured:
+            // ±170 px corrections oscillated between (267,356) and (532,146)
+            // forever. Deltas this small ride the ~1:1 part of the curve, so
+            // the error shrinks monotonically and convergence is certain;
+            // it just takes more, smaller steps.
+            auto clampStep = [](int v) {
+                return v > 24 ? 24 : v < -24 ? -24 : v;
+            };
             const int ex = mb.x - cx, ey = mb.y - cy;
-            if ((ex > 2 || ex < -2 || ey > 2 || ey < -2) && mbHome < 6) {
+            if ((ex > 2 || ex < -2 || ey > 2 || ey < -2) && mbHome < 64) {
                 ++mbHome;
-                mouseInject(ex, ey, 0, "home toward target");
+                mouseInject(clampStep(ex), clampStep(ey),
+                            0, "home toward target");
                 return; // stay in stage 2; the clocks were re-marked
             }
-            if (mbHome >= 6)
+            if (mbHome >= 64)
                 printf("-- mouse beat %zu: homing gave up at (%d,%d), "
                        "wanted (%d,%d); clicking anyway\n",
                        mbIdx + 1, cx, cy, mb.x, mb.y);
@@ -2141,7 +2165,7 @@ int main(int argc, char** argv)
                 return;
             }
             mouseInject(0, 0, 1, "button down");
-            mbStage = 3;
+            mbStage = mb.clicks == 3 ? 7 : 3;
             break;
         }
         case 3:
@@ -2150,6 +2174,41 @@ int main(int argc, char** argv)
             mouseInject(0, 0, 0, "button up");
             mbStage = 4;
             break;
+        case 7: { // drag: button held, home onto the drop point
+            if (!mouseSettled(2))
+                return;
+            const u32 posn = bus.ati().peek(0x0264);
+            const int cx = int((posn >> 16) & 0xFFFFu);
+            const int cy = int(posn & 0xFFFFu);
+            // Same clamp as the stage-2 homing, same measured reason.
+            auto clampStep = [](int v) {
+                return v > 24 ? 24 : v < -24 ? -24 : v;
+            };
+            const int ex = mb.x + mb.dx - cx, ey = mb.y + mb.dy - cy;
+            if ((ex > 2 || ex < -2 || ey > 2 || ey < -2) && mbHome < 64) {
+                ++mbHome;
+                mouseInject(clampStep(ex), clampStep(ey),
+                            1, "drag toward drop point");
+                return; // stay: the closed loop reads the cursor register
+            }
+            if (mbHome >= 64)
+                printf("-- mouse beat %zu: drag homing gave up at (%d,%d), "
+                       "wanted (%d,%d); dropping anyway\n",
+                       mbIdx + 1, cx, cy, mb.x + mb.dx, mb.y + mb.dy);
+            mbHome = 0;
+            mouseInject(0, 0, 0, "button up (drop)");
+            mbStage = 8;
+            break;
+        }
+        case 8: { // dropped: give the guest its redraw, keep the evidence
+            if (!mouseSettled(6))
+                return;
+            char nm[64];
+            snprintf(nm, sizeof nm, "ati_mouse_b%zu_drop.ppm", mbIdx + 1);
+            dumpScreen(nm);
+            mouseDone();
+            break;
+        }
         case 4:
             if (!mouseSettled(1))
                 return;

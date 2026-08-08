@@ -1055,16 +1055,14 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
     return true;
 }
 
-// BITBLT_MULTI (0x9B): N screen-to-screen copies, per rect three words —
-// [SRC_X|SRC_Y] [DST_X|DST_Y] [SRC_W|SRC_H], every one a HALF-SWAP of the
-// engine's register layout, routed onto the engine's direction-correct copy
-// path. This is the op a WINDOW DRAG submits: with it skipped, the window's
-// pixels never moved and the exposed area kept stale content — the user's
-// "fine until I move it". ⚠ The spec's prose calls the second word the
-// destination's "bottom-right corner" while naming the fields DST_X/DST_Y
-// and declaring the geometry identical to the source; it is treated as the
-// TOP-LEFT. If every dragged window lands offset by its own size, this is
-// the line to revisit.
+// BITBLT_MULTI (0x9B), and BITBLT (0x92) which is its one-rect form: N
+// screen-to-screen copies, per rect three words — [X|Y source] [X|Y dest]
+// [W|H], X and W in the high halves. The spec's prose calls the second
+// word the destination's "bottom-right corner"; the SDK's own worked
+// example (§6.4, y2|x2<<16 "destination location") and a live window
+// drag's stream (dst = src + exactly the commanded drag delta) both say
+// TOP-LEFT, and the stream outranks the prose. These are the window-move
+// and scroll ops.
 static bool cceOpBitbltMulti(R128Cell& c, const u32* body, u32 n)
 {
     u32 i = cceSettings(c, body, n);
@@ -1073,11 +1071,35 @@ static bool cceOpBitbltMulti(R128Cell& c, const u32* body, u32 n)
     while (i + 3u <= n) {
         const u32 s = body[i], d = body[i + 1u], wh = body[i + 2u];
         i += 3u;
-        if (!(wh >> 16) || !(wh & 0x3FFFu))
+        const u32 w = wh >> 16, h = wh & 0x3FFFu;
+        if (!w || !h)
             continue;
-        cceRegWrite(c, 0x1434u, (s >> 16) | (s << 16));   // SRC_Y_X
-        cceRegWrite(c, 0x1438u, (d >> 16) | (d << 16));   // DST_Y_X
-        cceRegWrite(c, 0x143Cu, (wh >> 16) | (wh << 16)); // H_W: draw
+        u32 sx = s >> 16, sy = s & 0xFFFFu; // packet: X high, Y low
+        u32 dx = d >> 16, dy = d & 0xFFFFu;
+        // ⚠ THE WALK ORDER IS THIS OP'S JOB, NOT THE DRIVER'S. The window
+        // drag submits an OVERLAPPING screen-to-screen copy with the GMC's
+        // direction bits at plain forward — and a forward walk into an
+        // overlap reads rows it has already overwritten. Measured: the
+        // drag's own blit, src=(117,152) dst=(186,241) 417x239, repeated
+        // the window image every dy=89 rows down the screen. The engine's
+        // register path honours DP_CNTL and treats a reversed origin as
+        // the far corner, so give it exactly what a safe driver would:
+        // direction away from the overlap, far-corner coordinates when
+        // reversed.
+        const bool l2r = dx <= sx, t2b = dy <= sy;
+        if (!l2r) {
+            sx += w - 1u;
+            dx += w - 1u;
+        }
+        if (!t2b) {
+            sy += h - 1u;
+            dy += h - 1u;
+        }
+        cceRegWrite(c, kDpCntl, (c.peek(kDpCntl) & ~3u) |
+                                    (l2r ? 1u : 0u) | (t2b ? 2u : 0u));
+        cceRegWrite(c, 0x1434u, (sy << 16) | sx); // SRC_Y_X
+        cceRegWrite(c, 0x1438u, (dy << 16) | dx); // DST_Y_X
+        cceRegWrite(c, 0x143Cu, (h << 16) | w);   // H_W: draw
     }
     return true;
 }
@@ -1337,6 +1359,16 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
             done = cceOpHostBlt(c, body, n);
         else if (op == 0x9Bu) // BITBLT_MULTI — SDK F.18
             done = cceOpBitbltMulti(c, body, n);
+        else if (op == 0x92u)
+            // BITBLT, the single-rectangle form — absent from the SDK's own
+            // opcode table. Decoded from a live window drag: GUI_CONTROL
+            // (no brush, src-from-VRAM, ROP CC) then one [SRC][DST][H_W]
+            // rect, byte-identical to a one-rect BITBLT_MULTI — dst arrived
+            // at src plus exactly the commanded drag delta. Mac OS moves a
+            // window's pixels with THIS op, so skipping it left every
+            // dragged window's content behind — "can't really see it any
+            // more" until a close/reopen forced a full redraw.
+            done = cceOpBitbltMulti(c, body, n);
         else if (op == 0x93u) // SMALL_TEXT — SDK F.10
             done = cceOpSmallText(c, body, n);
         else if (op == 0x19u) // NEXTCHAR — SDK F.16
@@ -1355,8 +1387,19 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
             ++gEng.cacheFlushes;
             done = true;
         }
-        if (!done)
-            ++gCceP3[op];
+        if (!done) {
+            // The map says WHICH op was skipped; the first few skipped
+            // packets say WHAT IT CARRIED — which is the whole question
+            // when the op is one the SDK's own table does not list
+            // (opcode 0x92 came off a live window drag exactly so).
+            if (++gCceP3[op] <= 2) {
+                printf("-- cce pkt3 op %02x SKIPPED, %u words:", op, n);
+                for (u32 k = 0; k < n && k < 12; ++k)
+                    printf(" %08x",
+                           gCceFifo[gCceHead + 1u + k]);
+                printf("%s\n", n > 12 ? " ..." : "");
+            }
+        }
         gCceHead += 1u + n;
         ++gEng.ccePkt3;
     }

@@ -50,6 +50,12 @@ public sealed class ShellSettings
     // An explicitly chosen CD image wins the slot; the console says so.
     public string SharedFolderPath { get; set; } = "";
 
+    // 📥 The drop box folder: files dropped on the display land here, the
+    // folder is packed into an HFS volume and handed to the guest on its
+    // second CD-class drive — no restart. Empty = the default under
+    // Documents/OpenPowerMac/Drop Box (see MachineSession.DropBoxFolder).
+    public string DropBoxPath { get; set; } = "";
+
     // Required for any picture. Without the card's FCode there is no display
     // node, so the OS has nothing to bind a driver to.
     public string AtiRomPath { get; set; } = "";

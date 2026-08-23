@@ -283,6 +283,73 @@ OPM_API int32_t opm_cd_present(const OpmMachine* m)
     return m->bus->cd().present() ? 1 : 0;
 }
 
+OPM_API int32_t opm_drop_seat(OpmMachine* m)
+{
+    m->bus->seatDrop();
+    return 1;
+}
+
+OPM_API int32_t opm_drop_attach(OpmMachine* m, const char* imgPath)
+{
+    if (!imgPath || !*imgPath)
+        return 0;
+    const bool ok = m->bus->attachDrop(imgPath);
+    if (!ok)
+        m->bus->seatDrop(); // the drive is there either way; the tray is empty
+    return ok ? 1 : 0;
+}
+
+OPM_API int32_t opm_drop_swap(OpmMachine* m, const char* imgPath)
+{
+    if (!imgPath || !*imgPath || !m->bus->drop().present())
+        return 0;
+    const bool ok = m->bus->drop().hostStage(imgPath);
+    m->bus->deviceStateChanged();
+    return ok ? 1 : 0;
+}
+
+OPM_API void opm_drop_eject(OpmMachine* m)
+{
+    if (!m->bus->drop().present())
+        return;
+    m->bus->drop().hostEject();
+    m->bus->deviceStateChanged();
+}
+
+OPM_API int32_t opm_drop_state(const OpmMachine* m)
+{
+    const AtaCell& d = m->bus->drop();
+    if (!d.present())
+        return 0;
+    if (d.awaitingGuestEject())
+        return 5;
+    if (d.swapPending())
+        return 2;
+    if (!d.mediaPresent())
+        return 1;
+    if (d.unitAttentionPending() || d.readsSinceInsert() == 0)
+        return 3;
+    return 4;
+}
+
+OPM_API uint64_t opm_drop_reads(const OpmMachine* m)
+{
+    return m->bus->drop().readsSinceInsert();
+}
+
+OPM_API uint32_t opm_drop_error(const OpmMachine* m, char* buf, uint32_t cap)
+{
+    if (!buf || !cap)
+        return 0;
+    const char* why = m->bus->drop().mediaError();
+    uint32_t n = 0;
+    while (why[n] && n + 1 < cap) {
+        buf[n] = why[n];
+        ++n;
+    }
+    buf[n] = 0;
+    return n;
+}
 OPM_API uint32_t opm_rom_note(const OpmMachine* m, char* buf, uint32_t cap)
 {
     if (!buf || !cap)

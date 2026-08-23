@@ -146,6 +146,14 @@ struct SnapReader {
             out[k] = static_cast<T>(u32v());
     }
 
+    // Is the next section this one? Nothing is consumed. This is how a
+    // section added after a format was already in the wild stays OPTIONAL:
+    // a stream without it reads exactly as before, a stream with it reads
+    // it, and the version number is left for changes to what already exists.
+    bool nextSectionIs(const char* tag4) const
+    {
+        return ok && end - p >= 4 && std::memcmp(p, tag4, 4) == 0;
+    }
     // Section framing, mirroring SnapWriter. beginSection checks the tag
     // and returns the payload end; endSection asserts the reader landed on
     // it exactly.

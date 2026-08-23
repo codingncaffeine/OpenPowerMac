@@ -246,6 +246,8 @@ public:
         ataDma_.dev = &cd_;
         hdDma_.dmaBus = this;
         hdDma_.dev = &hd_;
+        dropDma_.dmaBus = this;
+        dropDma_.dev = &drop_;
         // The two audio channels share the engine the ATA channels proved,
         // and both ends of the codec are the same cell: +0x8800 hands it
         // samples, +0x8900 asks it for them.
@@ -277,7 +279,7 @@ public:
         // refreshed on the path a device access takes — see noteNow(). The PMU
         // used to be handed &cpu.st.tb by each front end and would have read a
         // batch stale.
-        cd_.tbRef = hd_.tbRef = &nowTb_;
+        cd_.tbRef = hd_.tbRef = drop_.tbRef = &nowTb_;
         pmu_.tbRef = &nowTb_;
     }
 
@@ -570,6 +572,10 @@ public:
         pic_.setLine(11, hdDma_.irqLine()); // ata-4's DBDMA (reg 8a00)
         pic_.setLine(19, hd_.irqLine()); // ata-4@1f000, interrupts 0x13
         pic_.setLine(20, cd_.irqLine());
+        // ata-3@21000 — a Sawtooth's third channel, the Zip bay on the real
+        // board: device source 21, its DBDMA (0x8C00 = channel 12) source 13.
+        pic_.setLine(21, drop_.irqLine());
+        pic_.setLine(13, dropDma_.irqLine());
         // The audio DBDMA channels. A mac-io channel at +0x8000 + N*0x100
         // raises source N+1 — the two ATA channels are the recorded pairs
         // (0x8A00 = channel 10 = source 11, 0x8B00 = channel 11 = source
@@ -678,8 +684,9 @@ public:
         syncIrqs();
         cpuIrq_ = pic_.cpuLine();
         devDueTb_ = ohci_[0].nextTickTb();
-        const u64 due[5] = {ohci_[1].nextTickTb(), ati_.nextTickTb(),
-                            cd_.pendingTb(), hd_.pendingTb(), soundDueTb()};
+        const u64 due[6] = {ohci_[1].nextTickTb(), ati_.nextTickTb(),
+                            cd_.pendingTb(),      hd_.pendingTb(),
+                            drop_.pendingTb(),    soundDueTb()};
         for (const u64 d : due)
             if (d < devDueTb_)
                 devDueTb_ = d;
@@ -742,10 +749,12 @@ public:
         // can present a data phase.
         cd_.setDmaArmed(ataDma_.running());
         hd_.setDmaArmed(hdDma_.running());
+        drop_.setDmaArmed(dropDma_.running());
         // The cell's +0x300 interrupt register carries a latched image of
         // its DBDMA channel's interrupt, not just the drive's INTRQ.
         cd_.setDmaIrq(ataDma_.irqLine());
         hd_.setDmaIrq(hdDma_.irqLine());
+        drop_.setDmaIrq(dropDma_.irqLine());
         // Deferred ATA commands (see AtaCell::write case 0x070). When one
         // fires, its data phase has just opened, so resume any DBDMA list
         // parked on that channel — a DMA read arms the list before the
@@ -755,6 +764,8 @@ public:
             ataDma_.wake();
         if (hd_.tick())
             hdDma_.wake();
+        if (drop_.tick())
+            dropDma_.wake();
         // The codec is the one device that parks a channel on ITSELF: a
         // stream drains at its sample rate, so an output list is left
         // mid-descriptor until the FIFO has room again. Nothing the guest
@@ -827,6 +838,10 @@ public:
     // ISO is attached; the other buses stay empty. Non-data register
     // traffic is logged bus-tagged.
     const std::vector<RegWr>& ataLog() const { return ataLog_; }
+    // Accesses per ATA channel window: [0] ata-4 at +1f000, [1] ata-3 at
+    // +20000, [2] ata-3 at +21000. Whether the firmware and the OS ever
+    // look at a channel is the first question before seating a device there.
+    const u64* ataTouches() const { return ataTouches_; }
     // --ata-log-from N: the ring trims as it grows, so a command at 3.7 G
     // is long gone by the end of a 5 G run. Gate it and the window lands
     // where the question is.
@@ -842,8 +857,18 @@ public:
     u32 ohciBar(u32 i) const { return ohciBar_[i & 1u]; }
     bool attachCd(const char* path) { return cd_.attachIso(path); }
     bool attachHd(const char* path) { return hd_.attachDisk(path); }
+    // The third channel's drive: a second ATAPI CD-class device on
+    // ata-3@21000, which is where a Sawtooth's Zip bay sits. It is the
+    // host's drop box — a folder served as an HFS volume, republished by
+    // swapping the disc (see AtaCell::hostSwap). seatDrop() puts the drive
+    // on the channel with an empty tray; either must happen BEFORE the
+    // first instruction, because the firmware's bus scan and the OS's ATA
+    // Manager enumerate drives exactly once.
+    void seatDrop() { drop_.seat(); }
+    bool attachDrop(const char* path) { return drop_.attachIso(path); }
     AtaCell& hd() { return hd_; }
     AtaCell& cd() { return cd_; }
+    AtaCell& drop() { return drop_; }
 
     // SCC (+0x13000): MacRISC layout — ctrl B/A at +0x00/+0x20, data B/A
     // at +0x10/+0x30. Enough Z8530 to drain transmit (RR0 TX-empty) and
@@ -903,11 +928,11 @@ public:
     void setStamp(const u64* s)
     {
         stamp = s;
-        cd_.stamp = hd_.stamp = s;
+        cd_.stamp = hd_.stamp = drop_.stamp = s;
         pic_.stamp = s;
         ohci_[0].stamp = ohci_[1].stamp = s;
         ati_.stamp = s;
-        ataDma_.stamp = hdDma_.stamp = s;
+        ataDma_.stamp = hdDma_.stamp = dropDma_.stamp = s;
         sndOut_.stamp = sndIn_.stamp = s;
         for (DbdmaChannel& ch : dmaGen_)
             ch.stamp = s;
@@ -916,10 +941,10 @@ public:
     void setPcRef(const u32* p)
     {
         pcRef = p;
-        cd_.pcRef = hd_.pcRef = p;
+        cd_.pcRef = hd_.pcRef = drop_.pcRef = p;
         ohci_[0].pcRef = ohci_[1].pcRef = p;
         ati_.pcRef = p;
-        ataDma_.pcRef = hdDma_.pcRef = p;
+        ataDma_.pcRef = hdDma_.pcRef = dropDma_.pcRef = p;
         sndOut_.pcRef = sndIn_.pcRef = p;
         for (DbdmaChannel& ch : dmaGen_)
             ch.pcRef = p;
@@ -1024,6 +1049,8 @@ private:
                 return ataDma_.read(off - 0x8B00u, len);
             if (off - 0x8A00u < 0x100u)
                 return hdDma_.read(off - 0x8A00u, len);
+            if (off - 0x8C00u < 0x100u)
+                return dropDma_.read(off - 0x8C00u, len);
             // Channels 0-7: real engines with nothing attached. See the note
             // in the constructor — a register store here hangs the OS boot.
             if (off - 0x8000u < 0x800u)
@@ -1037,6 +1064,7 @@ private:
                     return snd_.read(off - AwacsCell::kRegBase, len);
             }
             if (off - 0x1F000u < 0x3000u) {
+                ++ataTouches_[(off - 0x1F000u) >> 12];
                 const bool isCd =
                     off - 0x20000u < 0x1000u && cd_.present();
                 // Unpopulated channel: the ATA data lines float high on the
@@ -1047,8 +1075,11 @@ private:
                 // and every probe of an empty slot burns its full timeout
                 // before the bus scan can move on.
                 const bool isHd = off < 0x20000u && hd_.present();
+                const bool isDrop =
+                    off - 0x21000u < 0x1000u && drop_.present();
                 u32 v = isCd   ? cd_.read(off - 0x20000u, len)
                         : isHd ? hd_.read(off - 0x1F000u, len)
+                        : isDrop ? drop_.read(off - 0x21000u, len)
                                : ((~0u >> (32 - 8 * len)) & ~0x80u);
                 if ((off & 0xFF0u) != 0 &&
                     !(stamp && *stamp < ataLogFrom)) {
@@ -1217,6 +1248,10 @@ private:
                 hdDma_.write(off - 0x8A00u, v, len);
                 return;
             }
+            if (off - 0x8C00u < 0x100u) {
+                dropDma_.write(off - 0x8C00u, v, len);
+                return;
+            }
             // Channels 0-7 — see the read path and the constructor. FLUSH has
             // to clear, and only the engine does that.
             if (off - 0x8000u < 0x800u) {
@@ -1238,6 +1273,7 @@ private:
                 }
             }
             if (off - 0x1F000u < 0x3000u) {
+                ++ataTouches_[(off - 0x1F000u) >> 12];
                 if ((off & 0xFF0u) != 0 &&
                     !(stamp && *stamp < ataLogFrom)) {
                     if (ataLog_.size() >= 6000)
@@ -1255,6 +1291,9 @@ private:
                 } else if (off - 0x1F000u < 0x1000u && hd_.present()) {
                     hd_.write(off - 0x1F000u, v, len);
                     hdDma_.wake(); // a command can open a fresh data phase
+                } else if (off - 0x21000u < 0x1000u && drop_.present()) {
+                    drop_.write(off - 0x21000u, v, len);
+                    dropDma_.wake();
                 }
                 return;
             }
@@ -1904,18 +1943,20 @@ private:
     std::vector<RegWr> ataLog_;
     AtaCell cd_;
     AtaCell hd_; // ata-4@1f000: the internal drive a Sawtooth boots from
+    AtaCell drop_; // ata-3@21000: the drop box, a second CD-class drive
     OpenPic pic_;
     OhciCell ohci_[2];
     u32 macioBar_ = 0;        // OF-assigned mac-io BAR0 (bridge window)
     u32 ohciBar_[2] = {0, 0}; // OF/OS-assigned BAR0 per function
     R128Cell ati_;
-    DbdmaChannel ataDma_, hdDma_;
+    DbdmaChannel ataDma_, hdDma_, dropDma_;
     // Channels 0-7 (+0x8000..+0x87FF): present, deviceless. See the
     // constructor for why they cannot be left to the register store.
     DbdmaChannel dmaGen_[8];
     AwacsCell snd_;
     DbdmaChannel sndOut_, sndIn_;
     std::vector<u8> atiRom_;
+    u64 ataTouches_[3] = {0, 0, 0};
     u64 romBase_ = 0; // FNV-1a of the boot flash as loaded (see the ctor)
     std::string romNote_; // what factoryConfigure did to the sys block, if anything
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;

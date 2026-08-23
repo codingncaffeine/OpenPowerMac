@@ -84,6 +84,31 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_rom_note(IntPtr m, byte[] buf, uint cap);
 
+    // 📥 The drop box — a second CD-class drive whose disc is an HFS volume
+    // built from the drop folder. The DRIVE must be seated right after
+    // opm_create (the guest enumerates drives once, at boot); the DISC is
+    // republished with opm_drop_swap, which is SAFE by construction: an
+    // empty tray takes the image now, a disc the guest has read waits until
+    // the guest puts the volume away (state 5). Paths are narrow like
+    // opm_create's.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_drop_seat(IntPtr m);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int opm_drop_attach(IntPtr m, string imgPath);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int opm_drop_swap(IntPtr m, string imgPath);
+
+    // 0 no drive · 1 tray empty · 2 swap staged (tray empty) · 3 disc in,
+    // unread · 4 disc in, read (mounted) · 5 disc in, read, a newer image
+    // waiting for the guest to put the volume away.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_drop_state(IntPtr m);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_drop_error(IntPtr m, byte[] buf, uint cap);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);
 

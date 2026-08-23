@@ -111,6 +111,143 @@ public sealed class MachineSession
     private volatile string? _snapWanted;
     public void RequestSnapshot(string path) => _snapWanted = path;
 
+    // 📥 The drop box. Files dropped on the display are copied into the drop
+    // folder on a worker thread, the folder is packed into a fresh HFS image
+    // there too (a big share takes seconds, and the machine must not stall
+    // for it), and only the hand-over — opm_drop_swap — runs here, between
+    // chunks, like every other request. The core decides what is safe:
+    // an empty tray takes the image now; a disc the guest has read waits
+    // for the guest's own Put Away (state 5), because a swap under a
+    // mounted volume makes Mac OS read the new disc through the old
+    // catalog (measured: a file opened afterwards shows garbage).
+    private volatile string? _dropWanted;
+    private int _dropSeq;
+    private int _dropBusy; // a copy+build in flight (Interlocked)
+    private readonly List<string> _dropImages = new(); // run-thread only
+    public static string DropBoxFolder(ShellSettings s) =>
+        string.IsNullOrWhiteSpace(s.DropBoxPath)
+            ? Path.Combine(Environment.GetFolderPath(
+                               Environment.SpecialFolder.MyDocuments),
+                           "OpenPowerMac", "Drop Box")
+            : s.DropBoxPath;
+    private string _dropFolder = "";
+
+    /// <summary>Copy the dropped files/folders into the drop folder, rebuild
+    /// the volume and hand it to the guest. Returns false when the machine
+    /// is not running or a previous drop is still being packed.</summary>
+    public bool RequestDrop(IReadOnlyList<string> paths)
+    {
+        if (!Running || paths.Count == 0)
+            return false;
+        if (Interlocked.CompareExchange(ref _dropBusy, 1, 0) != 0)
+        {
+            ConsoleQ.Enqueue("[drop box] still packing the previous drop — "
+                             + "try again in a moment\n");
+            return false;
+        }
+        var folder = _dropFolder;
+        Task.Run(() =>
+        {
+            try
+            {
+                Directory.CreateDirectory(folder);
+                int n = 0;
+                foreach (var p in paths)
+                {
+                    try
+                    {
+                        if (Directory.Exists(p))
+                        {
+                            CopyTree(p, Path.Combine(folder, Path.GetFileName(
+                                p.TrimEnd('\\', '/'))));
+                            n++;
+                        }
+                        else if (File.Exists(p))
+                        {
+                            File.Copy(p, Path.Combine(folder,
+                                                      Path.GetFileName(p)), true);
+                            n++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ConsoleQ.Enqueue($"[drop box] could not copy {p}: "
+                                         + $"{ex.Message}\n");
+                    }
+                }
+                if (n == 0)
+                    return;
+                var img = BuildDropImage(folder, out var note);
+                if (img == null)
+                {
+                    ConsoleQ.Enqueue($"[drop box] volume NOT built: {note}\n");
+                    return;
+                }
+                if (note.Length > 0)
+                    ConsoleQ.Enqueue($"[drop box] {note}\n");
+                ConsoleQ.Enqueue($"[drop box] {n} item(s) added; volume "
+                                 + "rebuilt\n");
+                _dropWanted = img;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _dropBusy, 0);
+            }
+        });
+        return true;
+    }
+
+    private static void CopyTree(string src, string dst)
+    {
+        Directory.CreateDirectory(dst);
+        foreach (var f in Directory.GetFiles(src))
+            File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), true);
+        foreach (var d in Directory.GetDirectories(src))
+            CopyTree(d, Path.Combine(dst, Path.GetFileName(d)));
+    }
+
+    // Pack the drop folder into a fresh image (a new name every time: the
+    // core holds the previous one open until the new disc is in, and
+    // Windows will not let an open file be overwritten). Null = refused,
+    // with the reason in `note`; on success `note` carries the builder's
+    // warnings (files it had to leave out).
+    private string? BuildDropImage(string folder, out string note)
+    {
+        var img = Path.Combine(Path.GetTempPath(),
+            $"opm_drop_{Environment.ProcessId}_{Interlocked.Increment(ref _dropSeq)}.img");
+        var err = new StringBuilder(512);
+        if (Native.opm_hfs_build(folder, img, "Drop Box", err, 512) == 0)
+        {
+            note = err.ToString();
+            try { File.Delete(img); } catch { }
+            return null;
+        }
+        note = err.ToString();
+        return img;
+    }
+
+    private static bool FolderHasContent(string folder)
+    {
+        try
+        {
+            return Directory.Exists(folder)
+                   && Directory.EnumerateFileSystemEntries(folder).Any();
+        }
+        catch { return false; }
+    }
+
+    private static string DropStateText(int st) => st switch
+    {
+        0 => "no drive",
+        1 => "tray empty",
+        2 => "tray open, the new volume goes in",
+        3 => "volume in, not read yet",
+        4 => "volume mounted",
+        5 => "updated — put away the Drop Box in the guest (drag it to the "
+             + "Trash, or select it and press Cmd-Y) to receive the new files",
+        _ => st.ToString(),
+    };
+
     private void Run(ShellSettings s)
     {
         Running = true;
@@ -198,6 +335,38 @@ public sealed class MachineSession
             }
             if (!string.IsNullOrWhiteSpace(s.AtiRomPath) && s.AtiAt > 0)
                 Native.opm_ati_at(m, s.AtiAt);
+            // 📥 Seat the drop drive NOW, before the first instruction — the
+            // guest enumerates drives exactly once. With content already in
+            // the folder the disc is in from power-on (mounted during boot,
+            // measured); otherwise the tray is empty and the guest polls it
+            // every ~1.7 s until a drop lands.
+            _dropFolder = DropBoxFolder(s);
+            {
+                string? img = FolderHasContent(_dropFolder)
+                    ? BuildDropImage(_dropFolder, out var dropNote)
+                    : null;
+                if (img != null && Native.opm_drop_attach(m, img) != 0)
+                {
+                    _dropImages.Add(img);
+                    ConsoleQ.Enqueue($"[drop box] volume attached from "
+                                     + $"{_dropFolder}\n");
+                }
+                else
+                {
+                    if (img != null)
+                    {
+                        try { File.Delete(img); } catch { }
+                        var eb = new byte[512];
+                        uint n = Native.opm_drop_error(m, eb, (uint)eb.Length);
+                        ConsoleQ.Enqueue("[drop box] volume REFUSED: "
+                            + Encoding.UTF8.GetString(eb, 0, (int)n) + "\n");
+                    }
+                    Native.opm_drop_seat(m);
+                    ConsoleQ.Enqueue($"[drop box] drive ready, tray empty — "
+                                     + "drop files on the display to hand "
+                                     + $"them to the guest ({_dropFolder})\n");
+                }
+            }
 
             // Pace the timebase from the host clock. This is what makes the
             // guest's clock true — see ShellSettings.Realtime — and it also
@@ -260,6 +429,7 @@ public sealed class MachineSession
             var sw = Stopwatch.StartNew();
             long lastShotMs = 0, lastStatMs = 0, lastStatInsns = 0;
             ulong executed = 0;
+            int dropState = Native.opm_drop_state(m);
 
             while (!_stop)
             {
@@ -301,6 +471,24 @@ public sealed class MachineSession
                 // loop takes B, and the file carries both plus the delta.
                 // Between chunks, for the reason above: the snapshot walks
                 // every device in the machine.
+                // 📥 A rebuilt drop volume: hand it over. The core's own
+                // rule decides whether it goes in now or waits for the
+                // guest's Put Away; the state line says which.
+                if (_dropWanted is string dropImg)
+                {
+                    _dropWanted = null;
+                    if (Native.opm_drop_swap(m, dropImg) != 0)
+                    {
+                        _dropImages.Add(dropImg);
+                        dropState = Native.opm_drop_state(m);
+                        ConsoleQ.Enqueue($"[drop box] {DropStateText(dropState)}\n");
+                    }
+                    else
+                    {
+                        try { File.Delete(dropImg); } catch { }
+                        ConsoleQ.Enqueue("[drop box] hand-over refused\n");
+                    }
+                }
                 if (_snapWanted is string snapPath)
                 {
                     _snapWanted = null;
@@ -467,6 +655,22 @@ public sealed class MachineSession
                         now > lastStatMs ? insns / (now - lastStatMs) / 100 : 0);
                     lastStatMs = now;
                     lastStatInsns = (long)executed;
+                    // The drop drive's state, reported on change: the user
+                    // sees the Put Away request, the tray opening, and the
+                    // mount — each a thing they can act on or stop waiting
+                    // for. Retired images go once the core has let go of
+                    // them (the open one cannot be deleted; try again).
+                    int ds = Native.opm_drop_state(m);
+                    if (ds != dropState)
+                    {
+                        if (ds != 0 && ds != 3)
+                            ConsoleQ.Enqueue($"[drop box] {DropStateText(ds)}\n");
+                        dropState = ds;
+                    }
+                    if (_dropImages.Count > 1)
+                        for (int k = _dropImages.Count - 2; k >= 0; k--)
+                            try { File.Delete(_dropImages[k]); _dropImages.RemoveAt(k); }
+                            catch { }
                 }
             }
         }
@@ -483,6 +687,12 @@ public sealed class MachineSession
             // opm_destroy: the ATAPI cell holds the file open until then.
             if (sharedImg != null)
                 try { File.Delete(sharedImg); } catch { }
+            // Drop images are rebuilt from the folder at need; none outlives
+            // the machine. After opm_destroy for the same reason.
+            foreach (var di in _dropImages)
+                try { File.Delete(di); } catch { }
+            _dropImages.Clear();
+            _dropWanted = null;
             Running = false;
             StatAudioRate = 0;
             _thread = null;

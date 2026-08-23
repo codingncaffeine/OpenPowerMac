@@ -23,7 +23,108 @@ bool AtaCell::attachIso(const char* path)
     // one of them. The new shapes have no old snapshots and record their
     // 2048-view size.
     isoBytes_ = media_.snapBytes();
+    mediaPath_ = path;
+    seated_ = true;
+    ejected_ = false;
     return true;
+}
+
+// --- the medium -------------------------------------------------------------
+
+void AtaCell::hostEject()
+{
+    if (disk_ || ejected_)
+        return;
+    ejected_ = true;
+    absentSeen_ = false;
+    ejectedAtTb_ = tbRef ? *tbRef : 0;
+    // A read in flight ends with the disc: the next chunk would have to
+    // come from a tray that is now empty.
+    readLeft_ = 0;
+}
+
+bool AtaCell::hostInsert(const char* path)
+{
+    if (disk_)
+        return false;
+    if (!media_.open(path)) {
+        // The refusal leaves the tray as it was: empty stays empty, and an
+        // open image that was ejected stays ejected (open() closed it, so
+        // it is gone for good; the guest sees no medium either way).
+        ejected_ = true;
+        return false;
+    }
+    isoBytes_ = media_.snapBytes();
+    mediaPath_ = path;
+    seated_ = true;
+    ejected_ = false;
+    unitAttention_ = true;
+    absentSeen_ = false;
+    ++insertions_;
+    readsSinceInsert_ = 0;
+    return true;
+}
+
+bool AtaCell::hostSwap(const char* path)
+{
+    if (disk_)
+        return false;
+    if (!mediaPresent())
+        return hostInsert(path);
+    stagedPath_ = path;
+    hostEject();
+    return true;
+}
+
+bool AtaCell::hostStage(const char* path)
+{
+    if (disk_)
+        return false;
+    if (!mediaPresent() || readsSinceInsert_ == 0)
+        return hostSwap(path); // nothing of this disc is cached anywhere
+    stagedPath_ = path; // the guest has read it: only its own eject may end it
+    return true;
+}
+
+void AtaCell::checkCondition(u8 key, u8 asc, u8 ascq)
+{
+    sense_ = key;
+    asc_ = asc;
+    ascq_ = ascq;
+    error_ = static_cast<u8>(0x04 | (key << 4));
+    data_.clear();
+    dataAt_ = 0;
+    readLeft_ = 0;
+    nsect_ = kIo | kCoD;
+    status_ = kDrdy | kErr;
+    irq_ = true;
+}
+
+// The commands that touch the disc. Everything else (INQUIRY, REQUEST
+// SENSE, MODE SENSE, PREVENT, START STOP, SET CD SPEED) answers with or
+// without one, as on the drive.
+bool AtaCell::needsMedium(u8 op)
+{
+    switch (op) {
+    case 0x00: // TEST UNIT READY
+    case 0x25: // READ CAPACITY
+    case 0x28: // READ(10)
+    case 0x2B: // SEEK
+    case 0x42: // READ SUB-CHANNEL
+    case 0x43: // READ TOC
+    case 0x44: // READ HEADER
+    case 0x4B: // PAUSE/RESUME
+    case 0x51: // READ DISC INFORMATION
+    case 0x52: // READ TRACK INFORMATION
+    case 0xA4: // REPORT KEY
+    case 0xA8: // READ(12)
+    case 0xAD: // READ DVD STRUCTURE
+    case 0xB9: // READ CD MSF
+    case 0xBE: // READ CD
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool AtaCell::attachDisk(const char* path)
@@ -94,6 +195,16 @@ std::string AtaCell::describe(const char* who) const
                  media_.shape(),
                  static_cast<unsigned long long>(media_.blocks()),
                  media_.tracks().size());
+        s += b;
+        snprintf(b, sizeof b,
+                 "--   medium: %s%s%s, inserted %u time(s), %llu blocks read "
+                 "since; guest ejects %u, lock=%d%s\n",
+                 ejected_ ? "EJECTED" : "in the drive",
+                 unitAttention_ ? ", unit attention pending" : "",
+                 stagedPath_.empty() ? "" : ", a swap is staged",
+                 insertions_, static_cast<unsigned long long>(readsSinceInsert_),
+                 guestEjects_, locked_ ? 1 : 0,
+                 absentSeen_ ? ", absence seen" : "");
         s += b;
     }
     snprintf(b, sizeof b,
@@ -642,6 +753,19 @@ void AtaCell::write(u32 off, u32 v, u32 len)
 // about every 390 M instructions.
 bool AtaCell::tick()
 {
+    // A staged swap: the new disc goes in once the guest has been told the
+    // tray is empty and a dwell has passed — or, for a guest that never
+    // asks, after the fallback. The refusal case (an image that will not
+    // open) leaves the tray empty; the host learns from mediaError().
+    if (!stagedPath_.empty() && ejected_ && tbRef) {
+        const u64 since = *tbRef - ejectedAtTb_;
+        if ((absentSeen_ && since >= kSwapDwellTb) ||
+            since >= kSwapFallbackTb) {
+            std::string p;
+            p.swap(stagedPath_);
+            hostInsert(p.c_str());
+        }
+    }
     if (!pending_ || !tbRef || *tbRef < pendAtTb_)
         return false;
     pending_ = false;
@@ -775,6 +899,22 @@ void AtaCell::packet(const u8* cdb)
         // zero-latency command — the device did the work and never said so.
         irq_ = true;
     };
+    // The medium first. A disc that just arrived is announced on the first
+    // command that is not INQUIRY or REQUEST SENSE, and an empty tray
+    // refuses every command that needs a disc — both with the sense the
+    // driver acts on. The hard-disk cell never goes through here.
+    if (!disk_ && cdb[0] != 0x12 && cdb[0] != 0x03) {
+        if (unitAttention_) {
+            unitAttention_ = false;
+            checkCondition(0x06, 0x28, 0x00); // medium may have changed
+            return;
+        }
+        if (needsMedium(cdb[0]) && !mediaPresent()) {
+            absentSeen_ = true;
+            checkCondition(0x02, 0x3A, 0x00); // medium not present
+            return;
+        }
+    }
     switch (cdb[0]) {
     case 0x00: // TEST UNIT READY
         complete();
@@ -784,7 +924,11 @@ void AtaCell::packet(const u8* cdb)
         data_[0] = 0x70;
         data_[2] = sense_;
         data_[7] = 10;
+        data_[12] = asc_;
+        data_[13] = ascq_;
         sense_ = 0;
+        asc_ = 0;
+        ascq_ = 0;
         break;
     }
     case 0x12: { // INQUIRY: same mechanism identity as IDENTIFY
@@ -798,8 +942,34 @@ void AtaCell::packet(const u8* cdb)
         memcpy(&data_[32], "7T02", 4);
         break;
     }
-    case 0x1B: // START STOP UNIT
+    case 0x1B: // START STOP UNIT: LoEj with Start clear opens the tray,
+               // LoEj with Start set closes it on whatever disc was in it.
+               // PREVENT is recorded but not enforced against the OS's own
+               // eject — a driver that forgets ALLOW first would otherwise
+               // wedge a Put Away, and the disc is the host's to give back.
+        if (!disk_ && (cdb[4] & 0x02)) {
+            if (cdb[4] & 0x01) {
+                if (media_.ok() && ejected_ && stagedPath_.empty()) {
+                    ejected_ = false;
+                    unitAttention_ = true;
+                    ++insertions_;
+                    readsSinceInsert_ = 0;
+                }
+            } else if (!ejected_) {
+                hostEject();
+                ++guestEjects_;
+            }
+        }
+        complete();
+        break;
     case 0x1E: // PREVENT ALLOW MEDIUM REMOVAL
+        if (noDoorLock_) { // E4: a drive without a door lock refuses it
+            checkCondition(0x05, 0x20, 0x00); // invalid command operation code
+            return;
+        }
+        locked_ = (cdb[4] & 0x01) != 0;
+        complete();
+        break;
     case 0x35: // SYNCHRONIZE CACHE — nothing is buffered here
     case 0xBB: // SET CD SPEED: a rate request, not a data transfer. Apple's
                // CD driver issues it during setup and treats the ABORT we
@@ -986,6 +1156,7 @@ void AtaCell::finishPio(bool chunkDrained)
     data_.assign(size_t(sectors) * 2048, 0);
     for (u32 k = 0; k < sectors; ++k)
         media_.readBlock(readLba_ + k, data_.data() + size_t(k) * 2048);
+    readsSinceInsert_ += sectors;
     dataAt_ = 0;
     readLba_ += sectors;
     readLeft_ -= sectors;

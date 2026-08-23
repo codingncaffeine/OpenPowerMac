@@ -24,6 +24,16 @@
                      off the mounted volume in Mac OS. -->
                 <MenuItem x:Name="miShared" Header="Choose Shared Folder…" Click="OnChooseShared" />
                 <MenuItem x:Name="miSharedClear" Header="Stop Sharing Folder" Click="OnClearShared" />
+                <!-- The drop box: drop files on the display while the machine
+                     runs; they are copied into this folder, packed into an HFS
+                     volume and handed to the guest on a second CD drive with
+                     no restart. A volume the guest has mounted is replaced
+                     only after the guest puts it away (the console says so). -->
+                <MenuItem x:Name="miDrop" Header="Drop _Box">
+                    <MenuItem Header="_Open Drop Box Folder" Click="OnOpenDropFolder" />
+                    <MenuItem Header="_Choose Drop Box Folder…" Click="OnChooseDropFolder" />
+                    <MenuItem Header="Use _Default Folder" Click="OnDefaultDropFolder" />
+                </MenuItem>
                 <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
                 <Separator />
                 <!-- The disks. Built on open (OnHardDiskOpened) because the
@@ -114,7 +124,8 @@
                 <RowDefinition Height="240" MinHeight="110" />
             </Grid.RowDefinitions>
 
-            <Border Grid.Row="0" Background="{StaticResource Letterbox}">
+            <Border Grid.Row="0" Background="{StaticResource Letterbox}"
+                    AllowDrop="True" DragOver="OnDisplayDragOver" Drop="OnDisplayDrop">
                 <Grid>
                     <Image x:Name="imgScreen" Stretch="Uniform"
                            RenderOptions.BitmapScalingMode="NearestNeighbor" />

@@ -42,10 +42,68 @@ public:
     // not the rule. Read/write, LBA28, and the plain ATA power-on
     // signature (01 01 00 00) instead of the ATAPI 01 01 14 EB.
     bool attachDisk(const char* path);
-    bool present() const { return iso_ != nullptr || media_.ok(); }
+    // A DRIVE is on the channel. ATA has no hot-plug: the drive is here from
+    // power-on or never, and it is what the firmware's bus scan and the OS's
+    // ATA Manager enumerate. The MEDIUM is the part that comes and goes.
+    bool present() const
+    {
+        return seated_ || iso_ != nullptr || media_.ok();
+    }
     // Why the last attachIso refused, for whoever owns the console.
     const char* mediaError() const { return media_.why().c_str(); }
     const CdImage& media() const { return media_; }
+
+    // --- the medium, as distinct from the drive ---------------------------
+    // The OS learns about media the way it learns from a real drive: TEST
+    // UNIT READY (and every other media-access command) answers NOT READY /
+    // MEDIUM NOT PRESENT while the tray is empty, and the first command
+    // after a disc arrives gets UNIT ATTENTION / MEDIUM MAY HAVE CHANGED,
+    // after which the driver reads the TOC and mounts what it finds. Nothing
+    // is injected into the guest: this is the protocol a swapped CD speaks.
+    //   seat()        an empty drive on the channel (tray open, nothing in it)
+    //   hostEject()   pull the disc from outside — the pinhole, not the OS's
+    //                 own eject, so PREVENT does not apply
+    //   hostInsert()  put a disc in: present, with the unit attention armed
+    //   hostSwap()    eject, let the guest SEE the empty tray (one media
+    //                 command refused, and at least kSwapDwellTb), then
+    //                 insert `path`; tick() carries it out. A guest that
+    //                 never looks gets the new disc after kSwapFallbackTb.
+    void seat() { seated_ = true; }
+    bool mediaPresent() const
+    {
+        return disk_ ? iso_ != nullptr : (media_.ok() && !ejected_);
+    }
+    void hostEject();
+    bool hostInsert(const char* path); // false: refused, mediaError() says why
+    bool hostSwap(const char* path);
+    // hostStage(): the SAFE republish, the only one the app may use. An
+    // empty tray takes the disc now; a disc the guest has never read is
+    // swapped (hostSwap); a disc the guest has READ stays in until the
+    // guest itself puts the volume away (START STOP LoEj), and the staged
+    // disc goes in after that. MEASURED (s45 E3): Mac OS swallows the
+    // UNIT ATTENTION on a mounted volume and re-reads the new disc through
+    // the OLD catalog — a file opened after such a swap shows garbage — and
+    // (E4) never polls a mounted drive, locked or not. awaitingGuestEject()
+    // is the state the app shows the user.
+    bool hostStage(const char* path);
+    bool awaitingGuestEject() const { return !stagedPath_.empty() && mediaPresent(); }
+    bool swapPending() const { return !stagedPath_.empty(); }
+    bool unitAttentionPending() const { return unitAttention_; }
+    bool lockedByGuest() const { return locked_; }
+    // Experiment: refuse PREVENT ALLOW MEDIUM REMOVAL (a drive with no door
+    // lock) to learn whether the guest keeps polling a mounted disc it cannot lock.
+    void setNoDoorLock(bool v) { noDoorLock_ = v; }
+    u32 insertions() const { return insertions_; }
+    u32 guestEjects() const { return guestEjects_; }
+    const std::string& mediaPath() const { return mediaPath_; }
+    u64 readsSinceInsert() const { return readsSinceInsert_; }
+    static constexpr u64 kSwapDwellTb = 25000000ull;     // 1 s at 25 MHz
+    static constexpr u64 kSwapFallbackTb = 125000000ull; // 5 s
+    // The media-change state travels in its own optional snapshot section
+    // (see SawtoothBus::snapSave) so snapshots written before it existed
+    // still load.
+    void snapSaveMedia(SnapWriter& w) const;
+    void snapLoadMedia(SnapReader& r);
     bool irqLine() const { return irq_; }
     void setDmaArmed(bool a) { dmaArmed_ = a; }
     // The channel's DBDMA engine raised its interrupt: latch it into the
@@ -94,7 +152,19 @@ public:
     bool tick(); // true when a deferred command ran: wake the DMA list
     // The timebase at which tick() could next do something, so the machine
     // loop need not ask on every instruction. ~0 when nothing is deferred.
-    u64 pendingTb() const { return pending_ ? pendAtTb_ : ~0ull; }
+    u64 pendingTb() const
+    {
+        u64 t = pending_ ? pendAtTb_ : ~0ull;
+        // A staged swap is also a timed event the machine loop must not
+        // sleep through.
+        if (!stagedPath_.empty() && ejected_) {
+            const u64 due = ejectedAtTb_ +
+                            (absentSeen_ ? kSwapDwellTb : kSwapFallbackTb);
+            if (due < t)
+                t = due;
+        }
+        return t;
+    }
     static constexpr u64 kTbPerUs = 25; // 25 MHz timebase = bus clock / 4
     u64 cmdDelayTb_ = 200 * kTbPerUs;
     // Set by the bus from the channel.s RUN bit. On this hardware DMA is
@@ -160,9 +230,16 @@ public:
     // resume restores the device completely. snapLoad keeps the live handle
     // and the stamp pointer, and reports a present/absent mismatch.
     void snapSave(SnapWriter& w) const;
-    void snapLoad(SnapReader& r);
+    // strictMedia: the run must attach the very image the snapshot had (the
+    // boot disk, the CD). A drive whose medium is a host-built volume that
+    // no resume can reproduce loads with strictMedia=false: whatever is in
+    // it now stays, and a mismatch leaves the tray EJECTED so the guest
+    // finds out the honest way, on its next poll.
+    void snapLoad(SnapReader& r, bool strictMedia = true);
 
 private:
+    void checkCondition(u8 key, u8 asc, u8 ascq);
+    static bool needsMedium(u8 op);
     void ataCommand(u8 cmd);
     void packet(const u8* cdb);
     void finishPio(bool moreData); // present data_ via DRQ or complete
@@ -232,6 +309,22 @@ private:
     u64 readLba_ = 0;
     u32 readLeft_ = 0;
     u8 sense_ = 0; // last sense key
+    u8 asc_ = 0, ascq_ = 0; // ...and its additional sense code, for REQUEST SENSE
+    // Media-change state (see the public block above). Existing refusal
+    // paths keep reporting ASC 0, exactly as they always have; only the
+    // media conditions carry a real ASC, because the driver acts on those.
+    bool seated_ = false;        // a drive, whether or not a disc is in it
+    bool ejected_ = false;       // media_ is open but the disc is out
+    bool locked_ = false;        // PREVENT ALLOW MEDIUM REMOVAL, as the guest left it
+    bool noDoorLock_ = false;    // PREVENT is refused with ILLEGAL REQUEST (experiment)
+    bool unitAttention_ = false; // a disc arrived: the next command hears about it
+    bool absentSeen_ = false;    // the guest was told "no medium" since the eject
+    std::string stagedPath_;     // hostSwap: the disc to insert once the tray was seen empty
+    std::string mediaPath_;      // the image in the tray (or ejected from it)
+    u64 ejectedAtTb_ = 0;
+    u32 insertions_ = 0;
+    u32 guestEjects_ = 0;
+    u64 readsSinceInsert_ = 0;   // 2048-byte blocks served from the current disc
     u32 pulled_ = 0; // data-register bytes served since the last command
     // Deferred command: the write lands, BSY goes up, and the command runs
     // cmdDelayTb_ timebase ticks later. See write() case 0x070.

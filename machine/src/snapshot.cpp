@@ -465,22 +465,48 @@ void AtaCell::snapSave(SnapWriter& w) const
     }
 }
 
-void AtaCell::snapLoad(SnapReader& r)
+void AtaCell::snapLoad(SnapReader& r, bool strictMedia)
 {
     const bool wasPresent = r.b();
     const u64 bytes = r.u64v();
-    if (r.ok && wasPresent != present()) {
-        r.fail(wasPresent ? "snapshot has media attached to an ATA cell that "
-                            "is empty in this run"
-                          : "this run attaches media to an ATA cell that was "
-                            "empty in the snapshot");
-        return;
+    if (strictMedia) {
+        if (r.ok && wasPresent != present()) {
+            r.fail(wasPresent ? "snapshot has media attached to an ATA cell "
+                                "that is empty in this run"
+                              : "this run attaches media to an ATA cell that "
+                                "was empty in the snapshot");
+            return;
+        }
+        if (r.ok && wasPresent && bytes != isoBytes_) {
+            r.fail("a different image is attached than the one in the "
+                   "snapshot");
+            return;
+        }
+        isoBytes_ = bytes;
+    } else {
+        // The drive is here if the run seated it OR the snapshot had one.
+        // Not unconditionally: a stream with no drive must not conjure
+        // one, or a resume carries a drive the guest never enumerated and
+        // a snapshot of THAT machine no longer re-serializes byte for byte
+        // (the round-trip test caught exactly this).
+        // The disc is whatever the host put in NOW, and the guest's cached
+        // catalog describes whatever was in at snapshot time — the same
+        // size proves nothing about the same bytes. So the tray is empty
+        // on resume, and a disc the host attached is STAGED to go back in
+        // the moment the guest has seen that: a clean remount, no stale
+        // catalog. The disc's own loader-side bookkeeping (isoBytes_) is
+        // the attached image's, not the stream's. With no disc attached
+        // the stream's own tray state stands (snapLoadMedia restores it),
+        // and a guest that had a disc mounted finds the tray empty on its
+        // next poll — the honest outcome.
+        seated_ = seated_ || wasPresent;
+        if (media_.ok()) {
+            ejected_ = true;
+            absentSeen_ = false;
+            ejectedAtTb_ = 0;
+            stagedPath_ = mediaPath_;
+        }
     }
-    if (r.ok && wasPresent && bytes != isoBytes_) {
-        r.fail("a different image is attached than the one in the snapshot");
-        return;
-    }
-    isoBytes_ = bytes;
     disk_ = r.b();
     diskSectors_ = r.u64v();
     wrLeft_ = r.u32v();
@@ -531,6 +557,61 @@ void AtaCell::snapLoad(SnapReader& r)
         r.raw(ev.cdb, 12);
         ev.xfer = r.u32v();
         log.push_back(ev);
+    }
+}
+
+// The media-change state, in its own stream so the cell's original layout
+// — and every snapshot written in it — stays exactly as it was.
+void AtaCell::snapSaveMedia(SnapWriter& w) const
+{
+    w.b(seated_);
+    w.b(ejected_);
+    w.b(locked_);
+    w.b(unitAttention_);
+    w.b(absentSeen_);
+    w.u8v(asc_);
+    w.u8v(ascq_);
+    w.str(stagedPath_);
+    w.u64v(ejectedAtTb_);
+    w.u32v(insertions_);
+    w.u32v(guestEjects_);
+    w.u64v(readsSinceInsert_);
+}
+
+void AtaCell::snapLoadMedia(SnapReader& r)
+{
+    // Merged, not assigned: a non-strict snapLoad just before this may have
+    // emptied the tray and staged the host's disc, and that verdict stands
+    // over whatever the stream says about the tray.
+    const bool sSeated = r.b();
+    const bool sEjected = r.b();
+    locked_ = r.b();
+    const bool sUa = r.b();
+    const bool sAbsentSeen = r.b();
+    asc_ = r.u8v();
+    ascq_ = r.u8v();
+    std::string sStaged = r.str();
+    const u64 sEjectedAt = r.u64v();
+    insertions_ = r.u32v();
+    guestEjects_ = r.u32v();
+    readsSinceInsert_ = r.u64v();
+    seated_ = seated_ || sSeated;
+    if (!stagedPath_.empty())
+        return; // the loader's re-insert wins; the stream's tray state is moot
+    ejected_ = ejected_ || sEjected;
+    unitAttention_ = sUa;
+    absentSeen_ = sAbsentSeen;
+    ejectedAtTb_ = sEjectedAt;
+    // A swap staged at snapshot time names a host file that may be gone;
+    // the eject half already happened, so the guest sees an empty tray and
+    // the host can stage again. Keeping a dead path would insert nothing
+    // and report a refusal nobody asked for.
+    if (!sStaged.empty()) {
+        FILE* f = fopen(sStaged.c_str(), "rb");
+        if (f) {
+            fclose(f);
+            stagedPath_ = sStaged;
+        }
     }
 }
 
@@ -1024,6 +1105,18 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     sec = w.begin("R128");
     ati_.snapSave(w);
     w.end(sec);
+    // The third ATA channel and the media-change state of both CD-class
+    // drives, as one OPTIONAL section after everything that existed before
+    // it: a snapshot without it (every one written before s44) loads with an
+    // empty third channel and discs that were never swapped, and a snapshot
+    // with it refuses in an older build at the section tag, honestly.
+    sec = w.begin("DROP");
+    w.b(drop_.present());
+    drop_.snapSave(w);
+    dropDma_.snapSave(w);
+    cd_.snapSaveMedia(w);
+    drop_.snapSaveMedia(w);
+    w.end(sec);
 }
 
 void SawtoothBus::snapLoad(SnapReader& r)
@@ -1141,6 +1234,23 @@ void SawtoothBus::snapLoad(SnapReader& r)
     e = r.beginSection("R128");
     ati_.snapLoad(r);
     r.endSection("R128", e);
+
+    if (r.nextSectionIs("DROP")) {
+        e = r.beginSection("DROP");
+        const bool hadDrive = r.b();
+        // A drive in the snapshot's third channel was enumerated by the
+        // guest at ITS boot; the run must seat one too, or the guest's
+        // driver talks to a channel that answers "nothing here". Seating it
+        // now, before the cell loads, is enough — what is in the tray is
+        // the host's business (strictMedia=false).
+        if (hadDrive)
+            drop_.seat();
+        drop_.snapLoad(r, false);
+        dropDma_.snapLoad(r);
+        cd_.snapLoadMedia(r);
+        drop_.snapLoadMedia(r);
+        r.endSection("DROP", e);
+    }
 
     // Pointers the constructor wired stay valid because RAM was restored in
     // place; re-assert the one that is derived from a container's storage.

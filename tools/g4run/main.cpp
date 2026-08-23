@@ -355,6 +355,27 @@ struct KeyBeat {
     u64 at = 0;
     std::string text;
 };
+// --drop-swap-at AT:image / --drop-eject-at AT. Split at the FIRST colon
+// and taken raw: a Windows path has a colon and backslashes of its own,
+// which is why this is not parseKeyBeat. An eject is a beat with no text.
+void parseDropBeat(const char* v, std::vector<KeyBeat>& out,
+                   bool eject = false)
+{
+    KeyBeat kb;
+    char* p = nullptr;
+    kb.at = strtoull(v, &p, 0);
+    if (eject) {
+        out.push_back(kb);
+        return;
+    }
+    if (!p || *p != ':' || !p[1]) {
+        printf("-- --drop-swap-at %s malformed (want AT:image); IGNORED\n", v);
+        return;
+    }
+    kb.text = p + 1;
+    out.push_back(kb);
+}
+
 void parseKeyBeat(const char* v, std::vector<KeyBeat>& out)
 {
     KeyBeat kb;
@@ -512,6 +533,15 @@ int main(int argc, char** argv)
     // coordinates at all: type the volume name (desktop type-select),
     // Cmd-O, type the title, Cmd-O.
     std::vector<KeyBeat> typeBeats, cmdBeats;
+    // --drop IMG / --drop-empty: the drop-box drive on ata-3@21000 from
+    // power-on (the guest enumerates drives once, at boot). --drop-swap-at
+    // AT:IMG and --drop-eject-at AT work its tray at an instruction beat,
+    // which is exactly what the app does when a file lands on the window;
+    // the guest's CD driver is then supposed to notice on its own.
+    const char* dropPath = nullptr;
+    bool dropEmpty = false;
+    bool dropNoLock = false; // --drop-no-lock: the drop drive refuses PREVENT (E4)
+    std::vector<KeyBeat> dropBeats; // text = image to insert; empty = eject
     // --bench: run the loop THE APP RUNS. g4run's own loop carries the whole
     // instrument set — including a std::map probe per instruction for the
     // first-visit census — so its MIPS figure is the harness's speed, not the
@@ -767,6 +797,11 @@ int main(int argc, char** argv)
         }
         if (!strcmp(a, "--type-beat")) { parseKeyBeat(next(), typeBeats); continue; }
         if (!strcmp(a, "--cmd-beat")) { parseKeyBeat(next(), cmdBeats); continue; }
+        if (!strcmp(a, "--drop")) { dropPath = next(); continue; }
+        if (!strcmp(a, "--drop-empty")) { dropEmpty = true; continue; }
+        if (!strcmp(a, "--drop-no-lock")) { dropNoLock = true; continue; }
+        if (!strcmp(a, "--drop-swap-at")) { parseDropBeat(next(), dropBeats); continue; }
+        if (!strcmp(a, "--drop-eject-at")) { parseDropBeat(next(), dropBeats, true); continue; }
         if (!strcmp(a, "--wav-out") && i + 1 < argc) {
             wavOut = argv[++i];
             continue;
@@ -1359,6 +1394,25 @@ int main(int argc, char** argv)
         else
             printf("-- cd attach FAILED: %s — %s\n", cdPath,
                    bus.cd().mediaError());
+    }
+    if (dropPath) {
+        if (bus.attachDrop(dropPath))
+            printf("-- drop box attached on ata-3@21000: %s [%s, %llu "
+                   "blocks]\n",
+                   dropPath, bus.drop().media().shape(),
+                   static_cast<unsigned long long>(
+                       bus.drop().media().blocks()));
+        else
+            printf("-- drop box attach FAILED: %s — %s\n", dropPath,
+                   bus.drop().mediaError());
+    } else if (dropEmpty || dropNoLock || !dropBeats.empty()) {
+        bus.seatDrop();
+        printf("-- drop box drive seated on ata-3@21000, tray empty\n");
+    }
+
+    if (dropNoLock) {
+        bus.drop().setNoDoorLock(true);
+        printf("-- drop box drive refuses PREVENT ALLOW MEDIUM REMOVAL (no door lock)\n");
     }
 
     if (serialRate)
@@ -2008,7 +2062,14 @@ int main(int argc, char** argv)
               [](const KeyBeat& a, const KeyBeat& b) { return a.at < b.at; });
     std::sort(cmdBeats.begin(), cmdBeats.end(),
               [](const KeyBeat& a, const KeyBeat& b) { return a.at < b.at; });
-    size_t tbIdx = 0, cbIdx = 0;
+    std::sort(dropBeats.begin(), dropBeats.end(),
+              [](const KeyBeat& a, const KeyBeat& b) { return a.at < b.at; });
+    size_t tbIdx = 0, cbIdx = 0, dbIdx = 0;
+    for (; dbIdx < dropBeats.size() && dropBeats[dbIdx].at < executed; ++dbIdx)
+        printf("-- drop beat @%llu SKIPPED: before this run's first "
+               "instruction (%llu)\n",
+               static_cast<unsigned long long>(dropBeats[dbIdx].at),
+               static_cast<unsigned long long>(executed));
     for (; tbIdx < typeBeats.size() && typeBeats[tbIdx].at < executed; ++tbIdx)
         printf("-- type-beat @%llu SKIPPED: before this run's first "
                "instruction (%llu)\n",
@@ -4107,6 +4168,25 @@ int main(int argc, char** argv)
             fflush(stdout);
             ++tbIdx;
         }
+        while (dbIdx < dropBeats.size() && executed == dropBeats[dbIdx].at) {
+            const KeyBeat& b = dropBeats[dbIdx];
+            if (b.text.empty()) {
+                bus.drop().hostEject();
+                printf("-- drop-eject @%llu\n",
+                       static_cast<unsigned long long>(executed));
+            } else {
+                const bool ok = bus.drop().hostSwap(b.text.c_str());
+                printf("-- drop-swap @%llu: %s — %s\n",
+                       static_cast<unsigned long long>(executed),
+                       b.text.c_str(),
+                       ok ? "staged (tray opened; inserts once the guest has "
+                            "seen it empty)"
+                          : bus.drop().mediaError());
+            }
+            bus.deviceStateChanged(); // poked from outside: reopen the gate
+            fflush(stdout);
+            ++dbIdx;
+        }
         while (cbIdx < cmdBeats.size() && executed == cmdBeats[cbIdx].at) {
             bus.ohci(0).typeChord(0x08, cmdBeats[cbIdx].text);
             bus.deviceStateChanged(); // poked from outside: reopen the gate
@@ -5697,6 +5777,30 @@ int main(int argc, char** argv)
             printf("\n");
         }
     }
+    if (bus.drop().present()) {
+        // The drop-box drive: its medium state names where a swap got to
+        // (tray open, absence seen, unit attention pending, blocks read
+        // since the insert), and its command log shows the driver's side
+        // of the conversation — the refusals included, which is the whole
+        // protocol.
+        fputs(bus.drop().describe("drop").c_str(), stdout);
+        const auto& dl = bus.drop().log;
+        printf("-- drop command log (%zu; last 200):\n", dl.size());
+        const size_t ds = dl.size() > 200 ? dl.size() - 200 : 0;
+        for (size_t k = ds; k < dl.size(); ++k) {
+            printf("   %c%02x @%-12llu pc=%08x xfer=%-6u", dl[k].kind,
+                   dl[k].val, static_cast<unsigned long long>(dl[k].at),
+                   dl[k].pc, dl[k].xfer);
+            if (dl[k].a || dl[k].b)
+                printf(" lba=%x+%x", dl[k].a, dl[k].b);
+            if (dl[k].kind != 'c') {
+                printf(" cdb=");
+                for (u32 c = 0; c < 12; ++c)
+                    printf("%02x", dl[k].cdb[c]);
+            }
+            printf("\n");
+        }
+    }
     {
         // The disk's own command log, the same way the CD's is reported.
         // Register traffic says what the driver poked; the command log says
@@ -5741,6 +5845,11 @@ int main(int argc, char** argv)
         // first 120 entries are an arbitrary window that has nothing to do
         // with what the run was asked to investigate.
         const auto& al = bus.ataLog();
+        printf("-- ata channel touches: ata-4@1f000 %llu, ata-3@20000 %llu, "
+               "ata-3@21000 %llu\n",
+               (unsigned long long)bus.ataTouches()[0],
+               (unsigned long long)bus.ataTouches()[1],
+               (unsigned long long)bus.ataTouches()[2]);
         printf("-- ata traffic (%zu; last 1200; off r/w.width val pc):\n",
                al.size());
         const size_t as = al.size() > 1200 ? al.size() - 1200 : 0;

@@ -536,6 +536,89 @@ public partial class MainWindow : Window
         UpdateTitle();
     }
 
+    // 📥 The drop box. Files dropped on the display go to the guest without a
+    // restart — see MachineSession.RequestDrop for the hand-over and its one
+    // rule (a mounted volume is replaced only after the guest puts it away).
+    private void OnDisplayDragOver(object sender, DragEventArgs e)
+    {
+        bool ok = _session is { Running: true }
+                  && e.Data.GetDataPresent(DataFormats.FileDrop);
+        e.Effects = ok ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private void OnDisplayDrop(object sender, DragEventArgs e)
+    {
+        e.Handled = true;
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop))
+            return;
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] files
+            || files.Length == 0)
+            return;
+        if (_session is not { Running: true } s)
+        {
+            MessageBox.Show(this,
+                "Start the machine first — the drop box hands files to a "
+                + "running guest.",
+                "Drop Box", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        s.RequestDrop(files);
+    }
+
+    private void OnOpenDropFolder(object sender, RoutedEventArgs e)
+    {
+        var folder = MachineSession.DropBoxFolder(_settings);
+        try
+        {
+            Directory.CreateDirectory(folder);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = folder,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Could not open {folder}\n\n{ex.Message}",
+                            "Drop Box", MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+        }
+    }
+
+    private void OnChooseDropFolder(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFolderDialog
+        {
+            Title = "Choose the drop box folder (dropped files are copied "
+                    + "here and handed to the guest)",
+        };
+        if (dlg.ShowDialog(this) != true)
+            return;
+        _settings.DropBoxPath = dlg.FolderName;
+        _settings.Save();
+        NoteDropFolderChange();
+    }
+
+    private void OnDefaultDropFolder(object sender, RoutedEventArgs e)
+    {
+        _settings.DropBoxPath = "";
+        _settings.Save();
+        NoteDropFolderChange();
+    }
+
+    // The drive is seated at Start with whatever the folder holds, and a
+    // running session keeps packing the folder it started with.
+    private void NoteDropFolderChange()
+    {
+        if (_session is { Running: true })
+            MessageBox.Show(this,
+                "Drop box folder set.\n\nThe running machine keeps using the "
+                + "folder it started with; the new one is used from the next "
+                + "start.",
+                "Drop Box", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
     // 🩺 The report a stall needs, delivered to the console pane so it can be
     // read and copied. Asked for on the machine's own thread — see
     // MachineSession.RequestDiagnostics.

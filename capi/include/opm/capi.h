@@ -105,6 +105,41 @@ OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
                           const char* volName, char* err,
                           uint32_t errCap);
 
+// 📥 The drop box: a second CD-class drive on the Sawtooth's third ATA
+// channel (ata-3@21000 — the Zip bay on the real board), whose disc is an
+// HFS volume the host builds from a folder (opm_hfs_build). Two rules from
+// the hardware:
+//   - the DRIVE must be on the channel before the first instruction — the
+//     firmware's bus scan and the OS's ATA Manager enumerate drives exactly
+//     once — so call opm_drop_seat (empty tray) or opm_drop_attach (with a
+//     disc) right after opm_create, never later;
+//   - the DISC changes only when the guest is not holding it. opm_drop_swap
+//     is the SAFE republish: an empty tray takes the image at once (the
+//     driver polls an empty drive every ~1.7 s and mounts a new disc in
+//     ~0.5 s, measured); a disc the guest never read is swapped with the
+//     UNIT ATTENTION a real drive raises; a disc the guest has READ stays
+//     in — Mac OS locks a mounted CD, never polls it again, and (measured,
+//     s45 E3) answers a swap under it by reading the NEW disc through the
+//     OLD catalog: a file opened afterwards shows garbage. So the image
+//     waits (state 5) until the guest puts the volume away (drag the
+//     Drop Box to the Trash, or Cmd-Y), and goes in right after. Nothing
+//     is injected into the guest and no restart is needed.
+// Paths are opened like opm_create's (narrow fopen). Call swap/eject from
+// the thread that runs the machine (like opm_key).
+// opm_drop_state: 0 no drive · 1 tray empty · 2 swap staged (tray empty,
+// a disc waiting to go in) · 3 disc in, the guest has not looked yet ·
+// 4 disc in and read from (mounted, or being mounted) · 5 disc in and read,
+// a newer image waiting for the guest to put the volume away. opm_drop_reads is
+// the block count read from the current disc. opm_drop_error carries the
+// last refusal (an image that would not open).
+OPM_API int32_t opm_drop_seat(OpmMachine* m);
+OPM_API int32_t opm_drop_attach(OpmMachine* m, const char* imgPath);
+OPM_API int32_t opm_drop_swap(OpmMachine* m, const char* imgPath);
+OPM_API void opm_drop_eject(OpmMachine* m);
+OPM_API int32_t opm_drop_state(const OpmMachine* m);
+OPM_API uint64_t opm_drop_reads(const OpmMachine* m);
+OPM_API uint32_t opm_drop_error(const OpmMachine* m, char* buf, uint32_t cap);
+
 // 💿 Whether a CD is actually in the drive, and if attach refused, why.
 // opm_create attaches the CD silently — a cdPath whose image cannot be
 // read (a cue naming a missing .bin, a compressed .dmg in a codec we do

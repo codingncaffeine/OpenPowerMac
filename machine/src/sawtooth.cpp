@@ -1,5 +1,7 @@
 #include "opm/sawtooth.hpp"
 
+#include <cstdio>
+
 namespace opm {
 
 // A 512 MB PC100 SDRAM DIMM, served over Keywest. Three slots are populated
@@ -137,6 +139,139 @@ u8 SawtoothBus::cacheRomByte() const
     case 160: return 0x00;  // L2OH 0, copy-back, synchronous burst SRAM
     default: return 0xFF;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The system-configuration block — the board's factory data in the flash.
+//
+// New World boot ROMs keep 0x80 bytes at fff03f00 (the updater calls the
+// section "sys") that HWInit reads to learn which board it is running on, and
+// 0x80 more at fff03f80 ("tst": the unit's serial number and Ethernet
+// address) ahead of the two NVRAM copies at fff04000/fff06000. A ROM READ
+// FROM A MACHINE carries all three; a ROM ASSEMBLED FROM THE FIRMWARE UPDATER
+// carries the updater's template "sys" block — which, in the 4.2.8f1
+// package, describes a board with I2S audio and a 66 MHz bus — an empty "tst"
+// and erased NVRAM. The template sent HWInit down its I2S path, where it
+// waits on a status bit at mac-io +0x10000 that nothing here will ever raise:
+// 999 million reads of one register, and a machine that "does not boot".
+//
+// The block as every real Sawtooth dump carries it (3.2.4f1 ship, 4.2.8f1 x2 —
+// identical apart from the ROM version/date words, one byte at +4d and the
+// checksum). Field meanings are what HWInit's reads of it show:
+//
+//   +00  c9 9c        magic
+//   +02  20 c1        flags; HWInit keys one presence test off the top nibble
+//   +04  00 04 28 f1  ROM version, BCD (4.2.8f1)   - kept from the dump
+//   +08  20 01 10 11  ROM date, BCD (2001-10-11)   - kept from the dump
+//   +0c  01 da 46 a0  board/product id; bits 7-5 of +0e select the AUDIO
+//                     hardware: 0x40 = Screamer on DAVbus (mac-io +14000,
+//                     the cell this machine has), 0x20 = I2S (+10000),
+//                     0x00 = none, 0xe0 = decided by +12
+//   +10  00 00 00 01
+//   +14  05 f0 3e 4d  60x bus clock, Hz (99,499,597 ~ 100 MHz)
+//   +18  03 f9 40 aa  66,666,666 Hz  } the 66 MHz side
+//   +1c  03 f9 40 aa  66,666,666 Hz  }
+//   +20  02 ee 00 00  49,152,000 Hz = 1024 x 48 kHz, the audio master clock
+//   +25, +30, +40..+44, +48..+4d, +51, +52, +5c  read by HWInit; all zero
+//   +7c  Adler-32 of +00..+7b, big-endian
+static constexpr u8 kSawtoothSys[SawtoothBus::kSysBlockSize] = {
+    0xc9, 0x9c, 0x20, 0xc1, 0x00, 0x04, 0x28, 0xf1,
+    0x20, 0x01, 0x10, 0x11, 0x01, 0xda, 0x46, 0xa0,
+    0x00, 0x00, 0x00, 0x01, 0x05, 0xf0, 0x3e, 0x4d,
+    0x03, 0xf9, 0x40, 0xaa, 0x03, 0xf9, 0x40, 0xaa,
+    0x02, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0x15, 0x3b, 0x2f, 0x80,
+};
+
+u32 SawtoothBus::sysBlockChecksum(const u8* block)
+{
+    u32 a = 1, b = 0;
+    for (u32 k = 0; k < kSysBlockSize - 4; ++k) {
+        a = (a + block[k]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    return (b << 16) | a;
+}
+
+// "Describes this board" is judged on the fields HWInit branches on and this
+// machine cannot satisfy any other way: the magic, the audio hardware and
+// the bus clock. Anything else a real Sawtooth's block might vary in is left
+// alone — the block is that machine's, and it boots.
+bool SawtoothBus::sysBlockIsSawtooth(const std::vector<u8>& rom)
+{
+    if (rom.size() < kSysBlock + kSysBlockSize)
+        return false;
+    const u8* s = rom.data() + kSysBlock;
+    if (s[0] != 0xc9 || s[1] != 0x9c)
+        return false;
+    if ((s[0x0e] & 0xe0) != 0x40)
+        return false;
+    const u32 bus = (u32(s[0x14]) << 24) | (u32(s[0x15]) << 16) |
+                    (u32(s[0x16]) << 8) | s[0x17];
+    return bus >= 90000000u && bus <= 110000000u;
+}
+
+std::string SawtoothBus::factoryConfigure(std::vector<u8>& rom)
+{
+    if (rom.size() < kSysBlock + kSysBlockSize || sysBlockIsSawtooth(rom))
+        return "";
+    u8* s = rom.data() + kSysBlock;
+    // Say what was there before it goes.
+    char was[160];
+    const bool hadMagic = s[0] == 0xc9 && s[1] == 0x9c;
+    const u32 bus = (u32(s[0x14]) << 24) | (u32(s[0x15]) << 16) |
+                    (u32(s[0x16]) << 8) | s[0x17];
+    const char* audio = "none";
+    switch (s[0x0e] & 0xe0) {
+    case 0x20: audio = "I2S at mac-io +10000"; break;
+    case 0x40: audio = "Screamer on DAVbus"; break;
+    case 0x00: audio = "none"; break;
+    default: audio = "unspecified"; break;
+    }
+    if (hadMagic)
+        snprintf(was, sizeof was,
+                 "audio type %02x (%s), bus clock %u.%02u MHz",
+                 s[0x0e] & 0xe0, audio, bus / 1000000u,
+                 (bus / 10000u) % 100u);
+    else
+        snprintf(was, sizeof was, "no block (%02x %02x ...)", s[0], s[1]);
+
+    // The dump's own ROM version and date stay; everything that describes
+    // the board becomes a Sawtooth's, and the checksum is recomputed over
+    // the result.
+    u8 keep[8];
+    for (u32 k = 0; k < 8; ++k)
+        keep[k] = s[4 + k];
+    for (u32 k = 0; k < kSysBlockSize; ++k)
+        s[k] = kSawtoothSys[k];
+    const bool versionPlausible = keep[0] == 0x00 && keep[4] == 0x20;
+    if (versionPlausible)
+        for (u32 k = 0; k < 8; ++k)
+            s[4 + k] = keep[k];
+    const u32 sum = sysBlockChecksum(s);
+    s[0x7c] = static_cast<u8>(sum >> 24);
+    s[0x7d] = static_cast<u8>(sum >> 16);
+    s[0x7e] = static_cast<u8>(sum >> 8);
+    s[0x7f] = static_cast<u8>(sum);
+
+    std::string note = "boot ROM: the system-configuration block at fff03f00 "
+                       "did not describe a Power Mac G4 (AGP Graphics) - ";
+    note += was;
+    note += " - so it was factory-configured as one (Screamer audio on "
+            "DAVbus, 100 MHz bus). A ROM assembled from Apple's firmware "
+            "updater carries a template here; one read from a machine "
+            "carries that machine's.";
+    return note;
 }
 
 } // namespace opm

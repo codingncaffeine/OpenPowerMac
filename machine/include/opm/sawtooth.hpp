@@ -51,9 +51,29 @@ public:
     static constexpr u32 kRomBase = 0xFFF00000u;
     static constexpr u32 kRomSize = 0x00100000u;
 
+    // The boot flash's SYSTEM CONFIGURATION block: 0x80 bytes at fff03f00,
+    // factory-programmed per board and read by HWInit to learn what it is
+    // running on (audio hardware, clocks, ...). A dump taken from a real
+    // machine carries that machine's block; a dump assembled from Apple's
+    // firmware-update package carries a TEMPLATE that describes some other
+    // board, and HWInit then polls hardware this machine does not have —
+    // forever. The constructor makes the block a Sawtooth's when it is
+    // not one (see factoryConfigure in sawtooth.cpp) and romNote() says
+    // what it did, so the shell can report it instead of a silent spin.
+    static constexpr u32 kSysBlock = 0x3F00u;
+    static constexpr u32 kSysBlockSize = 0x80u;
+    static bool sysBlockIsSawtooth(const std::vector<u8>& rom);
+    static std::string factoryConfigure(std::vector<u8>& rom);
+    static u32 sysBlockChecksum(const u8* block); // Adler-32 of +00..+7b
+    const std::string& romNote() const { return romNote_; }
+
     SawtoothBus(size_t ramBytes, std::vector<u8> rom)
         : ram_(ramBytes, 0), rom_(std::move(rom))
     {
+        // Factory data first, digest second: the digest below is what a
+        // snapshot compares against, and it must see the flash the machine
+        // actually boots from.
+        romNote_ = factoryConfigure(rom_);
         // Power-on DRAM is not zeroed on real hardware, and boot code
         // relies on that: the nanokernel reads a spinlock-timeout word
         // through a not-yet-set config pointer (landing in page zero) -
@@ -1897,6 +1917,7 @@ private:
     DbdmaChannel sndOut_, sndIn_;
     std::vector<u8> atiRom_;
     u64 romBase_ = 0; // FNV-1a of the boot flash as loaded (see the ctor)
+    std::string romNote_; // what factoryConfigure did to the sys block, if anything
     u32 atiFbBar_ = 0, atiRegBar_ = 0, atiRomBar_ = 0;
     // PCI I/O space is little-endian and this processor is not.
     static u32 ioSwap(u32 v, u32 len)

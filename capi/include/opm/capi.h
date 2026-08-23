@@ -115,6 +115,14 @@ OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
 OPM_API int32_t opm_cd_present(const OpmMachine* m);
 OPM_API uint32_t opm_cd_error(const OpmMachine* m, char* buf, uint32_t cap);
 
+// 🏭 What opm_create did to the boot ROM's system-configuration block, if
+// anything: empty when the dump already described a Power Mac G4 (AGP
+// Graphics); otherwise one sentence saying what the block described and
+// that it was factory-configured (a ROM assembled from Apple's firmware
+// updater carries a template that sends HWInit to poll hardware this
+// machine does not have). Fills `buf`, returns the bytes written.
+OPM_API uint32_t opm_rom_note(const OpmMachine* m, char* buf, uint32_t cap);
+
 // Queue text for the serial console (CRs included by the caller).
 OPM_API void opm_serial(OpmMachine* m, const char* text);
 

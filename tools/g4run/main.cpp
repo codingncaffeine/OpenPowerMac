@@ -1311,6 +1311,8 @@ int main(int argc, char** argv)
     }
     printf("-- rom: %zu bytes, ram: %zu MiB\n", rom.size(), ramMb);
     SawtoothBus bus(ramMb * 1024 * 1024, std::move(rom));
+    if (!bus.romNote().empty())
+        printf("-- %s\n", bus.romNote().c_str());
 
     char text[128];
     if (!disAt && disStart && disEnd > disStart) {

@@ -183,6 +183,19 @@ public sealed class MachineSession
                 reason = "create failed";
                 return;
             }
+            // A ROM dump assembled from Apple's firmware updater carries a
+            // template system-configuration block that describes some other
+            // board; the core factory-configures it as a Sawtooth and says
+            // so here, because the alternative was a machine that sat at
+            // power-on forever with nothing on the console explaining why.
+            {
+                var noteBuf = new byte[1024];
+                uint noteLen = Native.opm_rom_note(m, noteBuf, (uint)noteBuf.Length);
+                if (noteLen > 0)
+                    ConsoleQ.Enqueue("[shell] "
+                        + System.Text.Encoding.UTF8.GetString(noteBuf, 0, (int)noteLen)
+                        + "\n");
+            }
             if (!string.IsNullOrWhiteSpace(s.AtiRomPath) && s.AtiAt > 0)
                 Native.opm_ati_at(m, s.AtiAt);
 

@@ -22,6 +22,13 @@ Design, methodology, and the provenance ledger live in the
 No Apple software is included or distributed. ROMs and operating system media must be
 supplied by the user from their own hardware.
 
+The Boot ROM is the 1 MB image of a Power Mac G4 (AGP Graphics) — firmware 4.2.8f1 and
+3.2.4f1 are both known to boot. A ROM read out of a machine carries that machine's
+system-configuration block alongside the firmware; a ROM assembled from Apple's firmware
+updater carries a template block describing a different board instead, which sends the
+firmware off to wait on hardware this machine does not have. The emulator recognises that
+case, configures the block as a Sawtooth's before power-on, and says so in the console.
+
 ## Where it is
 
 **Arc 1 — a complete MPC7400 (PowerPC G4) CPU core — is done.** Every instruction,

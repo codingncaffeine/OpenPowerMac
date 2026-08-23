@@ -81,6 +81,9 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_cd_error(IntPtr m, byte[] buf, uint cap);
 
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_rom_note(IntPtr m, byte[] buf, uint cap);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);
 

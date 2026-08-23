@@ -283,6 +283,19 @@ OPM_API int32_t opm_cd_present(const OpmMachine* m)
     return m->bus->cd().present() ? 1 : 0;
 }
 
+OPM_API uint32_t opm_rom_note(const OpmMachine* m, char* buf, uint32_t cap)
+{
+    if (!buf || !cap)
+        return 0;
+    const std::string& note = m->bus->romNote();
+    uint32_t n = 0;
+    while (n < note.size() && n + 1 < cap) {
+        buf[n] = note[n];
+        ++n;
+    }
+    buf[n] = 0;
+    return n;
+}
 OPM_API uint32_t opm_cd_error(const OpmMachine* m, char* buf, uint32_t cap)
 {
     if (!buf || !cap)

@@ -2,6 +2,8 @@
 """The window comes back the way it was left.
 
     tools/headless.sh python3 tools/guitest/winsize.py [--app FILE] [--shots DIR]
+    tools/headless.sh weston --backend=headless --width=1280 --height=1024 --xwayland --idle-time=0 \\
+        -- python3 tools/guitest/winsize.py --wm [--app FILE]
 
 Starts the app on a scratch profile (it refuses to run outside
 tools/headless.sh), resizes its window the way a window manager would,
@@ -17,7 +19,13 @@ each order, since a window manager may send the two either way round. The
 app must remember that it was maximized AND the size it had before, ask to
 be maximized when it starts again, and come back at the earlier size once
 it is not maximized any more.
-Needs python-xlib, Pillow and ImageMagick.
+
+--wm is the same thing under a real window manager (the second line: a
+headless compositor with its X server, which ends when the test does):
+resize by asking it, close with what the title bar's close button sends
+before the delayed save has run, start again; maximize, close, start again;
+un-maximize back to the earlier size.
+Needs python-xlib, Pillow and ImageMagick; --wm needs weston.
 """
 import argparse, json, os, subprocess, sys, time
 from PIL import Image
@@ -26,6 +34,7 @@ from Xlib.ext import xtest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ap = argparse.ArgumentParser()
+ap.add_argument("--wm", action="store_true")
 ap.add_argument("--app", default=os.path.join(ROOT, "bin", "openpowermac"))
 ap.add_argument("--shots")
 a = ap.parse_args()
@@ -142,6 +151,62 @@ def start():
     app = subprocess.Popen([a.app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     w = find_window(); time.sleep(2.0)
     return app, w
+
+def wait_for(what, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if what(): return True
+        time.sleep(0.1)
+    return what()
+def ask_maximized(w, on):
+    """A request to the window manager, as a pager or a shortcut makes it."""
+    ev = protocol.event.ClientMessage(window=w, client_type=net("_NET_WM_STATE"),
+                                      data=(32, [1 if on else 0, MAXIMIZED[0], MAXIMIZED[1], 1, 0]))
+    root.send_event(ev, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask); d.sync()
+def close_button(w, app):
+    """What the title bar's close button sends."""
+    ev = protocol.event.ClientMessage(window=w, client_type=net("WM_PROTOCOLS"),
+                                      data=(32, [net("WM_DELETE_WINDOW"), X.CurrentTime, 0, 0, 0]))
+    w.send_event(ev); d.sync()
+    try: return app.wait(timeout=15) == 0
+    except subprocess.TimeoutExpired:
+        app.kill(); return False
+
+if a.wm:
+    chk = root.get_full_property(net("_NET_SUPPORTING_WM_CHECK"), Xatom.WINDOW)
+    if not chk: sys.exit("window size test: --wm needs a display with a window manager")
+    print("with a window manager: resize, close with the close button, start again")
+    app, w = start()
+    check(size(w) == (1024, 900) and not is_maximized(w), f"first launch, the default size: {size(w)}")
+    w.configure(width=940, height=740); d.sync()
+    check(wait_for(lambda: size(w) == (940, 740)), f"the window manager gave it the size asked for: {size(w)}")
+    time.sleep(0.3)                      # closed BEFORE the delayed save: the close must save it
+    check(close_button(w, app), "the close button closed the app")
+    check(saved() == (False, 940, 740), f"saved at close: {saved()}")
+    app, w = start()
+    check(size(w) == (940, 740) and not is_maximized(w), f"second launch: {size(w)}, maximized: {is_maximized(w)}")
+
+    print("maximize, close, start again")
+    ask_maximized(w, True)
+    check(wait_for(lambda: is_maximized(w) and size(w)[0] > 940), f"maximized: {size(w)}")
+    big = size(w)
+    time.sleep(0.3)
+    check(close_button(w, app), "the close button closed the app")
+    check(saved() == (True, 940, 740), f"saved at close: maximized, and the size it had before: {saved()}")
+    app, w = start()
+    check(wait_for(lambda: is_maximized(w) and size(w) == big), f"third launch came back maximized: {size(w)} (was {big})")
+
+    print("un-maximize: back to the size it had before; close, start again")
+    ask_maximized(w, False)
+    check(wait_for(lambda: not is_maximized(w) and size(w) == (940, 740)), f"un-maximized: {size(w)}")
+    time.sleep(2.0)
+    check(saved() == (False, 940, 740), f"saved while running: {saved()}")
+    check(close_button(w, app), "the close button closed the app")
+    app, w = start()
+    check(size(w) == (940, 740) and not is_maximized(w), f"fourth launch: {size(w)}, maximized: {is_maximized(w)}")
+    check(close_button(w, app), "the close button closed the app")
+    print("window size test:", "PASS" if not failures else f"FAIL ({len(failures)})")
+    sys.exit(0 if not failures else 1)
 
 try:
     print("first launch: the default size")

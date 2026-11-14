@@ -83,6 +83,7 @@ public partial class MainWindow : Window
             _layoutSave?.Stop();
             CaptureWindowLayout();
             _settings.Save();
+            Log.Line($"window: closing at {DescribeLayout()}; remembered for the next launch");
         };
     }
 
@@ -114,6 +115,11 @@ public partial class MainWindow : Window
         _normalSize = new Size(Width, Height);
         if (_settings.WindowMaximized)
             WindowState = WindowState.Maximized;
+        // The log says which it was, so "it did not come back" can be read
+        // from a run: nothing had been remembered, or this is what was.
+        Log.Line(_settings.WindowWidth >= MinWidth && _settings.WindowHeight >= MinHeight
+            ? $"window: opening as it was left: {DescribeLayout()}"
+            : $"window: no size remembered yet; opening at the default {Width:0}x{Height:0}");
 
         // Changes are saved a moment after they stop arriving: a drag sends a
         // stream of sizes and only the last one is worth a write.
@@ -123,6 +129,7 @@ public partial class MainWindow : Window
                 _layoutSave!.Stop();
                 CaptureWindowLayout();
                 _settings.SaveInBackground();
+                Log.Line($"window: now {DescribeLayout()}");
             });
         _layoutSave.Stop();
         Opened += (_, _) => _layoutReady = true;
@@ -139,6 +146,11 @@ public partial class MainWindow : Window
                 TouchLayout();
         };
     }
+
+    private string DescribeLayout() =>
+        $"{_settings.WindowWidth:0}x{_settings.WindowHeight:0}"
+        + (_settings.WindowMaximized ? ", maximized" : "")
+        + $", console pane {_settings.ConsoleHeight:0}";
 
     private void TouchLayout()
     {

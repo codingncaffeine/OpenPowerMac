@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs a command the way every GUI test of OpenPowerMac must run: on a virtual X
 # server (no window on the desktop), on its own D-Bus session that can start
-# nothing, with private XDG folders (never the real ~/.config/OpenPowerMac), and with
-# sound made impossible (tools/silent.sh).
+# nothing, with private XDG folders (never the real ~/.config/OpenPowerMac), and
+# behind the wall of tools/silent.sh: no sound, and no process of the desktop.
 #
 #   tools/headless.sh COMMAND [ARGS...]
 #   OPM_TEST_HOME=DIR tools/headless.sh ...   keep the scratch profile in DIR (default: a temp dir, removed)

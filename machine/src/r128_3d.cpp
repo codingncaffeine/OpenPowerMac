@@ -719,7 +719,12 @@ Rgba sampleTex(const Pipe& P, const TexUnit& t, float s, float tt, float lod)
     // LOD bias: TEX_CNTL_C 31:24, signed 4.4 fixed point. The field width is
     // r128_reg.h's; the fixed-point split is this model's reading — revisit
     // against real traffic if mip selection looks uniformly off by a power.
-    const int biasRaw = static_cast<int>((t.cntl >> 24) & 0xFFu);
+    // ⚠ TEX_CNTL_C, the pipeline's register — not the unit's own control
+    // register, whose top byte is the palette entries' datatype. This read
+    // the unit's until the undecoded-bits census pointed at it: a driver
+    // that sets "1555 palette entries" there was getting a sixteenth of a
+    // level of bias for it.
+    const int biasRaw = static_cast<int>((P.texCntl >> 24) & 0xFFu);
     lod += static_cast<float>(biasRaw >= 128 ? biasRaw - 256 : biasRaw) /
            16.0f;
     const bool mips = !((t.cntl >> 7) & 1u) && t.maxLevel > 0;
@@ -1811,9 +1816,9 @@ bool r128Reg3dDecodedBits(u32 off, u32& mask)
     case kZPitchC: mask = 0x000103FFu; return true;
     // TEX_CNTL_C: Z enable and write, stencil, the two texture enables, fog,
     // dither, alpha blend and test, specular, chroma key, the texel alpha
-    // mask, the two lighting functions. Bit 23 flushes the texel cache,
-    // which this model does not have.
-    case kTexCntlC: mask = 0x009FFFBBu; return true;
+    // mask, the two lighting functions, the LOD bias. Bit 23 flushes the
+    // texel cache, which this model does not have.
+    case kTexCntlC: mask = 0xFF9FFFBBu; return true;
     // MISC_3D_STATE_CNTL: reference alpha, the 3D function, the alpha
     // combine, table fog, the two blend factors, the alpha test.
     case kMisc3dStateCntl: mask = 0x07FF73FFu; return true;

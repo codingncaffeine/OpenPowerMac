@@ -449,6 +449,60 @@ TEST_CASE("3d: the texel alpha mask draws nothing where the alpha bit is clear")
     }
 }
 
+// The LOD bias is TEX_CNTL_C 31:24 (r128_reg.h), the pipeline's register. The
+// top byte of a unit's own control register is something else — the datatype
+// of its palette entries — and a driver that sets it must get no bias for it.
+TEST_CASE("3d: the LOD bias comes from TEX_CNTL_C, not the unit's register")
+{
+    // A 2x2 red base with a 1x1 blue mip, drawn one texel to a pixel: level
+    // 0 unless something biases it.
+    auto draw = [](u32 texCntl, u32 unitCntl) {
+        Rig3d r;
+        r.dst32();
+        r.openGate();
+        r.fpuSolidBoth();
+        auto t16 = [&](u32 at, u32 v) {
+            r.c.vram[at] = static_cast<u8>(v >> 8);
+            r.c.vram[at + 1u] = static_cast<u8>(v);
+        };
+        for (u32 i = 0; i < 4; ++i)
+            t16(0x80000u + i * 2u, 0xF800u); // red
+        t16(0x90000u, 0x001Fu);              // blue
+        r.reg(0x1C9Cu, (1u << 4) | texCntl);
+        r.reg(0x1CB0u, (4u << 16) | unitCntl); // 565
+        r.reg(0x1CB8u, 0x0111u);  // 2x2, mips down to 1x1
+        r.reg(0x1CC0u, 0x80000u); // slot 1: the 2-texel level
+        r.reg(0x1CBCu, 0x90000u); // slot 0: the 1-texel level
+        std::vector<u32> v;
+        auto vtxSt = [&](float x, float y, float s, float t) {
+            v.push_back(f2u(x));
+            v.push_back(f2u(y));
+            v.push_back(f2u(0.5f));
+            v.push_back(f2u(1.0f));
+            v.push_back(0xFFFFFFFFu);
+            v.push_back(f2u(s));
+            v.push_back(f2u(t));
+        };
+        vtxSt(0, 0, 0, 0);
+        vtxSt(2, 0, 1, 0);
+        vtxSt(0, 2, 0, 1);
+        vtxSt(2, 0, 1, 0);
+        vtxSt(2, 2, 1, 1);
+        vtxSt(0, 2, 0, 1);
+        r.prim(0x9u | 0x80u, 4u, 6u, v);
+        return r.pix32(0, 0);
+    };
+    const u32 red = 0xFFFF0000u, blue = 0xFF0000FFu;
+    const u32 nearestMip = 2u << 1, trilinear = 5u << 1;
+    CHECK(draw(0, nearestMip) == red);
+    // One whole level of bias, 4.4 fixed point, in the pipeline's register.
+    CHECK(draw(0x10u << 24, nearestMip) == blue);
+    // The palette datatype in the unit's register: no bias, so a trilinear
+    // sample at level 0 is all level 0.
+    CHECK(draw(0, trilinear | (1u << 24)) == red);
+    CHECK(draw(0, trilinear | (2u << 24)) == red);
+}
+
 TEST_CASE("3d: bilinear filtering blends adjacent texels")
 {
     Rig3d r;

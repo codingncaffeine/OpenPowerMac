@@ -497,7 +497,7 @@ TEST_CASE("3d: CI8 texels read through the palette LOAD_PALETTE filled")
 
 // ⭐⭐ THE OFFSET SLOTS ARE INDEXED BY LEVEL SIZE, NOT BY MIP NUMBER.
 //
-// Measured from Nanosaur's own register traffic: TEX_SIZE_PITCH_C cycled
+// Measured from a game's own register traffic: TEX_SIZE_PITCH_C cycled
 // 0x666/0x777/0x888 while the driver wrote ONLY PRIM_TEX_6/7/8_OFFSET_C —
 // one slot per texture, the slot number equal to log2 of the texture's
 // size, PRIM_TEX_0_OFFSET_C never once. The model used to read the base
@@ -541,7 +541,7 @@ TEST_CASE("3d: the texture base is read from the size-indexed offset slot, "
 }
 
 // The tiling-mode bits ride the offset's top two bits (SDK F.13: 0 linear,
-// 1 host-tiled, 2/3 via a SURFACE range). Nanosaur sets mode 3 with every
+// 1 host-tiled, 2/3 via a SURFACE range). The game sets mode 3 with every
 // SURFACE register zeroed — linear in fact — and 62 M samples per capture
 // must not each count as "unimplemented". A LIVE surface range covering
 // the address is the only honest trigger.
@@ -559,7 +559,7 @@ TEST_CASE("3d: tiling-mode bits with no live SURFACE range sample linear "
     r.reg(0x1C9Cu, 1u << 4);
     r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11));
     r.reg(0x1CB8u, 0x222u);
-    r.reg(0x1CC4u, 0xC0000000u | 0x80000u); // mode 3, as Nanosaur programs
+    r.reg(0x1CC4u, 0xC0000000u | 0x80000u); // mode 3, as the game programs
     const auto before = r128EngStats();
     std::vector<u32> v;
     auto vtxSt = [&](float x, float y, float s, float t) {
@@ -731,7 +731,7 @@ TEST_CASE("3d: the SCALE_3D_FN write gate drops context writes when steered "
 //
 // This model used to close the gate for every function except 2, so every
 // context register a driver programmed while the pipe sat in Scaling was
-// dropped on the floor — 4,392 of them in the first real Nanosaur session,
+// dropped on the floor — 4,392 of them in the first real game session,
 // and the primitives afterwards drew with whatever state happened to be
 // left. Nothing announced it: the writes were counted, not reported.
 //
@@ -755,7 +755,7 @@ TEST_CASE("3d: SCALE_3D_FN = Scaling leaves the context block writeable")
     CHECK(r128EngStats().gated3d - before.gated3d == 1);
 }
 
-// ⭐ THE REAL SHAPE OF THE NANOSAUR BUG: two registers disagreeing.
+// ⭐ THE REAL SHAPE OF THE BUG: two registers disagreeing.
 //
 // The driver ran with MISC_3D_STATE_CNTL = 00510200 (SCALE_3D_FN = 2,
 // TEXMAP_SHADE) and SCALE_3D_CNTL = 80000000, whose 7:6 field is 0. With

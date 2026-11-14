@@ -147,7 +147,7 @@ TEST_CASE("plain typing emits no modifier reports")
 }
 
 // The trademark sign is Option-2 on a US layout, and typing it is the only
-// way to type-select "Nanosaur™" past "Nanosaur Instructions.pdf" (space
+// way to type-select "Name™" past "Name Instructions.pdf" (space
 // sorts ahead of ™). Same rule: Option is announced before the '2'.
 TEST_CASE("the trademark character types as Option-2")
 {

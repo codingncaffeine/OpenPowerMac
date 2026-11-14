@@ -697,8 +697,8 @@ void OhciCell::typeChord(u8 extraMod, const std::string& s)
             usage = 43; // Tab: the Finder's "next item alphabetically"
         else if (static_cast<unsigned char>(c) == 0xAAu) {
             // MacRoman ™ is Option-2 on a US layout, and typing it is the
-            // only way to type-select "Nanosaur™" — plain "nanosaur"
-            // matches "Nanosaur Instructions.pdf" first, which sorts ahead
+            // only way to type-select an application named "Name™" — the
+            // plain name matches "Name Instructions.pdf" first, which sorts ahead
             // of it (space before ™), so three scripted launches opened a
             // PDF nobody could read instead of the game.
             usage = 31;  // '2'

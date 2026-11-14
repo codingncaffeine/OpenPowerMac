@@ -378,7 +378,7 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
         t.fmt = (t.cntl >> 16) & 0xFu;
         // ⭐⭐ THE OFFSET SLOTS ARE INDEXED BY LEVEL SIZE, NOT BY MIP NUMBER.
         //
-        // Measured from Nanosaur's own traffic (the diag register census):
+        // Measured from a game's own traffic (the diag register census):
         // TEX_SIZE_PITCH_C cycles 0x666/0x777/0x888 while the driver writes
         // ONLY PRIM_TEX_6/7/8_OFFSET_C — one slot per texture, the slot
         // number equal to log2 of the texture's size. So the base of a
@@ -1790,12 +1790,12 @@ bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v)
         //
         // This model closed the gate whenever the function was not 2, which
         // silently DROPPED every context write a driver made while the pipe
-        // sat in Scaling — 4,392 of them in the first real Nanosaur session,
+        // sat in Scaling — 4,392 of them in the first real game session,
         // the only refusal in the whole capture. Dropped state does not
         // announce itself: the primitives still draw, using whatever the
         // registers held before.
         // ⭐⭐ AND IT IS STEERED BY BOTH REGISTERS TOGETHER, NOT BY WHICHEVER
-        // WAS WRITTEN LAST. Measured from Nanosaur: the driver runs with
+        // WAS WRITTEN LAST. Measured in a game: the driver runs with
         // MISC_3D_STATE_CNTL = 00510200 (SCALE_3D_FN = 2, TEXMAP_SHADE — it
         // is plainly doing 3D, 314k triangles of it) while SCALE_3D_CNTL
         // reads 80000000, whose 7:6 field is 0. Under "last write wins" that

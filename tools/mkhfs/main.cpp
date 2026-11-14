@@ -7,7 +7,7 @@
 //   mkhfs <folder> <out.img> [volume name]
 //
 // ⚠ On Windows the narrow argv arrives in the ANSI code page, and a name
-// like "Nanosaur™" turns into bytes that are not valid UTF-8 — which the
+// like "Name™" turns into bytes that are not valid UTF-8 — which the
 // path layer rejects by throwing, which a naive main turns into a 0xC0000409
 // fail-fast with no message at all. The wide entry point plus an explicit
 // UTF-8 conversion is the whole fix.

@@ -389,7 +389,7 @@ void parseKeyBeat(const char* v, std::vector<KeyBeat>& out)
     }
     // \xNN and \t, because the characters that matter here cannot be typed
     // on a command line: the Finder needs a literal MacRoman ™ (\xaa) to
-    // type-select "Nanosaur™", and Tab to step to the next item.
+    // type-select a name that ends in one, and Tab to step to the next item.
     auto hex = [](char h) -> int {
         if (h >= '0' && h <= '9') return h - '0';
         if (h >= 'a' && h <= 'f') return h - 'a' + 10;

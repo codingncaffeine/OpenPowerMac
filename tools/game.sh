@@ -37,7 +37,10 @@ esac
 PLUS="${OPM_PLUS:-200000000}"
 
 ROM="${OPM_ROM:-$OPM_MEDIA/ROM 4.2.8f1 G4 AGP Sawtooth Stock/ROMs/@FFF00000 len-100000 All.rom}"
-CD="${OPM_CD:-$OPM_MEDIA/nanosaur/nanosaur_hfs.img}"
+# The game's disc: no default, because which game is this host's business.
+# Put OPM_GAME_CD=/path/to/the.img in scratch/local.env, or pass OPM_CD.
+CD="${OPM_CD:-${OPM_GAME_CD:-}}"
+[ -n "$CD" ] || { echo "FAIL: no game disc: set OPM_CD, or OPM_GAME_CD in scratch/local.env"; exit 1; }
 HD_SRC="${OPM_HD_SRC:-/d/OpenPowerMac Drives/macos9_2gb.img}"
 HD="${OPM_HD:-/d/OpenPowerMac Drives/_iter_hd${OPM_TAG:+_$OPM_TAG}.img}"
 for f in "$ROM" "$CD" "$HD_SRC"; do

@@ -895,7 +895,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
         }
     }
-    // 🖥 WHAT MODE THE SCREEN IS IN, as numbers. The Nanosaur black screen
+    // 🖥 WHAT MODE THE SCREEN IS IN, as numbers. A game's black screen
     // was undiagnosable live because nothing printed the CRTC state: the
     // game had switched the display to a format the scan-out refused, and
     // the only symptom was an app window with nothing in it. This line

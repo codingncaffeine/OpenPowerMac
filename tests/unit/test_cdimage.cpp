@@ -214,7 +214,7 @@ TEST_CASE("raw 2352 mode 2: user data behind the subheader")
     remove(p);
 }
 
-TEST_CASE("cue+bin, one data track: the Warcraft shape")
+TEST_CASE("cue+bin, one data track: a game disc's shape")
 {
     const char* cue = "opm_cdimg_wc3.cue";
     const char* bin = "opm_cdimg_wc3.bin";

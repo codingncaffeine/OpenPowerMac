@@ -177,6 +177,83 @@ struct HostPacer {
         base = std::chrono::steady_clock::now();
         tbBase = cpu.st.tb;
         lastTb = cpu.st.tb;
+        earnedFrom = ~0ull; // the next sync has no instruction count to compare
+    }
+
+    // ---- how far the clock may move in ONE step ----------------------------
+    //
+    // The host's clock says where the guest's clock should be; it does not say
+    // the guest may be taken there in one stride. Host time passes while this
+    // thread is not executing guest instructions at all: the card's command
+    // engine drawing a batch of triangles inside one register write, a disk
+    // read, the scheduler. On the real machine the processor keeps running
+    // through all of those. Handing the whole gap over at once shows the guest
+    // a processor that stopped dead while every device carried on, and a
+    // device with a deadline shorter than the gap is then serviced too late by
+    // construction.
+    //
+    // The sound driver is the one that shows it. Its DBDMA program is two
+    // slices of 512 frames (11.6 ms each at 44.1 kHz) and it refills a slice
+    // from the interrupt the other one raises. A step longer than a slice
+    // completes both before the handler runs once, the driver finds the
+    // channel stopped, takes its restart path, and the slice it should have
+    // filled plays as silence. Measured in a 3D game, where the engine draws a
+    // frame's triangles in long bursts: 359 of 1,715 slices silent.
+    //
+    // So the gap is a DEBT, repaid as the guest executes: at most kTbPerInsn
+    // ticks for each instruction run since the last step. One tick per
+    // instruction is a 25 MIPS processor, the slowest the guest is ever shown
+    // while a debt is being repaid; an emulator running faster than that
+    // repays at (its MIPS / 25) times real time and the clock is back on the
+    // host's within a few milliseconds. An asleep core is the exception and
+    // needs none: nothing wants the processor until the next deadline, so the
+    // clock goes straight there.
+    //
+    // The same game window, silent slices of the sound it should have played:
+    // one step (the control) 305 of 1,730; a 25 MIPS floor 6 of 1,614; 40 and
+    // 50 MIPS floors 5 and 4, and a 70 MIPS floor could no longer repay at all
+    // on a host doing 64 (the clock ran at 0.90x). The floor is the speed
+    // below which the guest's clock runs slow instead, so it stays well under
+    // what a modest host manages; the slices that are still lost are lost to
+    // the stall itself, which no repayment schedule gives back.
+    static constexpr u64 kTbPerInsn = 1;
+    // A step is never zero, or a guest that is behind and executing nothing
+    // countable could not move its clock at all.
+    static constexpr u64 kMinStepTb = 1;
+    // The control: false hands every gap over in one step, as before.
+    bool smooth = true;
+    u64 earnedFrom = ~0ull; // the instruction count at the last sync
+    u64 forgivenTb = 0;     // host time the guest was never told about
+    u64 held = 0;           // steps that stopped short of the host's clock
+    u64 maxDebtTb = 0;      // the furthest behind the guest's clock has been
+    // How far behind the host the clock was found, by size (see debtBucket).
+    static constexpr int kDebtBuckets = 7;
+    u64 debtHist[kDebtBuckets] = {};
+    static int debtBucket(u64 tb)
+    {
+        // < 0.1 ms, < 1, < 2, < 5, < 11.6 (one sound slice), < 50, beyond
+        static constexpr u64 edge[kDebtBuckets - 1] = {2500,   25000,  50000,
+                                                        125000, 290000, 1250000};
+        int i = 0;
+        while (i < kDebtBuckets - 1 && tb >= edge[i])
+            ++i;
+        return i;
+    }
+    static const char* debtBucketName(int i)
+    {
+        static constexpr const char* n[kDebtBuckets] = {
+            "<0.1ms", "<1ms", "<2ms", "<5ms", "<11.6ms", "<50ms", ">=50ms"};
+        return n[i];
+    }
+
+    // Where the host says the guest's clock should be right now.
+    u64 targetTb() const
+    {
+        const u64 ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - base)
+                .count());
+        return tbBase + ns / kNsPerTick;
     }
 
     // Move the guest's clock to where the host says it should be. Returns the
@@ -189,9 +266,25 @@ struct HostPacer {
     // stroke. One tick() of n cycles raises the decrementer at most once
     // however large n is — see the closed form there — so a big delta is a
     // late interrupt, never a burst of them.
-    u64 sync(Cpu& cpu)
+    //
+    // `executed` is the machine's instruction count, which is what the step is
+    // measured against. `napDueTb` is the nearest deadline when the core is
+    // asleep with nothing waiting for it, and zero when it is awake.
+    u64 sync(Cpu& cpu, u64 executed, u64 napDueTb)
     {
-        const auto now = std::chrono::steady_clock::now();
+        return syncAt(cpu, std::chrono::steady_clock::now(), executed,
+                      napDueTb);
+    }
+
+    // The same, against a moment the caller names: the tests script the host
+    // clock through this.
+    u64 syncAt(Cpu& cpu, std::chrono::steady_clock::time_point now,
+               u64 executed, u64 napDueTb)
+    {
+        const u64 ran = earnedFrom == ~0ull || executed < earnedFrom
+                            ? ~0ull
+                            : executed - earnedFrom;
+        earnedFrom = executed;
         // ⛔ THE CLOCK IS NOT WHERE WE LEFT IT: the guest wrote TBL/TBU, or it
         // was reset, or a snapshot was restored. Whatever the reason, the
         // number is now somebody else's, and pacing an old origin against it
@@ -211,11 +304,34 @@ struct HostPacer {
         const u64 want = tbBase + ns / kNsPerTick;
         if (want <= cpu.st.tb)
             return 0;
-        u64 delta = want - cpu.st.tb;
-        if (delta > kCatchupTb) {
+        const u64 debt = want - cpu.st.tb;
+        ++debtHist[debtBucket(debt)];
+        if (debt > maxDebtTb)
+            maxDebtTb = debt;
+        u64 delta = debt;
+        if (smooth) {
+            // What the guest has earned by executing, or the way to the next
+            // deadline when it is asleep and has nothing to execute.
+            u64 allow = ran > kCatchupTb ? kCatchupTb : ran * kTbPerInsn;
+            if (napDueTb > cpu.st.tb && napDueTb - cpu.st.tb > allow)
+                allow = napDueTb - cpu.st.tb;
+            if (allow < kMinStepTb)
+                allow = kMinStepTb;
+            if (delta > allow) {
+                delta = allow;
+                ++held;
+            }
+        }
+        // A debt the guest cannot repay is forgiven down to the cap: the
+        // origin moves, and the guest is never told about that time. With the
+        // control off this is the old behaviour exactly: one step of the cap.
+        if (!smooth && delta > kCatchupTb)
             delta = kCatchupTb;
+        if (debt - delta > (smooth ? kCatchupTb : 0)) {
+            const u64 keep = smooth ? kCatchupTb : 0;
+            forgivenTb += debt - delta - keep;
             base = now;
-            tbBase = cpu.st.tb + delta;
+            tbBase = cpu.st.tb + delta + keep;
             ++slips;
         }
         cpu.tick(static_cast<u32>(delta * cpu.cyclesPerTbTick));

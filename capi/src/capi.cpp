@@ -208,7 +208,7 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         while (m->executed < until && !cpu.halted &&
                !bus.pmu().resetRequest) {
             // 1. THE CLOCK, FROM OUTSIDE. Nothing else moves it now.
-            m->pace.sync(cpu);
+            m->pace.sync(cpu, m->executed, napDeadlineTb(cpu, bus));
             // 2. The devices, in the same breath, because the clock just
             //    crossed whatever deadlines it crossed and an interrupt that
             //    is due should reach the processor before more instructions
@@ -222,7 +222,7 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
             //    the guest sat idle at the Finder. Going round again rather
             //    than running: the clock has moved by the length of the wait,
             //    so the devices have to be looked at before anything else.
-            if (const uint64_t waited = hostIdleWait(cpu, bus, m->idle)) {
+            if (const uint64_t waited = hostIdleWait(cpu, bus, m->idle, m->pace)) {
                 idleNs += waited;
                 if (idleNs >= kMaxIdleNsPerCall)
                     break; // idle, and the caller has been kept long enough
@@ -738,6 +738,23 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
              static_cast<unsigned long long>(m->idle.skipped),
              static_cast<unsigned long long>(m->idle.overshootNs / 1000ull));
     s += b;
+    // How far behind the host's clock the guest's was found, and what became
+    // of it: repaid in steps (held), or more than the guest could be told
+    // about (lost). A machine that keeps up shows nothing past the first two
+    // sizes and loses nothing.
+    snprintf(b, sizeof b,
+             "--   clock behind the host: worst %.1f ms, %llu step(s) held "
+             "back, %.1f ms never handed over; by size:",
+             m->pace.maxDebtTb * HostPacer::kNsPerTick / 1e6,
+             static_cast<unsigned long long>(m->pace.held),
+             m->pace.forgivenTb * HostPacer::kNsPerTick / 1e6);
+    s += b;
+    for (int i = 0; i < HostPacer::kDebtBuckets; ++i) {
+        snprintf(b, sizeof b, " %s %llu", HostPacer::debtBucketName(i),
+                 static_cast<unsigned long long>(m->pace.debtHist[i]));
+        s += b;
+    }
+    s += "\n";
     // 📓 WHAT IT HAS BEEN DOING, not just where it stopped. A handler entered
     // once and a fault re-taken forever look identical in a single sample.
     {

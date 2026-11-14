@@ -560,6 +560,7 @@ int main(int argc, char** argv)
     // measured through it. A speed claim has to be made about the shipping
     // path, which is capi's opm_run: step, tick, sync, deliver.
     bool bench = false;
+    bool paceSmooth = true; // --no-pace-smooth
     // --no-dev-gate: service every device on every instruction (the control
     // for the gate; see SawtoothBus::devGateOff).
     bool devGate = true;
@@ -765,6 +766,9 @@ int main(int argc, char** argv)
         // this function over the limit (C1061). A `continue` costs no
         // depth at all.
         if (!strcmp(a, "--bench")) { bench = true; continue; }
+        // The control for HostPacer's stepped catch-up (--realtime only): hand
+        // every gap in host time to the guest in one step, as it used to be.
+        if (!strcmp(a, "--no-pace-smooth")) { paceSmooth = false; continue; }
         if (!strcmp(a, "--no-dev-gate")) { devGate = false; continue; }
         if (!strcmp(a, "--no-icache")) { icache = false; continue; }
         if (!strcmp(a, "--no-dxlate")) { dxlate = false; continue; }
@@ -1681,6 +1685,7 @@ int main(int argc, char** argv)
     // with the capi so the app and this tool cannot drift apart about it. See
     // machine/include/opm/hostclock.hpp.
     HostPacer pacer;
+    pacer.smooth = paceSmooth;
     pacer.anchor(cpu);
     // …and what this thread does when the guest has nothing for it. ⚠ IT IS
     // HERE BECAUSE THE APP HAS IT. --bench claims to run exactly the loop the
@@ -1745,7 +1750,7 @@ int main(int argc, char** argv)
             // there is no other direction: instructions no longer advance the
             // timebase, so the guest can only be behind the host, never ahead
             // of it. What used to be a correction is now the source.
-            pacer.sync(cpu);
+            pacer.sync(cpu, executed, napDeadlineTb(cpu, bus));
         } else if (fastTb && executed < fastTbUntil) {
             cpu.tick(fastTb);
         } else if (fastTbAfter) {
@@ -2381,7 +2386,7 @@ int main(int argc, char** argv)
                     idleAt = executed;
                     idleNs = 0;
                 }
-                if (const u64 w = hostIdleWait(cpu, bus, idleWait)) {
+                if (const u64 w = hostIdleWait(cpu, bus, idleWait, pacer)) {
                     idleNs += w;
                     tickPeripherals();
                     continue;
@@ -5406,6 +5411,20 @@ int main(int argc, char** argv)
                static_cast<unsigned long long>(ranTb),
                host > 0 ? ranTb / host / 1e6 : 0.0,
                host > 0 ? ranTb / host / 25.0e6 : 0.0, tickText, rtText);
+        if (realtime) {
+            // How far behind the host's clock the guest's was found, and what
+            // became of it — see HostPacer::sync.
+            printf("--   clock behind the host%s: worst %.1f ms, %llu step(s) "
+                   "held back, %.1f ms never handed over; by size:",
+                   pacer.smooth ? "" : " [--no-pace-smooth]",
+                   pacer.maxDebtTb * HostPacer::kNsPerTick / 1e6,
+                   static_cast<unsigned long long>(pacer.held),
+                   pacer.forgivenTb * HostPacer::kNsPerTick / 1e6);
+            for (int i = 0; i < HostPacer::kDebtBuckets; ++i)
+                printf(" %s %llu", HostPacer::debtBucketName(i),
+                       static_cast<unsigned long long>(pacer.debtHist[i]));
+            printf("\n");
+        }
         if (bench)
             printf("--   ^ THE APP'S LOOP (--bench): step, tick, sync, "
                    "deliver, and nothing else.\n");

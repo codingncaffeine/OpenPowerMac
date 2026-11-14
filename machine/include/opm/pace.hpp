@@ -145,26 +145,47 @@ inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 budget)
 //
 // Returns the nanoseconds waited (0 when the machine had work, or when the
 // deadline was too near to be worth a system call).
-OPM_PACE_COLD inline u64 hostIdleWaitSlow(const Cpu& cpu,
-                                          const SawtoothBus& bus,
-                                          HostWait& w)
+// The nearest moment anything could want an ASLEEP processor, in timebase: the
+// earlier of the next device deadline and the decrementer. Nothing else can
+// wake a sleeping core — see the note at the top of this file, which
+// enumerates the four sources and disposes of the other two. Zero when the
+// core is awake, or when an enabled interrupt is already waiting for it: then
+// the machine has work this instant.
+//
+// The pacer uses it too (HostPacer::sync): an asleep core has nothing to
+// execute, so its clock may go straight to this moment instead of being
+// repaid an instruction at a time.
+inline u64 napDeadlineTb(const Cpu& cpu, const SawtoothBus& bus)
 {
-    OPM_MARK(Loop);
-    // An enabled interrupt is already waiting: the machine has work this
-    // instant, whatever its core is doing.
+    if (!cpu.napping)
+        return 0;
     if ((cpu.st.msr & msr::EE) &&
         (cpu.smiPending || cpu.extIrqLine || cpu.decPending || cpu.pmPending))
         return 0;
-    // The two deadlines, in the one unit that survives the clock coming from
-    // outside. Nothing else can wake a sleeping core — see the note at the top
-    // of this file, which enumerates the four sources and disposes of the
-    // other two.
     u64 dueTb = bus.deviceDueTb();
     const u64 dec = cpu.tbUntilDec();
     if (dec != ~0ull && cpu.st.tb + dec < dueTb)
         dueTb = cpu.st.tb + dec;
+    return dueTb ? dueTb : 1; // a deadline of zero is still a deadline
+}
+
+OPM_PACE_COLD inline u64 hostIdleWaitSlow(const Cpu& cpu,
+                                          const SawtoothBus& bus,
+                                          HostWait& w, const HostPacer& pacer)
+{
+    OPM_MARK(Loop);
+    const u64 dueTb = napDeadlineTb(cpu, bus);
     if (dueTb <= cpu.st.tb)
-        return 0; // already due: service it, do not wait on it
+        return 0; // work now, or already due: service it, do not wait on it
+    // The guest's clock is BEHIND the host's (HostPacer repays a stall in
+    // steps), and the host's is already at this deadline: the wait has
+    // happened out there. Waiting again would keep the guest late for ever.
+    // Go round instead — one nanosecond is "waited, look again" to both
+    // callers — and the next sync takes an asleep core straight to it.
+    const u64 hostTb = pacer.targetTb();
+    if (hostTb >= dueTb)
+        return 1;
+    const u64 fromTb = hostTb > cpu.st.tb ? hostTb : cpu.st.tb;
     // ⚠ CLAMPED, FOR TWO UNRELATED REASONS THAT MEET AT THE SAME LINE. A
     // machine with nothing due at all leaves dueTb at ~0, and the multiply
     // would overflow into a wait measured in centuries; and this runs INSIDE
@@ -173,17 +194,18 @@ OPM_PACE_COLD inline u64 hostIdleWaitSlow(const Cpu& cpu,
     // does not bind — waking early is free, because the caller is a loop and
     // simply asks again — so it is compared in TIMEBASE, before the multiply
     // that would have overflowed.
-    const u64 tbLeft = dueTb - cpu.st.tb;
+    const u64 tbLeft = dueTb - fromTb;
     return w.wait(tbLeft > HostWait::kMaxAskNs / HostPacer::kNsPerTick
                       ? HostWait::kMaxAskNs
                       : tbLeft * HostPacer::kNsPerTick);
 }
 
-inline u64 hostIdleWait(const Cpu& cpu, const SawtoothBus& bus, HostWait& w)
+inline u64 hostIdleWait(const Cpu& cpu, const SawtoothBus& bus, HostWait& w,
+                        const HostPacer& pacer)
 {
     if (!cpu.napping)
         return 0;
-    return hostIdleWaitSlow(cpu, bus, w);
+    return hostIdleWaitSlow(cpu, bus, w, pacer);
 }
 
 // ---- the batch ------------------------------------------------------------

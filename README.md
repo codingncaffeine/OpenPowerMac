@@ -121,6 +121,12 @@ dialogs differ.
 instrumentation used to bring it up. The run scripts in `tools/` find it,
 the reference shelf and the install media through `tools/paths.sh`.
 
+`tools/capicheck.py` (Linux) and `tools/capicheck.ps1` (Windows) drive the
+library the app runs, the way the app runs it — real-time pacing included —
+with no window: the check for anything that works in `g4run` and not in the
+app. The Linux one can also hand the guest mouse travel or a key and report
+whether the guest took it and whether its cursor moved.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

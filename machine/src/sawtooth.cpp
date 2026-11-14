@@ -221,6 +221,80 @@ bool SawtoothBus::sysBlockIsSawtooth(const std::vector<u8>& rom)
     return bus >= 90000000u && bus <= 110000000u;
 }
 
+std::unique_ptr<SawtoothBus>
+SawtoothBus::afterSystemReset(std::unique_ptr<SawtoothBus> old)
+{
+    SawtoothBus& o = *old;
+    // What is in the drives, by path: the drive comes back as a new drive
+    // with the same disc in it. A CD the guest ejected stays out — a reset
+    // does not push a disc back in — and for the drop box the disc that was
+    // waiting to go in is the one a restarted guest should find.
+    const bool hdDrive = o.hd_.present();
+    const std::string hdPath = o.hd_.mediaPath();
+    const bool cdDrive = o.cd_.present();
+    const std::string cdPath = o.cd_.mediaPath();
+    const bool cdOut = cdDrive && !o.cd_.mediaPresent();
+    const bool dropDrive = o.drop_.present();
+    const std::string dropPath =
+        !o.drop_.stagedPath().empty()
+            ? o.drop_.stagedPath()
+            : (o.drop_.mediaPresent() ? o.drop_.mediaPath() : std::string());
+    // The front end's wiring, which is not the board's state.
+    const u64* const stampWas = o.stamp;
+    const u32* const pcWas = o.pcRef;
+    const u32* const lrWas = o.lrRef;
+    SnoopSink* const snoopWas = o.snoop;
+    u64 (*const clockWas)(void*) = o.deviceClock;
+    void* const clockCtxWas = o.deviceClockCtx;
+    const u64 visibleAt = o.atiVisibleAt, hideFrom = o.atiHideFrom,
+              hideTo = o.atiHideTo, ataLogFromWas = o.ataLogFrom;
+    // What a reset leaves alone.
+    std::vector<u8> ramImg = std::move(o.ram_);
+    std::vector<u8> flashImg = std::move(o.rom_);
+    std::vector<u8> cardRom = std::move(o.atiRom_);
+    const u64 romId = o.romBase_;
+    std::string note = std::move(o.romNote_);
+
+    // The old board goes FIRST: its drives hold the image files open, the
+    // hard disk's for writing, and the new board must open them after they
+    // are flushed and closed, not beside them.
+    old.reset();
+
+    std::unique_ptr<SawtoothBus> b(
+        new SawtoothBus(std::move(ramImg), std::move(flashImg), false));
+    // The identity a snapshot checks is the ROM the run STARTED from; the
+    // flash has NVRAM edits in it by now and must not be mistaken for a
+    // different ROM. The factory-data note is likewise the first start's.
+    b->romBase_ = romId;
+    b->romNote_ = std::move(note);
+    b->atiRom_ = std::move(cardRom);
+    if (hdDrive && !hdPath.empty())
+        b->hd_.attachDisk(hdPath.c_str());
+    if (cdDrive) {
+        if (!cdPath.empty() && b->cd_.attachIso(cdPath.c_str())) {
+            if (cdOut)
+                b->cd_.hostEject();
+        } else {
+            b->cd_.seat();
+        }
+    }
+    if (dropDrive) {
+        if (dropPath.empty() || !b->drop_.attachIso(dropPath.c_str()))
+            b->drop_.seat();
+    }
+    b->atiVisibleAt = visibleAt;
+    b->atiHideFrom = hideFrom;
+    b->atiHideTo = hideTo;
+    b->ataLogFrom = ataLogFromWas;
+    b->setStamp(stampWas);
+    b->setPcRef(pcWas);
+    b->lrRef = lrWas;
+    b->attachSnoop(snoopWas);
+    b->deviceClock = clockWas;
+    b->deviceClockCtx = clockCtxWas;
+    return b;
+}
+
 std::string SawtoothBus::factoryConfigure(std::vector<u8>& rom)
 {
     if (rom.size() < kSysBlock + kSysBlockSize || sysBlockIsSawtooth(rom))

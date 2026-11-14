@@ -140,6 +140,7 @@ bool AtaCell::attachDisk(const char* path)
     isoBytes_ = static_cast<u64>(ftello(iso_));
 #endif
     disk_ = true;
+    mediaPath_ = path; // so a system reset can put the same disk back
     diskSectors_ = isoBytes_ / 512u;
     // Plain ATA signature: no packet feature set, so the byte-count pair
     // stays zero where an ATAPI device answers 14 EB.

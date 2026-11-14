@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -68,7 +69,44 @@ public:
     const std::string& romNote() const { return romNote_; }
 
     SawtoothBus(size_t ramBytes, std::vector<u8> rom)
-        : ram_(ramBytes, 0), rom_(std::move(rom))
+        : SawtoothBus(std::vector<u8>(ramBytes, 0), std::move(rom), true)
+    {
+    }
+
+    // 🔁 A SYSTEM RESET, AS THE HARDWARE PERFORMS IT. The PMU's reset command
+    // pulls the reset line on every chip on the board: the bridges, mac-io
+    // and everything inside it (the interrupt controller, the DMA channels,
+    // the ATA interfaces, the sound codec), and every PCI function through
+    // PCI RST#, the graphics card and the USB controllers included. What it
+    // does not touch is what is not a register: the contents of RAM, the
+    // boot flash with Open Firmware's NVRAM in it, and the discs sitting in
+    // the drives.
+    //
+    // So a reset is a NEW BOARD built around those three, which is what this
+    // returns. It is built by the constructor, deliberately: that is the one
+    // state the firmware is known to come up from, because every power-on
+    // starts there, and a hand-kept list of "what to clear" is the shape of
+    // defect this machine has already paid for (see setStamp). Restarting
+    // only the processor — which is what a guest's Restart got until now —
+    // left every device as Mac OS had programmed it, and Open Firmware's
+    // second pass took an external interrupt from one of them the moment it
+    // enabled interrupts: `DEFAULT CATCH!, code=500`, and a prompt instead
+    // of a boot.
+    //
+    // The front end's own wiring is carried across (the instruction stamp,
+    // the pc and lr references, the snoop sink, the device clock, the card's
+    // visibility window); anything else a harness pokes into the board it
+    // must apply again.
+    static std::unique_ptr<SawtoothBus>
+    afterSystemReset(std::unique_ptr<SawtoothBus> old);
+
+private:
+    SawtoothBus(std::vector<u8> ram, std::vector<u8> rom, bool powerOnRam)
+        : ram_(std::move(ram)), rom_(std::move(rom))
+    {
+        init(powerOnRam);
+    }
+    void init(bool powerOnRam)
     {
         // Factory data first, digest second: the digest below is what a
         // snapshot compares against, and it must see the flash the machine
@@ -89,8 +127,9 @@ public:
             romBase_ ^= b;
             romBase_ *= 0x100000001b3ull;
         }
-        for (size_t i = 0; i < ram_.size(); ++i)
-            ram_[i] = static_cast<u8>(0x5Au ^ (i * 0x21u) ^ (i >> 11));
+        if (powerOnRam)
+            for (size_t i = 0; i < ram_.size(); ++i)
+                ram_[i] = static_cast<u8>(0x5Au ^ (i * 0x21u) ^ (i >> 11));
         // GPIO-region byte +0x61: the ROM polls bit 1 (TB-bounded) right
         // after arming the VIA/PMU cell and before continuing hardware
         // init — a ready/level input, high at power-on. (Semantic name
@@ -284,6 +323,7 @@ public:
         pmu_.tbRef = &nowTb_;
     }
 
+public:
     bool attachAtiRom(const char* path)
     {
         FILE* f = fopen(path, "rb");

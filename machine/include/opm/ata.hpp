@@ -96,6 +96,9 @@ public:
     u32 insertions() const { return insertions_; }
     u32 guestEjects() const { return guestEjects_; }
     const std::string& mediaPath() const { return mediaPath_; }
+    // The disc waiting to go in once the guest lets the current one go.
+    const std::string& stagedPath() const { return stagedPath_; }
+    bool isDisk() const { return disk_; }
     u64 readsSinceInsert() const { return readsSinceInsert_; }
     static constexpr u64 kSwapDwellTb = 25000000ull;     // 1 s at 25 MHz
     static constexpr u64 kSwapFallbackTb = 125000000ull; // 5 s

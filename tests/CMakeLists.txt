@@ -8,6 +8,7 @@ add_executable(opm_unit
   unit/test_r128_2d.cpp
   unit/test_r128_apertures.cpp
   unit/test_r128_scan.cpp
+  unit/test_reset.cpp
   unit/test_r128_cce.cpp
   unit/test_r128_3d.cpp
   unit/test_hfs.cpp

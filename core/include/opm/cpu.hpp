@@ -659,6 +659,34 @@ struct Cpu {
     // exactly like Open Firmware's `!`. The LR is the return address inside the
     // routine that CALLED it, which is the answer the question wanted.
     std::map<u32, u64> rpByLr;
+    // CACHED-DEVICE watch (--cache-watch): which code reaches a physical
+    // window THROUGH THE DATA CACHE, and under what mapping. A device's
+    // registers must be mapped cache-inhibited: reached through the cache, a
+    // read returns whatever the line held when it was filled and a store
+    // sits in the line until it is cast out, so an interrupt status is never
+    // seen to change and a written register never reaches the chip. From the
+    // device's side that looks like a driver that is not there, and its only
+    // trace is whole 32-byte rows of registers read and written equally
+    // often. Noted on the line FILL, which is the miss path, so the watch
+    // costs the hit path nothing. Instrument state, not snapshotted.
+    u32 cwPa = 0, cwEnd = 0; // inclusive byte range; cwEnd 0 disables
+    u64 cwFrom = 0;          // ignore fills before this instruction
+    u64 cwFills = 0, cwPushes = 0;
+    struct CwHit {
+        u32 pc, lr, pa, wimg, msr;
+        int bat;    // the DBAT whose block holds pa and is valid, or -1 = page table
+        bool write; // the access that missed was a store
+        u64 at;
+    };
+    std::vector<CwHit> cwLog; // the first 64
+    std::map<u32, u64> cwByPc;
+    void cwNote(u32 pa, u32 wimg, bool write);
+    // DIAGNOSTIC, NOT MACHINE TRUTH (--uncached-from). Treat every access at
+    // or above this physical address as cache-inhibited whatever the guest's
+    // mapping says. It supplies the control for the watch above: if a device
+    // that looked dead comes alive with its window forced uncached, the
+    // mapping is the whole defect and the device model is exonerated.
+    u32 diagUncachedBase = 0;
     // DIAGNOSTIC, NOT MACHINE TRUTH. Substitute wpForce for the value of any
     // 32-bit store landing exactly on wpPa. This exists to supply a positive
     // control: a chain that is decoded but not yet fixed can be proved end to

@@ -116,6 +116,8 @@ inline void lineStoreBE(u8* p, u32 len, u64 v)
 
 static void busWriteLine(Cpu& c, u32 base, const u8* b)
 {
+    if (c.cwEnd && base <= c.cwEnd && (base | 31u) >= c.cwPa)
+        ++c.cwPushes; // a cached line being written back into the watched window
     // The block the fetch buffer may be holding is about to be rewritten in
     // memory; see Cpu::fetchBase.
     c.fetchDropAt(base);
@@ -408,7 +410,8 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
         else if (rpByLr.size() < 512)
             rpByLr[caller] = 1;
     }
-    if (!dceOn() || (wimg & kWimgI)) {
+    if (!dceOn() || (wimg & kWimgI) ||
+        (diagUncachedBase && pa >= diagUncachedBase)) {
         noteL2Skew(pa, false);
         switch (len) {
         case 1: return bus->read8(pa);
@@ -426,11 +429,48 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
     const u32 set = setOf(pa);
     int w = lineWay(*this, pa);
     if (w < 0) {
+        if (cwEnd)
+            cwNote(pa, wimg, false);
         w = static_cast<int>(lineVictim(*this, pa));
         lineFill(*this, set, static_cast<u32>(w), pa);
         l1x[set].age[w] = ++l1dClock;
     }
     return lineLoadBE(&l1d[set][w].b[pa & 31u], len);
+}
+
+void Cpu::cwNote(u32 pa, u32 wimg, bool write)
+{
+    if (pa > cwEnd || (pa | 31u) < cwPa)
+        return;
+    if (cwFrom && wpStamp && *wpStamp < cwFrom)
+        return;
+    ++cwFills;
+    const u32 at = st.pc - 4u;
+    auto it = cwByPc.find(at);
+    if (it != cwByPc.end())
+        ++it->second;
+    else if (cwByPc.size() < 512)
+        cwByPc[at] = 1;
+    if (cwLog.size() >= 64)
+        return;
+    // Which mapping let this through: a data BAT whose block holds the
+    // address and is valid in this mode, else the page table.
+    int bat = -1;
+    if (st.msr & msr::DR) {
+        const bool user = userMode();
+        for (int i = 0; i < 4; ++i) {
+            const u32 u = st.dbatu[i];
+            if (!(user ? (u & 1u) : (u & 2u)))
+                continue;
+            const u32 blMask = (u >> 2) & 0x7FFu;
+            if ((((pa >> 17) ^ (st.dbatl[i] >> 17)) & (0x7FFFu & ~blMask)) == 0) {
+                bat = i;
+                break;
+            }
+        }
+    }
+    cwLog.push_back({at, st.lr, pa, wimg, st.msr, bat, write,
+                     wpStamp ? *wpStamp : 0});
 }
 
 bool Cpu::wpNote(u32 pa, u32 len, u64 v)
@@ -461,7 +501,8 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
     fetchDropRange(pa, len);
     if (wpEnd && wpNote(pa, len, v) && wpForceSet && len == 4 && pa == wpPa)
         v = wpForce; // diagnostic
-    if (!dceOn() || (wimg & kWimgI)) {
+    if (!dceOn() || (wimg & kWimgI) ||
+        (diagUncachedBase && pa >= diagUncachedBase)) {
         noteL2Skew(pa, true);
         switch (len) {
         case 1: bus->write8(pa, static_cast<u8>(v)); return;
@@ -489,6 +530,8 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
         }
     }
     if (w < 0) { // write-allocate
+        if (cwEnd)
+            cwNote(pa, wimg, true);
         w = static_cast<int>(lineVictim(*this, pa));
         lineFill(*this, set, static_cast<u32>(w), pa);
         l1x[set].age[w] = ++l1dClock;

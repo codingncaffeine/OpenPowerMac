@@ -488,6 +488,13 @@ int main(int argc, char** argv)
     const char* atiRomPath = nullptr;  // Rage 128 FCode expansion ROM
     u64 atiAt = 0;                     // hide the card until this insn
     u32 rpPa = 0, rpEnd = 0;  // --rp PA [--rp-end PA]: read census
+    // --cache-watch PA [--cache-watch-end PA] [--cache-watch-from N]: which
+    // code reaches a physical window through the data cache (Cpu::cwNote).
+    u32 cwPa = 0, cwEnd = 0;
+    u64 cwFrom = 0;
+    // --uncached-from PA: DIAGNOSTIC, not machine truth. Force everything at
+    // or above PA cache-inhibited (Cpu::diagUncachedBase).
+    u32 uncachedFrom = 0;
     u64 wpFrom = 0;                       // --wp-from N: ignore stores < N
     u32 wpMaxArg = 0;                     // --wp-max N: raise the 64 cap
     u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
@@ -787,6 +794,25 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--no-sound")) { soundOn = false; continue; }
         // --mouse-beat, NOT --mouse-at: that name was already taken by the
         // motion-cadence diagnostic below, and this ladder cannot grow.
+        // ⚠ C1061: standalone branches, like the ones around them. The long
+        // else-if chain below is at MSVC's nesting limit and must not grow.
+        if (!strcmp(a, "--cache-watch")) {
+            cwPa = static_cast<u32>(strtoul(next(), nullptr, 0));
+            if (!cwEnd) cwEnd = cwPa + 0xFFFu;
+            continue;
+        }
+        if (!strcmp(a, "--cache-watch-end")) {
+            cwEnd = static_cast<u32>(strtoul(next(), nullptr, 0));
+            continue;
+        }
+        if (!strcmp(a, "--cache-watch-from")) {
+            cwFrom = strtoull(next(), nullptr, 0);
+            continue;
+        }
+        if (!strcmp(a, "--uncached-from")) {
+            uncachedFrom = static_cast<u32>(strtoul(next(), nullptr, 0));
+            continue;
+        }
         if (!strcmp(a, "--mouse-beat")) { parseMouseAt(next(), mouseBeats); continue; }
         // --tri-dump N: print the next N textured triangles' raw vertices
         // (see r128Set3dTriDump). Hoisted: the else-if ladder is at C1061.
@@ -1461,6 +1487,14 @@ int main(int argc, char** argv)
     if (wpMaxArg) cpu.wpMax = wpMaxArg;
     cpu.rpPa = rpPa;   // physical READ watchpoint (census by reading pc)
     cpu.rpEnd = rpEnd;
+    cpu.cwPa = cwPa;   // cached-device watch
+    cpu.cwEnd = cwEnd;
+    cpu.cwFrom = cwFrom;
+    cpu.diagUncachedBase = uncachedFrom;
+    if (uncachedFrom)
+        printf("-- DIAGNOSTIC: everything at or above %08x is forced "
+               "cache-inhibited (--uncached-from); this is not the machine\n",
+               uncachedFrom);
     cpu.wpForce = wpForce;
     cpu.wpForceSet = wpForceSet;
     // Always go through the setter on a cold start: it sets the reset port
@@ -4981,6 +5015,31 @@ int main(int argc, char** argv)
                "translate at any point in this run. THIS IS NOT A NULL "
                "RESULT — the watch was never armed.\n",
                rpVa, rpVaEnd);
+    if (cpu.cwEnd) {
+        // Who reaches this window THROUGH THE CACHE. Zero is the healthy
+        // answer for a device: its registers are mapped cache-inhibited.
+        printf("-- cache watch %08x..%08x: %llu line fills, %llu lines "
+               "written back, from %zu distinct pc%s%s\n",
+               cpu.cwPa, cpu.cwEnd,
+               static_cast<unsigned long long>(cpu.cwFills),
+               static_cast<unsigned long long>(cpu.cwPushes),
+               cpu.cwByPc.size(), cpu.cwByPc.size() == 1 ? "" : "s",
+               cpu.cwFills ? "" : "  (none: nothing here is reached through "
+                                  "the data cache)");
+        for (const auto& h : cpu.cwLog)
+            printf("   %s pa=%08x wimg=%x (%s%s%s%s) via %s  msr=%08x "
+                   "pc=%08x lr=%08x @%llu\n",
+                   h.write ? "store" : "load ", h.pa, h.wimg,
+                   (h.wimg & 8u) ? "W" : "-", (h.wimg & 4u) ? "I" : "-",
+                   (h.wimg & 2u) ? "M" : "-", (h.wimg & 1u) ? "G" : "-",
+                   h.bat >= 0 ? (std::string("dbat") + std::to_string(h.bat)).c_str()
+                              : ((h.msr & 0x10u) ? "page table" : "real mode"),
+                   h.msr, h.pc, h.lr, static_cast<unsigned long long>(h.at));
+        printf("   -- by pc:\n");
+        for (const auto& [at, n] : cpu.cwByPc)
+            printf("   pc=%08x  x%llu\n", at,
+                   static_cast<unsigned long long>(n));
+    }
     if (cpu.rpEnd) {
         // Who READS this range. "0 readers" and "read by one site a million
         // times" are opposite diagnoses for a buffer the machine fills, and no

@@ -451,6 +451,28 @@ const char* r128RegName(u32 off)
 // engine traffic under the driver's DDC bit-banging — which is exactly what
 // happened to the existing ring.
 static constexpr u32 kEngLo = 0x0700, kEngHi = 0x2000;
+// ---- bits ever written as one (see the header) ------------------------------
+namespace {
+u32 gRegEverSet[0x1000] = {}; // one per register of the 16 KB block
+} // namespace
+u32 r128RegEverSet(u32 off) { return gRegEverSet[(off >> 2) & 0xFFFu]; }
+void r128RegEverReset() { std::memset(gRegEverSet, 0, sizeof gRegEverSet); }
+
+bool r128Reg3dDecodedBits(u32 off, u32& mask); // r128_3d.cpp
+bool r128RegDecodedBits(u32 off, u32& mask)
+{
+    if (r128Reg3dDecodedBits(off, mask))
+        return true;
+    switch (off) {
+    // CLR_CMP_CNTL: the two functions and the source select. What the
+    // engine does with each value is in ClrCmp, and an unapplied value is
+    // counted there; this only says the fields are read.
+    case 0x15C0u: mask = 0x03000707u; return true;
+    case 0x15C4u: case 0x15C8u: case 0x15CCu: mask = 0xFFFFFFFFu; return true;
+    default: return false;
+    }
+}
+
 // ---- the pixel watch (see the header) --------------------------------------
 u32 gR128PwLo = 0, gR128PwHi = 0;
 namespace {
@@ -2783,6 +2805,7 @@ void R128Cell::write(u32 off, u32 v, u32 len)
                      (((v >> (8 * (len - 1 - k))) & 0xFFu) << (8 * lane));
         }
     }
+    gRegEverSet[(off >> 2) & 0xFFFu] |= native;
     const u64 at = stamp ? *stamp : 0;
     note(off & ~3u, native, true);
     noteEngine(off & ~3u, native, pcRef ? *pcRef : 0, at, true);

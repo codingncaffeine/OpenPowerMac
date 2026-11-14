@@ -275,6 +275,24 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out);
 // CRTC_GEN_CNTL bit 16 (cursor enable) is set.
 void r128ScanCursor(const R128Cell& c, const R128Scan& s, u8* bgra);
 
+// --- Bits the guest sets that nothing here reads -----------------------------
+//
+// A control bit this model does not decode is invisible until a picture is
+// wrong, and then it looks like a drawing bug: a game's menu buttons drew as
+// black rectangles because one bit of TEX_CNTL_C was not read. So every
+// register write also folds its value into "bits ever written as one", and
+// r128RegDecodedBits says, for the state registers, which bits the model
+// reads or knowingly leaves alone. The difference is the list of features a
+// guest is asking for and not getting; the diagnostics print it.
+//
+// ⚠ THE MASKS ARE A SECOND STATEMENT OF WHAT THE DECODERS DO, kept next to
+// them (r128_3d.cpp for the 3D context, r128.cpp for the 2D engine) and to be
+// changed with them. A register with no mask is reported as not audited.
+u32 r128RegEverSet(u32 off);
+void r128RegEverReset();
+// The bits of register `off` this model decodes. False if it has no entry.
+bool r128RegDecodedBits(u32 off, u32& mask);
+
 // --- Who wrote this pixel ---------------------------------------------------
 //
 // A wrong pixel has three possible authors — the processor storing through

@@ -1793,6 +1793,56 @@ int r128Gate3dState() { return gGate3d; }
 
 void r128Set3dTriDump(int n) { gTriDump = n; }
 
+// Which bits of each 3D state register this file reads — the second statement
+// of gatherPipe and the samplers that r128RegDecodedBits is built from. A bit
+// a guest sets outside its register's mask is a feature it asked for and did
+// not get. ⚠ Change a decoder, change its line here.
+bool r128Reg3dDecodedBits(u32 off, u32& mask)
+{
+    switch (off) {
+    // PM4_VC_FPU_SETUP: front direction, back and front face functions, the
+    // shade function, the flat-shade vertex. Bit 8 selects 3D mode, which is
+    // the only mode this file is reached in.
+    case kFpuSetup: mask = 0x0000417Fu; return true;
+    // Z_STEN_CNTL_C: depth width and test, the stencil test and its three
+    // operations.
+    case kZStenCntlC: mask = 0x07777076u; return true;
+    // Z_PITCH_C: the pitch, and the tile bit (read as linear, counted).
+    case kZPitchC: mask = 0x000103FFu; return true;
+    // TEX_CNTL_C: Z enable and write, stencil, the two texture enables, fog,
+    // dither, alpha blend and test, specular, chroma key, the texel alpha
+    // mask, the two lighting functions. Bit 23 flushes the texel cache,
+    // which this model does not have.
+    case kTexCntlC: mask = 0x009FFFBBu; return true;
+    // MISC_3D_STATE_CNTL: reference alpha, the 3D function, the alpha
+    // combine, table fog, the two blend factors, the alpha test.
+    case kMisc3dStateCntl: mask = 0x07FF73FFu; return true;
+    // PRIM/SEC_TEX_CNTL_C: the two filters, mip disable, the clamp modes,
+    // perspective disable, the datatype, the palette select; the secondary
+    // unit's coordinate select. Bits 25:24 are the palette entries' own
+    // datatype: a pseudo-colour texel is read through the palette at the
+    // width it was loaded with whatever they say (a simplification the
+    // header lists), and no other format looks at a palette.
+    case kPrimTexCntlC: mask = 0x033F5BFEu; return true;
+    case kSecTexCntlC: mask = 0x033F5BFFu; return true;
+    // The combine registers: colour function and its two factors, alpha
+    // function and its two factors.
+    case kPrimTexCombineCntlC:
+    case kSecTexCombineCntlC: mask = 0x0E3FFCFFu; return true;
+    case kTexSizePitchC:
+    case kFogColorC:
+    case kConstantColorC:
+    case kPrimTexBorderColorC:
+    case kSecTexBorderColorC:
+    case kTexClrCmpClrC:
+    case kTexClrCmpMskC:
+    case kStenRefMaskC:
+    case kPlane3dMaskC:
+    case kZOffsetC: mask = 0xFFFFFFFFu; return true;
+    default: return false;
+    }
+}
+
 bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v)
 {
     if (off == kFogTableIndex) {

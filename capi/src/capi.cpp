@@ -1132,6 +1132,51 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                          static_cast<unsigned long long>(n), a.peek(off));
                 s += b;
             }
+            // 🔎 …AND WHAT THE GUEST ASKED FOR THAT NOTHING HERE READS: the
+            // bits it has written as one, outside the bits this model
+            // decodes. See r128RegDecodedBits. An empty list is the claim
+            // "every control bit this guest uses is modelled", for the
+            // registers that have a mask; the others are named so the claim
+            // is not read as wider than it is.
+            {
+                std::string miss, unaudited;
+                // The second texture unit's registers are written with
+                // defaults by a driver that never switches the unit on
+                // (TEX_CNTL_C bit 5); what they hold then asks for nothing.
+                const bool secOn = (r128RegEverSet(0x1C9Cu) & 0x20u) != 0;
+                for (const auto& [off, n] : a.writeCount) {
+                    if (off < 0x0700u || off > 0x1DFFu)
+                        continue;
+                    if (!secOn && off >= 0x1D00u && off <= 0x1D30u)
+                        continue;
+                    const u32 ever = r128RegEverSet(off);
+                    u32 mask = 0;
+                    const char* nm = r128RegName(off);
+                    if (r128RegDecodedBits(off, mask)) {
+                        if (ever & ~mask) {
+                            snprintf(b, sizeof b,
+                                     "--   %04x %-28s set %08x, of which NOT "
+                                     "DECODED: %08x\n",
+                                     off, nm ? nm : "(unnamed)", ever,
+                                     ever & ~mask);
+                            miss += b;
+                        }
+                    } else if (off >= 0x1A00u || off == 0x146Cu ||
+                               off == 0x16C0u || off == 0x16C4u ||
+                               off == 0x16C8u) {
+                        snprintf(b, sizeof b, " %04x=%08x", off, ever);
+                        unaudited += b;
+                    }
+                }
+                s += "-- control bits the guest set that this model does "
+                     "not decode:\n";
+                s += miss.empty() ? "--   none, in the registers that are "
+                                    "audited\n"
+                                  : miss;
+                if (!unaudited.empty())
+                    s += "--   not audited (bits ever set):" + unaudited +
+                         "\n";
+            }
             // Said plainly, because this is the one question the capture
             // exists to answer.
             const auto it = a.writeCount.find(0x1CBCu);
@@ -1666,6 +1711,27 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                      macDate(m->bus->read32(pa)).c_str());
             s += b;
         }
+    }
+    // 🎚 THE DAC'S TABLE. In the direct-colour modes the palette RAM is the
+    // gamma ramp: every channel goes through it on the way out, which is how
+    // Mac OS corrects for the monitor and how a game fades the screen. The
+    // scan-out here applies it only in 8-bit mode, so what the guest has
+    // loaded says what is being left out: an identity ramp, nothing; a
+    // gamma curve, the picture's tone; a ramp scaled toward black, a fade.
+    {
+        const R128Cell& a = m->bus->ati();
+        bool identity = true;
+        for (u32 k = 0; k < 256 && identity; ++k)
+            identity = a.pal(static_cast<u8>(k)) == (k * 0x010101u);
+        const auto wr = a.writeCount.find(0x00B4u);
+        snprintf(b, sizeof b,
+                 "-- dac table: %llu entries written; %s; entries 0/64/128/"
+                 "192/255 = %06x %06x %06x %06x %06x\n",
+                 static_cast<unsigned long long>(
+                     wr == a.writeCount.end() ? 0ull : wr->second),
+                 identity ? "an identity ramp" : "NOT an identity ramp",
+                 a.pal(0), a.pal(64), a.pal(128), a.pal(192), a.pal(255));
+        s += b;
     }
     // 🖱 IS THE GUEST LISTENING TO ITS KEYBOARD AND MOUSE? "The pointer does
     // not move" has three causes that look the same from the window: the

@@ -471,10 +471,18 @@ void AtaCell::snapLoad(SnapReader& r, bool strictMedia)
     const u64 bytes = r.u64v();
     if (strictMedia) {
         if (r.ok && wasPresent != present()) {
-            r.fail(wasPresent ? "snapshot has media attached to an ATA cell "
-                                "that is empty in this run"
-                              : "this run attaches media to an ATA cell that "
-                                "was empty in the snapshot");
+            // A drive with nothing in its tray is still a drive the guest
+            // enumerated; the app's machine always has its CD drive, and
+            // g4run seats an empty one with --cd-empty.
+            r.fail(!wasPresent
+                       ? "this run has a drive on an ATA cell that was "
+                         "empty in the snapshot"
+                       : bytes == 0
+                             ? "the snapshot has a drive with an empty tray "
+                               "on an ATA cell that has no drive in this "
+                               "run (g4run: --cd-empty)"
+                             : "snapshot has media attached to an ATA cell "
+                               "that is empty in this run");
             return;
         }
         if (r.ok && wasPresent && bytes != isoBytes_) {

@@ -136,6 +136,30 @@ TEST_CASE("system reset: the discs stay in the drives")
     remove(kDisc);
 }
 
+TEST_CASE("system reset: a disc that was waiting to go in is the one in the drive")
+{
+    // The host chose a new disc while the guest had the old one mounted, so
+    // it was staged behind it. After a reset nothing has the old disc
+    // mounted, and a guest that starts again should find the new one.
+    const char* kNext = "opm_reset_next.iso";
+    REQUIRE(makeFile(kDisc, 0xC3, 64u * 2048u));
+    REQUIRE(makeFile(kNext, 0x3C, 32u * 2048u));
+    {
+        auto bus = makeBus();
+        REQUIRE(bus->attachCd(kDisc));
+        REQUIRE(bus->cd().hostSwap(kNext)); // staged; the tray opens first
+        REQUIRE(bus->cd().stagedPath() == kNext);
+
+        bus = SawtoothBus::afterSystemReset(std::move(bus));
+
+        CHECK(bus->cd().mediaPresent());
+        CHECK(bus->cd().mediaPath() == kNext);
+        CHECK(bus->cd().stagedPath().empty());
+    }
+    remove(kDisc);
+    remove(kNext);
+}
+
 TEST_CASE("system reset: the front end's wiring is carried across")
 {
     auto bus = makeBus();

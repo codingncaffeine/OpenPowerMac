@@ -226,19 +226,21 @@ SawtoothBus::afterSystemReset(std::unique_ptr<SawtoothBus> old)
 {
     SawtoothBus& o = *old;
     // What is in the drives, by path: the drive comes back as a new drive
-    // with the same disc in it. A CD the guest ejected stays out — a reset
-    // does not push a disc back in — and for the drop box the disc that was
-    // waiting to go in is the one a restarted guest should find.
+    // with the same disc in it. A disc that is out of its tray stays out —
+    // a reset does not push one back in — and a disc that was waiting for
+    // the guest to let the current one go is the one a restarted guest
+    // should find, because nothing has the old one mounted any more.
+    auto discIn = [](const AtaCell& d) {
+        return !d.stagedPath().empty()
+                   ? d.stagedPath()
+                   : (d.mediaPresent() ? d.mediaPath() : std::string());
+    };
     const bool hdDrive = o.hd_.present();
     const std::string hdPath = o.hd_.mediaPath();
     const bool cdDrive = o.cd_.present();
-    const std::string cdPath = o.cd_.mediaPath();
-    const bool cdOut = cdDrive && !o.cd_.mediaPresent();
+    const std::string cdPath = discIn(o.cd_);
     const bool dropDrive = o.drop_.present();
-    const std::string dropPath =
-        !o.drop_.stagedPath().empty()
-            ? o.drop_.stagedPath()
-            : (o.drop_.mediaPresent() ? o.drop_.mediaPath() : std::string());
+    const std::string dropPath = discIn(o.drop_);
     // The front end's wiring, which is not the board's state.
     const u64* const stampWas = o.stamp;
     const u32* const pcWas = o.pcRef;
@@ -271,12 +273,8 @@ SawtoothBus::afterSystemReset(std::unique_ptr<SawtoothBus> old)
     if (hdDrive && !hdPath.empty())
         b->hd_.attachDisk(hdPath.c_str());
     if (cdDrive) {
-        if (!cdPath.empty() && b->cd_.attachIso(cdPath.c_str())) {
-            if (cdOut)
-                b->cd_.hostEject();
-        } else {
+        if (cdPath.empty() || !b->cd_.attachIso(cdPath.c_str()))
             b->cd_.seat();
-        }
     }
     if (dropDrive) {
         if (dropPath.empty() || !b->drop_.attachIso(dropPath.c_str()))

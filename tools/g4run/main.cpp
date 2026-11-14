@@ -547,6 +547,10 @@ int main(int argc, char** argv)
     // the guest's CD driver is then supposed to notice on its own.
     const char* dropPath = nullptr;
     bool dropEmpty = false;
+    // --cd-empty: the CD drive on its channel with nothing in the tray, which
+    // is how the app's machine starts when no image is chosen. A snapshot
+    // saved from such a machine resumes only in a run that has the drive.
+    bool cdEmpty = false;
     bool dropNoLock = false; // --drop-no-lock: the drop drive refuses PREVENT (E4)
     std::vector<KeyBeat> dropBeats; // text = image to insert; empty = eject
     // --bench: run the loop THE APP RUNS. g4run's own loop carries the whole
@@ -825,6 +829,7 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--cmd-beat")) { parseKeyBeat(next(), cmdBeats); continue; }
         if (!strcmp(a, "--drop")) { dropPath = next(); continue; }
         if (!strcmp(a, "--drop-empty")) { dropEmpty = true; continue; }
+        if (!strcmp(a, "--cd-empty")) { cdEmpty = true; continue; }
         if (!strcmp(a, "--drop-no-lock")) { dropNoLock = true; continue; }
         if (!strcmp(a, "--drop-swap-at")) { parseDropBeat(next(), dropBeats); continue; }
         if (!strcmp(a, "--drop-eject-at")) { parseDropBeat(next(), dropBeats, true); continue; }
@@ -1420,6 +1425,9 @@ int main(int argc, char** argv)
         else
             printf("-- cd attach FAILED: %s — %s\n", cdPath,
                    bus.cd().mediaError());
+    } else if (cdEmpty) {
+        bus.cd().seat();
+        printf("-- cd drive seated on ata-3@20000, tray empty\n");
     }
     if (dropPath) {
         if (bus.attachDrop(dropPath))

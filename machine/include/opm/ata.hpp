@@ -86,6 +86,8 @@ public:
     // (E4) never polls a mounted drive, locked or not. awaitingGuestEject()
     // is the state the app shows the user.
     bool hostStage(const char* path);
+    // Forget a disc that was waiting to go in: the host changed its mind.
+    void hostCancelStage() { stagedPath_.clear(); }
     bool awaitingGuestEject() const { return !stagedPath_.empty() && mediaPresent(); }
     bool swapPending() const { return !stagedPath_.empty(); }
     bool unitAttentionPending() const { return unitAttention_; }

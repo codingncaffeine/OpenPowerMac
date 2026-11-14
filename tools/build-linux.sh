@@ -22,6 +22,13 @@ GEN=(); command -v ninja >/dev/null && GEN=(-G Ninja)
 "${NICE[@]}" dotnet build gui -c Release -v q --nologo
 
 # bin/app is the build output; bin/openpowermac is the one thing to run.
+# Not while the app is running from it: the folder is replaced, and a running
+# app that then reaches for a file it had not loaded yet finds a different
+# build, or nothing — with a guest's disk image open for writing.
+if pgrep -f "$PWD/bin/app/OpenPowerMac" >/dev/null 2>&1; then
+  echo "build: built, but bin/ was NOT refreshed: the app is running from it. Close it and run this again." >&2
+  exit 3
+fi
 rm -rf bin/app && mkdir -p bin/app
 cp -a gui/bin/Release/net10.0/. bin/app/
 cat > bin/openpowermac <<'LAUNCH'

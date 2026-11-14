@@ -45,6 +45,10 @@ struct OpmMachine {
     // has nothing for it. It carries a timer handle and the learned cost of
     // asking for a wait, so it belongs to the machine rather than to one call.
     HostWait idle;
+    // Input events the front end handed over (keyboard, mouse): the other
+    // half of the diagnostics' "reports delivered", so a dead pointer can be
+    // told apart from a front end that never sent anything.
+    uint64_t hidInjected[2] = {0, 0};
 
     ~OpmMachine() { delete bus; }
 };
@@ -389,6 +393,7 @@ OPM_API void opm_key_event(OpmMachine* m, uint32_t usage, uint32_t down)
 {
     m->bus->ohci(0).keyEvent(static_cast<uint8_t>(usage), down != 0u);
     m->bus->deviceStateChanged();
+    ++m->hidInjected[0];
 }
 
 OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
@@ -396,6 +401,7 @@ OPM_API void opm_mouse(OpmMachine* m, int32_t dx, int32_t dy,
 {
     m->bus->ohci(1).moveMouse(dx, dy, static_cast<uint8_t>(buttons));
     m->bus->deviceStateChanged();
+    ++m->hidInjected[1];
 }
 
 // The exception vectors by name. A report that prints 900 and lets the reader
@@ -1396,6 +1402,51 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         detail("audio-out", 0x8800, m->bus->sndOut());
         detail("ata-hd", 0x8A00, m->bus->hdDma());
         detail("ata-cd", 0x8B00, m->bus->ataDma());
+    }
+    // 🖱 IS THE GUEST LISTENING TO ITS KEYBOARD AND MOUSE? "The pointer does
+    // not move" has three causes that look the same from the window: the
+    // front end is not delivering motion, the guest never enumerated the
+    // device, or it enumerated it and is not polling. `injected` against
+    // `delivered` separates the first from the rest; setups and interrupt-IN
+    // TDs separate the last two; and the time of the last poll says whether
+    // a guest that once polled has stopped.
+    for (u32 f = 0; f < 2; ++f) {
+        const OhciCell& oc = m->bus->ohci(f);
+        const bool mouse = oc.hid() == OhciCell::Hid::Mouse;
+        snprintf(b, sizeof b,
+                 "-- usb%u (%s): control=%08x intEnable=%08x intStatus=%08x "
+                 "irq=%d rhDescA=%08x port1=%08x port2=%08x\n",
+                 f, mouse ? "mouse" : "keyboard", oc.controlView(),
+                 oc.intEnableView(), oc.intStatusView(), oc.irqLine() ? 1 : 0,
+                 oc.rhDescAView(), oc.portView(0), oc.portView(1));
+        s += b;
+        snprintf(b, sizeof b,
+                 "--   %llu setups, %llu interrupt-IN TDs (ep0=%llu "
+                 "nak-empty=%llu no-buffer=%llu), %llu reports delivered, "
+                 "%llu injected\n",
+                 static_cast<unsigned long long>(oc.setupsSeen),
+                 static_cast<unsigned long long>(oc.inTds),
+                 static_cast<unsigned long long>(oc.inEp0),
+                 static_cast<unsigned long long>(oc.nakEmpty),
+                 static_cast<unsigned long long>(oc.noBuffer),
+                 static_cast<unsigned long long>(oc.reportsSent),
+                 static_cast<unsigned long long>(m->hidInjected[f]));
+        s += b;
+        snprintf(b, sizeof b,
+                 "--   polled from @%llu to @%llu (now @%llu); %llu frames, "
+                 "last @%llu; %s\n",
+                 static_cast<unsigned long long>(oc.firstInTd),
+                 static_cast<unsigned long long>(oc.lastInTd),
+                 static_cast<unsigned long long>(m->executed),
+                 static_cast<unsigned long long>(oc.frames),
+                 static_cast<unsigned long long>(oc.lastFrameAt),
+                 mouse ? (oc.mouseIdle() ? "nothing waiting to be reported"
+                                         : "MOTION OR A BUTTON STILL WAITING "
+                                           "for the guest to poll")
+                       : (oc.keyboardIdle() ? "nothing waiting to be reported"
+                                            : "KEYS STILL WAITING for the "
+                                              "guest to poll"));
+        s += b;
     }
     s += m->bus->hd().describe("hd");
     s += m->bus->cd().describe("cd");

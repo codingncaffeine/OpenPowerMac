@@ -5749,8 +5749,10 @@ int main(int argc, char** argv)
         const u64 ftot = cpu.fetchHits + cpu.fetchFillsL1 + cpu.fetchFillsL2 +
                          cpu.fetchFillsMem + cpu.fetchUncached;
         if (ftot)
-            printf("--   fetch buffer: %.1f%% hit (%llu of %llu); fills "
-                   "L1=%llu L2=%llu mem=%llu, uncacheable=%llu\n",
+            printf("--   fetch path (the instructions the line executor "
+                   "handed to step()): %.1f%% found their block resident "
+                   "(%llu of %llu); fills L1=%llu L2=%llu mem=%llu, "
+                   "uncacheable=%llu\n",
                    100.0 * static_cast<double>(cpu.fetchHits) /
                        static_cast<double>(ftot),
                    static_cast<unsigned long long>(cpu.fetchHits),
@@ -5789,6 +5791,13 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(cpu.dmPageHits),
                    static_cast<unsigned long long>(cpu.dmPageMisses),
                    static_cast<unsigned long long>(cpu.dmEpochs));
+        // …and the instruction side's (Cpu::ImPage): a branch to another
+        // page answered from an entry, against one that had to be walked.
+        if (cpu.imHits + cpu.imMisses)
+            printf("--   fetch page memo: %llu page changes answered from an "
+                   "entry, %llu walked\n",
+                   static_cast<unsigned long long>(cpu.imHits),
+                   static_cast<unsigned long long>(cpu.imMisses));
         u32 hotPc[24];
         u64 hotN[24];
         const size_t np = prof::topPcs(hotPc, hotN, 24);

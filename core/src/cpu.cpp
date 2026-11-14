@@ -21,21 +21,16 @@ std::vector<Handler>& slots()
     return v;
 }
 
-// Everything step() has to check about an ISA row BEFORE it can dispatch,
-// precomputed once per row.
+// The gate bits (Cpu::kPreIll and friends), precomputed once per row.
 //
 // These are properties of the row and never change, but they used to be
 // recomputed for every emulated instruction: isFpInsn and isVecInsn are each a
 // switch over the operand pattern, so two switches ran on the hot path forever
 // to answer a question the table already knew. The profiler charged 15.1% of
 // the machine to "decode" — twice what the instruction handlers themselves
-// cost. Zero, the overwhelmingly common value, means "dispatch, no checks".
-enum : u8 {
-    kPreIll = 1u,  // architected but not implemented on the 7400
-    kPrePriv = 2u, // supervisor-only
-    kPreFp = 4u,   // needs MSR[FP]
-    kPreVec = 8u,  // needs MSR[VEC]
-};
+// cost.
+constexpr u8 kPreIll = Cpu::kPreIll, kPrePriv = Cpu::kPrePriv,
+             kPreFp = Cpu::kPreFp, kPreVec = Cpu::kPreVec;
 
 std::vector<u8>& preGates()
 {
@@ -321,8 +316,7 @@ u64 Cpu::run(u64 n)
 //   no async is pending       hoisted: nothing inside a batch can raise one
 //                             (see the contract on pendCycles), and the one
 //                             thing that could — enabling MSR[EE] with a line
-//                             already asserted — is an mtmsr, which ends the
-//                             batch when it does that (h_mtmsr).
+//                             already asserted — is an mtmsr, which ends it.
 //   no nap, no IABR, no
 //   trace, no perfmon         hoisted: all four are checked once per line and
 //                             hand the whole line back to step() if live.
@@ -338,26 +332,78 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
     // that is up to a batch stale.
     u64& i = stamp;
     const u64 until = first + n;
+    // What one instruction is charged. Nothing inside a batch can change
+    // either term: the harness sets them between batches.
+    const u32 cyc = insnCycles + extraCycles;
+    // ⭐ THE LINE-ENTRY CONTEXT. A line is entered every 4.5 instructions in
+    // a game, and each entry used to re-ask everything: the eight conditions
+    // that send an instruction to step() instead, then the fetch
+    // translation's four validity compares. Every one of those answers is a
+    // function of MSR and of state only a handful of instructions can write,
+    // so once established they stand until one of these happens:
+    //
+    //   MSR changes                compared on every entry (an exception, an
+    //                              rfi, an mtmsr all show up here);
+    //   an instruction took the    it is the only way a privileged
+    //   execRow path, or step()    instruction runs, and step() may have
+    //                              moved the fetch translation: both drop
+    //                              the context;
+    //   anything else the          a segment register, a BAT, SDR1, tlbie,
+    //   questions depend on        HID0, MMCR0, IABR, the decrementer, a nap:
+    //                              every writer ends the BATCH (batchBreak),
+    //                              and the context does not outlive one.
+    //
+    // The interrupt lines cannot rise inside a batch at all (the contract on
+    // pendCycles), so "nothing deliverable is pending" stands with the MSR.
+    bool lxValid = false;
+    u32 lxMsr = 0, lxPage = 0, lxPa = 0;
     while (i < until) {
-        // The conditions the inner loop hoists. Rare enough that paying for
-        // the check once per line is free, and live rarely enough that the
-        // fallback costs nothing measurable: iabr and the trace bits are debug
-        // features, mmcr0 is zero for this machine's whole life, and a napping
-        // core belongs to the nap skip.
-        const bool slow =
-            lineExecOff || napping || st.mmcr0 || (st.iabr & 2u) ||
-            (st.msr & (msr::SE | msr::BE)) ||
-            ((st.msr & msr::EE) &&
-             (smiPending || extIrqLine || decPending || pmPending));
         u32 word = 0;
-        FetchLine* fl;
+        FetchLine* fl = nullptr;
         {
             // The probe is the fetch path — bill it there. Left unmarked it
             // inherited whatever phase the previous instruction ended in, and
             // the one piece of real work the line executor still does per line
             // showed up as loop overhead.
             OPM_MARK(Fetch);
-            fl = slow ? nullptr : fetchBlockFast(st.pc, word);
+            const u32 pc = st.pc;
+            if (lxValid && st.msr == lxMsr) {
+                // Another page under the same mapping: the page memo, or the
+                // full path below if it does not hold this one.
+                if ((pc >> 12) != lxPage) {
+                    if (fetchPageProbe(pc, lxPa))
+                        lxPage = pc >> 12;
+                    else
+                        lxValid = false;
+                }
+                if (lxValid) {
+                    const u32 pa = lxPa | (pc & 0xFFFu);
+                    FetchLine& cand = fetchLine[fetchSlot(pa)];
+                    if (cand.base == (pa & ~31u)) {
+                        fl = &cand;
+                        word = (pa >> 2) & 7u;
+                    }
+                }
+            } else {
+                lxValid = false;
+                // The conditions the inner loop hoists. iabr and the trace
+                // bits are debug features, mmcr0 is zero for this machine's
+                // whole life, and a napping core belongs to the nap skip.
+                const bool slow =
+                    lineExecOff || napping || st.mmcr0 || (st.iabr & 2u) ||
+                    (st.msr & (msr::SE | msr::BE)) ||
+                    ((st.msr & msr::EE) &&
+                     (smiPending || extIrqLine || decPending || pmPending));
+                fl = slow ? nullptr : fetchBlockFast(pc, word);
+                // Little-endian fetches munge the address; the context's
+                // shortcut does not, so it is not offered there.
+                if (fl && !(st.msr & msr::LE)) {
+                    lxValid = true;
+                    lxMsr = st.msr;
+                    lxPage = xlPage;
+                    lxPa = xlPa;
+                }
+            }
         }
         if (!fl) {
             // No block, or something the line loop may not assume away. One
@@ -365,6 +411,7 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
             // the next trip round finds it.
             step();
             ++i;
+            lxValid = false;
             if (batchBreak || halted)
                 break;
             continue;
@@ -382,6 +429,7 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
                            until);
             OPM_PH(Loop);
             if (ran) {
+                lxValid = false; // blocks chain, and run privileged fallbacks
                 if (batchBreak || halted)
                     break;
                 continue;
@@ -389,19 +437,63 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
         }
         OPM_COUNT(lineEntries);
         const u32 base = fl->base;
+        const u32 slot = static_cast<u32>(fl - fetchLine);
+        const Handler* const fnp = &fetchFn[size_t(slot) * 8u];
+        // Words of this line that may NOT take the fast path right now: the
+        // FP words if MSR[FP] is clear, the vector words if MSR[VEC] is. Once
+        // per line, because nothing on the fast path can change MSR and stay
+        // in the line (an exception leaves it by pc).
+        const u32 gate = fetchGate[slot];
+        const u32 blocked = ((st.msr & msr::FP) ? 0u : (gate & 0xFFu)) |
+                            ((st.msr & msr::VEC) ? 0u : (gate >> 8));
+        // How many instructions this entry may run: to the end of the block
+        // or of the batch, whichever is nearer. One counter instead of two
+        // compares per instruction.
+        u32 left = 8u - word;
+        if (until - i < left)
+            left = static_cast<u32>(until - i);
         for (;;) {
             const u32 cia = st.pc;
             const u32 insn = fl->w[word];
-            const u32 row = fl->row[word];
+            const Handler fn = fnp[word];
             OPM_COUNT(lineInsns);
-            if (!execFast(insn, row))
-                execRow(insn, row);
-            ++i;
-            if (batchBreak || halted)
-                goto done;
-            if (i >= until || st.pc != cia + 4u || ++word == 8u ||
-                fl->base != base)
+            if (!fn || ((blocked >> word) & 1u)) {
+                // Everything with a decision in it: illegal, privileged, a
+                // facility switched off, unimplemented. ⚠ AND THE LINE ENDS
+                // WITH IT. This is the only way an mtmsr runs, and an mtmsr
+                // can enable interrupts with one already waiting or switch
+                // translation under the block being executed; going back to
+                // the top re-asks both, so the interrupt is taken before the
+                // next instruction — as step() takes it — and not at the end
+                // of the block.
+                execRow(insn, fl->row[word]);
+                ++i;
+                lxValid = false;
+                if (batchBreak || halted)
+                    goto done;
                 break;
+            }
+            // The fall-through of execRow, inline: an ordinary instruction
+            // with a bound handler and no gate. ⚠ IT DUPLICATES NO RULE —
+            // every decision stays in execRow, above.
+            raisedThisStep = false;
+            curInsn = insn;
+            st.pc = cia + 4u;
+            // ⚠ THE MARKERS ARE NOT OPTIONAL ON THIS PATH. They compile away
+            // entirely in the shipping build, and without them the profiling
+            // build bills the handler — nine tenths of the instructions this
+            // machine executes — to whatever phase the run loop last set.
+            OPM_PH(Exec);
+            fn(*this, insn, kIsa[fl->row[word]]);
+            OPM_PH(Tick);
+            pendCycles += cyc; // charge(): batching is on, so no sync here
+            OPM_PH(Loop);
+            ++i;
+            if (batchBreak) // halt() sets it too
+                goto done;
+            if (--left == 0u || st.pc != cia + 4u || fl->base != base)
+                break;
+            ++word;
         }
     }
 done:

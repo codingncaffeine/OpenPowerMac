@@ -600,6 +600,8 @@ void Cpu::dmDropAll()
         dmLine[k] = DmLine{};
     for (u32 k = 0; k < kDmPages; ++k)
         dmPage[k] = DmPage{};
+    for (u32 k = 0; k < kImPages; ++k)
+        imPage[k] = ImPage{};
     dmEpoch = kDmEpochStep;
 }
 
@@ -618,10 +620,14 @@ void Cpu::dmEnter()
     if (dmSigHid0 != st.hid0 || dmSigDabr != st.dabr ||
         std::memcmp(dmSigSr, st.sr, sizeof dmSigSr) != 0 ||
         std::memcmp(dmSigBat, st.dbatu, sizeof st.dbatu) != 0 ||
-        std::memcmp(dmSigBat + 4, st.dbatl, sizeof st.dbatl) != 0) {
+        std::memcmp(dmSigBat + 4, st.dbatl, sizeof st.dbatl) != 0 ||
+        std::memcmp(dmSigIbat, st.ibatu, sizeof st.ibatu) != 0 ||
+        std::memcmp(dmSigIbat + 4, st.ibatl, sizeof st.ibatl) != 0) {
         std::memcpy(dmSigSr, st.sr, sizeof dmSigSr);
         std::memcpy(dmSigBat, st.dbatu, sizeof st.dbatu);
         std::memcpy(dmSigBat + 4, st.dbatl, sizeof st.dbatl);
+        std::memcpy(dmSigIbat, st.ibatu, sizeof st.ibatu);
+        std::memcpy(dmSigIbat + 4, st.ibatl, sizeof st.ibatl);
         dmSigHid0 = st.hid0;
         dmSigDabr = st.dabr;
         OPM_COUNT(dmEpochs);

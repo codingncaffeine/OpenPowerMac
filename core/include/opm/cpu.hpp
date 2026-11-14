@@ -376,6 +376,13 @@ struct Cpu {
     // no snapshot layout depends on it.
     const Handler* dispFn = nullptr; // handler per ISA row
     const u8* dispPre = nullptr;     // pre-dispatch gate bits per ISA row
+    // The gate bits: everything step() has to check about an ISA row BEFORE
+    // it can dispatch. Zero, the overwhelmingly common value, means
+    // "dispatch, no checks".
+    static constexpr u8 kPreIll = 1u;  // architected, not implemented on the 7400
+    static constexpr u8 kPrePriv = 2u; // supervisor-only
+    static constexpr u8 kPreFp = 4u;   // needs MSR[FP]
+    static constexpr u8 kPreVec = 8u;  // needs MSR[VEC]
 
     Cpu();
     // ⏱ ONE WIRING SITE. The bus is handed the processor's clock here rather
@@ -414,6 +421,7 @@ struct Cpu {
     {
         halted = true;
         haltReason = std::move(reason);
+        batchBreak = true; // the line executor tests one flag, not two
     }
 
     // Execute up to n instructions; returns the number actually executed.
@@ -428,40 +436,13 @@ struct Cpu {
     // bug this project has already paid for twice, and the second copy is
     // always the one nobody measures.
     void execRow(u32 insn, u32 row);
-    // The FALL-THROUGH of execRow, inline, for the line executor's inner loop:
-    // an ordinary instruction with no gate, a bound handler, and none of the
-    // hoisted conditions live. Returns false without touching anything if the
-    // instruction is not that, and the caller hands it to execRow.
-    //
-    // ⚠ IT DUPLICATES NO RULE. Every decision — illegal, privileged, FP and
-    // vector availability, the unimplemented halt, the performance monitor,
-    // the trace — stays in execRow and this defers to it. What is inline here
-    // is the part with no decisions in it, because MSVC will not inline a
-    // function the size of execRow and the line loop was paying a call with
-    // two arguments on every emulated instruction.
-    bool execFast(u32 insn, u32 row)
-    {
-        if (row == kNoRow)
-            return false;
-        const Handler fn = dispFn[row];
-        if (dispPre[row] || !fn)
-            return false;
-        raisedThisStep = false;
-        curInsn = insn;
-        st.pc += 4;
-        // ⚠ THE MARKERS ARE NOT OPTIONAL ON THIS PATH. They compile away
-        // entirely in the shipping build, and without them the profiling build
-        // bills the handler — nine tenths of the instructions this machine
-        // executes — to whatever phase the run loop last set. Measured: with
-        // them missing, `execute` read 4.3% and `run loop` read 64.8% on a
-        // machine that had not changed. Fourth marker to lie in this project.
-        OPM_PH(Exec);
-        fn(*this, insn, kIsa[row]);
-        OPM_PH(Tick);
-        charge(insnCycles + extraCycles);
-        OPM_PH(Loop);
-        return true;
-    }
+    // The FALL-THROUGH of execRow — an ordinary instruction with a bound
+    // handler and no gate — is inline in runSteps' inner loop, because MSVC
+    // will not inline a function the size of execRow and the line loop was
+    // paying a call with two arguments on every emulated instruction. It
+    // duplicates no rule: every decision (illegal, privileged, FP and vector
+    // availability, the unimplemented halt, the performance monitor, the
+    // trace) stays here, and the loop defers to it.
 
     // Vector to an exception per the UM ch.4 model: SRR0/SRR1 composition,
     // MSR transition (clears VEC/POW/EE/PR/FP/FE0/SE/BE/FE1/PM/IR/DR/RI,
@@ -521,11 +502,12 @@ struct Cpu {
         u32 vsid = 0, pi = 0, rpn = 0, wimg = 0, pp = 0;
     };
     TlbEntry itlb[64][2], dtlb[64][2];
-    // dtlbLru[64] is not a set: it is where the data memo (see DmLine below)
-    // writes when a translation came from no TLB entry at all, so that its
-    // replay of "the other way is now least recently used" needs no branch.
-    // The 64 real sets are the only ones the snapshot carries.
-    u8 itlbLru[64] = {}, dtlbLru[65] = {};
+    // Element [64] of each is not a set: it is where the translation memos
+    // (see DmLine below) write when a translation came from no TLB entry at
+    // all, so that their replay of "the other way is now least recently used"
+    // needs no branch. The 64 real sets are the only ones the snapshot
+    // carries.
+    u8 itlbLru[65] = {}, dtlbLru[65] = {};
     bool mmuProbe = false; // instrumentation: bypass TLB and R/C writeback
     // Harness convention (ppcrun flat rig only — never the machine): treat
     // real-mode accesses at/above this base as cache-inhibited so MMIO
@@ -764,6 +746,22 @@ struct Cpu {
         u32 w[8] = {};
     };
     FetchLine fetchLine[kFetchLines];
+    // ⭐ THE HANDLER OF EACH WORD, BOUND WHEN THE BLOCK IS FILLED. The line
+    // executor used to get from a word to its handler in three loads and
+    // three tests per instruction — the row, the gate byte for the row, the
+    // handler for the row. Those are functions of the word, so they belong
+    // with the word: fetchFn[slot * 8 + k] is the handler, or null for a word
+    // that needs execRow's decisions (illegal, privileged, unimplemented).
+    // A word that only needs MSR[FP] or MSR[VEC] keeps its handler, and
+    // fetchGate[slot] says which words those are — bit k for FP, bit 8 + k
+    // for VEC — so the executor tests the MSR once per line.
+    //
+    // Beside the lines rather than inside them: the JIT addresses FetchLine
+    // by layout, and 264 KB of pointers do not belong in a Cpu that tests
+    // put on the stack. Filled and dropped with the line, never on their own.
+    std::unique_ptr<Handler[]> fetchFn =
+        std::make_unique<Handler[]>(size_t(kFetchLines) * 8u);
+    std::unique_ptr<u16[]> fetchGate = std::make_unique<u16[]>(kFetchLines);
 
     // ---- instruction translation cache -----------------------------------
     //
@@ -871,14 +869,67 @@ struct Cpu {
     void dmDropAll();
     void dmEnter(); // runSteps: decide whether the memo may be used
     void dmNoteLine(u32 ea, u32 len, u32 pa, u32 wimg, bool write);
+
+    // ---- …and the instruction side's ------------------------------------
+    //
+    // The same idea for the page an instruction is fetched from. The fetch
+    // path keeps ONE page's translation (xlPage below), so every branch that
+    // leaves the page re-translated: a BAT sweep, a TLB probe, and a trip
+    // through step() to do it — 27.7 M of them in a 1.2 G-instruction game
+    // window. ImPage remembers 256 pages, and a hit replays the one thing the
+    // instruction-side translate() does to the machine, the ITLB set's LRU
+    // write. Its inputs are covered exactly as the data memo's are: MSR's
+    // IR/PR/LE in the key, the segment registers and instruction BATs by the
+    // shared epoch, the ITLB entry by `itlbStamp`. Same switch, same rule
+    // about being live only inside runSteps.
+    static constexpr u32 kImPages = 256;
+    static constexpr u32 kImMsr = msr::IR | msr::PR | msr::LE;
+    struct ImPage {
+        u32 page = ~0u; // ea >> 12, or ~0
+        u32 key = kDmNever;
+        u32 paPage = 0;
+        u32 stamp = 0;
+        u8 slot = 128, lruIdx = 64, lruVal = 0, rsv = 0;
+    };
+    std::unique_ptr<ImPage[]> imPage = std::make_unique<ImPage[]>(kImPages);
+    u32 itlbStamp[129] = {};
+    u8 imSlot = 128; // as dmSlot, for the last successful FETCH translate()
+    u32 dmSigIbat[8] = {};
+    u64 imHits = 0, imMisses = 0; // census, profiling build only
+    // The page of `ea`, if the memo holds it: on a hit the one-page fetch
+    // translation (xlPage and friends) is moved to that page exactly as
+    // fetchDecoded would have moved it, and the page's physical base comes
+    // back. Never walks and never raises; a miss leaves everything alone.
+    bool fetchPageProbe(u32 ea, u32& paPage)
+    {
+        if (dmLive == kDmOff)
+            return false;
+        const u32 page = ea >> 12;
+        const ImPage& m = imPage[page & (kImPages - 1u)];
+        if (m.page != page || m.key != (dmLive | (st.msr & kImMsr)) ||
+            itlbStamp[m.slot] != m.stamp)
+            return false;
+        OPM_COUNT(imHits);
+        itlbLru[m.lruIdx] = m.lruVal;
+        xlGen = mmuGen;
+        xlPage = page;
+        xlMsr = st.msr & kImMsr;
+        xlSr = st.sr[ea >> 28];
+        xlPa = m.paPage;
+        paPage = m.paPage;
+        return true;
+    }
+    bool fetchXlate(u32 ea, u32& pa); // the fetch path's translation front
     // DIAGNOSTIC (--no-icache): bypass the fetch block cache, the cached
     // decode and this translation cache all at once, restoring the fetch path
     // byte for byte as it was before they existed. See Cpu::fetchDecoded.
     bool fetchCacheOff = false;
-    // DIAGNOSTIC (--no-dxlate): switch the data memo above off, so every
-    // data access is translated and looked up in the L1 in full. Same rule as
-    // --no-icache: a cache is a claim, and the claim's control run needs a
-    // switch. The two runs must write the same fingerprints.
+    // DIAGNOSTIC (--no-dxlate): switch the translation memos off — the data
+    // memo above and the instruction page memo — so every data access is
+    // translated and looked up in the L1 in full and every change of
+    // instruction page is walked. Same rule as --no-icache: a cache is a
+    // claim, and the claim's control run needs a switch. The two runs must
+    // write the same fingerprints.
     bool dxlCacheOff = false;
     // Census, counted only in the profiling build. A cache is a bet on
     // locality and a bet has to be settled with a number.

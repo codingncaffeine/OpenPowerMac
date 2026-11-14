@@ -1109,8 +1109,11 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         ++c.mmuGen;
         c.batchBreak = true; // the mapping moved: see Cpu::runSteps
     }
-    if (spr == 1013)
-        c.batchBreak = true; // DABR: the data memo is made without one armed
+    // DABR: the data memo is made without one armed. MMCR0 and IABR: the
+    // line executor decides once per mapping whether either is live, and
+    // every writer of what it decided on ends the batch (Cpu::runSteps).
+    if (spr == 1013 || spr == 952 || spr == 936 || spr == 1010)
+        c.batchBreak = true;
     *sprPtr(c, spr) = v;
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)

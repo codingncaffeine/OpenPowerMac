@@ -95,8 +95,8 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
             *wimg = (realModeInhibitBase && ea >= realModeInhibitBase)
                         ? (kWimgReal | kWimgI)
                         : kWimgReal;
-        if (!fetch)
-            dmSlot = 128; // no TLB entry behind this answer: see Cpu::DmLine
+        // No TLB entry behind this answer: see Cpu::DmLine.
+        (fetch ? imSlot : dmSlot) = 128;
         return true;
     }
     const bool user = userMode();
@@ -127,8 +127,7 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
         pa = b.pa;
         if (wimg)
             *wimg = b.wimg;
-        if (!fetch)
-            dmSlot = 128;
+        (fetch ? imSlot : dmSlot) = 128;
         return true;
     }
 
@@ -185,8 +184,7 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
             if (wimg)
                 *wimg = e.wimg;
             tlbLru[set] = static_cast<u8>(way ^ 1u); // other way is LRU
-            if (!fetch)
-                dmSlot = static_cast<u8>(set * 2u + way);
+            (fetch ? imSlot : dmSlot) = static_cast<u8>(set * 2u + way);
             return true;
         }
     }
@@ -252,12 +250,10 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                                     pageIndex, w1 & 0xFFFFF000u,
                                     (w1 >> 3) & 0xFu, pp};
                 tlbLru[set] = static_cast<u8>(way ^ 1u);
-                if (!fetch) {
-                    // The entry that was here is gone, and whatever the memo
-                    // remembered through it goes with it.
-                    ++dtlbStamp[set * 2u + way];
-                    dmSlot = static_cast<u8>(set * 2u + way);
-                }
+                // The entry that was here is gone, and whatever a memo
+                // remembered through it goes with it.
+                ++(fetch ? itlbStamp : dtlbStamp)[set * 2u + way];
+                (fetch ? imSlot : dmSlot) = static_cast<u8>(set * 2u + way);
             }
             return true;
         }
@@ -281,6 +277,7 @@ void Cpu::tlbInvalidateClass(u32 ea)
     for (u32 way = 0; way < 2; ++way) {
         itlb[set][way].v = false;
         dtlb[set][way].v = false;
+        ++itlbStamp[set * 2u + way];
         ++dtlbStamp[set * 2u + way];
     }
 }
@@ -293,6 +290,7 @@ void Cpu::tlbFlushAll()
         for (u32 w = 0; w < 2; ++w) {
             itlb[s][w] = TlbEntry{};
             dtlb[s][w] = TlbEntry{};
+            ++itlbStamp[s * 2u + w];
             ++dtlbStamp[s * 2u + w];
         }
         itlbLru[s] = dtlbLru[s] = 0;
@@ -464,6 +462,55 @@ bool Cpu::writeVSlow(u32 ea, u32 len, u64 v)
     return true;
 }
 
+// The fetch path's translation: the one-page cache when its inputs are
+// unchanged, then the page memo (Cpu::ImPage), then the walk. MSR and the
+// segment register are compared directly; the BATs, SDR1 and the page table
+// are covered by mmuGen. See Cpu::xlPage.
+//
+// ⚠ The marker covers the CACHE CHECKS as well as the walk. Cpu::translate
+// marks itself, but on a hit it is never called, so the comparison work was
+// being billed to the fetch bucket and made "fetch" look like 42.7% of the
+// machine. Same failure as a clock advance inheriting its caller's phase: a
+// profiler that bills work to whoever it happened to run inside sends the
+// next reader to the wrong file.
+bool Cpu::fetchXlate(u32 ea, u32& pa)
+{
+    OPM_MARK(Xlate);
+    const u32 page = ea >> 12;
+    const u32 msrKey = st.msr & (msr::IR | msr::PR | msr::LE);
+    const u32 srKey = st.sr[ea >> 28];
+    if (xlGen == mmuGen && xlPage == page && xlMsr == msrKey &&
+        xlSr == srKey) {
+        pa = xlPa | (ea & 0xFFFu);
+        return true;
+    }
+    u32 paPage;
+    if (fetchPageProbe(ea, paPage)) { // moves the one-page cache itself
+        pa = paPage | (ea & 0xFFFu);
+        return true;
+    }
+    if (!translate(ea, false, true, pa))
+        return false;
+    xlGen = mmuGen;
+    xlPage = page;
+    xlMsr = msrKey;
+    xlSr = srKey;
+    xlPa = pa & ~0xFFFu;
+    if (dmLive != kDmOff) {
+        OPM_COUNT(imMisses);
+        const u8 slot = imSlot;
+        ImPage& m = imPage[page & (kImPages - 1u)];
+        m.page = page;
+        m.key = dmLive | msrKey;
+        m.paPage = pa & ~0xFFFu;
+        m.stamp = itlbStamp[slot];
+        m.slot = slot;
+        m.lruIdx = static_cast<u8>(slot < 128u ? slot >> 1 : 64u);
+        m.lruVal = static_cast<u8>((slot & 1u) ^ 1u);
+    }
+    return true;
+}
+
 bool Cpu::fetch32(u32 ea, u32& insn)
 {
     u32 row;
@@ -491,33 +538,8 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         row = d ? static_cast<u32>(d - kIsa) : kNoRow;
         return true;
     }
-    // Translation, from the one-page cache when its inputs are unchanged.
-    // MSR and the segment register are compared directly; the BATs, SDR1 and
-    // the page table are covered by mmuGen. See Cpu::xlPage.
-    // ⚠ The marker covers the CACHE CHECK as well as the walk. Cpu::translate
-    // marks itself, but on a hit it is never called, so the comparison work
-    // was being billed to the fetch bucket and made "fetch" look like 42.7% of
-    // the machine. Same failure as a clock advance inheriting its caller's
-    // phase: a profiler that bills work to whoever it happened to run inside
-    // sends the next reader to the wrong file.
-    {
-        OPM_MARK(Xlate);
-        const u32 page = ea >> 12;
-        const u32 msrKey = st.msr & (msr::IR | msr::PR | msr::LE);
-        const u32 srKey = st.sr[ea >> 28];
-        if (xlGen == mmuGen && xlPage == page && xlMsr == msrKey &&
-            xlSr == srKey) {
-            pa = xlPa | (ea & 0xFFFu);
-        } else {
-            if (!translate(ea, false, true, pa))
-                return false;
-            xlGen = mmuGen;
-            xlPage = page;
-            xlMsr = msrKey;
-            xlSr = srKey;
-            xlPa = pa & ~0xFFFu;
-        }
-    }
+    if (!fetchXlate(ea, pa))
+        return false;
     // The block buffer, if it still holds this block. See Cpu::fetchBase for
     // the invalidation contract — every writer of memory or of a cache drops
     // it, so a hit here is the same word the long path below would produce.
@@ -553,13 +575,34 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         // that were not asked for are paid off many times over — and decode
         // has no side effects, so decoding a word that is never executed
         // costs nothing but this.
+        // …and bind each word's handler, for the line executor: see
+        // Cpu::fetchFn. A word keeps its handler if the only thing standing
+        // between it and dispatch is MSR[FP] or MSR[VEC], and the gate word
+        // says which those are.
+        const u32 slot = fetchSlot(pa);
+        Handler* const fnp = &fetchFn[size_t(slot) * 8u];
+        u32 gates = 0;
         for (u32 k = 0; k < 8; ++k) {
             const u32 v = (u32(raw[k * 4]) << 24) | (u32(raw[k * 4 + 1]) << 16) |
                           (u32(raw[k * 4 + 2]) << 8) | u32(raw[k * 4 + 3]);
             fl.w[k] = v;
             const InsnDesc* d = decode(v);
             fl.row[k] = d ? static_cast<u16>(d - kIsa) : kNoRow;
+            Handler h = nullptr;
+            if (d) {
+                const size_t r = static_cast<size_t>(d - kIsa);
+                const u8 pre = dispPre[r];
+                if (!(pre & (kPreIll | kPrePriv))) {
+                    h = dispFn[r];
+                    if (h && (pre & kPreFp))
+                        gates |= 1u << k;
+                    if (h && (pre & kPreVec))
+                        gates |= 0x100u << k;
+                }
+            }
+            fnp[k] = h;
         }
+        fetchGate[slot] = static_cast<u16>(gates);
         // The refill is the JIT's invalidation edge: the drop alone cannot
         // be, because a dropped line refills under the SAME base and the
         // compiled block would match it again with stale words. Identical

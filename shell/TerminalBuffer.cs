@@ -40,7 +40,13 @@ public sealed class TerminalBuffer
         {
             case '\x1B': _st = St.Esc; return;
             case '\r': _col = 0; return;
+            // A new line starts at the left margin. The firmware sends CRLF,
+            // where the CR already did that; the shell's own messages end in
+            // a bare LF, and treating it as "down a row, same column" started
+            // every one of them where the line above ended, off to the right
+            // of the pane.
             case '\n':
+                _col = 0;
                 _row++;
                 while (_row >= _lines.Count) _lines.Add(new StringBuilder());
                 Trim();

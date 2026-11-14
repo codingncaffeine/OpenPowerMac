@@ -33,9 +33,10 @@
 #
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
+. tools/paths.sh
 
 SRC="${OPM_INSTALLED:-/d/OpenPowerMac Drives/macos9_2gb.img}"
-COPY="${OPM_HANG_COPY:-../scratch/openpowermac/macos9_hang.img}"
+COPY="${OPM_HANG_COPY:-$OPM_SCRATCH/macos9_hang.img}"
 
 [ -f "$SRC" ] || { echo "FAIL: no installed disk at $SRC"; exit 1; }
 
@@ -47,11 +48,11 @@ cp "$SRC" "$COPY" || { echo "FAIL: copy"; exit 1; }
 # changes, this one has to change with it or the two timelines diverge.
 DEFAULT_SERIAL='" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 probe-pci-device;unselect-dev;dev /pci@f0000000/pci1002,5046@10;" ATY,Rage128Pd" device-name;" display" device-type;" ATY,Rage128Pd" encode-string " compatible" property;" /pci@f2000000" select-dev;3000000 to pci-probe-request;unselect-dev;probe-pci;dev /pci@f2000000/pci106b,19@18;" usb" device-name;" usb" device-type;dev /pci@f2000000/pci106b,19@19;" usb" device-name;" usb" device-type;mac-boot'
 
-exec "${OPM_BIN:-./build/tools/g4run/Release/g4run.exe}" \
- --rom "../scratch/openpowermac/roms/newworld/sawtooth_4.2.8f1_stock.rom" \
+exec "${OPM_BIN:-$OPM_G4RUN}" \
+ --rom "$OPM_SCRATCH/roms/newworld/sawtooth_4.2.8f1_stock.rom" \
  --exc 0 --fast-tb "${OPM_FAST_TB:-4}" \
  --hd "$COPY" \
- --ati-rom "../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom" \
+ --ati-rom "$OPM_SCRATCH/ati/ati_oem_rage128pro_136_agp_full.rom" \
  --ati-at "${OPM_ATI_AT:-1}" \
  --serial-input "${OPM_SERIAL-$DEFAULT_SERIAL}" \
  --max "${OPM_MAX:-12000000000}" --heartbeat "${OPM_HEARTBEAT:-250000000}" \

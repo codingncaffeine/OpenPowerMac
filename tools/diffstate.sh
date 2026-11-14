@@ -17,7 +17,7 @@
 # window with a smaller mark.
 #
 #   tools/diffstate.sh --max 200000000 --every 20000000
-#   tools/diffstate.sh --from ../scratch/openpowermac/desk28_ft4.snap \
+#   tools/diffstate.sh --from $OPM_SCRATCH/desk28_ft4.snap \
 #                      --max 15200000000 --every 25000000
 #
 # Anything after the recognised options is passed to BOTH runs. Run B always
@@ -25,6 +25,7 @@
 # "the machine as it ships" against "the machine as it was before any of this".
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
+. tools/paths.sh
 
 FROM=""
 MAX=200000000
@@ -46,7 +47,7 @@ RESUME=()
 # ⚠ The two runs must not share the writable disk image: a boot writes to it,
 # and the second run would start from a volume the first one had already
 # changed. Each gets its own copy.
-HD_SRC="${OPM_HD:-../scratch/openpowermac/hd.img}"
+HD_SRC="${OPM_HD:-$OPM_SCRATCH/hd.img}"
 cp "$HD_SRC" "$OUT/a.img" && cp "$HD_SRC" "$OUT/b.img" || exit 1
 
 echo "== A: as it ships"

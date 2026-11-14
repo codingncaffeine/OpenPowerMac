@@ -20,6 +20,7 @@
 # every other respect, so it read as a finding rather than as a harness fault.
 # The app has always used 1 (shell.json's AtiAt); so does this now.
 cd "$(dirname "$0")/.." || exit 1
+. tools/paths.sh
 
 DEFAULT_SERIAL='" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 probe-pci-device;unselect-dev;dev /pci@f0000000/pci1002,5046@10;" ATY,Rage128Pd" device-name;" display" device-type;" ATY,Rage128Pd" encode-string " compatible" property;" /pci@f2000000" select-dev;3000000 to pci-probe-request;unselect-dev;probe-pci;dev /pci@f2000000/pci106b,19@18;" usb" device-name;" usb" device-type;dev /pci@f2000000/pci106b,19@19;" usb" device-name;" usb" device-type;mac-boot'
 
@@ -34,7 +35,7 @@ DEFAULT_SERIAL='" /pci@f0000000" select-dev;10 8000 probe-pci-device;8000 10 pro
 # 2026-08-01: the user consolidated the loose Downloads media into
 # "Downloads/Open Power Mac/" — PowerMacG4.iso, the 9.2.2 universal
 # install, the restore DVD and the 8.6 material all live there now.
-OPM_CD="${OPM_CD:-/c/Users/gamer/Downloads/mac stuff/Open Power Mac/PowerMacG4.iso}"
+OPM_CD="${OPM_CD:-$OPM_MEDIA/PowerMacG4.iso}"
 [ -f "$OPM_CD" ] || { echo "FAIL: boot CD missing: $OPM_CD (set OPM_CD)"; exit 1; }
 
 # ⚠ --fast-tb WAS 60 UNTIL 2026-07-30 AND IS NOW 4. With the KeyLargo timer
@@ -43,12 +44,12 @@ OPM_CD="${OPM_CD:-/c/Users/gamer/Downloads/mac stuff/Open Power Mac/PowerMacG4.i
 # machine services ticks back to back and the boot dies at 2.5 G with a blank
 # screen. 4 gives it 333,000 and lands the timebase at 1.06x real. See the
 # note on SawtoothBus::klTimerOn.
-exec "${OPM_BIN:-./build/tools/g4run/Release/g4run.exe}" \
- --rom "../scratch/openpowermac/roms/newworld/sawtooth_4.2.8f1_stock.rom" \
+exec "${OPM_BIN:-$OPM_G4RUN}" \
+ --rom "$OPM_SCRATCH/roms/newworld/sawtooth_4.2.8f1_stock.rom" \
  --exc 0 --fast-tb "${OPM_FAST_TB:-4}" \
  --cd "$OPM_CD" \
- --hd "${OPM_HD:-../scratch/openpowermac/hd.img}" \
- --ati-rom "../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom" \
+ --hd "${OPM_HD:-$OPM_SCRATCH/hd.img}" \
+ --ati-rom "$OPM_SCRATCH/ati/ati_oem_rage128pro_136_agp_full.rom" \
  --ati-at "${OPM_ATI_AT:-1}" \
  --serial-input "${OPM_SERIAL-$DEFAULT_SERIAL}" \
  "$@"

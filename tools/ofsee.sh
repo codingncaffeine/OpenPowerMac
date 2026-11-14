@@ -10,10 +10,11 @@
 #   OPM_ARM=N   arm the name table at instruction N (default 207090000)
 #   OPM_ROM=..  ROM image (default serialcons.rom)
 cd "$(dirname "$0")/.." || exit 1
+. tools/paths.sh
 
 ARM="${OPM_ARM:-207090000}"
-ROM="${OPM_ROM:-../scratch/openpowermac/serialcons.rom}"
-OUT="../scratch/openpowermac/logs/ofsee.log"
+ROM="${OPM_ROM:-$OPM_SCRATCH/serialcons.rom}"
+OUT="$OPM_SCRATCH/logs/ofsee.log"
 mkdir -p "$(dirname "$OUT")"
 
 OPM_ATI_AT="${OPM_ATI_AT:-1}" OPM_SERIAL="${OPM_SERIAL-}" \

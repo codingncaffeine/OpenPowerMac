@@ -13,11 +13,12 @@
 # Needs the shelf images; it is a local check, not a CI one — CI has no ROM.
 set -e
 cd "$(dirname "$0")/.."
+. tools/paths.sh
 
-ROM=../scratch/openpowermac/roms/newworld/sawtooth_4.2.8f1_stock.rom
-CD=/c/Users/gamer/Downloads/PowerMacG4.iso
-ATI=../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom
-G4=./build/tools/g4run/Release/g4run.exe
+ROM="$OPM_SCRATCH/roms/newworld/sawtooth_4.2.8f1_stock.rom"
+CD="$OPM_MEDIA/PowerMacG4.iso"
+ATI="$OPM_SCRATCH/ati/ati_oem_rage128pro_136_agp_full.rom"
+G4="$OPM_G4RUN"
 MAX=${1:-3000000000}
 
 for f in "$ROM" "$CD" "$ATI" "$G4"; do

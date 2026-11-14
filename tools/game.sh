@@ -19,6 +19,7 @@
 # own copy; two runs sharing one corrupt each other silently.
 # Extra flags are appended verbatim.
 cd "$(dirname "$0")/.." || exit 1
+. tools/paths.sh
 
 SNAP_DIR="${OPM_SNAP_DIR:-/d/Open Power Mac Snapshots}"
 SNAP_NAME="${OPM_SNAP:-moment2}"
@@ -35,8 +36,8 @@ esac
 [ -n "$AT" ] || { echo "FAIL: unknown snapshot $SNAP_NAME — set OPM_AT to its instruction count"; exit 1; }
 PLUS="${OPM_PLUS:-200000000}"
 
-ROM="${OPM_ROM:-/c/Users/gamer/Downloads/Open Power Mac/ROM 4.2.8f1 G4 AGP Sawtooth Stock/ROMs/@FFF00000 len-100000 All.rom}"
-CD="${OPM_CD:-/c/Users/gamer/Downloads/nanosaur/nanosaur_hfs.img}"
+ROM="${OPM_ROM:-$OPM_MEDIA/ROM 4.2.8f1 G4 AGP Sawtooth Stock/ROMs/@FFF00000 len-100000 All.rom}"
+CD="${OPM_CD:-$OPM_MEDIA/nanosaur/nanosaur_hfs.img}"
 HD_SRC="${OPM_HD_SRC:-/d/OpenPowerMac Drives/macos9_2gb.img}"
 HD="${OPM_HD:-/d/OpenPowerMac Drives/_iter_hd${OPM_TAG:+_$OPM_TAG}.img}"
 for f in "$ROM" "$CD" "$HD_SRC"; do
@@ -56,12 +57,12 @@ if [ -z "${OPM_HD:-}" ]; then
     cp "$HD_SRC" "$HD" || exit 1
 fi
 
-exec "${OPM_BIN:-./build/tools/g4run/Release/g4run.exe}" \
+exec "${OPM_BIN:-$OPM_G4RUN}" \
  --rom "$ROM" \
  --ram 1536 --exc 0 --fast-tb "${OPM_FAST_TB:-4}" \
  --hd "$HD" \
  --cd "$CD" \
- --ati-rom ../scratch/openpowermac/ati/ati_oem_rage128pro_136_agp_full.rom \
+ --ati-rom "$OPM_SCRATCH/ati/ati_oem_rage128pro_136_agp_full.rom" \
  --ati-at 1 \
  --resume-from "$SNAP" \
  --max "$((AT + PLUS))" \

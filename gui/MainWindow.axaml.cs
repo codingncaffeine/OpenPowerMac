@@ -37,6 +37,7 @@ public partial class MainWindow : Window
         miAutoBoot.IsChecked = _settings.AutoBoot;
         miSound.IsChecked = _settings.Sound;
         UpdateTitle();
+        UpdateNoVideoHint();
 
         // 60 Hz: the frame is copied only when the session published a new
         // one, and pointer travel gathered by the capture is handed over on
@@ -86,6 +87,13 @@ public partial class MainWindow : Window
     private double _pendX, _pendY;
     private uint _buttons;
 
+    // What one capture delivered, logged when it ends: a pointer that "does
+    // not move" is either nothing arriving from the grab or nothing reaching
+    // the guest, and these two numbers say which.
+    private long _sentReports, _sentDx, _sentDy, _sentButtons;
+    // OPM_INPUT_TRACE=1 logs every report handed to the guest.
+    private static readonly bool InputTrace = Environment.GetEnvironmentVariable("OPM_INPUT_TRACE") == "1";
+
     // Everything the guest currently believes is held down, so it can be let
     // go when this window stops receiving key-ups.
     private readonly HashSet<uint> _held = new();
@@ -129,6 +137,7 @@ public partial class MainWindow : Window
             return;
         _captured = true;
         _pendX = _pendY = 0;
+        _sentReports = _sentDx = _sentDy = _sentButtons = 0;
         _lastMouse = null;
         Cursor = HiddenCursor;
         imgScreen.Cursor = HiddenCursor;
@@ -153,6 +162,8 @@ public partial class MainWindow : Window
         Cursor = null;
         imgScreen.Cursor = null;
         UpdateCaptureHint();
+        Log.Line($"input: capture released — sent {_sentReports} motion reports, travel {_sentDx}/{_sentDy}, "
+                 + $"{_sentButtons} button reports; source {(_grab is null ? "window pointer" : "X11 raw (" + _grab.Stats() + ")")}");
     }
 
     private bool _hintCaptured, _hintVisible;
@@ -204,6 +215,14 @@ public partial class MainWindow : Window
             return;
         _pendX -= dx;
         _pendY -= dy;
+        if (_captured)
+        {
+            _sentReports++;
+            _sentDx += dx;
+            _sentDy += dy;
+        }
+        if (InputTrace)
+            Log.Line($"input trace: mouse {dx},{dy} buttons {_buttons}");
         s.SendMouse(dx, dy, _buttons);
     }
 
@@ -289,6 +308,9 @@ public partial class MainWindow : Window
             return;   // wheel and extra buttons: a boot mouse has two
         FlushMouse();
         _buttons = down ? _buttons | bit : _buttons & ~bit;
+        _sentButtons++;
+        if (InputTrace)
+            Log.Line($"input trace: button {button} {(down ? "down" : "up")} -> buttons {_buttons}");
         s.SendMouse(0, 0, _buttons);
     }
 
@@ -703,9 +725,48 @@ public partial class MainWindow : Window
             "Card ROM (*.rom;*.bin)|*.rom;*.bin|All files (*.*)|*.*", _settings.AtiRomPath);
         if (path == null)
             return;
+        // Refused here, at the moment of the mistake: a wrong file in this
+        // slot gives a machine that boots and shows nothing. Reading the file
+        // is file work, so it happens off the UI thread.
+        string why = "";
+        if (!ModalLoop.Wait(Task.Run(() => MachineSession.LooksLikeCardRom(path, out why))))
+        {
+            Notice($"{Path.GetFileName(path)} is not a graphics card ROM: {why}.\n\n"
+                   + "Choose the ATI Rage 128 Pro card's own ROM (about 64 to 128 KB). "
+                   + "The 1 MB boot ROM goes in File ▸ Choose Boot ROM… instead.",
+                   "ATI card ROM", MessageBoxImage.Warning);
+            return;
+        }
         _settings.AtiRomPath = path;
         _settings.Save();
         UpdateTitle();
+        UpdateNoVideoHint();
+    }
+
+    private const string HintReady =
+        "Machine ▸ Start boots the Sawtooth ROM.\nThe firmware talks on the serial console below until the display comes up.";
+
+    /// <summary>What the empty screen area says. With no usable card ROM the
+    /// display never comes up, and a machine that is running blind must not
+    /// look like one that is merely still booting.</summary>
+    private void UpdateNoVideoHint()
+    {
+        string ati = _settings.AtiRomPath;
+        if (string.IsNullOrWhiteSpace(ati))
+        {
+            txtHint.Text = "No ATI card ROM is chosen, so the machine will have no picture.\n"
+                           + "File ▸ Choose ATI Card ROM… (the Rage 128 Pro card's own ROM).";
+            return;
+        }
+        txtHint.Text = HintReady;
+        // The check reads the file; do it off the UI thread and come back.
+        Task.Run(() => MachineSession.LooksLikeCardRom(ati, out string why) ? null : why)
+            .ContinueWith(t =>
+            {
+                if (t.Result is { } why && ati == _settings.AtiRomPath)
+                    txtHint.Text = $"The ATI card ROM is not a card ROM ({why}),\nso the machine will have no picture. "
+                                   + "File ▸ Choose ATI Card ROM…";
+            }, TaskScheduler.FromCurrentSynchronizationContext());
     }
 
     // ---- hard disks ----

@@ -236,6 +236,33 @@ public sealed class MachineSession
         catch { return false; }
     }
 
+    /// <summary>Whether a file can be a PCI card's expansion ROM. Every one
+    /// begins with the signature 55 AA (PCI Local Bus specification, expansion
+    /// ROM header), which is how Open Firmware recognises the card's FCode in
+    /// the first place; a file without it gives a card the firmware cannot
+    /// read, so no display node is built and the machine boots with no
+    /// picture. The usual way to get here is choosing the 1 MB boot ROM
+    /// again in the card's slot.</summary>
+    public static bool LooksLikeCardRom(string path, out string why)
+    {
+        why = "";
+        try
+        {
+            using var f = File.OpenRead(path);
+            if (f.ReadByte() == 0x55 && f.ReadByte() == 0xAA)
+                return true;
+            why = f.Length == 1024 * 1024
+                ? "it is a 1 MB image with no card signature — this looks like the boot ROM"
+                : "it does not begin with the PCI card ROM signature 55 AA";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            why = ex.Message;
+            return false;
+        }
+    }
+
     private static string DropStateText(int st) => st switch
     {
         0 => "no drive",
@@ -309,6 +336,18 @@ public sealed class MachineSession
                     }
                 }
             }
+            // Without the card's own ROM there is no display node and the
+            // machine boots blind — running, reading its disks, and showing
+            // nothing. Say which case this is before it starts, because from
+            // the window it is indistinguishable from a hang.
+            if (string.IsNullOrWhiteSpace(s.AtiRomPath))
+                ConsoleQ.Enqueue("[shell] no ATI card ROM chosen — the machine "
+                                 + "will run with NO PICTURE (File ▸ Choose ATI "
+                                 + "Card ROM…)\n");
+            else if (!LooksLikeCardRom(s.AtiRomPath, out var atiWhy))
+                ConsoleQ.Enqueue("[shell] the ATI card ROM is not a card ROM: "
+                                 + $"{atiWhy}. The machine will run with NO "
+                                 + $"PICTURE: {s.AtiRomPath}\n");
             m = Native.opm_create(s.RomPath,
                                   cdPath,
                                   string.IsNullOrWhiteSpace(s.HdPath) ? null : s.HdPath,

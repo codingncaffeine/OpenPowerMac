@@ -341,7 +341,77 @@ public:
             atiRom_.clear();
         return ok;
     }
-    R128Cell& ati() { return ati_; }
+    // 🧵 THE CARD'S COMMAND ENGINE MAY BE RUNNING ON ITS OWN THREAD (see "The
+    // command engine on its own thread" in opm/r128.hpp), so the card is
+    // reached three ways and which one is not a matter of taste:
+    //
+    //   ati()        for anything that reads what the engine produces — the
+    //                reports, the tests, a snapshot. It finishes the queue
+    //                first, so the caller sees the card as it would be had
+    //                every packet executed where it was submitted.
+    //   atiScanout() for the picture. A monitor reads video memory while the
+    //                card draws; waiting for the engine at every frame would
+    //                stall the machine thirty times a second. Take an
+    //                R128RegLock around the register reads.
+    //   ati_         inside this class, under atiBefore()/R128RegLock, which
+    //                is what the guest's own accesses do below.
+    R128Cell& ati()
+    {
+        atiDrain();
+        return ati_;
+    }
+    const R128Cell& atiScanout() const { return ati_; }
+    // The memory routes the engine uses when a packet reads system RAM.
+    CceMem atiMem()
+    {
+        return CceMem{ram_.data(), static_cast<u32>(ram_.size()),
+                      agpGartBase(), agpAperBase(), snoop};
+    }
+    // Finish whatever the engine still has queued, on this thread.
+    void atiDrain()
+    {
+        if (r128AsyncBusy())
+            r128AsyncDrain(ati_, atiMem());
+    }
+    // The registers whose value a queued packet may read or write — the PM4
+    // block (status, the indirect dispatch pair, the vertex-format word), the
+    // bus-master block, the surface ranges, and everything from the FIFO up:
+    // the 2D and 3D state, the scratch-register fence, GUI_STAT. An access
+    // to one of these waits for the queue; the rest of the card (CRTC, DAC,
+    // cursor, the interrupt pair) only takes the register lock.
+    static bool atiEngineReg(u32 off)
+    {
+        off &= 0x1FFCu;
+        return (off >= 0x0700u && off < 0x0800u) ||
+               (off >= 0x0A00u && off < 0x0B40u) || off >= 0x1000u;
+    }
+    void atiBefore(u32 off)
+    {
+        if (r128AsyncBusy() && atiEngineReg(off)) {
+            r128AsyncDrainCause(off & 0x1FFCu);
+            atiDrain();
+        }
+    }
+    // A READ, which is where a driver asks the engine how it stands. The two
+    // status words and the scratch registers answer for the engine as it is
+    // (see opm/r128.hpp) — unless the command FIFO is nearly full, when the
+    // honest answer would be "wait" and finishing the queue is the wait.
+    void atiBeforeRead(u32 off)
+    {
+        if (!r128AsyncBusy())
+            return;
+        const u32 a = off & 0x1FFCu;
+        if (r128AsyncStrict()) {
+            // the proof mode: every engine register waits
+        } else if (a == 0x07B8u || a == 0x1740u) {
+            if (r128AsyncFifoQueued() < 48u)
+                return;
+        } else if (a >= 0x15E0u && a < 0x15F8u) {
+            return;
+        }
+        atiBefore(off);
+    }
+
     bool atiPresent() const { return !atiRom_.empty(); }
     // Harness sequencing: hide the AGP function from config space until
     // this instruction count. OF picks its console (~228M) before the
@@ -659,7 +729,10 @@ public:
         // display is source 48 — and the OS has 48 unmasked at priority 2,
         // matching the node's AAPL,interrupt-priorities. Source 32 is the
         // mac-io TIMER, which nothing uses and which the OS leaves masked.
-        pic_.setLine(48, ati_.irqLine());
+        {
+            R128RegLock atiLock;
+            pic_.setLine(48, ati_.irqLine());
+        }
     }
     // One edge, then the line goes back down and the channel's condition is
     // consumed. ⚠ The ATA channels deliberately do NOT go through here: their
@@ -717,6 +790,11 @@ public:
         nowTb_ = tb;
         ati_.noteTb(tb);
         snd_.noteTb(tb);
+        // The card's engine stopped at a packet that reads system memory,
+        // which only this thread may do. Ahead of the gate: it is not a
+        // timed event and no deadline announces it.
+        if (r128AsyncNeedsService())
+            r128AsyncService(ati_, atiMem());
         if (!devGateOff && devGen_ == devGenSeen_ && tb < devDueTb_)
             return cpuIrq_;
         ++devServices_;
@@ -725,7 +803,16 @@ public:
         syncIrqs();
         cpuIrq_ = pic_.cpuLine();
         devDueTb_ = ohci_[0].nextTickTb();
-        const u64 due[6] = {ohci_[1].nextTickTb(), ati_.nextTickTb(),
+        u64 atiDue;
+        {
+            // ⚠ The register lock is held for the card's own calls and never
+            // across anything else: a device below may write video memory,
+            // which waits for the engine, and the engine's thread takes this
+            // lock while it holds the engine.
+            R128RegLock atiLock;
+            atiDue = ati_.nextTickTb();
+        }
+        const u64 due[6] = {ohci_[1].nextTickTb(), atiDue,
                             cd_.pendingTb(),      hd_.pendingTb(),
                             drop_.pendingTb(),    soundDueTb()};
         for (const u64 d : due)
@@ -784,7 +871,10 @@ public:
         ohci_[0].tick(tb);
         ohci_[1].tick(tb);
         // The display retraces on the same clock as everything else.
-        ati_.tick(tb);
+        {
+            R128RegLock atiLock;
+            ati_.tick(tb);
+        }
         // DMA on this hardware is selected by the channel, not the opcode:
         // tell each cell whether its DBDMA list is armed before any command
         // can present a data phase.
@@ -1183,6 +1273,8 @@ private:
                 // lane o-4 - not 3-(o-4), which put every byte in the wrong
                 // half of the register.
                 const u32 lane = len == 4u ? 0u : (o - 4u);
+                atiBeforeRead(idx);
+                R128RegLock atiLock;
                 return ioSwap(ati_.read(idx + lane, len), len);
             }
             return 0;
@@ -1190,13 +1282,23 @@ private:
         // The 16 KB window holds TWO IDENTICAL 8 KB register apertures
         // (Register Reference Guide 2.2); the same register answers at
         // +off and at +0x2000+off. See R128Cell::regRead, CONFIG_REG_1_BASE.
-        if (atiRegBar_ && pa - atiRegBar_ < 0x4000u)
-            return ati_.read((pa - atiRegBar_) & 0x1FFFu, len);
-        if (atiFbBar_ && pa - atiFbBar_ < (64u << 20))
+        if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
+            const u32 off = (pa - atiRegBar_) & 0x1FFFu;
+            atiBeforeRead(off);
+            R128RegLock atiLock;
+            return ati_.read(off, len);
+        }
+        if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {
             // Both halves address the same VRAM; the upper is the
-            // big-endian alias.
+            // big-endian alias. Video memory is what the engine draws into:
+            // the guest reads it finished.
+            if (r128AsyncBusy()) {
+                r128AsyncDrainCause(kR128DrainFbRead);
+                atiDrain();
+            }
             return get(ati_.vram.data() + ((pa - atiFbBar_) & 0x01FFFFFFu),
                        len);
+        }
         if (pa - kSizeWin < 0x20000000u) {
             const u32 v =
                 get(ram_.data() + ((pa - kSizeWin) & ((dimms().mb << 20) - 1)), len);
@@ -1411,6 +1513,8 @@ private:
                 // lane o-4 - not 3-(o-4), which put every byte in the wrong
                 // half of the register.
                 const u32 lane = len == 4u ? 0u : (o - 4u);
+                atiBefore(idx);
+                R128RegLock atiLock;
                 ati_.write(idx + lane, sv, len);
                 return;
             }
@@ -1418,7 +1522,16 @@ private:
         }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
             const u32 off = (pa - atiRegBar_) & 0x1FFFu; // either aperture
-            ati_.write(off, v, len);
+            // A FIFO word does not wait for the engine: it queues behind it
+            // (r128CceFifoWord). Every other engine register does.
+            const bool fifoWord =
+                (off & ~3u) == 0x1000u || (off & ~3u) == 0x1004u;
+            if (!fifoWord)
+                atiBefore(off);
+            {
+                R128RegLock atiLock;
+                ati_.write(off, v, len);
+            }
             // The card is a BUS MASTER, and this is the one place it acts as
             // one: writing the transfer address starts a fetch out of system
             // memory. The walk lives here rather than in the cell because the
@@ -1464,6 +1577,11 @@ private:
             // stays shut until the display driver programs it — so a guest
             // that paints into VRAM without ever setting the mode looks
             // identical to one that never ran.
+            // The guest writes video memory the engine is done with.
+            if (r128AsyncBusy()) {
+                r128AsyncDrainCause(kR128DrainFbWrite);
+                atiDrain();
+            }
             ++ati_.fbWrites;
             const u32 fo = pa - atiFbBar_;
             if (fo < ati_.fbLo) ati_.fbLo = fo;

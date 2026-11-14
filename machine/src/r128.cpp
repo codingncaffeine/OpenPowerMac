@@ -4,6 +4,11 @@
 #include "opm/bus.hpp" // SnoopSink: the bus-master fetch answers to it
 #include "opm/prof.hpp" // OPM_MARK(Cce): the engine's own profile bucket
 #include <cstring> // memmove, for the blitter's row copies
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace opm {
 
@@ -661,8 +666,28 @@ static u32 cceBswap(u32 v)
            (v << 24);
 }
 
-static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
-                     u32 aperBase, SnoopSink* snoop);
+// Who is running the packet loop, which decides what it may do.
+enum class CceMode {
+    Sync,     // the engine's thread is off: execute everything, here
+    EmuFront, // the machine's thread, engine thread on: execute what is cheap
+              // or needs system memory, hand a long stream over
+    EmuDrain, // the machine's thread, and the guest is about to look:
+              // execute everything, here
+    Worker,   // the engine's thread: no system memory
+};
+// How a run of the packet loop ended.
+enum class CceRun {
+    Empty,    // nothing complete is left staged
+    HandOff,  // EmuFront: the rest is for the engine's thread
+    NeedsEmu, // Worker: the packet at the head needs system memory
+    Yield,    // Worker: the machine's thread asked for the engine
+};
+static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode);
+
+namespace {
+void asyncSubmit(R128Cell& c, const CceMem& m);
+void asyncRelease(R128Cell& c, const CceMem& m);
+}
 
 // An INDSIZE write seen while a packet is still executing must not fetch on
 // the spot: the fetched body has to land BETWEEN this packet and the next
@@ -672,6 +697,114 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
 // parse loop performs it at the packet boundary.
 static std::vector<u32> gCcePendingInd;
 
+// ── The command engine on its own thread (see opm/r128.hpp) ───────────────
+//
+// Three locks, always taken in this order when more than one is held:
+//
+//   engMu   whoever is executing packets holds it. The engine's thread
+//           holds it while it runs and gives it up between two packets when
+//           the machine's thread asks (drainReq); the machine's thread holds
+//           it for as long as it executes. It is what "the engine is mine"
+//           means while work is queued.
+//   regMu   the cell's register store, its logs and its censuses, for one
+//           access (the machine's thread) or one packet's register work (the
+//           engine's thread, which lets it go while it rasterizes).
+//   inboxMu the FIFO words that arrived behind a running engine — and the
+//           busy flag's fall, so "queue it" and "nothing is running, execute
+//           it yourself" cannot both be decided about the same word.
+//
+// gR128AsyncBusy is only ever RAISED by the machine's thread (a hand-off) and
+// only falls when a run finds nothing left. So when the machine's thread
+// reads it false, nothing else is touching the card and nothing will until
+// that same thread submits again: the idle case takes no lock at all.
+std::atomic<bool> gR128AsyncBusy{false};
+std::atomic<bool> gR128AsyncNeedsEmu{false};
+namespace {
+// A stream shorter than this is executed where it was submitted: waking a
+// thread costs more than a few small packets do.
+constexpr size_t kHandOffWords = 256;
+void asyncWorkerMain();
+struct Async {
+    std::mutex engMu;
+    std::condition_variable engCv;
+    std::mutex regMu;
+    std::mutex inboxMu;
+    std::vector<u32> inbox;
+    std::atomic<bool> on{false};
+    std::atomic<bool> strict{false};
+    std::atomic<bool> drainReq{false};
+    std::atomic<bool> hold{false};
+    R128Cell* cell = nullptr; // under engMu
+    CceMem mem;               // under engMu: system memory as the engine's
+                              // thread may read it (asyncRelease)
+    bool quit = false;        // under engMu
+    bool started = false;     // the machine's thread only
+    std::thread th;
+    R128AsyncStats st;
+    u32 cause = kR128DrainOther; // the machine's thread only
+    std::map<u32, R128DrainCause> causes;
+    ~Async()
+    {
+        if (!started)
+            return;
+        {
+            std::lock_guard<std::mutex> lk(engMu);
+            quit = true;
+        }
+        engCv.notify_all();
+        th.join();
+        started = false; // a card destroyed after this has nothing to abandon
+    }
+};
+// ⚠ Defined after every engine static above it on purpose: statics are torn
+// down in reverse, so the thread is joined before the staging vectors go.
+Async gAsync;
+thread_local int tRegDepth = 0;
+} // namespace
+
+void r128AsyncEnable(bool on, bool strict)
+{
+    gAsync.on.store(on);
+    gAsync.strict.store(on && strict);
+}
+bool r128AsyncEnabled() { return gAsync.on.load(); }
+bool r128AsyncStrict() { return gAsync.strict.load(std::memory_order_relaxed); }
+const R128AsyncStats& r128AsyncStats() { return gAsync.st; }
+void r128AsyncHold(bool hold)
+{
+    {
+        std::lock_guard<std::mutex> lk(gAsync.engMu);
+        gAsync.hold.store(hold);
+    }
+    gAsync.engCv.notify_one();
+}
+void r128AsyncDrainCause(u32 cause) { gAsync.cause = cause; }
+u32 r128AsyncFifoQueued()
+{
+    std::lock_guard<std::mutex> ib(gAsync.inboxMu);
+    return static_cast<u32>(gAsync.inbox.size());
+}
+const std::map<u32, R128DrainCause>& r128AsyncDrainCauses()
+{
+    return gAsync.causes;
+}
+void r128AsyncRegRelease() { gAsync.regMu.unlock(); }
+void r128AsyncRegTake() { gAsync.regMu.lock(); }
+
+R128RegLock::R128RegLock()
+{
+    if (!r128AsyncBusy())
+        return;
+    if (tRegDepth++ == 0)
+        gAsync.regMu.lock();
+    held_ = true;
+}
+R128RegLock::~R128RegLock()
+{
+    if (held_ && --tRegDepth == 0)
+        gAsync.regMu.unlock();
+}
+
 // A machine is being created: no packet stream exists yet, whatever a
 // previous machine in this process left staged. See the header note — a
 // stale half-packet here desynchronises every subsequent submission, and
@@ -679,6 +812,7 @@ static std::vector<u32> gCcePendingInd;
 // then froze mid-redraw".
 void r128CceReset()
 {
+    r128AsyncAbandon(nullptr); // the engine's thread must not be mid-stream
     gCceFifo.clear();
     gCceHead = 0;
     gCceDepth = 0;
@@ -776,6 +910,10 @@ static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
 // translation, the same miss counter, the same first-eight log.
 bool r128CceGartRead(const CceMem& m, u32 agp, u32& out)
 {
+    if (!m.ram) { // the engine's thread: counted as a miss, never a read
+        ++gEng.cceGartMiss;
+        return false;
+    }
     return cceGartRead(m.ram, m.ramSize, m.gartBase, m.aperBase, agp, out,
                        m.snoop);
 }
@@ -1291,35 +1429,86 @@ void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
 {
     if (!gEng2dOn || !ram)
         return;
+    OPM_MARK(Cce);
+    const CceMem m{ram, ramSize, gartBase, aperBase, snoop};
+    r128AsyncDrain(c, m); // a direct dispatch goes behind what is queued
     gCceDepth = 64; // dispatch budget for this guest-visible entry
     gCcePendingInd.push_back(sizeDwords);
-    cceParse(c, ram, ramSize, gartBase, aperBase, snoop);
+    asyncSubmit(c, m);
 }
 
-static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
-                     u32 aperBase, SnoopSink* snoop)
+// The packet loop. Every CCE packet — 2D blits and the whole 3D rasterizer —
+// executes inside it, on whichever thread `mode` says is running it.
+static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
 {
-    // Every CCE packet — 2D blits and the whole 3D rasterizer — executes
-    // inside this loop, which itself runs inside the guest's MMIO store.
-    // The marker gives that host time its own profile bucket instead of
-    // billing a software-rasterized triangle to "mem write".
-    OPM_MARK(Cce);
+    const bool worker = mode == CceMode::Worker;
     for (;;) {
-        cceDrainPending(c, ram, ramSize, gartBase, aperBase, snoop);
+        if (worker && gAsync.drainReq.load(std::memory_order_relaxed))
+            return CceRun::Yield; // between packets: the engine can be taken
+        // Drop what has been consumed, here between packets where nothing
+        // points into the vector. Not only when the stream runs dry: with the
+        // engine on its own thread a busy title keeps it fed and it may not
+        // run dry for a long time.
+        if (gCceHead > 0x10000u) {
+            gCceFifo.erase(gCceFifo.begin(),
+                           gCceFifo.begin() + static_cast<long>(gCceHead));
+            gCceHead = 0;
+        }
+        // A dispatched indirect buffer is fetched out of system memory.
+        if (!gCcePendingInd.empty()) {
+            // On the engine's thread memory is as it stood at the hand-off,
+            // and this dispatch may be younger than that.
+            if (worker)
+                return CceRun::NeedsEmu;
+            cceDrainPending(c, m.ram, m.ramSize, m.gartBase, m.aperBase,
+                            m.snoop);
+        }
         const size_t avail = gCceFifo.size() - gCceHead;
-        if (!avail)
+        u32 w = 0, type = 2u, n = 0;
+        bool complete = false;
+        if (avail) {
+            w = gCceFifo[gCceHead];
+            type = w >> 30;
+            n = ((w >> 16) & 0x3FFFu) + 1u;
+            complete = type == 2u || (type == 1u ? avail >= 3u
+                                                 : avail >= 1u + n);
+        }
+        if (!complete) {
+            if (mode == CceMode::Sync)
+                break;
+            // Nothing runnable is staged. Words the guest wrote while the
+            // engine was running come in now; and if there are none, this is
+            // where the engine goes idle — decided under the inbox lock, so a
+            // word arriving at this moment is either taken here or executed
+            // by its own writer, never left behind.
+            std::lock_guard<std::mutex> ib(gAsync.inboxMu);
+            if (!gAsync.inbox.empty()) {
+                // ...by the machine's thread only. What these words refer to
+                // — a texture, a vertex buffer, the body of a dispatch — was
+                // written after the hand-off, and the engine's thread sees
+                // memory as it stood then.
+                if (worker)
+                    return CceRun::NeedsEmu;
+                gCceFifo.insert(gCceFifo.end(), gAsync.inbox.begin(),
+                                gAsync.inbox.end());
+                gAsync.inbox.clear();
+                gCceDepth = 64; // each of these was a guest-visible entry
+                continue;
+            }
+            gR128AsyncBusy.store(false, std::memory_order_release);
             break;
-        const u32 w = gCceFifo[gCceHead];
-        const u32 type = w >> 30;
+        }
         if (type == 2u) { // filler
             ++gCceHead;
             ++gEng.ccePkt2;
             continue;
         }
+        // The engine's thread holds the register lock for a packet's register
+        // work; the 3D unit lets it go while it rasterizes.
+        std::unique_lock<std::mutex> rl(gAsync.regMu, std::defer_lock);
+        if (worker)
+            rl.lock();
         if (type == 0u) {
-            const u32 n = ((w >> 16) & 0x3FFFu) + 1u;
-            if (avail < 1u + n)
-                break;
             const u32 base = (w & 0x7FFu) << 2;
             const bool oneReg = (w >> 15) & 1u;
             gCceHead += 1u; // consume the header BEFORE executing: a body
@@ -1333,8 +1522,6 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
             continue;
         }
         if (type == 1u) {
-            if (avail < 3u)
-                break;
             cceRegWrite(c, (w & 0x7FFu) << 2, gCceFifo[gCceHead + 1u]);
             cceRegWrite(c, ((w >> 11) & 0x7FFu) << 2,
                         gCceFifo[gCceHead + 2u]);
@@ -1345,10 +1532,21 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
         // Type-3: an operation packet. COUNT = N-1 body DWORDs; the body is
         // consumed exactly by the HEADER count whatever the op does, so a
         // half-understood operation can never desynchronise the stream.
-        const u32 n = ((w >> 16) & 0x3FFFu) + 1u;
-        if (avail < 1u + n)
-            break;
         const u32 op = (w >> 8) & 0xFFu;
+        const bool op3d =
+            op == 0x25u || op == 0x23u || op == 0x2Eu || op == 0x2Cu;
+        if (mode != CceMode::Sync) {
+            // An operation at the head of a long stream is the engine
+            // thread's; a short one costs less here than waking it.
+            if (mode == CceMode::EmuFront && avail >= kHandOffWords)
+                return CceRun::HandOff;
+            if (worker)
+                ++gAsync.st.workerPkts;
+            else if (mode == CceMode::EmuDrain)
+                ++gAsync.st.drainPkts;
+            else
+                ++gAsync.st.inlinePkts;
+        }
         const u32* body = &gCceFifo[gCceHead + 1u];
         bool done = false;
         if (op == 0x91u) // PAINT — SDK F.9
@@ -1375,12 +1573,11 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
             done = cceOpNextChar(c, body, n);
         else if (op == 0x1Eu) // SET_SCISSORS — SDK F.22
             done = cceOpSetScissors(c, body, n);
-        else if (op == 0x25u || op == 0x23u || op == 0x2Eu ||
-                 op == 0x2Cu) // the 3D packets — SDK F.24/F.26/F.27/F.21
-            done = r128Cce3dOp(c, op, body, n,
-                               CceMem{ram, ramSize, gartBase, aperBase,
-                                      snoop});
-        else if (op == 0x2Du) {
+        else if (op3d) { // the 3D packets — SDK F.24/F.26/F.27/F.21
+            CceMem pm = m;
+            pm.worker = worker;
+            done = r128Cce3dOp(c, op, body, n, pm);
+        } else if (op == 0x2Du) {
             // PURGE — flush and purge the pixel cache. Every operation here
             // is resident in VRAM the moment its packet executes, so the
             // purge is complete when asked for, same as PC_GUI_CTLSTAT.
@@ -1408,11 +1605,157 @@ static void cceParse(R128Cell& c, const u8* ram, u32 ramSize, u32 gartBase,
     if (gCceHead == gCceFifo.size()) {
         gCceFifo.clear();
         gCceHead = 0;
-    } else if (gCceHead > 0x10000u) {
-        gCceFifo.erase(gCceFifo.begin(),
-                       gCceFifo.begin() + static_cast<long>(gCceHead));
-        gCceHead = 0;
     }
+    return CceRun::Empty;
+}
+
+namespace {
+
+// The engine's thread: run packets whenever there are some and nobody on the
+// machine's thread has asked for the engine.
+void asyncWorkerMain()
+{
+    std::unique_lock<std::mutex> lk(gAsync.engMu);
+    for (;;) {
+        gAsync.engCv.wait(lk, [] {
+            return gAsync.quit ||
+                   (gR128AsyncBusy.load() && !gAsync.drainReq.load() &&
+                    !gR128AsyncNeedsEmu.load() && !gAsync.hold.load());
+        });
+        if (gAsync.quit)
+            return;
+        if (cceRun(*gAsync.cell, gAsync.mem, CceMode::Worker) ==
+            CceRun::NeedsEmu)
+            gR128AsyncNeedsEmu.store(true);
+        // Empty: the run let the busy flag fall itself. Yield: the wait
+        // above gives the lock up until the request is withdrawn.
+    }
+}
+
+// Take the engine from its thread: it stops at the next packet boundary and
+// stays stopped until the request is withdrawn.
+struct EngineTaken {
+    std::unique_lock<std::mutex> lk;
+    EngineTaken()
+    {
+        gAsync.drainReq.store(true);
+        lk = std::unique_lock<std::mutex>(gAsync.engMu);
+    }
+    ~EngineTaken()
+    {
+        gAsync.drainReq.store(false);
+        lk.unlock();
+        gAsync.engCv.notify_one();
+    }
+};
+
+// What the engine's thread is about to be given, under engMu: the cell, and
+// system memory. A card-initiated read of memory is snooped against the
+// processor's caches, and those are the machine thread's; so the modified
+// lines are copied out to memory HERE (SnoopSink::publish — nothing else
+// about the caches changes), and the engine's thread then reads memory
+// directly, as it stood at this moment. Everything the stream refers to — its
+// textures in AGP space, a vertex buffer, the GART table itself — was written
+// by the guest before it submitted the stream, so it is all there.
+void asyncRelease(R128Cell& c, const CceMem& m)
+{
+    if (m.snoop && m.ram)
+        m.snoop->publish(const_cast<u8*>(m.ram), m.ramSize);
+    gAsync.cell = &c;
+    gAsync.mem = m;
+    gAsync.mem.snoop = nullptr;
+    gAsync.mem.worker = true;
+    ++gAsync.st.handOffs;
+}
+
+// The machine's thread has staged something and owns the engine (it was idle
+// on entry): execute it, or the part of it that belongs here, and hand a long
+// stream over.
+void asyncSubmit(R128Cell& c, const CceMem& m)
+{
+    if (!gAsync.on.load()) {
+        cceRun(c, m, CceMode::Sync);
+        return;
+    }
+    if (cceRun(c, m, CceMode::EmuFront) != CceRun::HandOff)
+        return;
+    if (!gAsync.started) {
+        gAsync.started = true;
+        gAsync.th = std::thread(asyncWorkerMain);
+    }
+    {
+        std::lock_guard<std::mutex> lk(gAsync.engMu);
+        asyncRelease(c, m);
+        gR128AsyncBusy.store(true, std::memory_order_release);
+    }
+    gAsync.engCv.notify_one();
+}
+
+} // namespace
+
+void r128AsyncDrain(R128Cell& c, const CceMem& m)
+{
+    if (!r128AsyncBusy())
+        return;
+    OPM_MARK(Cce);
+    const auto t0 = std::chrono::steady_clock::now();
+    const u64 pkts0 = gAsync.st.drainPkts;
+    {
+        EngineTaken taken;
+        if (r128AsyncBusy())
+            cceRun(c, m, CceMode::EmuDrain); // ends by letting busy fall
+        gR128AsyncNeedsEmu.store(false);
+    }
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+    ++gAsync.st.drains;
+    gAsync.st.drainNs += ns;
+    R128DrainCause& dc = gAsync.causes[gAsync.cause];
+    ++dc.n;
+    dc.ns += ns;
+    dc.pkts += gAsync.st.drainPkts - pkts0;
+    gAsync.cause = kR128DrainOther;
+}
+
+void r128AsyncService(R128Cell& c, const CceMem& m)
+{
+    if (!r128AsyncNeedsService())
+        return;
+    OPM_MARK(Cce);
+    // The engine's thread is parked on the flag, so the lock is free.
+    std::unique_lock<std::mutex> lk(gAsync.engMu);
+    if (!gR128AsyncNeedsEmu.load())
+        return;
+    ++gAsync.st.services;
+    gCceDepth = 64; // dispatch budget, as at any entry that fetches
+    const CceRun r = cceRun(c, m, CceMode::EmuFront);
+    if (r == CceRun::HandOff)
+        asyncRelease(c, m); // still busy: the rest is the engine's
+    gR128AsyncNeedsEmu.store(false);
+    lk.unlock();
+    if (r == CceRun::HandOff)
+        gAsync.engCv.notify_one();
+}
+
+void r128AsyncAbandon(const R128Cell* c)
+{
+    if (!gAsync.started)
+        return;
+    EngineTaken taken;
+    if (c && gAsync.cell != c)
+        return;
+    gCceFifo.clear();
+    gCceHead = 0;
+    gCcePendingInd.clear();
+    {
+        std::lock_guard<std::mutex> ib(gAsync.inboxMu);
+        gAsync.inbox.clear();
+        gR128AsyncBusy.store(false, std::memory_order_release);
+    }
+    gR128AsyncNeedsEmu.store(false);
+    gAsync.cell = nullptr;
 }
 
 void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
@@ -1427,9 +1770,19 @@ void r128CceFifoWord(R128Cell& c, u32 raw, u32 len, const u8* ram,
     }
     OPM_MARK(Cce); // staging is engine cost too, not the guest's store
     ++gEng.cceWords;
+    if (gAsync.started) {
+        // The engine is running: this word goes behind what it has, in the
+        // order it was written. Decided under the inbox lock — see cceRun.
+        std::lock_guard<std::mutex> ib(gAsync.inboxMu);
+        if (r128AsyncBusy()) {
+            gAsync.inbox.push_back(cceBswap(raw));
+            ++gAsync.st.inboxWords;
+            return;
+        }
+    }
     gCceDepth = 64; // dispatch budget for this guest-visible entry
     gCceFifo.push_back(cceBswap(raw));
-    cceParse(c, ram, ramSize, gartBase, aperBase, snoop);
+    asyncSubmit(c, CceMem{ram, ramSize, gartBase, aperBase, snoop});
 }
 
 size_t r128CceStaged(u32& headWord)
@@ -1477,6 +1830,8 @@ void r128CceRingKick(R128Cell& c, u8* ram, u32 ramSize, u32 gartBase,
     if (rptr == wptr)
         return;
     OPM_MARK(Cce); // ring fetch + execute: the engine's cost, named
+    const CceMem m{ram, ramSize, gartBase, aperBase, snoop};
+    r128AsyncDrain(c, m); // behind whatever is queued
     ++gEng.cceRingKicks;
     gCceDepth = 64; // indirect budget, per guest-visible entry
     while (rptr != wptr) {
@@ -1494,7 +1849,9 @@ void r128CceRingKick(R128Cell& c, u8* ram, u32 ramSize, u32 gartBase,
         rptr = (rptr + 1u) & (sizeDw - 1u);
     }
     c.setReg(0x0710u, rptr);
-    cceParse(c, ram, ramSize, gartBase, aperBase, snoop);
+    // Executed here whatever the engine's thread is for: the write-back
+    // below says the ring was CONSUMED, and a driver believes it.
+    cceRun(c, m, CceMode::Sync);
     // The read-pointer write-back. Snooped: a status word landing under a
     // live stale cache line is invisible to the driver polling it —
     // session 30's DBDMA lesson, applied to the one mechanism the SDK
@@ -1526,8 +1883,18 @@ u32 R128Cell::regRead(u32 idx)
     // aperture. Session 30 wrote this down for mac-io as *claiming an address
     // and implementing it are different things*; this is the same trap, on
     // the register a command engine's bring-up reads first.
-    if (gEng2dOn && (off == kGuiStat || off == kPm4Stat))
-        return kGuiStatIdle;
+    if (gEng2dOn && (off == kGuiStat || off == kPm4Stat)) {
+        if (!r128AsyncBusy())
+            return kGuiStatIdle;
+        // The engine is running on its own thread and the guest is asking
+        // how it stands (the bus does not finish the queue for this read —
+        // SawtoothBus::atiBeforeRead). The free count is the 64-entry FIFO
+        // less the words written behind the engine; busy is PM4_BUSY at 16
+        // and GUI_ACTIVE at 31, the same flip-flops in both registers.
+        const u32 queued = r128AsyncFifoQueued();
+        const u32 room = queued < kGuiStatIdle ? kGuiStatIdle - queued : 0u;
+        return room | 0x00010000u | 0x80000000u;
+    }
     switch (off) {
     case kConfigAper0Base: {
         // The framebuffer aperture BASE, not its size. Returning 32 MB here

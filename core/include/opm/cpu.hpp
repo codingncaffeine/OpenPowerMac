@@ -917,6 +917,8 @@ struct Cpu {
     void dcbClean(u32 pa, bool invalidate); // dcbst / dcbf
     void dcbKill(u32 pa);                   // dcbi
     void l1dFlushAll(bool writeback);
+    // SnoopSink::publish: modified lines copied out to memory, state untouched.
+    void publishModified(u8* ram, u32 ramSize) const;
     // Snoop response for a bus master (see SnoopSink in bus.hpp). Pushes
     // every modified line covering [pa, pa+len) all the way to MEMORY —
     // not into the L2, which a DMA engine cannot see either — and
@@ -1048,6 +1050,7 @@ struct CpuSnoop final : SnoopSink {
     Cpu* cpu = nullptr;
     void snoopRead(u32 pa, u32 len) override;
     void snoopWrite(u32 pa, u32 len) override;
+    void publish(u8* ram, u32 ramSize) override;
 };
 
 // Binds every implemented handler into the dispatch used by Cpu::step.

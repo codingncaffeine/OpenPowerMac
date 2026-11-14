@@ -23,6 +23,7 @@ add_executable(opm_unit
   unit/test_sysblock.cpp
   unit/test_dropbox.cpp
   unit/test_pace.cpp
+  unit/test_r128_async.cpp
 )
 target_link_libraries(opm_unit PRIVATE opmcore opmmachine)
 target_include_directories(opm_unit SYSTEM PRIVATE vendor)

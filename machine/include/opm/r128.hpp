@@ -1,6 +1,7 @@
 #pragma once
 #include "opm/types.hpp"
 
+#include <atomic>
 #include <map>
 #include <utility>
 #include <vector>
@@ -9,6 +10,11 @@ namespace opm {
 
 struct SnapWriter;
 struct SnapReader;
+class R128Cell;
+// The card is going away (or a machine is starting): the command engine's
+// own thread, if it is working, forgets its queue. With a cell, only if that
+// is the cell it is working on. See "The command engine on its own thread".
+void r128AsyncAbandon(const R128Cell* c);
 
 // ATI Rage 128 Pro AGP ('PF', 1002:5046) — the Sawtooth's video card.
 // Bring-up model: the card's own FCode ROM (user-supplied dump, served
@@ -34,6 +40,8 @@ public:
     u32 fbLo = 0xFFFFFFFFu, fbHi = 0;
 
     R128Cell() : vram(32u << 20, 0) {}
+    // The engine's thread must not be left drawing into a card that is gone.
+    ~R128Cell() { r128AsyncAbandon(this); }
 
     struct Ev {
         u64 at;
@@ -454,6 +462,11 @@ struct CceMem {
     const u8* ram = nullptr;
     u32 ramSize = 0, gartBase = 0, aperBase = 0;
     SnoopSink* snoop = nullptr;
+    // The engine's own thread is executing (see "The command engine on its
+    // own thread" below): memory is read directly, as it stood when the
+    // stream was handed over, and the register lock is held and may be let
+    // go for the length of a draw.
+    bool worker = false;
 };
 // One GART-translated LE32 read out of AGP space (the parser's own walk,
 // exported for the 3D unit's vertex and texture fetches).
@@ -494,6 +507,128 @@ void r128Set3dTriDump(int n);
 void r128CceRingKick(R128Cell& c, u8* ram, u32 ramSize, u32 gartBase,
                      u32 aperBase, SnoopSink* snoop);
 const R128EngStats& r128EngStats();
+
+// --- The command engine on its own thread ---------------------------------
+//
+// A packet stream executes where it is submitted: inside the guest's store to
+// the FIFO. For a 3D title that is a frame's triangles rasterized in software
+// while the emulated processor stands still — measured in one, 37% of the host
+// time, in stretches of up to 10 ms during which no guest instruction runs and
+// no interrupt is taken. The real card draws while the processor carries on.
+//
+// With this on, an indirect buffer's packets are executed by a second thread.
+// What the guest can observe is unchanged, because every place it could look
+// waits for the engine first:
+//
+//   - a read or write of the engine's own registers (the PM4 block, the bus
+//     master block, the surface ranges, everything from 0x1000 up: the 2D
+//     and 3D state) and any access to video memory DRAIN the queue: whatever
+//     is still queued is executed there and then, by the calling thread,
+//     before the access;
+//   - the registers a driver ASKS the engine through are answered as the
+//     engine stands: PM4_STAT and GUI_STAT say busy and how much room the
+//     command FIFO has, and the scratch registers hold the last fence the
+//     stream has reached. Those are the card's own answers to "are you
+//     done" and "may I send more", and a driver that polls them is doing
+//     what it does on the real card — where forcing the queue to finish at
+//     every status read would stop the processor once per submission;
+//   - the other registers (the CRTC, the DAC, the cursor, the interrupt pair
+//     the vertical-blank handler uses) have nothing to do with the engine and
+//     only take the register lock, which the engine holds for a packet's
+//     register work and lets go while it rasterizes;
+//   - FIFO words written while the engine is running queue up behind it.
+//
+// System memory is the one thing the second thread cannot simply read: a
+// card-initiated read is snooped against the processor's caches, and those
+// belong to the processor's thread. So at every hand-off the machine's thread
+// copies the modified cache lines out to memory (SnoopSink::publish), and the
+// engine's thread reads memory directly, as it stood then. That covers what a
+// stream refers to — textures in AGP space, a vertex buffer, the GART — since
+// the guest wrote those before it submitted the stream. What it does not
+// cover is anything submitted LATER: FIFO words that arrive behind a running
+// engine, and the indirect buffer they dispatch. The engine stops when it
+// reaches those, and the machine's thread takes them at its next look at the
+// devices (r128AsyncService), executes what is short, and hands the rest
+// back with memory published again.
+//
+// Off by default, and left off wherever a run has to be reproducible: when
+// the work happens is the one thing this changes, and under host pacing that
+// is already not reproducible. All state is file-static in r128.cpp, like
+// the rest of the engine: no snapshot moves.
+//
+// `strict` is the proof mode: the status words and the scratch registers
+// finish the queue like every other engine register, so NOTHING the guest
+// can read depends on how far the engine's thread has got. A strict run is
+// then the synchronous machine instruction for instruction — same registers,
+// same video memory, same fingerprint at any count — which is how the
+// threading itself is checked (g4run --ati-thread-strict against
+// --no-ati-thread).
+void r128AsyncEnable(bool on, bool strict = false);
+bool r128AsyncEnabled();
+bool r128AsyncStrict();
+extern std::atomic<bool> gR128AsyncBusy;     // packets queued or executing
+extern std::atomic<bool> gR128AsyncNeedsEmu; // stopped at a packet that needs
+                                             // the machine's thread
+inline bool r128AsyncBusy()
+{
+    return gR128AsyncBusy.load(std::memory_order_acquire);
+}
+inline bool r128AsyncNeedsService()
+{
+    return gR128AsyncNeedsEmu.load(std::memory_order_relaxed);
+}
+// Execute everything still queued, on the calling thread. On return the
+// engine is idle and the caller owns the card outright until it next submits.
+void r128AsyncDrain(R128Cell& c, const CceMem& m);
+// Keep the engine's thread from running what it is handed until this is
+// lifted. For the tests, which need "a stream is queued and none of it has
+// executed" to be a state they can stand in rather than a race they might
+// win.
+void r128AsyncHold(bool hold);
+// FIFO words the guest has written that the engine has not taken yet: what a
+// running engine's command FIFO holds.
+u32 r128AsyncFifoQueued();
+// Why the next drain is happening, for the census below: a register offset,
+// or one of these.
+constexpr u32 kR128DrainFbRead = 0xFFFF0001u, kR128DrainFbWrite = 0xFFFF0002u,
+              kR128DrainOther = 0xFFFF0000u;
+void r128AsyncDrainCause(u32 cause);
+struct R128DrainCause {
+    u64 n = 0, ns = 0, pkts = 0;
+};
+// What the guest looked at when it had to wait, by cause. A wait is the
+// engine's thread not helping, so the busiest line here is the next thing to
+// look at.
+const std::map<u32, R128DrainCause>& r128AsyncDrainCauses();
+// Take the stream on from where the engine stopped (words submitted after
+// the hand-off), then hand the rest back.
+void r128AsyncService(R128Cell& c, const CceMem& m);
+// The register lock, for an access that does not need the queue finished.
+// Takes nothing when the engine is idle; nests.
+struct R128RegLock {
+    R128RegLock();
+    ~R128RegLock();
+    R128RegLock(const R128RegLock&) = delete;
+    R128RegLock& operator=(const R128RegLock&) = delete;
+
+  private:
+    bool held_ = false;
+};
+// For the 3D unit, on the engine's thread only: let the register lock go for
+// the length of a draw, which touches video memory and nothing else.
+void r128AsyncRegRelease();
+void r128AsyncRegTake();
+struct R128AsyncStats {
+    u64 handOffs = 0;   // times a stream was handed to the engine's thread
+    u64 workerPkts = 0; // packets that thread executed
+    u64 inlinePkts = 0; // packets executed where they were submitted
+    u64 drains = 0;     // times the guest looked and work was still queued
+    u64 drainNs = 0;    // ...and how long finishing it took
+    u64 drainPkts = 0;  // ...and how many packets the looking thread ran
+    u64 services = 0;   // times the engine stopped for the machine's thread
+    u64 inboxWords = 0; // FIFO words queued behind a running engine
+};
+const R128AsyncStats& r128AsyncStats();
 // --no-ati-2d: put the card back the way it was before the engine existed,
 // so a boot that never touches the GUI block can be shown to be unchanged.
 void r128SetEngine2d(bool on);

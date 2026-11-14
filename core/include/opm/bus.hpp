@@ -24,6 +24,22 @@ struct SnoopSink {
     virtual void snoopRead(u32 pa, u32 len) = 0;
     // A bus master is about to WRITE this range: push, then invalidate.
     virtual void snoopWrite(u32 pa, u32 len) = 0;
+    // Copy every modified line that lies in main memory ([0, ramSize) of
+    // `ram`) out to it, and change NOTHING else: the lines stay modified and
+    // the caches are exactly as they were. What it buys is that a device
+    // working on another thread can then read memory as it stood at this
+    // moment without asking — a snoop walks the caches, and those belong to
+    // the processor's thread.
+    //
+    // The processor reads a modified line from its cache, never from the
+    // memory under it, so this is invisible to a guest — with one exception
+    // that has to be said: a line INVALIDATED while modified (dcbi, a flash
+    // invalidate) discards its bytes, and the memory under it then shows
+    // what was published rather than what was there before the store. Code
+    // that relies on a store being thrown away is relying on the opposite
+    // of what a cache is for; the machine that never publishes (a run with
+    // no device thread) keeps the exact behaviour.
+    virtual void publish(u8* /*ram*/, u32 /*ramSize*/) {}
 };
 
 // Physical-address bus. The 7400 has a 32-bit physical address space (52-bit

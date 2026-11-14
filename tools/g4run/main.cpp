@@ -561,6 +561,8 @@ int main(int argc, char** argv)
     // path, which is capi's opm_run: step, tick, sync, deliver.
     bool bench = false;
     bool paceSmooth = true; // --no-pace-smooth
+    bool atiThread = true;  // --no-ati-thread
+    bool atiStrict = false; // --ati-thread-strict
     // --no-dev-gate: service every device on every instruction (the control
     // for the gate; see SawtoothBus::devGateOff).
     bool devGate = true;
@@ -769,6 +771,14 @@ int main(int argc, char** argv)
         // The control for HostPacer's stepped catch-up (--realtime only): hand
         // every gap in host time to the guest in one step, as it used to be.
         if (!strcmp(a, "--no-pace-smooth")) { paceSmooth = false; continue; }
+        // The control for the card's command engine running on its own
+        // thread (--bench --realtime, as in the app): execute every packet
+        // where the guest submits it, as it used to be.
+        if (!strcmp(a, "--no-ati-thread")) { atiThread = false; continue; }
+        // ...and the proof mode: the thread on in ANY --bench run, with every
+        // engine register waiting for it, so the run must match
+        // --no-ati-thread fingerprint for fingerprint (opm/r128.hpp).
+        if (!strcmp(a, "--ati-thread-strict")) { atiStrict = true; continue; }
         if (!strcmp(a, "--no-dev-gate")) { devGate = false; continue; }
         if (!strcmp(a, "--no-icache")) { icache = false; continue; }
         if (!strcmp(a, "--no-dxlate")) { dxlate = false; continue; }
@@ -2359,6 +2369,9 @@ int main(int argc, char** argv)
     // processor, advance the machine's clock, recompute the interrupt lines,
     // deliver. Everything g4run does around this is measurement, and a speed
     // number that includes the measurement is a number about g4run.
+    // The app's loop has the app's engine thread. Only here: every other
+    // loop in this file is an instrument and has to be reproducible.
+    r128AsyncEnable(bench && atiThread && (realtime || atiStrict), atiStrict);
     if (bench)
         while (executed < maxInsns && !cpu.halted) {
             // The scripted pointer advances between batches: a batch is
@@ -2415,6 +2428,9 @@ int main(int argc, char** argv)
             fingerprint(executed);
         }
 
+    // Everything from here on reads the card as a finished thing.
+    bus.atiDrain();
+    r128AsyncEnable(false);
     while (!bench && executed < maxInsns && !cpu.halted) {
         const u32 pc = cpu.st.pc;
         // A machine that cannot restart. Open Firmware's `reset-all` sends
@@ -5424,6 +5440,40 @@ int main(int argc, char** argv)
                 printf(" %s %llu", HostPacer::debtBucketName(i),
                        static_cast<unsigned long long>(pacer.debtHist[i]));
             printf("\n");
+        }
+        if (bench && (realtime || atiStrict)) {
+            const R128AsyncStats& as = r128AsyncStats();
+            printf("--   card engine thread%s: %llu stream(s) handed over, "
+                   "%llu packets there, %llu here; the guest waited %llu "
+                   "time(s), %.1f ms, %llu packets; it stopped for this "
+                   "thread %llu time(s); %llu FIFO words queued behind it\n",
+                   !(bench && atiThread) ? " [off]"
+                   : atiStrict           ? " [strict]"
+                                         : "",
+                   static_cast<unsigned long long>(as.handOffs),
+                   static_cast<unsigned long long>(as.workerPkts),
+                   static_cast<unsigned long long>(as.inlinePkts),
+                   static_cast<unsigned long long>(as.drains),
+                   as.drainNs / 1e6,
+                   static_cast<unsigned long long>(as.drainPkts),
+                   static_cast<unsigned long long>(as.services),
+                   static_cast<unsigned long long>(as.inboxWords));
+            for (const auto& [cause, dc] : r128AsyncDrainCauses()) {
+                char what[48];
+                if (cause == kR128DrainFbRead)
+                    snprintf(what, sizeof what, "a read of video memory");
+                else if (cause == kR128DrainFbWrite)
+                    snprintf(what, sizeof what, "a write to video memory");
+                else if (cause == kR128DrainOther)
+                    snprintf(what, sizeof what, "the harness");
+                else
+                    snprintf(what, sizeof what, "register %04x %s", cause,
+                             r128RegName(cause) ? r128RegName(cause) : "");
+                printf("--     waited on %s: %llu time(s), %.1f ms, %llu "
+                       "packets\n",
+                       what, static_cast<unsigned long long>(dc.n),
+                       dc.ns / 1e6, static_cast<unsigned long long>(dc.pkts));
+            }
         }
         if (bench)
             printf("--   ^ THE APP'S LOOP (--bench): step, tick, sync, "

@@ -12,6 +12,7 @@
 #include <thread>
 #include <utility>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -92,6 +93,10 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     // stopped mid-packet would otherwise poison the new stream (see
     // r128CceReset in opm/r128.hpp).
     r128CceReset();
+    // ...and its engine is on this thread until opm_set_realtime says the
+    // clock comes from the host: the switch is process-wide, and a previous
+    // machine in this process may have left it on.
+    r128AsyncEnable(false);
     m->bus = new SawtoothBus(size_t(ramMb ? ramMb : 256) * 1024 * 1024,
                              std::move(rom));
     // The machine has its CD drive whether or not there is a disc in it. A
@@ -273,6 +278,14 @@ OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
 {
     m->realtime = on != 0;
     m->pace.anchor(m->cpu);
+    // The card's command engine gets its own thread when the clock comes
+    // from the host, and only then: an instruction-paced run has to be
+    // reproducible, and when a packet executes is the one thing the thread
+    // changes (opm/r128.hpp). OPM_ATI_THREAD=0 in the environment keeps the
+    // engine on this thread, for telling the two apart from outside.
+    m->bus->atiDrain();
+    const char* env = getenv("OPM_ATI_THREAD");
+    r128AsyncEnable(m->realtime && !(env && env[0] == '0'));
 }
 
 OPM_API uint64_t opm_rt_slips(const OpmMachine* m) { return m->pace.slips; }
@@ -755,6 +768,26 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         s += b;
     }
     s += "\n";
+    {
+        // Where the card's packets were executed. `waited` is the time this
+        // thread spent finishing the queue because the guest looked at the
+        // engine or at video memory while work was still on it.
+        const R128AsyncStats& as = r128AsyncStats();
+        snprintf(b, sizeof b,
+                 "-- card engine thread: %s; %llu stream(s) handed over, "
+                 "%llu packets there, %llu here; the guest waited %llu "
+                 "time(s), %.1f ms, %llu packets; it stopped for this "
+                 "thread %llu time(s); %llu FIFO words queued behind it\n",
+                 r128AsyncEnabled() ? "on" : "off",
+                 static_cast<unsigned long long>(as.handOffs),
+                 static_cast<unsigned long long>(as.workerPkts),
+                 static_cast<unsigned long long>(as.inlinePkts),
+                 static_cast<unsigned long long>(as.drains), as.drainNs / 1e6,
+                 static_cast<unsigned long long>(as.drainPkts),
+                 static_cast<unsigned long long>(as.services),
+                 static_cast<unsigned long long>(as.inboxWords));
+        s += b;
+    }
     // 📓 WHAT IT HAS BEEN DOING, not just where it stopped. A handler entered
     // once and a fault re-taken forever look identical in a single sample.
     {
@@ -1656,8 +1689,17 @@ OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
     // drift — the olive-desktop byte-order bug and the refused-15/16-bpp
     // black screen were both two-copies defects. bypp == 0 is the one
     // refusal left: a format the shared table cannot scan.
-    R128Cell& ati = m->bus->ati();
-    const R128Scan sc = r128ScanDecode(ati);
+    //
+    // The picture is read the way a monitor reads it: whatever is in video
+    // memory now, without waiting for the card's command engine to finish
+    // what it has queued (SawtoothBus::atiScanout). The register lock is held
+    // for the registers only, not for the walk over the pixels.
+    const R128Cell& ati = m->bus->atiScanout();
+    R128Scan sc;
+    {
+        R128RegLock lock;
+        sc = r128ScanDecode(ati);
+    }
     if (!sc.enabled || !sc.bypp || sc.w < 64 || sc.w > 2048 || sc.h < 64 ||
         sc.h > 1536)
         return -1;
@@ -1671,7 +1713,10 @@ OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
         r128ScanRow(ati, sc, y, bgra + size_t(y) * sc.w * 4u);
     // The hardware cursor, composited after the framebuffer walk — Mac OS
     // draws its pointer with the cursor engine, so VRAM alone shows none.
-    r128ScanCursor(ati, sc, bgra);
+    {
+        R128RegLock lock;
+        r128ScanCursor(ati, sc, bgra);
+    }
     return 1;
 }
 

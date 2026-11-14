@@ -19,9 +19,15 @@ set(OPM_MACHINE_SRC
   src/hfs.cpp
 )
 
+# The card's command engine runs on a thread of its own (src/r128.cpp). On
+# glibc the thread functions are in libc itself; on musl and older systems
+# they are not, and the link fails without this.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 add_library(opmmachine STATIC ${OPM_MACHINE_SRC})
 target_include_directories(opmmachine PUBLIC include)
-target_link_libraries(opmmachine PUBLIC opmcore)
+target_link_libraries(opmmachine PUBLIC opmcore Threads::Threads)
 if(MSVC)
   target_compile_definitions(opmmachine PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -31,7 +37,7 @@ endif()
 # inline functions, which is an ODR violation the linker will not report.
 add_library(opmmachine_prof STATIC EXCLUDE_FROM_ALL ${OPM_MACHINE_SRC})
 target_include_directories(opmmachine_prof PUBLIC include)
-target_link_libraries(opmmachine_prof PUBLIC opmcore_prof)
+target_link_libraries(opmmachine_prof PUBLIC opmcore_prof Threads::Threads)
 if(MSVC)
   target_compile_definitions(opmmachine_prof PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()

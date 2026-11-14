@@ -1720,6 +1720,28 @@ bool pipeReady(R128Cell& c, const CceMem& m, Pipe& P)
     return gatherPipe(c, m, P);
 }
 
+// On the engine's own thread the register lock is held when a packet starts.
+// A draw reads its state out of the Pipe gathered at its head and touches
+// video memory and counters, never a register, so the lock is let go for its
+// length: the machine's thread can then reach the registers that have nothing
+// to do with the engine (the vertical-blank pair, the cursor) while a large
+// triangle is being filled.
+struct RegLend {
+    bool on;
+    explicit RegLend(bool w) : on(w)
+    {
+        if (on)
+            r128AsyncRegRelease();
+    }
+    ~RegLend()
+    {
+        if (on)
+            r128AsyncRegTake();
+    }
+    RegLend(const RegLend&) = delete;
+    RegLend& operator=(const RegLend&) = delete;
+};
+
 } // namespace
 
 // ── Entry points from the parser and the register engine ──────────────────
@@ -1854,6 +1876,7 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
         src.wordCount = n - 2u;
         src.fmt = fmt;
         src.stride = stride;
+        RegLend lend(m.worker);
         assemble(P, src, cntl & 0xFu, count, nullptr, false);
         return true;
     }
@@ -1926,6 +1949,7 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
                 count = vsize;
             }
         }
+        RegLend lend(m.worker);
         assemble(P, src, cntl & 0xFu, count, idxWords, walk == 1u);
         return true;
     }

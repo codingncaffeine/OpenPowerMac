@@ -685,6 +685,40 @@ void CpuSnoop::snoopWrite(u32 pa, u32 len)
         cpu->snoopPush(pa, len, true);
 }
 
+void CpuSnoop::publish(u8* ram, u32 ramSize)
+{
+    if (cpu)
+        cpu->publishModified(ram, ramSize);
+}
+
+// See SnoopSink::publish. The L2's copies go first: a block modified in both
+// caches is newer in the L1 (the note on l1dFlushAll below), so the L1's
+// bytes are the ones that must be left standing. Lines outside main memory
+// are a device's, and a device is written when the cache casts the line out,
+// not before.
+void Cpu::publishModified(u8* ram, u32 ramSize) const
+{
+    if (ramSize < 32u)
+        return;
+    for (const L2Line& e : l2) {
+        if (!e.v || !e.d)
+            continue;
+        const u64 base = static_cast<u64>(e.tag) << 5;
+        if (base <= ramSize - 32u)
+            std::memcpy(ram + base, e.b, 32);
+    }
+    for (u32 s = 0; s < 128; ++s)
+        for (u32 w = 0; w < 8; ++w) {
+            const DLine& e = l1d[s][w];
+            const u32 tv = l1x[s].tv[w];
+            if (!(tv & 1u) || !e.d)
+                continue;
+            const u32 base = ((tv >> 1) << 12) | (s << 5);
+            if (base <= ramSize - 32u)
+                std::memcpy(ram + base, e.b, 32);
+        }
+}
+
 // Harness/instrument coherence: dirty lines go straight to the bus so the
 // observed memory image is the architectural one.
 //

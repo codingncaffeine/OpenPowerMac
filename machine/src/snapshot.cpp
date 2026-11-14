@@ -1292,6 +1292,11 @@ void SawtoothBus::snapLoad(SnapReader& r)
 void saveSnapshot(const Cpu& cpu, const SawtoothBus& bus, const HarnessState& h,
                   SnapWriter& w)
 {
+    // The card's command engine may still have packets queued on its own
+    // thread. What is saved is the card with all of them executed — finishing
+    // them changes nothing a guest could have seen, which is why a function
+    // that takes the machine const may do it.
+    const_cast<SawtoothBus&>(bus).atiDrain();
     w.u32v(kSnapMagic);
     w.u32v(kSnapVersion);
     w.u64v(layoutDigest());

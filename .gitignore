@@ -46,3 +46,12 @@ shell/native/
 
 # Release artifact (dotnet publish) — built every pass, never committed
 shell/publish/
+
+# Linux front end build artifacts (native/ receives libopmcapi.so from CMake)
+gui/bin/
+gui/obj/
+gui/native/
+
+# The runnable dev build (tools/build.sh) and local work files
+/bin/
+/scratch/

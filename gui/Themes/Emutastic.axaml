@@ -1,0 +1,174 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Styles.Resources>
+        <ResourceDictionary>
+            <!-- ===== Palette (Emutastic: dark surface, red accent) ===== -->
+            <Color x:Key="WindowBgColor">#FF1B1B1D</Color>
+            <Color x:Key="SurfaceColor">#FF232326</Color>
+            <Color x:Key="SurfaceAltColor">#FF2C2C31</Color>
+            <Color x:Key="BorderColor">#FF3A3A40</Color>
+            <Color x:Key="AccentColor">#FFE03535</Color>
+            <Color x:Key="AccentHoverColor">#FFEC4A4A</Color>
+            <Color x:Key="TextPrimaryColor">#FFEAEAEA</Color>
+            <Color x:Key="TextSecondaryColor">#FF9A9AA0</Color>
+
+            <SolidColorBrush x:Key="WindowBg" Color="#FF1B1B1D" />
+            <SolidColorBrush x:Key="Surface" Color="#FF232326" />
+            <SolidColorBrush x:Key="SurfaceAlt" Color="#FF2C2C31" />
+            <SolidColorBrush x:Key="BorderBrush" Color="#FF3A3A40" />
+            <SolidColorBrush x:Key="Accent" Color="#FFE03535" />
+            <SolidColorBrush x:Key="AccentHover" Color="#FFEC4A4A" />
+            <SolidColorBrush x:Key="TextPrimary" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="TextSecondary" Color="#FF9A9AA0" />
+            <SolidColorBrush x:Key="Letterbox" Color="#FF0D0D0F" />
+
+            <!-- ===== Menus: the Fluent theme's own tokens, in this palette ===== -->
+            <SolidColorBrush x:Key="MenuFlyoutPresenterBackground" Color="#FF232326" />
+            <SolidColorBrush x:Key="MenuFlyoutPresenterBorderBrush" Color="#FF3A3A40" />
+            <SolidColorBrush x:Key="MenuFlyoutItemBackground" Color="Transparent" />
+            <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPointerOver" Color="#FFE03535" />
+            <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPressed" Color="#FFEC4A4A" />
+            <SolidColorBrush x:Key="MenuFlyoutItemBackgroundDisabled" Color="Transparent" />
+            <SolidColorBrush x:Key="MenuFlyoutItemForeground" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutItemForegroundPointerOver" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutItemForegroundPressed" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutItemForegroundDisabled" Color="#FF9A9AA0" />
+            <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForeground" Color="#FF9A9AA0" />
+            <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForegroundPointerOver" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForegroundPressed" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutItemKeyboardAcceleratorTextForegroundDisabled" Color="#FF9A9AA0" />
+            <SolidColorBrush x:Key="MenuFlyoutSubItemChevron" Color="#FF9A9AA0" />
+            <SolidColorBrush x:Key="MenuFlyoutSubItemChevronPointerOver" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutSubItemChevronPressed" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutSubItemChevronSubMenuOpened" Color="#FFEAEAEA" />
+            <SolidColorBrush x:Key="MenuFlyoutSubItemChevronDisabled" Color="#FF9A9AA0" />
+            <CornerRadius x:Key="OverlayCornerRadius">4</CornerRadius>
+        </ResourceDictionary>
+    </Styles.Resources>
+
+    <!-- ===== Window ===== -->
+    <Style Selector=":is(Window)">
+        <Setter Property="Background" Value="{DynamicResource WindowBg}" />
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+        <Setter Property="FontSize" Value="13" />
+    </Style>
+
+    <!-- ===== TextBlock ===== -->
+    <Style Selector="TextBlock.secondary">
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondary}" />
+    </Style>
+
+    <!-- ===== Menu bar ===== -->
+    <Style Selector="Menu">
+        <Setter Property="Background" Value="{DynamicResource Surface}" />
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+        <Setter Property="Padding" Value="4,2" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="0,0,0,1" />
+    </Style>
+    <Style Selector="Menu > MenuItem">
+        <Setter Property="Padding" Value="9,5" />
+        <Setter Property="CornerRadius" Value="3" />
+    </Style>
+    <Style Selector="MenuItem">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+    </Style>
+    <Style Selector="MenuItem > Separator">
+        <Setter Property="Background" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="Margin" Value="30,4,8,4" />
+    </Style>
+    <Style Selector="TextBlock.gesture">
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondary}" />
+        <Setter Property="Margin" Value="24,0,0,0" />
+    </Style>
+
+    <!-- ===== Button ===== -->
+    <Style Selector="Button">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+        <Setter Property="Background" Value="{DynamicResource SurfaceAlt}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="14,6" />
+        <Setter Property="CornerRadius" Value="4" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="HorizontalContentAlignment" Value="Center" />
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Accent}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Accent}" />
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+    </Style>
+    <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource AccentHover}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource AccentHover}" />
+    </Style>
+    <Style Selector="Button:disabled /template/ ContentPresenter#PART_ContentPresenter">
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondary}" />
+        <Setter Property="Opacity" Value="0.6" />
+    </Style>
+
+    <!-- Accent (primary) button variant -->
+    <Style Selector="Button.accent">
+        <Setter Property="Background" Value="{DynamicResource Accent}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Accent}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+
+    <!-- ===== TextBox ===== -->
+    <Style Selector="TextBox">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+        <Setter Property="Background" Value="{DynamicResource WindowBg}" />
+        <Setter Property="CaretBrush" Value="{DynamicResource Accent}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="7,5" />
+        <Setter Property="CornerRadius" Value="4" />
+    </Style>
+    <Style Selector="TextBox:pointerover /template/ Border#PART_BorderElement">
+        <Setter Property="Background" Value="{DynamicResource WindowBg}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    </Style>
+    <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+        <Setter Property="Background" Value="{DynamicResource WindowBg}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Accent}" />
+    </Style>
+    <Style Selector="TextBox:pointerover, TextBox:focus">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+    </Style>
+
+    <!-- ===== ComboBox ===== -->
+    <Style Selector="ComboBox">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+        <Setter Property="Background" Value="{DynamicResource WindowBg}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="4" />
+        <Setter Property="Height" Value="30" />
+    </Style>
+    <Style Selector="ComboBox:pointerover /template/ Border#Background">
+        <Setter Property="Background" Value="{DynamicResource WindowBg}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Accent}" />
+    </Style>
+    <Style Selector="ComboBoxItem">
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+        <Setter Property="Padding" Value="8,5" />
+        <Setter Property="CornerRadius" Value="3" />
+    </Style>
+    <Style Selector="ComboBoxItem:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Accent}" />
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+    </Style>
+
+    <!-- ===== Message box glyph ===== -->
+    <Style Selector="Border.message-glyph">
+        <Setter Property="Background" Value="{DynamicResource SurfaceAlt}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="Border.message-glyph.alert">
+        <Setter Property="Background" Value="{DynamicResource Accent}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Accent}" />
+    </Style>
+
+</Styles>

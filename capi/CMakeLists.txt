@@ -21,3 +21,12 @@ if(WIN32 AND MSVC)
             $<TARGET_FILE:opmcapi>
             ${CMAKE_SOURCE_DIR}/shell/native/opmcapi.dll)
 endif()
+
+# The Linux front end (gui/, Avalonia) picks the library up from gui/native/
+# (gitignored), the same way.
+if(UNIX AND NOT APPLE)
+  add_custom_command(TARGET opmcapi POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:opmcapi>
+            ${CMAKE_SOURCE_DIR}/gui/native/libopmcapi.so)
+endif()

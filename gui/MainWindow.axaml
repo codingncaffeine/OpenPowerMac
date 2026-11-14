@@ -1,0 +1,133 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="OpenPowerMac.Gui.MainWindow"
+        Title="OpenPowerMac"
+        Icon="avares://OpenPowerMac/Assets/OpenPowerMac.ico"
+        Width="1024" Height="900" MinWidth="720" MinHeight="560"
+        DragDrop.AllowDrop="True">
+    <DockPanel>
+        <Menu x:Name="MainMenu" DockPanel.Dock="Top">
+            <MenuItem Header="_File">
+                <MenuItem x:Name="miRom" Header="Choose Boot ROM…" Click="OnChooseRom" />
+                <MenuItem x:Name="miCd" Header="Choose CD Image…" Click="OnChooseCd" />
+                <!-- Ejecting the CD is how a Mac chooses to boot from its hard
+                     disk: Open Firmware prefers the CD while one is in the drive. -->
+                <MenuItem x:Name="miCdEject" Header="_Eject CD (boot from hard disk)" Click="OnEjectCd" />
+                <Separator />
+                <!-- Packed into a read-only HFS volume at every Start and mounted
+                     in the guest like an inserted CD. -->
+                <MenuItem x:Name="miShared" Header="Choose Shared Folder…" Click="OnChooseShared" />
+                <MenuItem x:Name="miSharedClear" Header="Stop Sharing Folder" Click="OnClearShared" />
+                <!-- Files dropped on the display go to the guest on a second CD
+                     drive with no restart. -->
+                <MenuItem x:Name="miDrop" Header="Drop _Box">
+                    <MenuItem Header="_Open Drop Box Folder" Click="OnOpenDropFolder" />
+                    <MenuItem Header="_Choose Drop Box Folder…" Click="OnChooseDropFolder" />
+                    <MenuItem Header="Use _Default Folder" Click="OnDefaultDropFolder" />
+                </MenuItem>
+                <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
+                <Separator />
+                <!-- Rebuilt each time it opens: the history and the size of each
+                     image are facts about the filesystem. -->
+                <MenuItem x:Name="miHd" Header="_Hard Disk" SubmenuOpened="OnHardDiskOpened">
+                    <!-- Sparse images. 120 GB is the drive's LBA28 ceiling. -->
+                    <MenuItem x:Name="miHdNew" Header="_New Disk Image">
+                        <MenuItem Header="_20 GB" Tag="20480" Click="OnNewHd" />
+                        <MenuItem Header="_40 GB" Tag="40960" Click="OnNewHd" />
+                        <MenuItem Header="_80 GB" Tag="81920" Click="OnNewHd" />
+                        <MenuItem Header="1_20 GB" Tag="122880" Click="OnNewHd" />
+                    </MenuItem>
+                    <MenuItem x:Name="miHdChoose" Header="_Choose Disk Image…" Click="OnChooseHd" />
+                    <Separator x:Name="miHdSep" />
+                    <MenuItem x:Name="miHdDetach" Header="_Detach (no hard disk)" Click="OnDetachHd" />
+                </MenuItem>
+                <Separator />
+                <MenuItem Header="E_xit" Click="OnExit" />
+            </MenuItem>
+            <MenuItem Header="_Machine">
+                <MenuItem x:Name="miStart" Header="_Start" Click="OnStart" />
+                <MenuItem x:Name="miStop" Header="S_top" Click="OnStop" IsEnabled="False" />
+                <Separator />
+                <MenuItem x:Name="miAutoBoot" Header="Auto-boot script (display + USB + mac-boot)"
+                          ToggleType="CheckBox" Click="OnAutoBootToggled" />
+                <Separator />
+                <!-- RAM on the NEXT start: only totals real PC100 modules can
+                     express. 1.5 GB = three 512 MB modules, a Sawtooth's most. -->
+                <MenuItem x:Name="miRam" Header="M_emory" SubmenuOpened="OnMemoryOpened">
+                    <MenuItem Header="_64 MB" Tag="64" ToggleType="Radio" Click="OnSetRam" />
+                    <MenuItem Header="_128 MB" Tag="128" ToggleType="Radio" Click="OnSetRam" />
+                    <MenuItem Header="_256 MB" Tag="256" ToggleType="Radio" Click="OnSetRam" />
+                    <MenuItem Header="_512 MB" Tag="512" ToggleType="Radio" Click="OnSetRam" />
+                    <MenuItem Header="1 _GB" Tag="1024" ToggleType="Radio" Click="OnSetRam" />
+                    <MenuItem Header="1._5 GB" Tag="1536" ToggleType="Radio" Click="OnSetRam" />
+                </MenuItem>
+                <Separator />
+                <MenuItem x:Name="miSound" Header="S_ound" ToggleType="CheckBox" Click="OnSoundToggled" />
+                <Separator />
+                <MenuItem x:Name="miDiag" Header="_Diagnostics — why is it stuck?" Click="OnDiagnostics" />
+                <MenuItem x:Name="miSnap" Header="Save S_napshot — hand this moment to the harness"
+                          Click="OnSaveSnapshot" />
+            </MenuItem>
+        </Menu>
+
+        <Border DockPanel.Dock="Bottom" Background="{DynamicResource Surface}"
+                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Padding="10,4">
+            <DockPanel>
+                <TextBlock x:Name="txtVideo" DockPanel.Dock="Right" Classes="secondary" Text="no video" />
+                <StackPanel Orientation="Horizontal" Spacing="18">
+                    <TextBlock x:Name="txtState" Classes="secondary" Text="stopped" />
+                    <TextBlock x:Name="txtInsns" Classes="secondary" Text="0 insns" />
+                    <TextBlock x:Name="txtMips" Classes="secondary" Text="" />
+                    <TextBlock x:Name="txtPc" Classes="secondary" Text="" FontFamily="monospace" />
+                    <TextBlock x:Name="txtAudio" Classes="secondary" Text="" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <Grid RowDefinitions="*,4,240">
+            <Border x:Name="brdScreen" Grid.Row="0" Background="{DynamicResource Letterbox}" MinHeight="200">
+                <Grid>
+                    <Image x:Name="imgScreen" Stretch="Uniform" Focusable="True"
+                           RenderOptions.BitmapInterpolationMode="None" />
+                    <StackPanel x:Name="pnlNoVideo" VerticalAlignment="Center" HorizontalAlignment="Center"
+                                IsHitTestVisible="False">
+                        <TextBlock Text="OpenPowerMac" FontSize="26" FontWeight="SemiBold"
+                                   HorizontalAlignment="Center" Classes="secondary" />
+                        <TextBlock x:Name="txtHint" Margin="0,10,0,0" FontSize="13" TextAlignment="Center"
+                                   Classes="secondary"
+                                   Text="Machine ▸ Start boots the Sawtooth ROM.&#10;The firmware talks on the serial console below until the display comes up." />
+                    </StackPanel>
+                    <!-- A machine that can swallow the pointer has to say so, and
+                         how to get it back. -->
+                    <Border x:Name="brdCapture" VerticalAlignment="Bottom" HorizontalAlignment="Center"
+                            Margin="0,0,0,10" Padding="10,4" CornerRadius="3" Opacity="0.82"
+                            Background="{DynamicResource Surface}" BorderThickness="1"
+                            BorderBrush="{DynamicResource BorderBrush}" IsVisible="False"
+                            IsHitTestVisible="False">
+                        <TextBlock x:Name="txtCapture" FontSize="12" Classes="secondary"
+                                   Text="Click the screen to capture the pointer" />
+                    </Border>
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Row="1" ResizeDirection="Rows" Background="{DynamicResource BorderBrush}"
+                          Focusable="False" />
+
+            <DockPanel Grid.Row="2" Background="{DynamicResource Surface}" MinHeight="110">
+                <DockPanel DockPanel.Dock="Bottom" Margin="6,4,6,6">
+                    <Button x:Name="btnSend" DockPanel.Dock="Right" Content="Send" MinWidth="70"
+                            Margin="6,0,0,0" Click="OnSend" IsEnabled="False" />
+                    <TextBox x:Name="txtInput" FontFamily="monospace" FontSize="13"
+                             VerticalContentAlignment="Center" KeyDown="OnInputKeyDown"
+                             ToolTip.Tip="One Forth line — Enter sends with CR; ';' splits into separate lines" />
+                </DockPanel>
+                <TextBox x:Name="txtConsole" IsReadOnly="True" FontFamily="monospace" FontSize="13"
+                         TextWrapping="NoWrap" AcceptsReturn="True"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                         BorderThickness="0" Margin="6,6,6,0"
+                         Background="{DynamicResource Letterbox}" />
+            </DockPanel>
+        </Grid>
+    </DockPanel>
+</Window>

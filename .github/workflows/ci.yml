@@ -28,6 +28,22 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  linux-gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build the native core (copies libopmcapi.so into gui/native)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPM_BUILD_TESTS=OFF
+          cmake --build build --target opmcapi
+      - name: Build the Linux app
+        run: dotnet build gui -c Release --nologo
+      - name: The app carries the core
+        run: test -f gui/bin/Release/net10.0/libopmcapi.so
+
   linux-oracle:
     runs-on: ubuntu-latest
     steps:

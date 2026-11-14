@@ -80,7 +80,24 @@ ledger with its source tier and how it was verified.
 
 ## Building
 
-Requires CMake and a C++20 compiler (MSVC and GCC are both kept green).
+Requires CMake and a C++20 compiler (GCC and MSVC are both kept green).
+
+### Linux
+
+Needs the .NET 10 SDK for the app, and SDL3 at run time for sound
+(`libsdl3` / `libsdl3-0`).
+
+```
+tools/build-linux.sh
+bin/openpowermac
+```
+
+That builds the core, runs its tests, builds the app (`gui/`, Avalonia) and
+refreshes the runnable build in `bin/`. Settings live in
+`~/.config/OpenPowerMac/shell.json`. Click the screen to capture the mouse and
+keyboard; middle-click or Esc gives them back.
+
+### Windows
 
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -88,14 +105,21 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-`tools/g4run` is the machine's command-line front end and carries the instrumentation used
-to bring it up. The Windows GUI (`shell/`, WPF on .NET) builds separately once the native
+The Windows GUI (`shell/`, WPF on .NET) builds separately once the native
 library exists — it picks `opmcapi.dll` up from `shell/native/`:
 
 ```
 cd shell
 dotnet build -c Release
 ```
+
+The two front ends share the machine session, settings and console code
+(`shell/MachineSession.cs` and friends); only the window, input, sound and
+dialogs differ.
+
+`tools/g4run` is the machine's command-line front end on both, and carries the
+instrumentation used to bring it up. The run scripts in `tools/` find it,
+the reference shelf and the install media through `tools/paths.sh`.
 
 ## License
 

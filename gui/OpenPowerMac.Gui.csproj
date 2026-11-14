@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The Linux front end (Avalonia). The Windows one is shell/ (WPF); the
+       machine session, settings, console interpreter, WAV capture and the
+       capi imports are the SAME source files, linked from shell/, so the two
+       front ends cannot drift on how they drive the machine. Only the
+       platform layer is this project's own: the window, input capture, the
+       SDL3 sound sink, dialogs and theme. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>OpenPowerMac</AssemblyName>
+    <RootNamespace>OpenPowerMac.Gui</RootNamespace>
+    <Product>OpenPowerMac</Product>
+    <AssemblyTitle>OpenPowerMac</AssemblyTitle>
+    <Version>0.1.0</Version>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="../shell/MachineSession.cs" Link="Shared/MachineSession.cs" />
+    <Compile Include="../shell/ShellSettings.cs" Link="Shared/ShellSettings.cs" />
+    <Compile Include="../shell/TerminalBuffer.cs" Link="Shared/TerminalBuffer.cs" />
+    <Compile Include="../shell/AudioCapture.cs" Link="Shared/AudioCapture.cs" />
+    <Compile Include="../shell/Native.cs" Link="Shared/Native.cs" />
+  </ItemGroup>
+
+  <!-- The native core, built by CMake into gui/native. CopyToPublishDirectory
+       too: without it a published tree is an app with no machine in it. -->
+  <ItemGroup>
+    <None Include="native/libopmcapi.so" Condition="Exists('native/libopmcapi.so')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Link>libopmcapi.so</Link>
+    </None>
+  </ItemGroup>
+
+</Project>

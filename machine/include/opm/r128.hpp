@@ -356,7 +356,7 @@ struct R128EngStats {
     u64 agpTarget = 0;   // an offset in the upper 32 MB: AGP, not VRAM
     u64 clippedOut = 0;  // entirely outside the scissor
     u64 hostData = 0;    // source is HOST_DATA (stage 3, not built yet)
-    u64 colorCompare = 0; // a colour-key function this engine ignores
+    u64 colorCompare = 0; // a colour compare this engine did not apply
     u64 waitUntil = 0;   // WAIT_UNTIL events, all satisfiable at once here
     u64 cacheFlushes = 0; // PC_GUI_CTLSTAT flush/invalidate pulses answered
     u64 bmFetches = 0;    // bus-master fetches into the GUI scratch registers

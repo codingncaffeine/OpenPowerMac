@@ -382,6 +382,54 @@ TEST_CASE("cce: HOSTDATA_BLT colour keeps the guest's MEMORY byte order")
     CHECK(r.c.vram[stride * 3u + 4u * 4u + 0u] == 0x55);
 }
 
+// A sprite pushed from system memory with its surround keyed out: colour
+// host data with CLR_CMP_CNTL = 0x01000005 (compare the source, draw when
+// not equal) and a key of zero, which is what a driver programs for one.
+// GUI_CONTROL bit 28 clear leaves that setting alone; set, it switches the
+// compare off for the packet.
+TEST_CASE("cce: HOSTDATA_BLT colour honours the source colour key")
+{
+    for (const bool keyed : {true, false}) {
+        CceRig r;
+        // What is on screen already, at (3,2)..(4,3) of a 32-px-wide surface.
+        const size_t stride = 4u * 8u * 4u;
+        for (u32 y = 2; y < 4; ++y)
+            for (u32 x = 3; x < 5; ++x)
+                for (u32 k = 0; k < 4; ++k)
+                    r.c.vram[stride * y + x * 4u + k] = 0x77;
+        r.c.write(0x15C4u, be(0x00000000u), 4); // CLR_CMP_CLR_SRC
+        r.c.write(0x15CCu, be(0xFFFFFFFFu), 4); // CLR_CMP_MSK
+        r.c.write(0x15C0u, be(0x01000005u), 4); // CLR_CMP_CNTL
+        const u32 gc = 2u | 8u | (15u << 4) | (6u << 8) | (3u << 12) |
+                       (0xCCu << 16) | (keyed ? 0u : 1u << 28);
+        r.body({
+            0xC0009400u | (12u << 16),
+            gc,
+            0x00800000u, // DST_PITCH_OFFSET
+            0x00000000u, // SC_TOP_LEFT
+            0x001F001Fu, // SC_BOT_RITE
+            0x00000000u, // FRGD
+            0x00000000u, // BKGD
+            0x00020003u, // BaseY=2 | BaseX=3
+            0x00020002u, // 2x2
+            0x00000004u, // four DWORDs
+            0x00000000u, // the key: memory bytes 00 00 00 00
+            0xD8C7B6A5u, // a pixel: A5 B6 C7 D8
+            0x44332211u, // a pixel: 11 22 33 44
+            0x00000000u, // the key again
+        });
+        r.fifo(0x000101CEu);
+        r.fifo(0x00101000u);
+        r.fifo(0x0000000Eu);
+        CAPTURE(keyed);
+        auto byte0 = [&](u32 x, u32 y) { return r.c.vram[stride * y + x * 4u]; };
+        CHECK(byte0(4, 2) == 0xA5); // the sprite's own pixels land either way
+        CHECK(byte0(3, 3) == 0x11);
+        CHECK(byte0(3, 2) == (keyed ? 0x77 : 0x00)); // the surround
+        CHECK(byte0(4, 3) == (keyed ? 0x77 : 0x00));
+    }
+}
+
 TEST_CASE("cce: BITBLT_MULTI (0x9B) copies through the engine's blit path")
 {
     CceRig r;

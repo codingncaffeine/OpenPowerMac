@@ -1154,6 +1154,78 @@ static bool cceOpPaintMulti(R128Cell& c, const u32* body, u32 n)
     return true;
 }
 
+// ---- colour compare (CLR_CMP_CNTL, 0x15C0) ----------------------------------
+//
+// The 2D engine's transparency: a pixel is drawn or left alone by comparing
+// the SOURCE pixel, the DESTINATION pixel or both against a key, through a
+// mask. A sprite with a black surround is pushed with "source, function 5,
+// key black" and only its own pixels land.
+//
+// ⚠ THE TABLE READS TWO WAYS AND MEANS ONE. Register guide 3-178 gives each
+// function an expression and an action — "5 = SRC_CLR = CLR_CMP_CLR_SRC
+// (CMP_NEQ_COLOR, draw when neq)" — and the two look like opposites. They are
+// the same statement: the expression is what SUPPRESSES the pixel, exactly as
+// "1 = True" is "never draw", and the action is its complement. This engine
+// used to count the setting and draw every pixel, on the grounds that the
+// table contradicted itself; a driver settles it. For a sprite on a black
+// surround the Mac driver programs 0x01000005 with a key of zero, which is
+// transparency only under "draw when not equal".
+//
+//   0 always draw   1 never draw   4 draw when equal   5 draw when not equal
+//
+// Function 7 (flip through SRC_FRGD_CLR when equal), the reserved values and
+// the HILITE source are not applied; they are counted in colorCompare, which
+// is now "a compare this engine did not apply" and nothing else.
+static u32 rop3(u32 rop, u32 P, u32 S, u32 D);
+static bool ropUsesSrc(u32 rop);
+static bool ropUsesPat(u32 rop);
+static bool ropUsesDst(u32 rop);
+
+namespace {
+struct ClrCmp {
+    u32 fnSrc = 0, fnDst = 0; // only 1, 4 and 5 ever suppress a pixel
+    u32 keySrc = 0, keyDst = 0, mask = 0;
+    bool any = false;     // some pixel could be suppressed
+    bool unknown = false; // …or the setting is one this engine does not apply
+
+    static bool one(u32 fn, u32 pix, u32 key, u32 mask)
+    {
+        switch (fn) {
+        case 1u: return false;
+        case 4u: return ((pix ^ key) & mask) == 0u;
+        case 5u: return ((pix ^ key) & mask) != 0u;
+        default: return true;
+        }
+    }
+    bool draws(u32 S, u32 D) const
+    {
+        return one(fnSrc, S, keySrc, mask) && one(fnDst, D, keyDst, mask);
+    }
+};
+
+// `bypp` is the pixel's width: the key and the mask are compared over the
+// pixel's own bits and no further.
+ClrCmp clrCmpDecode(u32 cntl, u32 keySrc, u32 keyDst, u32 mask, u32 bypp)
+{
+    ClrCmp k;
+    const u32 which = (cntl >> 24) & 3u; // 0 destination, 1 source, 2 both
+    const u32 fs = cntl & 7u, fd = (cntl >> 8) & 7u;
+    const u32 bits = bypp >= 4u ? 0xFFFFFFFFu : (1u << (bypp * 8u)) - 1u;
+    if (which == 1u || which == 2u)
+        k.fnSrc = fs;
+    if (which == 0u || which == 2u)
+        k.fnDst = fd;
+    auto applied = [](u32 fn) { return fn == 1u || fn == 4u || fn == 5u; };
+    k.unknown = which == 3u || (k.fnSrc && !applied(k.fnSrc)) ||
+                (k.fnDst && !applied(k.fnDst));
+    k.any = applied(k.fnSrc) || applied(k.fnDst);
+    k.keySrc = keySrc & bits;
+    k.keyDst = keyDst & bits;
+    k.mask = mask & bits;
+    return k;
+}
+} // namespace
+
 // HOSTDATA_BLT (0x94): bit-packed mono bitmaps expanded through
 // foreground/background — the large-glyph text path (SDK F.11, mirroring
 // the Windows LARGEBITGLYPH). The engine's register-path mono expansion is
@@ -1196,6 +1268,18 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
     const u32 fg = conv(body[i0]), bk = conv(body[i0 + 1u]);
     const u32 dstOff = c.peek(0x1404u);
     const u32 pitchBytes = c.peek(0x1408u) * 8u * bpp;
+    // Colour pixels go through the raster op and the colour compare, as any
+    // other source does: a sprite arrives this way with its surround keyed
+    // out. The 1-bit forms are expanded as before — what "the source colour"
+    // is for a compare against an expanded bit is not something the guide
+    // says — and a compare left on across one is counted instead.
+    const u32 rop = (gc >> 16) & 0xFFu;
+    const ClrCmp key = clrCmpDecode(c.peek(0x15C0u), c.peek(0x15C4u),
+                                    c.peek(0x15C8u), c.peek(0x15CCu), bpp);
+    if (key.unknown || (key.any && srcType != 3u))
+        ++gEng.colorCompare;
+    const bool plainCopy = rop == 0xCCu && !key.any;
+    const u32 brush = ropUsesPat(rop) ? c.peek(0x147Cu) : 0u;
     // The engine normalises SC_TOP_LEFT/SC_BOTTOM_RIGHT into the split
     // canonical cells — read those, not the alias offsets.
     const int scL = static_cast<int>(c.peek(0x1640u) & 0x3FFFu),
@@ -1241,15 +1325,39 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
                                    static_cast<u64>(px) * bpp;
                     if (at + bpp > c.vram.size())
                         continue;
+                    if (!plainCopy) {
+                        // The pixel as a number, most significant byte
+                        // first, the way every reader of video memory sees
+                        // it — the key is compared against that.
+                        u32 S = 0, D = 0;
+                        for (u32 k = 0; k < bpp; ++k) {
+                            const u64 s = sb + k;
+                            S = (S << 8) |
+                                ((raster[s >> 2] >> (8u * (s & 3u))) & 0xFFu);
+                            D = (D << 8) | c.vram[at + k];
+                        }
+                        if (!key.draws(S, D))
+                            continue;
+                        const u32 v = rop3(rop, brush, S, D);
+                        if (r128PixelWatched(at, bpp))
+                            r128PixelWatchNote(
+                                "2d host data",
+                                "colour pixels pushed to (%d,%d %ux%u), rop "
+                                "%02x, colour compare %08x key %08x mask "
+                                "%08x, wrote %x",
+                                bx, by, wPx, hPx, rop, c.peek(0x15C0u),
+                                c.peek(0x15C4u), c.peek(0x15CCu), v);
+                        for (u32 k = 0; k < bpp; ++k)
+                            c.vram[at + k] =
+                                static_cast<u8>(v >> (8u * (bpp - 1u - k)));
+                        continue;
+                    }
                     if (r128PixelWatched(at, bpp))
                         r128PixelWatchNote(
                             "2d host data",
                             "colour pixels pushed to (%d,%d %ux%u), "
-                            "GUI_CONTROL %08x (rop %02x), colour compare "
-                            "%08x key %08x mask %08x",
-                            bx, by, wPx, hPx, gc, (gc >> 16) & 0xFFu,
-                            c.peek(0x15C0u), c.peek(0x15C4u),
-                            c.peek(0x15CCu));
+                            "GUI_CONTROL %08x (rop %02x), no colour compare",
+                            bx, by, wPx, hPx, gc, (gc >> 16) & 0xFFu);
                     for (u32 k = 0; k < bpp; ++k) {
                         const u64 s = sb + k;
                         c.vram[at + k] = static_cast<u8>(
@@ -2317,15 +2425,16 @@ void R128Cell::engBlit()
         return;
     }
 
-    // ⚠ A COLOUR-KEY FUNCTION THIS ENGINE DOES NOT APPLY. The manual's own
-    // two renderings of CLR_CMP_FN_SRC contradict each other about which
-    // sense of the comparison suppresses the pixel, so implementing it from
-    // the document would be a guess in the one place a guess is invisible —
-    // transparent pixels drawn opaque look like an ordinary drawing bug. The
-    // blit still runs; the count says how often the omission could matter,
-    // and a non-zero count is the instruction to go and settle the semantics.
+    // The colour compare: see ClrCmp. A source compare needs a source, so a
+    // fill only ever takes the destination half.
     const u32 cmp = rd(kClrCmpCntl);
-    if ((cmp & 0x7u) || ((cmp >> 8) & 0x7u))
+    ClrCmp key = clrCmpDecode(cmp, rd(0x15C4u), rd(0x15C8u), rd(kClrCmpMsk),
+                              bypp);
+    if (!usesSrc && key.fnSrc) {
+        key.fnSrc = 0;
+        key.any = key.fnDst == 1u || key.fnDst == 4u || key.fnDst == 5u;
+    }
+    if (key.unknown)
         ++gEng.colorCompare;
 
     // --- draw -----------------------------------------------------------
@@ -2364,7 +2473,7 @@ void R128Cell::engBlit()
     };
 
     const bool plain = mask == 0xFFFFFFFFu;
-    if (!usesSrc && !usesDst) {
+    if (!usesSrc && !usesDst && !key.any) {
         // The result does not depend on anything that varies across the
         // rectangle, so evaluate the op ONCE and fill. This is PATCOPY,
         // BLACKNESS and WHITENESS, and every other op that reduces to a
@@ -2377,7 +2486,7 @@ void R128Cell::engBlit()
             for (u32 c = 0; c < cw; ++c)
                 putPix(d + static_cast<size_t>(c) * bypp, fill);
         }
-    } else if (rop == 0xCCu && plain) {
+    } else if (rop == 0xCCu && plain && !key.any) {
         // Straight SRCCOPY with no write mask: whole rows at a time.
         ++gEng.copies;
         for (u32 r = 0; r < ch; ++r) {
@@ -2393,7 +2502,7 @@ void R128Cell::engBlit()
         }
     } else {
         // The general case: evaluate the truth table per pixel.
-        ++gEng.copies;
+        ++(usesSrc ? gEng.copies : gEng.fills);
         for (u32 r = 0; r < ch; ++r) {
             const u32 rr = t2b ? r : ch - 1u - r;
             const size_t d = dstOff + (static_cast<size_t>(y0) + rr) * dstStride +
@@ -2410,7 +2519,9 @@ void R128Cell::engBlit()
                 const size_t dp = d + static_cast<size_t>(cc) * bypp;
                 const u32 S = usesSrc ? pixAt(s + static_cast<size_t>(cc) * bypp)
                                       : 0u;
-                const u32 D = usesDst ? pixAt(dp) : 0u;
+                const u32 D = (usesDst || key.fnDst) ? pixAt(dp) : 0u;
+                if (key.any && !key.draws(S, D))
+                    continue; // keyed out: the destination keeps its pixel
                 putPix(dp, rop3(rop, pat, S, D));
             }
         }

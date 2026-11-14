@@ -171,6 +171,107 @@ TEST_CASE("r128 2d: SRCCOPY moves a rectangle")
         }
 }
 
+// CLR_CMP_CNTL (0x15C0): the engine's transparency. Register guide 3-178;
+// function 5 is "draw when not equal", 4 "draw when equal", 1 "never draw",
+// each against a key through a mask, on the source pixel (bits 25:24 = 1),
+// the destination pixel (0) or both (2).
+TEST_CASE("r128 2d: a source colour key leaves the destination where the "
+          "source is the key")
+{
+    constexpr u32 kClrCmpCntl = 0x15C0, kKeySrc = 0x15C4, kKeyDst = 0x15C8,
+                  kCmpMsk = 0x15CC;
+    for (const u32 fn : {5u, 4u, 1u, 0u}) {
+        R128Cell c;
+        surface(c);
+        // A 4x1 source: key, colour, key-but-for-the-top-byte, colour.
+        setPix(c, 0, 0, 0x00000000u);
+        setPix(c, 1, 0, 0x00112233u);
+        setPix(c, 2, 0, 0xFF000000u);
+        setPix(c, 3, 0, 0x00445566u);
+        for (u32 x = 0; x < 4; ++x)
+            setPix(c, 20 + x, 9, 0x00ABCDEFu); // what is there already
+        wr(c, kGmc, gmc(0xCCu, 3u, 2u));
+        surface(c);
+        wr(c, kKeySrc, 0x00000000u);
+        wr(c, kKeyDst, 0x00000000u);
+        wr(c, kCmpMsk, 0x00FFFFFFu); // the top byte is not compared
+        wr(c, kClrCmpCntl, fn | (1u << 24));
+        wr(c, kSrcYX, 0);
+        wr(c, kDstYX, 20u | (9u << 16));
+        wr(c, kDstHeightWidth, 4u | (1u << 16));
+        CAPTURE(fn);
+        const u32 kept = 0x00ABCDEFu;
+        switch (fn) {
+        case 5u: // a sprite: everything but the key
+            CHECK(pix(c, 20, 9) == kept);
+            CHECK(pix(c, 21, 9) == 0x00112233u);
+            CHECK(pix(c, 22, 9) == kept); // equal through the mask
+            CHECK(pix(c, 23, 9) == 0x00445566u);
+            break;
+        case 4u: // its complement
+            CHECK(pix(c, 20, 9) == 0x00000000u);
+            CHECK(pix(c, 21, 9) == kept);
+            CHECK(pix(c, 22, 9) == 0xFF000000u);
+            CHECK(pix(c, 23, 9) == kept);
+            break;
+        case 1u: // never
+            for (u32 x = 0; x < 4; ++x)
+                CHECK(pix(c, 20 + x, 9) == kept);
+            break;
+        default: // always: the plain copy
+            CHECK(pix(c, 20, 9) == 0x00000000u);
+            CHECK(pix(c, 21, 9) == 0x00112233u);
+            CHECK(pix(c, 22, 9) == 0xFF000000u);
+            CHECK(pix(c, 23, 9) == 0x00445566u);
+            break;
+        }
+    }
+}
+
+TEST_CASE("r128 2d: a destination colour key draws only over the key, fills "
+          "included")
+{
+    constexpr u32 kClrCmpCntl = 0x15C0, kKeyDst = 0x15C8, kCmpMsk = 0x15CC;
+    R128Cell c;
+    surface(c);
+    setPix(c, 30, 4, 0x00FF00FFu); // the key colour
+    setPix(c, 31, 4, 0x00123456u); // anything else
+    setPix(c, 32, 4, 0x00FF00FFu);
+    wr(c, kGmc, gmc(0xF0u, 0u, 0u)); // PATCOPY: a solid fill
+    surface(c);
+    wr(c, kBrushFrgd, 0x00C0FFEEu);
+    wr(c, kKeyDst, 0x00FF00FFu);
+    wr(c, kCmpMsk, 0xFFFFFFFFu);
+    wr(c, kClrCmpCntl, (4u << 8) | (0u << 24)); // destination, draw when equal
+    const auto before = r128EngStats();
+    wr(c, kDstYX, 30u | (4u << 16));
+    wr(c, kDstHeightWidth, 3u | (1u << 16));
+    CHECK(pix(c, 30, 4) == 0x00C0FFEEu);
+    CHECK(pix(c, 31, 4) == 0x00123456u);
+    CHECK(pix(c, 32, 4) == 0x00C0FFEEu);
+    const auto& e = r128EngStats();
+    CHECK(e.fills - before.fills == 1);
+    CHECK(e.colorCompare == before.colorCompare); // applied, so not counted
+}
+
+TEST_CASE("r128 2d: a compare this engine does not apply is counted and "
+          "draws")
+{
+    constexpr u32 kClrCmpCntl = 0x15C0;
+    R128Cell c;
+    surface(c);
+    setPix(c, 0, 0, 0x00112233u);
+    wr(c, kGmc, gmc(0xCCu, 3u, 2u));
+    surface(c);
+    wr(c, kClrCmpCntl, 7u | (1u << 24)); // "flip when equal"
+    const auto before = r128EngStats();
+    wr(c, kSrcYX, 0);
+    wr(c, kDstYX, 40u | (2u << 16));
+    wr(c, kDstHeightWidth, 1u | (1u << 16));
+    CHECK(pix(c, 40, 2) == 0x00112233u);
+    CHECK(r128EngStats().colorCompare - before.colorCompare == 1);
+}
+
 TEST_CASE("r128 2d: an overlapping copy respects the programmed direction")
 {
     // Scrolling a window down by one row overlaps itself. The hardware is

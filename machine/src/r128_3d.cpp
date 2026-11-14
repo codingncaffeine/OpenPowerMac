@@ -259,6 +259,7 @@ struct Pipe {
     u32 texCntl = 0, misc = 0;
     bool blendEn = false, alphaTestEn = false, fogEn = false, fogTable = false;
     bool specEn = false, chromaEn = false, ditherEn = false;
+    bool alphaMask = false;   // TEX_CNTL_C bit 13: see shadeFragment
     u32 blendSrc = 1, blendDst = 0, blendComb = 0, alphaOp = 7, refAlpha = 0;
     float fogR = 0, fogG = 0, fogB = 0;
     u32 chromaClr = 0, chromaMsk = 0;
@@ -340,6 +341,7 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     P.alphaTestEn = (P.texCntl >> 10) & 0x1u;
     P.specEn = (P.texCntl >> 11) & 0x1u;
     P.chromaEn = (P.texCntl >> 12) & 0x1u;
+    P.alphaMask = (P.texCntl >> 13) & 0x1u;
     P.fogEn = (P.texCntl >> 7) & 0x1u;
     P.ditherEn = (P.texCntl >> 8) & 0x1u;
     P.fogTable = (P.misc >> 14) & 0x1u;
@@ -1054,6 +1056,25 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
             if ((t32 & P.chromaMsk) == (P.chromaClr & P.chromaMsk))
                 return false;
         }
+        // ⭐ THE TEXEL'S ALPHA AS A CUTOUT (TEX_CNTL_C bit 13). r128_reg.h
+        // names the bit's two values ALPHA_IN_TEX_COMPLETE_A and
+        // ALPHA_IN_TEX_LSB_A; the SDK's field tables stop at bit 10 and
+        // neither register guide prints the register. What it does is
+        // pinned by a driver and a picture: the Mac driver sets it, with
+        // ALPHA_EN and ALPHA_TST_EN both clear, for the draws whose ARGB1555
+        // texels carry a shape — flat menu buttons, each a quad — and on the
+        // real machine the texels with their alpha bit clear are not drawn.
+        // With the bit ignored every such quad drew its whole rectangle, the
+        // cut-away part in the texels' own black.
+        //
+        // So: the texture's alpha is one bit, and a sample whose bit is
+        // clear writes nothing — no colour, no depth. The sample's alpha is
+        // taken after filtering and rounded to that bit, which is what
+        // leaves a bilinear sample on the shape's edge its darkened rim.
+        // ⚠ That last choice is this model's: nothing here says whether the
+        // chip decides from the filtered alpha or from the nearest texel's.
+        if (P.alphaMask && tex0.a < 127.5f)
+            return false;
         Rgba out = combineUnit(P, t0, tex0, fr.diffuse, fr.diffuse);
         if (P.tex[1].on) {
             const TexUnit& t1 = P.tex[1];

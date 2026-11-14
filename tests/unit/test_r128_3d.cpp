@@ -13,6 +13,7 @@
 #include "opm/r128.hpp"
 
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using namespace opm;
@@ -375,6 +376,77 @@ TEST_CASE("3d: nearest-neighbour texturing maps the quadrants of a 2x2")
     CHECK(r.pix32(12, 3) == 0xFF00FF00u);  // green (565 expands exactly)
     CHECK(r.pix32(3, 12) == 0xFF0000FFu);  // blue
     CHECK(r.pix32(12, 12) == 0xFFFFFFFFu); // white
+}
+
+// TEX_CNTL_C bit 13: the texel's one alpha bit as a cutout. A driver sets it
+// with blending and the alpha test both off for textures that carry a shape,
+// and the texels outside the shape are not drawn at all — not their colour,
+// and not their depth, or whatever is drawn behind the quad afterwards would
+// be cut to its rectangle anyway.
+TEST_CASE("3d: the texel alpha mask draws nothing where the alpha bit is clear")
+{
+    for (const bool mask : {true, false}) {
+        Rig3d r;
+        r.dst32();
+        r.openGate();
+        r.fpuSolidBoth();
+        for (u32 i = 0; i < 64u * 64u * 2u; ++i)
+            r.c.vram[0x20000u + i] = 0xFF; // Z16 at 128 KB, far plane
+        r.reg(0x1C90u, 0x20000u);
+        r.reg(0x1C94u, 64u / 8u);
+        r.reg(0x1C98u, (0u << 1) | (1u << 4)); // 16-bit, Z_TEST_LESS
+        // 2x2 ARGB1555 at VRAM 512 KB: opaque red, clear black /
+        //                              clear green, opaque white.
+        auto t16 = [&](u32 i, u32 v) {
+            r.c.vram[0x80000u + i * 2u] = static_cast<u8>(v >> 8);
+            r.c.vram[0x80000u + i * 2u + 1u] = static_cast<u8>(v);
+        };
+        t16(0, 0xFC00u);
+        t16(1, 0x0000u);
+        t16(2, 0x03E0u);
+        t16(3, 0xFFFFu);
+        r.reg(0x1CB0u, 3u << 16); // ARGB1555, nearest, wrap
+        r.reg(0x1CB8u, 0x111u);
+        r.reg(0x1CC0u, 0x80000u);
+        // Z on, Z write on, texture on, and the mask or not.
+        r.reg(0x1C9Cu, 0x3u | (1u << 4) | (mask ? 1u << 13 : 0u));
+        std::vector<u32> v;
+        auto vtxSt = [&](float x, float y, float s, float t) {
+            v.push_back(f2u(x));
+            v.push_back(f2u(y));
+            v.push_back(f2u(0.25f));
+            v.push_back(f2u(1.0f));
+            v.push_back(0xFFFFFFFFu);
+            v.push_back(f2u(s));
+            v.push_back(f2u(t));
+        };
+        vtxSt(0, 0, 0, 0);
+        vtxSt(16, 0, 1, 0);
+        vtxSt(0, 16, 0, 1);
+        vtxSt(16, 0, 1, 0);
+        vtxSt(16, 16, 1, 1);
+        vtxSt(0, 16, 0, 1);
+        r.prim(0x9u | 0x80u, 4u, 6u, v);
+        // Then something behind the quad, untextured: it shows wherever the
+        // quad left the depth alone.
+        r.reg(0x1C9Cu, 0x3u);
+        std::vector<u32> behind;
+        for (const auto& [x, y] : {std::pair{0.f, 0.f}, {16.f, 0.f}, {0.f, 16.f},
+                                   {16.f, 0.f}, {16.f, 16.f}, {0.f, 16.f}})
+            Rig3d::vtx(behind, x, y, 0.75f, 0xFF123456u);
+        r.prim(0x9u, 4u, 6u, behind);
+
+        CAPTURE(mask);
+        CHECK(r.pix32(3, 3) == 0xFFFF0000u);   // opaque red, in front
+        CHECK(r.pix32(12, 12) == 0xFFFFFFFFu); // opaque white, in front
+        if (mask) {
+            CHECK(r.pix32(12, 3) == 0xFF123456u); // cut away: what is behind
+            CHECK(r.pix32(3, 12) == 0xFF123456u);
+        } else {
+            CHECK(r.pix32(12, 3) == 0x00000000u); // the texel's own black
+            CHECK(r.pix32(3, 12) == 0x0000FF00u); // …and its own green
+        }
+    }
 }
 
 TEST_CASE("3d: bilinear filtering blends adjacent texels")

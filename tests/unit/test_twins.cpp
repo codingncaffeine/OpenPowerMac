@@ -108,7 +108,7 @@ constexpr u32 kVirt = 0x00400000;
 constexpr u32 kAlias = 0x00C00000;
 constexpr u32 kBatEa = 0x20000000;
 constexpr u32 kVsidA = 0x111, kVsidB = 0x222;
-constexpr u32 kRam = 16u << 20;
+constexpr u32 kRam = 13u << 20;
 
 u32 dform(u32 op, u32 rt, u32 ra, u32 d)
 {
@@ -142,10 +142,12 @@ struct Machine {
     Cpu& cpu = *cpuUp;
     u64 stamp = 0;
 
-    explicit Machine(bool memo, bool lineExec = true)
+    // The JIT is off unless asked for: one variable at a time, and it has
+    // its own twins in test_jit.cpp. The last test here turns everything on.
+    explicit Machine(bool memo, bool lineExec = true, bool jit = false)
     {
         cpu.attach(bus);
-        cpu.jitOn = false; // one variable at a time: the JIT has its own twins
+        cpu.jitOn = jit;
         cpu.dxlCacheOff = !memo;
         cpu.lineExecOff = !lineExec;
     }
@@ -391,6 +393,57 @@ u32 liveEntries(const Cpu& c)
     return n;
 }
 
+// Run both machines to `target` instructions and name the first thing that
+// differs, or nullptr.
+//
+// ⚠ IN INSTRUCTIONS, NOT IN CALLS. runSteps returns at the first instruction
+// that ends a batch, and this program has one every dozen or so (mtsr, tlbie,
+// mtmsr, a BAT write), so a fixed number of calls is a few thousand
+// instructions — three trips round the loop, which is not a test of anything
+// that has to warm up. The registers are compared after every call and the
+// whole machine every 251st, and at the end.
+//
+// `pokes` adds, between batches, what a harness is allowed to do behind the
+// processor's back: a segment register written directly, the TLB flushed,
+// the cache flushed to memory.
+const char* runTwins(Machine& a, Machine& b, u64 target, Rng& r, bool pokes)
+{
+    u64 calls = 0;
+    while (a.stamp < target) {
+        const u64 n = 1u + r.next() % 3000u;
+        a.run(n);
+        b.run(n);
+        ++calls;
+        if (a.stamp != b.stamp)
+            return "the instruction count";
+        if (std::memcmp(a.cpu.st.gpr, b.cpu.st.gpr, sizeof a.cpu.st.gpr) != 0)
+            return "a GPR";
+        if (a.cpu.st.pc != b.cpu.st.pc || a.cpu.st.msr != b.cpu.st.msr)
+            return "pc or MSR";
+        if (calls % 251u == 0u)
+            if (const char* d = firstDifference(a, b))
+                return d;
+        if (!pokes)
+            continue;
+        switch (r.next() % 400u) {
+        case 0:
+            a.cpu.st.sr[0] = b.cpu.st.sr[0] = (r.next() & 1u) ? kVsidA : kVsidB;
+            break;
+        case 1:
+            a.cpu.tlbFlushAll();
+            b.cpu.tlbFlushAll();
+            break;
+        case 2:
+            a.cpu.l1dFlushAll(true);
+            b.cpu.l1dFlushAll(true);
+            break;
+        default:
+            break;
+        }
+    }
+    return firstDifference(a, b);
+}
+
 } // namespace
 
 TEST_CASE("data memo: the same machine as walking every access")
@@ -401,36 +454,8 @@ TEST_CASE("data memo: the same machine as walking every access")
         Machine memo(true), walk(false);
         REQUIRE(memo.setUp(prog));
         REQUIRE(walk.setUp(prog));
-        const char* diff = nullptr;
-        u64 done = 0;
-        for (u32 batch = 0; batch < 220 && !diff; ++batch) {
-            const u64 n = 1u + r.next() % 3000u;
-            memo.run(n);
-            walk.run(n);
-            done += n;
-            diff = firstDifference(memo, walk);
-            // Between batches, what a harness is allowed to do behind the
-            // processor's back: a segment register poked directly, the TLB
-            // flushed, the cache flushed to memory.
-            switch (r.next() % 24u) {
-            case 0:
-                memo.cpu.st.sr[0] = walk.cpu.st.sr[0] =
-                    (r.next() & 1u) ? kVsidA : kVsidB;
-                break;
-            case 1:
-                memo.cpu.tlbFlushAll();
-                walk.cpu.tlbFlushAll();
-                break;
-            case 2:
-                memo.cpu.l1dFlushAll(true);
-                walk.cpu.l1dFlushAll(true);
-                break;
-            default:
-                break;
-            }
-        }
+        const char* diff = runTwins(memo, walk, 150000, r, true);
         CAPTURE(iter);
-        CAPTURE(done);
         const std::string what = diff ? diff : "nothing";
         CAPTURE(what); // the first thing that differed
         CHECK(diff == nullptr);
@@ -565,13 +590,7 @@ TEST_CASE("line executor: the same machine as one instruction at a time")
         Machine line(true, true), single(true, false);
         REQUIRE(line.setUp(prog));
         REQUIRE(single.setUp(prog));
-        const char* diff = nullptr;
-        for (u32 batch = 0; batch < 220 && !diff; ++batch) {
-            const u64 n = 1u + r.next() % 3000u;
-            line.run(n);
-            single.run(n);
-            diff = firstDifference(line, single);
-        }
+        const char* diff = runTwins(line, single, 150000, r, false);
         const std::string what = diff ? diff : "nothing";
         CAPTURE(iter);
         CAPTURE(what);
@@ -642,5 +661,38 @@ TEST_CASE("line executor: instructions after an mtmsr are fetched under the new 
         CAPTURE(lineExec);
         CHECK(m.cpu.st.gpr[3] == 0u);
         CHECK(m.cpu.st.gpr[4] == 14u);
+    }
+}
+
+// ---- everything at once -------------------------------------------------------
+
+TEST_CASE("jit with the memos: the same machine as one instruction at a time, walking")
+{
+    // What ships on a host with the JIT: compiled blocks whose loads and
+    // stores go through the data memo and whose page changes go through the
+    // page memo — against the machine with none of the three.
+    for (u32 iter = 0; iter < 6; ++iter) {
+        Rng r{0x717A11ull + iter * 0x9E3779B9ull};
+        const std::vector<u32> prog = buildProgram(r, 500);
+        Machine all(true, true, true), none(false, false, false);
+        REQUIRE(all.setUp(prog));
+        REQUIRE(none.setUp(prog));
+        const char* diff = runTwins(all, none, 150000, r, false);
+        const std::string what = diff ? diff : "nothing";
+        CAPTURE(iter);
+        CAPTURE(what);
+        CHECK(diff == nullptr);
+        CHECK(all.cpu.excRingAt == 0u);
+        // Compiled blocks did run, and their loads and stores did go through
+        // the shims the memo sits behind. Only where the JIT exists: other
+        // hosts interpret and never create the cache.
+#if defined(__x86_64__) || defined(_M_X64)
+        REQUIRE(all.cpu.jit != nullptr);
+#endif
+        if (all.cpu.jit) {
+            CHECK(all.cpu.jit->insns > 100000u);
+            CHECK(all.cpu.jit->memOps > 20000u);
+            CHECK(liveEntries(all.cpu) > 16u);
+        }
     }
 }

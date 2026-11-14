@@ -95,6 +95,8 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
             *wimg = (realModeInhibitBase && ea >= realModeInhibitBase)
                         ? (kWimgReal | kWimgI)
                         : kWimgReal;
+        if (!fetch)
+            dmSlot = 128; // no TLB entry behind this answer: see Cpu::DmLine
         return true;
     }
     const bool user = userMode();
@@ -125,6 +127,8 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
         pa = b.pa;
         if (wimg)
             *wimg = b.wimg;
+        if (!fetch)
+            dmSlot = 128;
         return true;
     }
 
@@ -174,12 +178,15 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                 // search to set C. Modeled as invalidate + reload so the
                 // walk below re-reads the PTE (and faults if it is gone).
                 e.v = false;
+                ++dtlbStamp[set * 2u + way]; // only a data access is a store
                 break;
             }
             pa = e.rpn | (ea & 0xFFFu);
             if (wimg)
                 *wimg = e.wimg;
             tlbLru[set] = static_cast<u8>(way ^ 1u); // other way is LRU
+            if (!fetch)
+                dmSlot = static_cast<u8>(set * 2u + way);
             return true;
         }
     }
@@ -245,6 +252,12 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                                     pageIndex, w1 & 0xFFFFF000u,
                                     (w1 >> 3) & 0xFu, pp};
                 tlbLru[set] = static_cast<u8>(way ^ 1u);
+                if (!fetch) {
+                    // The entry that was here is gone, and whatever the memo
+                    // remembered through it goes with it.
+                    ++dtlbStamp[set * 2u + way];
+                    dmSlot = static_cast<u8>(set * 2u + way);
+                }
             }
             return true;
         }
@@ -268,6 +281,7 @@ void Cpu::tlbInvalidateClass(u32 ea)
     for (u32 way = 0; way < 2; ++way) {
         itlb[set][way].v = false;
         dtlb[set][way].v = false;
+        ++dtlbStamp[set * 2u + way];
     }
 }
 
@@ -279,6 +293,7 @@ void Cpu::tlbFlushAll()
         for (u32 w = 0; w < 2; ++w) {
             itlb[s][w] = TlbEntry{};
             dtlb[s][w] = TlbEntry{};
+            ++dtlbStamp[s * 2u + w];
         }
         itlbLru[s] = dtlbLru[s] = 0;
     }
@@ -323,41 +338,52 @@ bool Cpu::leAlignCheck(u32 ea, u32 len)
     return false;
 }
 
-// The data path's translation front: one page per direction, validated the
-// way the fetch cache in fetchDecoded is (MSR data bits + segment register
-// compared per access, everything else carried by mmuGen). The direction
-// split is load-bearing — see the field comment in cpu.hpp: only a store's
-// own walk sets the page table's C bit, so a store must never ride a
-// translation a load filled. The marker matters for the same reason the
-// fetch path's does: on a hit translate() never runs, and unmarked compare
-// work would bill itself to the caller's bucket.
+// The data path's translation front: the memo's page table (Cpu::DmPage). A
+// hit is a translation whose every input is unchanged, and it replays the one
+// thing translate() would have done to the machine on the way to the same
+// answer — the TLB set's LRU write — so the TLB's replacement order follows
+// every access, exactly as it does when each one is walked. Outside a batch,
+// and whenever the memo is switched off, this IS translate().
+//
+// A store may only ride an entry a store made: that store's walk set the page
+// table's C bit and proved the protection, which a load's walk does neither
+// of. The marker matters for the same reason the fetch path's does: on a hit
+// translate() never runs, and unmarked compare work would bill itself to the
+// caller's bucket.
 bool Cpu::xlateData(u32 ea, bool write, u32& pa, u32& wimg)
 {
     OPM_MARK(Xlate);
-    if (dxlCacheOff)
+    if (dmLive == kDmOff)
         return translate(ea, write, false, pa, &wimg);
     const u32 page = ea >> 12;
-    const u32 msrKey = st.msr & (msr::DR | msr::PR | msr::LE);
-    const u32 srKey = st.sr[ea >> 28];
-    const int d = write ? 1 : 0;
-    if (dxlGen[d] == mmuGen && dxlPage[d] == page && dxlMsr[d] == msrKey &&
-        dxlSr[d] == srKey) {
-        pa = dxlPa[d] | (ea & 0xFFFu);
-        wimg = dxlWimg[d];
+    DmPage& m = dmPage[page & (kDmPages - 1u)];
+    const u32 key = dmLive | (st.msr & kDmMsr);
+    if (m.page == page && (write ? m.wkey : m.rkey) == key &&
+        dtlbStamp[m.slot] == m.stamp) {
+        OPM_COUNT(dmPageHits);
+        dtlbLru[m.lruIdx] = m.lruVal;
+        dmSlot = m.slot;
+        pa = m.paPage | (ea & 0xFFFu);
+        wimg = m.wimg;
         return true;
     }
+    OPM_COUNT(dmPageMisses);
     if (!translate(ea, write, false, pa, &wimg))
         return false;
-    dxlGen[d] = mmuGen;
-    dxlPage[d] = page;
-    dxlMsr[d] = msrKey;
-    dxlSr[d] = srKey;
-    dxlPa[d] = pa & ~0xFFFu;
-    dxlWimg[d] = wimg;
+    const u8 slot = dmSlot;
+    m.page = page;
+    m.rkey = key;
+    m.wkey = write ? key : kDmNever;
+    m.paPage = pa & ~0xFFFu;
+    m.stamp = dtlbStamp[slot];
+    m.wimg = static_cast<u8>(wimg);
+    m.slot = slot;
+    m.lruIdx = static_cast<u8>(slot < 128u ? slot >> 1 : 64u);
+    m.lruVal = static_cast<u8>((slot & 1u) ^ 1u);
     return true;
 }
 
-bool Cpu::readV(u32 ea, u32 len, u64& out)
+bool Cpu::readVSlow(u32 ea, u32 len, u64& out)
 {
     out = 0;
     u32 pa;
@@ -388,6 +414,7 @@ bool Cpu::readV(u32 ea, u32 len, u64& out)
         if (!xlateData(ea, false, pa, wimg))
             return false;
         out = memRead(pa, len, wimg);
+        dmNoteLine(ea, len, pa, wimg, false);
         return true;
     }
     for (u32 i = 0; i < len; ++i) {
@@ -398,7 +425,7 @@ bool Cpu::readV(u32 ea, u32 len, u64& out)
     return true;
 }
 
-bool Cpu::writeV(u32 ea, u32 len, u64 v)
+bool Cpu::writeVSlow(u32 ea, u32 len, u64 v)
 {
     u32 pa;
     if (!leAlignCheck(ea, len))
@@ -426,6 +453,7 @@ bool Cpu::writeV(u32 ea, u32 len, u64 v)
         if (!xlateData(ea, true, pa, wimg))
             return false;
         memWrite(pa, len, v, wimg);
+        dmNoteLine(ea, len, pa, wimg, true);
         return true;
     }
     for (u32 i = 0; i < len; ++i) {

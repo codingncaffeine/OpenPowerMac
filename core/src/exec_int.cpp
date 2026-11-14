@@ -1094,6 +1094,9 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
     if (spr == 1008) { // HID0: honor cache-control transitions
         const u32 old = c.st.hid0;
         c.st.hid0 = v;
+        // HID0[DCE] decides whether a data access goes through the cache at
+        // all, which the data memo takes as settled for a whole batch.
+        c.batchBreak = true;
         if (~old & v & 0x00000400u)
             c.l1dFlushAll(false); // DCFI 0->1: flash invalidate, no wb
         return;
@@ -1106,6 +1109,8 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         ++c.mmuGen;
         c.batchBreak = true; // the mapping moved: see Cpu::runSteps
     }
+    if (spr == 1013)
+        c.batchBreak = true; // DABR: the data memo is made without one armed
     *sprPtr(c, spr) = v;
 }
 void h_mftb(Cpu& c, u32 i, const InsnDesc&)

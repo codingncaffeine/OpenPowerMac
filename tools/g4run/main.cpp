@@ -5767,12 +5767,28 @@ int main(int argc, char** argv)
                    "asleep and fetched nothing\n",
                    static_cast<unsigned long long>(cpu.napSteps));
         if (ftot)
-            printf("--   fetch drops: icbi=%llu snoop=%llu flush=%llu "
-                   "(each throws away all %u lines)\n",
+            printf("--   fetch drops: icbi=%llu flush=%llu (each throws away "
+                   "all %u lines); bus-master writes snooped=%llu (each "
+                   "drops only the lines it lands on)\n",
                    static_cast<unsigned long long>(cpu.fetchDropIcbi),
-                   static_cast<unsigned long long>(cpu.fetchDropSnoop),
                    static_cast<unsigned long long>(cpu.fetchDropFlush),
-                   Cpu::kFetchLines);
+                   Cpu::kFetchLines,
+                   static_cast<unsigned long long>(cpu.fetchDropSnoop));
+        // The data memo (Cpu::DmLine). A hit is a load or store answered
+        // from an entry; a fill is one that took the full path and left an
+        // entry behind. Accesses the memo never covers (devices, line
+        // crossings, write-through pages) are in neither.
+        if (cpu.dmHits + cpu.dmMisses)
+            printf("--   data memo: %.1f%% of covered accesses answered from "
+                   "an entry (%llu hits, %llu fills); page table behind it "
+                   "%llu hits, %llu walks; %llu epochs\n",
+                   100.0 * static_cast<double>(cpu.dmHits) /
+                       static_cast<double>(cpu.dmHits + cpu.dmMisses),
+                   static_cast<unsigned long long>(cpu.dmHits),
+                   static_cast<unsigned long long>(cpu.dmMisses),
+                   static_cast<unsigned long long>(cpu.dmPageHits),
+                   static_cast<unsigned long long>(cpu.dmPageMisses),
+                   static_cast<unsigned long long>(cpu.dmEpochs));
         u32 hotPc[24];
         u64 hotN[24];
         const size_t np = prof::topPcs(hotPc, hotN, 24);

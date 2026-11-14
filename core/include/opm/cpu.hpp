@@ -2,9 +2,11 @@
 #include "types.hpp"
 #include "bus.hpp"
 #include "insn.hpp"
+#include "bits.hpp" // the line byte helpers the inline load/store use
 #include "jit.hpp"  // compiled-line cache; pure derived state, see the header
 #include "prof.hpp" // markers on the inline execution path; compiled away
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -406,6 +408,7 @@ struct Cpu {
         if (jit)
             jit->dropAll(); // compiled lines are derived from dropped lines
         tlbFlushAll();
+        dmDropAll();
     }
     void halt(std::string reason)
     {
@@ -518,7 +521,11 @@ struct Cpu {
         u32 vsid = 0, pi = 0, rpn = 0, wimg = 0, pp = 0;
     };
     TlbEntry itlb[64][2], dtlb[64][2];
-    u8 itlbLru[64] = {}, dtlbLru[64] = {};
+    // dtlbLru[64] is not a set: it is where the data memo (see DmLine below)
+    // writes when a translation came from no TLB entry at all, so that its
+    // replay of "the other way is now least recently used" needs no branch.
+    // The 64 real sets are the only ones the snapshot carries.
+    u8 itlbLru[64] = {}, dtlbLru[65] = {};
     bool mmuProbe = false; // instrumentation: bypass TLB and R/C writeback
     // Harness convention (ppcrun flat rig only — never the machine): treat
     // real-mode accesses at/above this base as cache-inhibited so MMIO
@@ -773,30 +780,105 @@ struct Cpu {
     u64 mmuGen = 0, xlGen = ~0ull;
     u32 xlPage = 0, xlPa = 0, xlMsr = 0, xlSr = 0;
     void xlDrop() { xlGen = ~0ull; }
-    // ---- data translation caches, one page per DIRECTION ------------------
+    // ---- the data path's memo ---------------------------------------------
     //
-    // The data twins of the instruction cache above, and the reason they are
-    // split by direction is the page table's C bit: the walk for a STORE
-    // sets it and the walk for a load does not, so a store served from a
-    // translation a load filled would leave a dirty page looking clean to
-    // the OS's pager. Each entry fills only from its own direction's
-    // successful walk; failures never fill. WIMG rides along so a cached
-    // hit routes MMIO exactly as the walk would. Validity is the fetch
-    // cache's contract item for item: MSR's data bits and the segment
-    // register compared per access, the BATs / SDR1 / page table / TLB
-    // carried by mmuGen (SPRs 25 and 528-543 bump it; so do tlbie/tlbia).
-    // Lives out here with the other caches: no snapshot cost, and a resumed
-    // machine simply misses once per direction.
-    u64 dxlGen[2] = {~0ull, ~0ull};
-    u32 dxlPage[2] = {}, dxlPa[2] = {}, dxlMsr[2] = {}, dxlSr[2] = {};
-    u32 dxlWimg[2] = {};
+    // A guest load or store is a translation and then a data-cache access,
+    // and both are models with state of their own: a TLB hit makes the other
+    // way of its set the least recently used, a cache hit stamps the line's
+    // age, a store marks the line modified and drops any fetched copy of it.
+    // The answer to "where does this address live" hardly ever changes
+    // between two accesses to the same 32 bytes, yet every access re-derived
+    // it: a BAT sweep or a page-cache compare, a TLB probe, an eight-way tag
+    // search. That re-derivation was 40% of the processor thread in a game.
+    //
+    // The memo remembers the answer and REPLAYS the state changes. A hit does
+    // exactly what translate() followed by memRead()/memWrite() would have
+    // done to the machine — the LRU write, the age stamp, the dirty bit, the
+    // fetch drop, the bytes — and nothing else, so the machine with the memo
+    // is the machine without it, bit for bit. `dxlCacheOff` (--no-dxlate) is
+    // the control: it walks every access, and the two must end identical.
+    //
+    // ⚠ WHAT A HIT TAKES ON TRUST, AND WHAT RETIRES IT. An entry is one EA
+    // line (32 bytes) and holds where it translated to and where that block
+    // sits in the L1. Each input to that answer is covered by exactly one of:
+    //
+    //   MSR[DR], [PR], [LE]      in the key, compared on every hit. Entries are
+    //                            never made in little-endian mode, so the hit
+    //                            path owes no munging and no alignment check.
+    //   segment registers, data  `dmEpoch`, also in the key. runSteps compares
+    //   BATs, HID0, DABR         them against a copy on entry (dmEnter) and
+    //                            retires every entry if one moved. Every writer
+    //                            of those ends its batch, so a batch never runs
+    //                            on with a stale epoch.
+    //   the TLB entry used       `dtlbStamp`, one counter per entry, bumped by
+    //                            everything that rewrites or invalidates that
+    //                            entry: a reload, the first-store C-bit rewalk,
+    //                            tlbie, tlbia.
+    //   the L1 line              compared on every hit: the way's (tag|valid)
+    //                            word. Eviction, dcbi, dcbf, a snoop kill and
+    //                            the flash invalidate all change it.
+    //   write permission, C bit  an entry is good for stores only if a store
+    //                            made it (wkey): the walk that store took set C
+    //                            and proved the protection.
+    //
+    // ⚠ IT IS LIVE ONLY INSIDE runSteps. `dmLive` is the dead value everywhere
+    // else, so step() called by a test rig or an instrumented loop takes the
+    // full path, and so does everything while a watchpoint, a read census,
+    // the cached-device watch, the uncached diagnostic or an MMU probe is
+    // armed: those live on the full path and must see every access.
+    //
+    // Never made for a cache-inhibited or write-through page, with the data
+    // cache off, or for an access that crosses a line. Lives outside
+    // CpuState, like every cache here: no snapshot carries it.
+    static constexpr u32 kDmLines = 4096; // at most 1024 can be valid at once
+    static constexpr u32 kDmPages = 256;
+    static constexpr u32 kDmMsr = msr::DR | msr::PR | msr::LE;
+    static constexpr u32 kDmOff = 2u;   // dmLive outside a batch: matches no key
+    static constexpr u32 kDmNever = 4u; // a stored key that nothing matches
+    static constexpr u32 kDmEpochStep = 0x8000u; // above every kDmMsr bit
+    struct DmLine {
+        u32 eaLine = ~0u; // ea >> 5, or ~0: no line is numbered that
+        u32 rkey = kDmNever, wkey = kDmNever;
+        u32 paLine = 0; // pa >> 5
+        u32 tv = 0;     // what l1x[set].tv[way] must still read
+        u32 stamp = 0;  // what dtlbStamp[slot] must still read
+        u8 set = 0, way = 0;
+        u8 slot = 128;  // dtlb entry (set * 2 + way), or 128: none was used
+        u8 lruIdx = 64, lruVal = 0; // the LRU write a TLB hit makes
+        u8 rsv[3] = {};
+    };
+    struct DmPage {
+        u32 page = ~0u; // ea >> 12, or ~0
+        u32 rkey = kDmNever, wkey = kDmNever;
+        u32 paPage = 0; // pa & ~0xFFF
+        u32 stamp = 0;
+        u8 wimg = 0, slot = 128, lruIdx = 64, lruVal = 0;
+    };
+    // Heap-owned: 134 KB that a Cpu on somebody's stack should not carry.
+    std::unique_ptr<DmLine[]> dmLine = std::make_unique<DmLine[]>(kDmLines);
+    std::unique_ptr<DmPage[]> dmPage = std::make_unique<DmPage[]>(kDmPages);
+    u32 dtlbStamp[129] = {}; // [128] never moves: "no TLB entry was used"
+    u32 dmEpoch = kDmEpochStep;
+    u32 dmLive = kDmOff;
+    // The translation path of the last successful DATA translate(): the dtlb
+    // entry it used, or 128. xlateData passes it on to the entry it fills.
+    u8 dmSlot = 128;
+    // The inputs dmEpoch stands for, as they were when it was last current.
+    u32 dmSigSr[16] = {}, dmSigBat[8] = {}, dmSigHid0 = 0, dmSigDabr = 0;
+    // Census, profiling build only.
+    u64 dmHits = 0, dmMisses = 0, dmPageHits = 0, dmPageMisses = 0,
+        dmEpochs = 0;
+    void dmDropAll();
+    void dmEnter(); // runSteps: decide whether the memo may be used
+    void dmNoteLine(u32 ea, u32 len, u32 pa, u32 wimg, bool write);
     // DIAGNOSTIC (--no-icache): bypass the fetch block cache, the cached
     // decode and this translation cache all at once, restoring the fetch path
     // byte for byte as it was before they existed. See Cpu::fetchDecoded.
     bool fetchCacheOff = false;
-    // DIAGNOSTIC (--no-dxlate): bypass the data translation caches, walking
-    // every data access as before they existed. Same rule as --no-icache: a
-    // cache is a claim, and the claim's control run needs a switch.
+    // DIAGNOSTIC (--no-dxlate): switch the data memo above off, so every
+    // data access is translated and looked up in the L1 in full. Same rule as
+    // --no-icache: a cache is a claim, and the claim's control run needs a
+    // switch. The two runs must write the same fingerprints.
     bool dxlCacheOff = false;
     // Census, counted only in the profiling build. A cache is a bet on
     // locality and a bet has to be settled with a number.
@@ -1009,12 +1091,52 @@ struct Cpu {
     // requested, receives the access's WIMG nibble (W=8,I=4,M=2,G=1; real
     // mode reads as 0b0011 per PEM 7.2).
     bool translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg = nullptr);
-    // translate() through the one-page data caches (see dxlGen above): the
-    // data path's equivalent of the fetch cache in fetchDecoded. Guest data
-    // accesses only — instruments and probes keep calling translate().
+    // translate() through the memo's page table (see DmPage above). Guest
+    // data accesses only — instruments and probes keep calling translate().
     bool xlateData(u32 ea, bool write, u32& pa, u32& wimg);
-    bool readV(u32 ea, u32 len, u64& out);
-    bool writeV(u32 ea, u32 len, u64 v);
+    // ⭐ A GUEST LOAD / STORE. The memo's hit is here, inline, so that a
+    // handler's load is a table probe and a byte swap; everything else — the
+    // first touch of a line, a page crossing, a device, a fault — is the full
+    // path in readVSlow/writeVSlow, which is also the only path there is
+    // outside runSteps. See DmLine for what a hit replays and why that is
+    // the whole of what the full path would have done.
+    bool readV(u32 ea, u32 len, u64& out)
+    {
+        const u32 line = ea >> 5;
+        const DmLine& m = dmLine[line & (kDmLines - 1u)];
+        if (m.eaLine == line && m.rkey == (dmLive | (st.msr & kDmMsr)) &&
+            (ea & 31u) + len <= 32u && dtlbStamp[m.slot] == m.stamp &&
+            l1x[m.set].tv[m.way] == m.tv) {
+            OPM_MARK(Read);
+            OPM_COUNT(dmHits);
+            dtlbLru[m.lruIdx] = m.lruVal;
+            l1x[m.set].age[m.way] = ++l1dClock;
+            out = lineLoadBE(&l1d[m.set][m.way].b[ea & 31u], len);
+            return true;
+        }
+        return readVSlow(ea, len, out);
+    }
+    bool writeV(u32 ea, u32 len, u64 v)
+    {
+        const u32 line = ea >> 5;
+        const DmLine& m = dmLine[line & (kDmLines - 1u)];
+        if (m.eaLine == line && m.wkey == (dmLive | (st.msr & kDmMsr)) &&
+            (ea & 31u) + len <= 32u && dtlbStamp[m.slot] == m.stamp &&
+            l1x[m.set].tv[m.way] == m.tv) {
+            OPM_MARK(Write);
+            OPM_COUNT(dmHits);
+            dtlbLru[m.lruIdx] = m.lruVal;
+            fetchDropAt(m.paLine << 5); // the store may land on fetched code
+            l1x[m.set].age[m.way] = ++l1dClock;
+            DLine& e = l1d[m.set][m.way];
+            lineStoreBE(&e.b[ea & 31u], len, v);
+            e.d = true;
+            return true;
+        }
+        return writeVSlow(ea, len, v);
+    }
+    bool readVSlow(u32 ea, u32 len, u64& out);
+    bool writeVSlow(u32 ea, u32 len, u64 v);
     bool fetch32(u32 ea, u32& insn);
     // Fetch AND decode in one step, through the caches above. `row` comes back
     // as an index into kIsa, or kNoRow when the word decodes to nothing.

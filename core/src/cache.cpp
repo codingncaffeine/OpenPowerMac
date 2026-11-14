@@ -31,87 +31,6 @@ inline u32 tagOf(u32 pa) { return pa >> 12; }
 inline constexpr u32 kWimgW = 8u;
 inline constexpr u32 kWimgI = 4u;
 
-// ⭐ THE LINE'S BYTES, AS ONE ACCESS INSTEAD OF `len` OF THEM. A cache line
-// holds the guest's memory in guest (big-endian) order, so assembling a value
-// out of it was written the obvious way — `v = (v << 8) | b[o + i]` — and
-// that loop is a runtime loop, because `len` reaches memRead as a parameter.
-// Every 32-bit load in the machine therefore cost four dependent
-// load-shift-or steps, and every store four shift-and-store steps, on the
-// HOTTEST path this emulator has (mem ops are 15.9% of the instructions the
-// game executes and a far larger share of its time).
-//
-// These do the identical thing in one unaligned host access plus a byte swap.
-// Identical, not equivalent-in-practice: the caller has already proved the
-// access lies inside the 32-byte block ((pa & 31) + len <= 32), the bytes are
-// the same bytes in the same order, and a byte swap is exactly what
-// "big-endian assembly on a little-endian host" means. The default arm keeps
-// the general loop, so a length nobody passes today still behaves.
-inline u64 lineLoadBE(const u8* p, u32 len)
-{
-    switch (len) {
-    case 1:
-        return p[0];
-    case 2: {
-        u16 v;
-        std::memcpy(&v, p, 2);
-        return u16((v >> 8) | (v << 8));
-    }
-    case 4: {
-        u32 v;
-        std::memcpy(&v, p, 4);
-        return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
-               ((v >> 8) & 0xFF00u) | (v >> 24);
-    }
-    case 8: {
-        u64 v;
-        std::memcpy(&v, p, 8);
-        v = ((v & 0x00FF00FF00FF00FFull) << 8) |
-            ((v >> 8) & 0x00FF00FF00FF00FFull);
-        v = ((v & 0x0000FFFF0000FFFFull) << 16) |
-            ((v >> 16) & 0x0000FFFF0000FFFFull);
-        return (v << 32) | (v >> 32);
-    }
-    default: {
-        u64 v = 0;
-        for (u32 i = 0; i < len; ++i)
-            v = (v << 8) | p[i];
-        return v;
-    }
-    }
-}
-inline void lineStoreBE(u8* p, u32 len, u64 v)
-{
-    switch (len) {
-    case 1:
-        p[0] = u8(v);
-        return;
-    case 2: {
-        const u16 t = u16((u16(v) >> 8) | (u16(v) << 8));
-        std::memcpy(p, &t, 2);
-        return;
-    }
-    case 4: {
-        const u32 s = u32(v);
-        const u32 t = ((s & 0xFFu) << 24) | ((s & 0xFF00u) << 8) |
-                      ((s >> 8) & 0xFF00u) | (s >> 24);
-        std::memcpy(p, &t, 4);
-        return;
-    }
-    case 8: {
-        u64 t = ((v & 0x00FF00FF00FF00FFull) << 8) |
-                ((v >> 8) & 0x00FF00FF00FF00FFull);
-        t = ((t & 0x0000FFFF0000FFFFull) << 16) |
-            ((t >> 16) & 0x0000FFFF0000FFFFull);
-        t = (t << 32) | (t >> 32);
-        std::memcpy(p, &t, 8);
-        return;
-    }
-    default:
-        for (u32 i = 0; i < len; ++i)
-            p[i] = static_cast<u8>(v >> (8 * (len - 1 - i)));
-        return;
-    }
-}
 } // namespace
 
 static void busWriteLine(Cpu& c, u32 base, const u8* b)
@@ -671,6 +590,82 @@ void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
         if (a == last || a + 32u < a) // range done, or address wrap
             break;
     }
+}
+
+// ---- the data path's memo (Cpu::DmLine) -------------------------------------
+
+void Cpu::dmDropAll()
+{
+    for (u32 k = 0; k < kDmLines; ++k)
+        dmLine[k] = DmLine{};
+    for (u32 k = 0; k < kDmPages; ++k)
+        dmPage[k] = DmPage{};
+    dmEpoch = kDmEpochStep;
+}
+
+// Called by runSteps before the first instruction of every batch. Two
+// questions: may the memo be used at all, and is everything its epoch stands
+// for still as it was. Asked here and not on the hit path because every
+// writer of these ends its batch — and because a harness that pokes a
+// segment register or a BAT between batches is then covered too.
+void Cpu::dmEnter()
+{
+    if (dxlCacheOff || mmuProbe || rpEnd || wpEnd || cwEnd ||
+        diagUncachedBase) {
+        dmLive = kDmOff;
+        return;
+    }
+    if (dmSigHid0 != st.hid0 || dmSigDabr != st.dabr ||
+        std::memcmp(dmSigSr, st.sr, sizeof dmSigSr) != 0 ||
+        std::memcmp(dmSigBat, st.dbatu, sizeof st.dbatu) != 0 ||
+        std::memcmp(dmSigBat + 4, st.dbatl, sizeof st.dbatl) != 0) {
+        std::memcpy(dmSigSr, st.sr, sizeof dmSigSr);
+        std::memcpy(dmSigBat, st.dbatu, sizeof st.dbatu);
+        std::memcpy(dmSigBat + 4, st.dbatl, sizeof st.dbatl);
+        dmSigHid0 = st.hid0;
+        dmSigDabr = st.dabr;
+        OPM_COUNT(dmEpochs);
+        dmEpoch += kDmEpochStep;
+        if (!dmEpoch) // wrapped: an entry from 131072 epochs ago could match
+            dmDropAll();
+    }
+    dmLive = dmEpoch;
+}
+
+// Remember where this line's access ended up, after the full path has taken
+// it there. The conditions are the ones a hit does not check again; see the
+// list on Cpu::DmLine.
+void Cpu::dmNoteLine(u32 ea, u32 len, u32 pa, u32 wimg, bool write)
+{
+    if (dmLive == kDmOff || (wimg & (kWimgI | kWimgW)) || !dceOn() ||
+        (st.msr & msr::LE) || (st.dabr & 3u) || (pa & 31u) + len > 32u)
+        return;
+    const int w = lineWayQuiet(*this, pa);
+    if (w < 0)
+        return; // a cached access leaves its line resident; nothing to say
+    OPM_COUNT(dmMisses);
+    const u32 set = setOf(pa);
+    const u32 line = ea >> 5;
+    const u32 key = dmLive | (st.msr & kDmMsr);
+    const u8 slot = dmSlot;
+    const u32 stamp = dtlbStamp[slot];
+    DmLine& m = dmLine[line & (kDmLines - 1u)];
+    // A load refilling a line that a store had made good for stores: nothing
+    // the store proved has moved (same epoch and mode, same untouched TLB
+    // entry), only the block's place in the cache has.
+    const bool keepW = m.eaLine == line && m.wkey == key && m.slot == slot &&
+                       m.stamp == stamp;
+    m.eaLine = line;
+    m.rkey = key;
+    m.wkey = (write || keepW) ? key : kDmNever;
+    m.paLine = pa >> 5;
+    m.tv = l1x[set].tv[w];
+    m.stamp = stamp;
+    m.set = static_cast<u8>(set);
+    m.way = static_cast<u8>(w);
+    m.slot = slot;
+    m.lruIdx = static_cast<u8>(slot < 128u ? slot >> 1 : 64u);
+    m.lruVal = static_cast<u8>((slot & 1u) ^ 1u);
 }
 
 void CpuSnoop::snoopRead(u32 pa, u32 len)

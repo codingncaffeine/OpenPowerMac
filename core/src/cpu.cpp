@@ -329,6 +329,7 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
 {
     batchBreak = false;
     batching = true;
+    dmEnter(); // the data memo is live from here to `done`: see Cpu::DmLine
     const u64 first = stamp;
     // ⚠ `i` IS THE CALLER'S OWN COUNTER, not a local copy written back at the
     // end: see the note on the declaration. Counting here and publishing later
@@ -404,6 +405,7 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
     }
 done:
     batching = false;
+    dmLive = kDmOff;
     {
         OPM_MARK(Tick); // the batch's whole clock advance, in one place
         syncClock();

@@ -339,6 +339,7 @@ void loadCpu(SnapReader& r, Cpu& c)
     // would serve instructions from a machine that no longer exists.
     c.fetchDrop();
     c.xlDrop();
+    c.dmDropAll();
     const u8* e = r.beginSection("CPU ");
     loadCpuState(r, c.st);
     c.extIrqLine = r.b();

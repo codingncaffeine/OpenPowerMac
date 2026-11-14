@@ -275,6 +275,19 @@ public sealed class MachineSession
         _ => st.ToString(),
     };
 
+    // The CD drive's state, said the way the user can act on it.
+    private static string CdStateText(int st) => st switch
+    {
+        0 => "no drive",
+        1 => "tray empty",
+        2 => "tray open, the new disc goes in",
+        3 => "disc in the drive",
+        4 => "disc mounted",
+        5 => "a new disc is waiting — put away the current CD in Mac OS (drag it "
+             + "to the Trash, or select it and press Cmd-Y) and it goes in",
+        _ => st.ToString(),
+    };
+
     private void Run(ShellSettings s)
     {
         Running = true;
@@ -470,6 +483,14 @@ public sealed class MachineSession
             ulong executed = 0;
             int dropState = Native.opm_drop_state(m);
             ulong restarts = 0;
+            // 💿 The CD the user has chosen, as last handed to the machine.
+            // The settings object is the window's own and changes under this
+            // thread when a disc is chosen or ejected from the menu; the
+            // machine follows it, the way a drive follows what is put in its
+            // tray. (A change used to wait for the next Start, and a guest
+            // that was simply restarted never saw it.)
+            string cdApplied = s.CdPath ?? "";
+            int cdState = Native.opm_cd_state(m);
 
             while (!_stop)
             {
@@ -713,6 +734,44 @@ public sealed class MachineSession
                     // mount — each a thing they can act on or stop waiting
                     // for. Retired images go once the core has let go of
                     // them (the open one cannot be deleted; try again).
+                    string cdWanted = s.CdPath ?? "";
+                    if (cdWanted != cdApplied)
+                    {
+                        cdApplied = cdWanted;
+                        if (cdWanted.Length == 0)
+                        {
+                            ConsoleQ.Enqueue(Native.opm_cd_eject(m) != 0
+                                ? "[cd] ejected\n"
+                                : "[cd] Mac OS is using this disc — drag it to the "
+                                  + "Trash in Mac OS (or select it and press Cmd-Y) "
+                                  + "to eject it. The drive will be empty the next "
+                                  + "time the machine is started.\n");
+                        }
+                        else if (Native.opm_cd_insert(m, cdWanted) != 0)
+                        {
+                            cdState = Native.opm_cd_state(m);
+                            ConsoleQ.Enqueue($"[cd] {Path.GetFileName(cdWanted)}: "
+                                             + $"{CdStateText(cdState)}\n");
+                        }
+                        else
+                        {
+                            var eb = new byte[512];
+                            uint en = Native.opm_cd_error(m, eb, (uint)eb.Length);
+                            ConsoleQ.Enqueue("[cd] disc REFUSED: "
+                                + Encoding.UTF8.GetString(eb, 0, (int)en)
+                                + $"\n[cd]   image: {cdWanted}\n");
+                        }
+                    }
+                    // What the drive does next is the guest's doing: it mounts
+                    // the disc on its own poll, and it is the guest that lets
+                    // a mounted one go.
+                    int cs = Native.opm_cd_state(m);
+                    if (cs != cdState)
+                    {
+                        if (cs != 0 && cs != 3)
+                            ConsoleQ.Enqueue($"[cd] {CdStateText(cs)}\n");
+                        cdState = cs;
+                    }
                     int ds = Native.opm_drop_state(m);
                     if (ds != dropState)
                     {

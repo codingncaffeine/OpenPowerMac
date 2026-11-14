@@ -500,9 +500,9 @@ public partial class MainWindow : Window
         if (_session is { Running: true })
             MessageBox.Show(
                 this,
-                "CD ejected.\n\nThe machine is running and opened its media "
-                + "when it started — this takes effect the next time you "
-                + "start it.",
+                "The disc comes out of the running machine now, unless Mac "
+                + "OS has it mounted — in that case drag it to the Trash in "
+                + "Mac OS. The console says which.",
                 "Eject CD", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 

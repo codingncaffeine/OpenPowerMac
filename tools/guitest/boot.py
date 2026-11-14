@@ -3,7 +3,7 @@
 
     tools/headless.sh python3 tools/guitest/boot.py --rom FILE --ati-rom FILE
         [--hard-disk FILE] [--cd FILE] [--ram MB] [--seconds N] [--shots DIR] [--sound]
-        [--mouse] [--keys] [--app FILE]
+        [--mouse] [--keys] [--cd-later FILE] [--app FILE]
 
 Writes a scratch shell.json (never the real profile: it refuses to run outside
 tools/headless.sh), copies the hard disk into the scratch profile so the
@@ -14,7 +14,9 @@ every 15 seconds. With --mouse it then clicks the screen (which captures the
 pointer), moves the mouse the way a hand would, and middle-clicks to release;
 the guest's picture must change where its cursor moved. With --keys it also
 presses a key while captured and then asks for Machine > Diagnostics, whose
-USB section must show the guest taking the keyboard's reports. Passes when the
+USB section must show the guest taking the keyboard's reports. With --cd-later
+it chooses a CD image from the File menu while the machine runs, through the
+file dialog, and the console must say the guest mounted it. Passes when the
 window shows a guest picture by the end, the mouse moved the guest's cursor
 if asked, the app exits by itself after File > Exit, and its log holds no
 error.
@@ -37,6 +39,9 @@ ap.add_argument("--shots")
 ap.add_argument("--sound", action="store_true")
 ap.add_argument("--mouse", action="store_true",
                 help="at the end: click the screen to capture, move, release; the guest picture must change")
+ap.add_argument("--cd-later", metavar="FILE",
+                help="once the machine is up: File > Choose CD Image, pick FILE in the file dialog; "
+                     "the console must report the disc mounted")
 ap.add_argument("--keys", action="store_true",
                 help="with --mouse: while captured, press a key; the guest must take the keyboard reports")
 ap.add_argument("--app", default=os.path.join(ROOT, "bin", "openpowermac"))
@@ -75,6 +80,26 @@ def click(x, y, button=1):
     xtest.fake_input(d, X.ButtonPress, button); xtest.fake_input(d, X.ButtonRelease, button)
     d.sync(); time.sleep(0.5)
 
+SHIFTED = {"_": "minus", "~": "grave", ":": "semicolon", "+": "equal", "(": "9", ")": "0", "&": "7", "!": "1"}
+PLAIN = {"/": "slash", ".": "period", "-": "minus", " ": "space", ",": "comma", "=": "equal", ";": "semicolon"}
+def type_text(text):
+    """Type a string as key presses, with Shift where the character needs it."""
+    shift = d.keysym_to_keycode(XK.string_to_keysym("Shift_L"))
+    for ch in text:
+        name, shifted = ch, False
+        if ch in PLAIN: name = PLAIN[ch]
+        elif ch in SHIFTED: name, shifted = SHIFTED[ch], True
+        elif ch.isupper(): name, shifted = ch.lower(), True
+        code = d.keysym_to_keycode(XK.string_to_keysym(name))
+        if not code:
+            sys.exit(f"boot test: cannot type {ch!r}")
+        if shifted: xtest.fake_input(d, X.KeyPress, shift)
+        xtest.fake_input(d, X.KeyPress, code); xtest.fake_input(d, X.KeyRelease, code)
+        if shifted: xtest.fake_input(d, X.KeyRelease, shift)
+    # One burst, then one flush: a file dialog completes the path as it is
+    # typed, and keys that arrive between its completions come out doubled.
+    d.sync()
+
 def shot(name):
     out = os.path.join(shots, name + ".png")
     subprocess.run(["import", "-window", "root", out], check=False)
@@ -89,6 +114,18 @@ t0 = time.time(); n = 1
 while time.time() - t0 < a.seconds:
     time.sleep(15)
     shot(f"{n:02d}-{int(time.time() - t0)}s"); n += 1
+cd_ok = None
+if a.cd_later:
+    # File > Choose CD Image…, then the path typed into the dialog's location
+    # field (Ctrl+L opens it) and Return: the way a user picks a file.
+    click(33, 26); click(80, 83)
+    time.sleep(4.0)
+    shot("80-picker")
+    key("l", ["Control_L"]); time.sleep(0.8)
+    type_text(os.path.abspath(a.cd_later)); time.sleep(0.5)
+    shot("81-typed")
+    key("Return"); time.sleep(12.0)
+    shot("82-disc")
 final = shot("99-final")
 moved = None
 if a.mouse:
@@ -134,6 +171,16 @@ errors = [l for l in log.splitlines() if "UNHANDLED" in l or "FATAL" in l]
 print(f"boot test: exited by itself={exited} rc={rc} colours in screen area={colours} shots={shots}")
 for l in log.splitlines(): print("  log:", l)
 for l in console.splitlines()[-25:]: print("  console:", l)
+if a.cd_later:
+    try:
+        saved = json.load(open(os.path.join(profile, "shell.json"))).get("CdPath", "")
+    except Exception as ex:
+        saved = f"(unreadable: {ex})"
+    print(f"boot test: the app saved CdPath = {saved!r}")
+    cd_lines = [l for l in console.splitlines() if l.startswith("[cd]")]
+    cd_ok = any("disc mounted" in l for l in cd_lines)
+    print("boot test: CD chosen while running: " + ("MOUNTED by the guest" if cd_ok else "NOT mounted")
+          + "".join("\n    " + l for l in cd_lines))
 keys_ok = None
 if a.keys:
     # The LAST keyboard section of the diagnostics: reports the guest took
@@ -144,6 +191,6 @@ if a.keys:
     keys_ok = injected >= 4 and delivered >= 4
     print(f"boot test: keyboard handed over {injected} event(s), the guest took {delivered} report(s): "
           + ("TAKEN" if keys_ok else "NOT TAKEN"))
-ok = exited and colours > 40 and not errors and (moved is None or moved > 0) and keys_ok is not False
+ok = exited and colours > 40 and not errors and (moved is None or moved > 0) and keys_ok is not False and cd_ok is not False
 print("boot test:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

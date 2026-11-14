@@ -587,6 +587,8 @@ public partial class MainWindow : Window
             _settings.CdPath);
         if (path == null)
             return;
+        // A running machine follows this too: the disc goes into its drive and
+        // Mac OS mounts it, the way it would a disc put in the tray.
         _settings.CdPath = path;
         _settings.Save();
         UpdateTitle();
@@ -596,12 +598,11 @@ public partial class MainWindow : Window
     // the CD, so taking it out is how you tell it to boot the disk.
     private void OnEjectCd(object? sender, RoutedEventArgs e)
     {
+        // A running machine follows this: the disc comes out now unless Mac OS
+        // has it mounted, and the console says which (MachineSession.Run).
         _settings.CdPath = "";
         _settings.Save();
         UpdateTitle();
-        if (_session is { Running: true })
-            Notice("CD ejected.\n\nThe machine is running and opened its media when it started — "
-                   + "this takes effect the next time you start it.", "Eject CD");
     }
 
     private void OnChooseShared(object? sender, RoutedEventArgs e)

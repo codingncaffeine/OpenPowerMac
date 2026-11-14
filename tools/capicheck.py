@@ -10,7 +10,7 @@ shows in the app can be reproduced and measured from a terminal.
     tools/capicheck.py --rom FILE --ati-rom FILE [--cd FILE] [--hd FILE]
         [--ram MB] [--seconds N] [--no-realtime] [--fast-tb N] [--no-drop]
         [--mouse-at SECONDS] [--key-at SECONDS] [--press T:USAGE[,USAGE...]]...
-        [--out DIR] [--lib FILE]
+        [--cd-insert T:FILE]... [--cd-eject T]... [--out DIR] [--lib FILE]
 
   --hd          copied into --out first (sparse); the original is never written
   --no-realtime pace the timebase from the instruction count (--fast-tb), as
@@ -21,6 +21,10 @@ shows in the app can be reproduced and measured from a terminal.
                 whether the guest's cursor moved
   --key-at T    T seconds in: press and release Caps Lock (harmless), and say
                 whether the keyboard report was taken
+  --cd-insert   T:FILE puts an image in the CD drive T seconds in, as choosing
+                one in the app does; --cd-eject T presses eject. Each prints
+                the drive's state, and the last line says whether the guest
+                read the disc
   --press T:U   T seconds in: press the HID usage(s) U, hold, release. The power
                 key (0x66) and then R (0x15) is a Restart from the keyboard;
                 the five-second lines and the final "-- pmu:" line then say
@@ -50,6 +54,10 @@ ap.add_argument("--key-at", type=float)
 ap.add_argument("--press", action="append", default=[], metavar="T:USAGE[,USAGE...]",
                 help="T seconds in: press these HID usages in order, hold, release in reverse (repeatable). "
                      "0x66 is the power key, 0x15 is R.")
+ap.add_argument("--cd-insert", action="append", default=[], metavar="T:FILE",
+                help="T seconds in: put this image in the running machine's CD drive (repeatable)")
+ap.add_argument("--cd-eject", action="append", default=[], type=float, metavar="T",
+                help="T seconds in: press the drive's eject button (repeatable)")
 ap.add_argument("--out", default=os.path.join(ROOT, "scratch", "capicheck"))
 ap.add_argument("--lib", default=os.path.join(ROOT, "build", "capi", "libopmcapi.so"))
 a = ap.parse_args()
@@ -85,6 +93,12 @@ opm_diag = fn("opm_diag", u32, P, ctypes.c_char_p, u32)
 opm_mouse = fn("opm_mouse", None, P, i32, i32, u32)
 opm_key_event = fn("opm_key_event", None, P, u32, u32)
 opm_cd_present = fn("opm_cd_present", i32, P)
+opm_cd_insert = fn("opm_cd_insert", i32, P, ctypes.c_char_p)
+opm_cd_eject = fn("opm_cd_eject", i32, P)
+opm_cd_state = fn("opm_cd_state", i32, P)
+opm_cd_error = fn("opm_cd_error", u32, P, ctypes.c_char_p, u32)
+CD_STATE = {0: "no drive", 1: "tray empty", 2: "tray open, the new disc goes in", 3: "disc in, not read yet",
+            4: "disc mounted", 5: "a new disc is waiting for the guest to put the current one away"}
 
 enc = lambda s: os.path.abspath(s).encode() if s else None
 m = opm_create(enc(a.rom), enc(a.cd), enc(hd), enc(a.ati_rom), a.ram, a.fast_tb)
@@ -151,7 +165,14 @@ for spec in a.press:
     usages = [int(k, 0) for k in keys.split(",") if k]
     events += [(float(t) + 0.05 * i, ("down", u)) for i, u in enumerate(usages)]
     events += [(float(t) + 0.4 + 0.05 * i, ("up", u)) for i, u in enumerate(reversed(usages))]
+for spec in a.cd_insert:
+    t, _, path = spec.partition(":")
+    if not os.path.exists(path):
+        sys.exit(f"capicheck: missing {path}")
+    events.append((float(t), ("cd-insert", os.path.abspath(path))))
+events += [(t, ("cd-eject", None)) for t in a.cd_eject]
 events.sort(key=lambda e: e[0])
+cd_state = None
 before = {}
 verdicts = []
 
@@ -172,7 +193,19 @@ while True:
     now = time.monotonic() - t0
     while events and events[0][0] <= now:
         _, what = events.pop(0)
-        if isinstance(what, tuple):
+        if isinstance(what, tuple) and what[0] == "cd-insert":
+            ok = opm_cd_insert(m, what[1].encode())
+            why = b""
+            if not ok:
+                eb = ctypes.create_string_buffer(512)
+                why = eb.raw[:opm_cd_error(m, eb, len(eb))]
+            print(f"   t={now:5.1f}s  cd insert {os.path.basename(what[1])}: "
+                  + (CD_STATE[opm_cd_state(m)] if ok else "REFUSED: " + why.decode(errors="replace")), flush=True)
+        elif isinstance(what, tuple) and what[0] == "cd-eject":
+            ok = opm_cd_eject(m)
+            print(f"   t={now:5.1f}s  cd eject: " + ("out" if ok else "REFUSED, the guest has the tray locked")
+                  + f" ({CD_STATE[opm_cd_state(m)]})", flush=True)
+        elif isinstance(what, tuple):
             opm_key_event(m, what[1], 1 if what[0] == "down" else 0)
             print(f"   t={now:5.1f}s  key {what[1]:#04x} {what[0]}", flush=True)
         elif what == "mouse-before":
@@ -197,6 +230,11 @@ while True:
             verdicts.append(f"keyboard: Caps Lock down and up handed over; the guest took {took} report(s): "
                             + ("TAKEN" if took > 0 else "NOT TAKEN"))
 
+    st = opm_cd_state(m)
+    if st != cd_state:
+        if cd_state is not None:
+            print(f"   t={now:5.1f}s  cd: {CD_STATE[st]}", flush=True)
+        cd_state = st
     while opm_audio(m, pcm, len(pcm)) > 0:
         pass
     while True:
@@ -242,6 +280,12 @@ else:
 print(usb_part(final))
 for l in final.splitlines():
     if l.startswith("-- pmu:"): print(l)
+keep = False
+for l in final.splitlines():
+    if l.startswith("-- cd ata cell"): keep = True
+    elif keep and not l.startswith("--   "): keep = False
+    if keep and ("cd ata cell" in l or "medium:" in l or "media:" in l): print(l)
+print(f"-- cd drive: {CD_STATE[opm_cd_state(m)]}")
 for v in verdicts:
     print("--", v)
 print(f"-- reports and the last frame: {a.out}")

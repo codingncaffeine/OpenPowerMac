@@ -87,6 +87,20 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_cd_error(IntPtr m, byte[] buf, uint cap);
 
+    // 💿 The CD drive of the running machine: it is on its channel whether or
+    // not a disc was in it at start, so a disc can go in or come out later.
+    // opm_cd_insert returns 0 when the image cannot be read (opm_cd_error
+    // says why); opm_cd_eject returns 0 when the guest has the tray locked,
+    // which Mac OS does for a mounted volume. States as opm_drop_state.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int opm_cd_insert(IntPtr m, string imgPath);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_cd_eject(IntPtr m);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_cd_state(IntPtr m);
+
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_rom_note(IntPtr m, byte[] buf, uint cap);
 

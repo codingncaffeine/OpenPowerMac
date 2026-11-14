@@ -52,6 +52,9 @@ struct OpmMachine {
     uint64_t hidInjected[2] = {0, 0};
     // Restarts the guest asked for and got (PMU_RESET). See opm_run.
     uint64_t restarts = 0;
+    // Why the last opm_cd_insert refused, when it refused before the drive
+    // was involved at all.
+    std::string cdRefusal;
 
     ~OpmMachine() { delete bus; }
 };
@@ -91,8 +94,12 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     r128CceReset();
     m->bus = new SawtoothBus(size_t(ramMb ? ramMb : 256) * 1024 * 1024,
                              std::move(rom));
-    if (cdPath && *cdPath)
-        m->bus->attachCd(cdPath);
+    // The machine has its CD drive whether or not there is a disc in it. A
+    // drive that only existed when an image was chosen at start left no tray
+    // to put a disc into afterwards: the guest enumerates its drives once,
+    // so choosing an image later reached nothing, and neither did a restart.
+    if (!(cdPath && *cdPath && m->bus->attachCd(cdPath)))
+        m->bus->cd().seat();
     if (hdPath && *hdPath)
         m->bus->attachHd(hdPath);
     if (atiRomPath && *atiRomPath)
@@ -333,7 +340,73 @@ OPM_API void opm_serial(OpmMachine* m, const char* text)
 
 OPM_API int32_t opm_cd_present(const OpmMachine* m)
 {
-    return m->bus->cd().present() ? 1 : 0;
+    // The DISC, not the drive: the drive is always there now.
+    return m->bus->cd().mediaPresent() ? 1 : 0;
+}
+
+// What a CD-class drive is doing, as the shell reports it. One function for
+// the CD drive and the drop box, which are the same cell on two channels.
+static int32_t driveState(const AtaCell& d)
+{
+    if (!d.present())
+        return 0;
+    if (d.awaitingGuestEject())
+        return 5;
+    if (d.swapPending())
+        return 2;
+    if (!d.mediaPresent())
+        return 1;
+    if (d.unitAttentionPending() || d.readsSinceInsert() == 0)
+        return 3;
+    return 4;
+}
+
+OPM_API int32_t opm_cd_state(const OpmMachine* m)
+{
+    return driveState(m->bus->cd());
+}
+
+OPM_API int32_t opm_cd_insert(OpmMachine* m, const char* imgPath)
+{
+    m->cdRefusal.clear();
+    if (!imgPath || !*imgPath) {
+        m->cdRefusal = "no image was named";
+        return 0;
+    }
+    // Looked at before it is staged. A staged disc goes in later, when the
+    // guest has let the current one go, and an image that cannot be read
+    // would be refused then — to a user who chose it minutes earlier and was
+    // told it was on its way.
+    {
+        CdImage probe;
+        if (!probe.open(imgPath)) {
+            m->cdRefusal = probe.why();
+            return 0;
+        }
+    }
+    AtaCell& cd = m->bus->cd();
+    const bool ok = cd.hostStage(imgPath);
+    if (!ok)
+        m->cdRefusal = cd.mediaError();
+    m->bus->deviceStateChanged();
+    return ok ? 1 : 0;
+}
+
+OPM_API int32_t opm_cd_eject(OpmMachine* m)
+{
+    AtaCell& cd = m->bus->cd();
+    cd.hostCancelStage(); // whatever was waiting to go in is not wanted now
+    if (!cd.mediaPresent())
+        return 1;
+    // The button on the drive does nothing while the host has the tray
+    // locked, and Mac OS locks it for as long as the volume is mounted.
+    // Pulling the disc anyway is the pinhole, and what follows is Mac OS
+    // asking for a disc it can no longer find.
+    if (cd.lockedByGuest())
+        return 0;
+    cd.hostEject();
+    m->bus->deviceStateChanged();
+    return 1;
 }
 
 OPM_API int32_t opm_drop_seat(OpmMachine* m)
@@ -371,18 +444,7 @@ OPM_API void opm_drop_eject(OpmMachine* m)
 
 OPM_API int32_t opm_drop_state(const OpmMachine* m)
 {
-    const AtaCell& d = m->bus->drop();
-    if (!d.present())
-        return 0;
-    if (d.awaitingGuestEject())
-        return 5;
-    if (d.swapPending())
-        return 2;
-    if (!d.mediaPresent())
-        return 1;
-    if (d.unitAttentionPending() || d.readsSinceInsert() == 0)
-        return 3;
-    return 4;
+    return driveState(m->bus->drop());
 }
 
 OPM_API uint64_t opm_drop_reads(const OpmMachine* m)
@@ -420,7 +482,8 @@ OPM_API uint32_t opm_cd_error(const OpmMachine* m, char* buf, uint32_t cap)
 {
     if (!buf || !cap)
         return 0;
-    const char* why = m->bus->cd().mediaError();
+    const char* why = m->cdRefusal.empty() ? m->bus->cd().mediaError()
+                                           : m->cdRefusal.c_str();
     uint32_t n = 0;
     while (why[n] && n + 1 < cap) {
         buf[n] = why[n];

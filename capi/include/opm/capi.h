@@ -156,6 +156,23 @@ OPM_API uint32_t opm_drop_error(const OpmMachine* m, char* buf, uint32_t cap);
 OPM_API int32_t opm_cd_present(const OpmMachine* m);
 OPM_API uint32_t opm_cd_error(const OpmMachine* m, char* buf, uint32_t cap);
 
+// 💿 The CD drive of a RUNNING machine. The drive is on its channel from
+// power-on whether or not opm_create was given an image, so a disc can go in
+// afterwards, by the protocol a real drive speaks (the same one the drop box
+// uses): NOT READY while the tray is empty, UNIT ATTENTION when a disc
+// arrives, and the guest's own driver mounts it on its next poll.
+//
+// opm_cd_insert puts `imgPath` in: now if the tray is empty or the guest has
+// not read the disc that is in it; after the guest puts the current volume
+// away if it has one mounted (state 5). Returns 0 when the image cannot be
+// read; opm_cd_error says why. opm_cd_eject takes the disc out and returns 1,
+// or returns 0 and does nothing when the guest has the tray locked — which
+// Mac OS does for as long as the volume is mounted; the user ejects that one
+// in the guest. opm_cd_state uses opm_drop_state's numbering.
+OPM_API int32_t opm_cd_insert(OpmMachine* m, const char* imgPath);
+OPM_API int32_t opm_cd_eject(OpmMachine* m);
+OPM_API int32_t opm_cd_state(const OpmMachine* m);
+
 // 🏭 What opm_create did to the boot ROM's system-configuration block, if
 // anything: empty when the dump already described a Power Mac G4 (AGP
 // Graphics); otherwise one sentence saying what the block described and

@@ -154,3 +154,23 @@ TEST_CASE("undefined SPR: illegal vs privileged by SPR bit 4")
         CHECK((c.st.srr1 & 0x00080000u) != 0);
     }
 }
+
+TEST_CASE("MSSCR0 DL1HWF: the hardware flush completes and clears its bit")
+{
+    // Software sets DL1HWF and spins until the processor clears it; a bit
+    // stored verbatim never clears and the guest waits forever. The other
+    // MSSCR0 bits are stored as written.
+    NullBus bus;
+    Cpu c;
+    c.attach(bus);
+    c.reset();
+    c.st.pc = 0x1000;
+    c.st.msr = 0;
+    c.st.gpr[3] = 0x00C00000u; // DL1HWF | the reset-value bit
+    bus.write32(0x1000, encMtspr(3, 1014));
+    bus.write32(0x1004, encMfspr(4, 1014));
+    c.step();
+    c.step();
+    CHECK(c.st.pc == 0x1008u);
+    CHECK(c.st.gpr[4] == 0x00400000u);
+}

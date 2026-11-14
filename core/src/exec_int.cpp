@@ -26,6 +26,7 @@ namespace opm {
 //   bit 31 V          this SPR holds a valid threshold
 // THRM3 bit 31 is E, the unit enable.
 namespace {
+constexpr u32 kMsscr0Dl1hwf = 0x00800000u; // MSSCR0 bit 8
 constexpr u32 kThrmTin = 0x80000000u;
 constexpr u32 kThrmTiv = 0x40000000u;
 constexpr u32 kThrmTid = 0x00000004u;
@@ -1004,6 +1005,28 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
                 fprintf(stderr, "l2cr <= %08x pc=%08x lr=%08x tb=%llu\n", v,
                         c.st.pc - 4u, c.st.lr,
                         static_cast<unsigned long long>(c.st.tb)),
+                    ++n;
+        }
+        return;
+    }
+    if (spr == 1014) { // MSSCR0: DL1HWF is a command, like L2CR's L2HWF
+        // DL1HWF (bit 8): setting it makes the processor flush the L1 data
+        // cache in hardware, and the processor CLEARS THE BIT when the flush
+        // is done; software sets it and spins on it. The Power Mac G4
+        // Software Install and Restore disc does exactly that at 000954ac
+        // (`mfspr r8,1014; rlwinm. r8,r8,0,8,8; bne`), so storing the bit
+        // verbatim wedged the boot there at the Apple logo forever.
+        const bool hwf = (v & kMsscr0Dl1hwf) != 0;
+        c.st.msscr0 = v & ~kMsscr0Dl1hwf;
+        if (hwf)
+            c.l1dFlushAll(true);
+        { // Which code drives the memory subsystem, and when: bounded, like
+          // the L2CR timeline above.
+            static int n = 0;
+            if (n < 16)
+                fprintf(stderr, "msscr0 <= %08x%s pc=%08x lr=%08x tb=%llu\n", v,
+                        hwf ? " (L1 data cache flushed)" : "", c.st.pc - 4u,
+                        c.st.lr, static_cast<unsigned long long>(c.st.tb)),
                     ++n;
         }
         return;

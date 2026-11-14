@@ -114,6 +114,25 @@ const Result& result();
 // The n hottest sampled guest pcs, most first. Returns how many were written.
 size_t topPcs(u32* pc, u64* hits, size_t cap);
 
+// ---- the HOST side: which of the emulator's own instructions are running ----
+//
+// The phase markers above answer "which part of the machine" and stop there:
+// `execute` is one bucket for four hundred handlers, and a marker cannot be
+// put inside each of them without the tax this header exists to avoid. This
+// sampler asks the host instead. A timer on the CALLING thread's own CPU time
+// interrupts it, the handler records the interrupted instruction's address,
+// and hostDump writes "offset-in-the-executable count" lines that
+// tools/hostprof.py turns into functions and source lines.
+//
+// It needs no markers, so it measures the SHIPPING build — and it counts CPU
+// time, not wall time, so a paced machine's sleeps are not in it. Linux only;
+// elsewhere hostStart returns false and nothing else happens.
+bool hostStart(unsigned hz);
+void hostStop();
+// Returns the number of samples written, 0 when there were none or the file
+// could not be opened.
+size_t hostDump(const char* path);
+
 } // namespace prof
 } // namespace opm
 

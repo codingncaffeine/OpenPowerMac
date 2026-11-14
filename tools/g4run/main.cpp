@@ -609,6 +609,8 @@ int main(int argc, char** argv)
     // tools/diffstate.sh runs the pair.
     u64 fpEvery = 0, fpNext = ~0ull;
     unsigned profHz = 0;               // --profile HZ (g4prof only)
+    unsigned hostProfHz = 0;           // --profile-host HZ FILE
+    const char* hostProfPath = nullptr;
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
     bool fastTbSet = false;            // CLI wins over a resumed value
     bool realtime = false;             // --realtime: TB from the host clock
@@ -860,6 +862,11 @@ int main(int argc, char** argv)
         }
         if (!strcmp(a, "--profile")) {
             profHz = static_cast<unsigned>(strtoul(next(), nullptr, 0));
+            continue;
+        }
+        if (!strcmp(a, "--profile-host") && i + 2 < argc) {
+            hostProfHz = static_cast<unsigned>(strtoul(argv[++i], nullptr, 0));
+            hostProfPath = argv[++i];
             continue;
         }
         if (!strcmp(a, "--rom")) romPath = next();
@@ -2361,6 +2368,17 @@ int main(int argc, char** argv)
         }
     };
 
+    // The host-address sampler needs no markers, so it runs in this binary
+    // as built. It samples THIS thread, which is the one the processor runs
+    // on.
+    if (hostProfHz) {
+        if (prof::hostStart(hostProfHz))
+            printf("-- sampling host addresses at %u Hz of this thread's CPU "
+                   "time -> %s\n",
+                   hostProfHz, hostProfPath);
+        else
+            printf("-- --profile-host ignored: not available on this host\n");
+    }
     if (profHz) {
 #if OPM_PROFILING
         if (prof::start(profHz, &cpu.st.pc))
@@ -5688,6 +5706,13 @@ int main(int argc, char** argv)
                        static_cast<double>(ran));
         }
 #endif
+    }
+    if (hostProfHz) {
+        prof::hostStop();
+        const size_t n = prof::hostDump(hostProfPath);
+        printf("-- host profile: %zu samples -> %s (tools/hostprof.py reads "
+               "it)\n",
+               n, hostProfPath);
     }
     // Where the host time went. Sampled, so it is a distribution and not a
     // ledger: percentages under about 1% are noise at any realistic rate.

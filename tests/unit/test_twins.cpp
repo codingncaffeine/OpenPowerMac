@@ -580,6 +580,63 @@ TEST_CASE("data memo: off outside a batch and while a watch is armed")
     }
 }
 
+// ---- the instruction page memo -------------------------------------------------
+
+TEST_CASE("page memo: the ITLB's replacement order follows every change of page")
+{
+    // Code fetched through the page table, on three pages that share one
+    // ITLB set of two ways. The loop goes A, B, A, B and every fourth time
+    // round A, C: which of A and B the reload for C evicts depends on which
+    // was used last, and that is the LRU write a change of page makes — the
+    // one thing a memo hit has to replay. Get it wrong and the walking twin
+    // ends up holding a different pair of pages.
+    constexpr u32 kA = 0x01000000u, kB = 0x01040000u, kC = 0x01080000u;
+    constexpr u32 kPa = 0x00300000u;
+    Machine memo(true), walk(false);
+    for (Machine* m : {&memo, &walk}) {
+        REQUIRE(m->setUp({}));
+        REQUIRE(m->map(kVsidA, kA, kPa));
+        REQUIRE(m->map(kVsidA, kB, kPa + 0x1000u));
+        REQUIRE(m->map(kVsidA, kC, kPa + 0x2000u));
+        const u32 a[] = {
+            dform(14, 3, 3, 1),                           // addi r3, r3, 1
+            dform(28, 3, 4, 3),                           // andi. r4, r3, 3
+            16u << 26 | 12u << 21 | 2u << 16 | 8u,        // beq +8
+            18u << 26 | ((kB - (kA + 12u)) & 0x03FFFFFCu), // b B
+            18u << 26 | ((kC - (kA + 16u)) & 0x03FFFFFCu), // b C
+        };
+        for (u32 k = 0; k < 5; ++k)
+            m->bus.write32(kPa + k * 4u, a[k]);
+        m->bus.write32(kPa + 0x1000u, dform(14, 5, 5, 1)); // B: addi r5, r5, 1
+        m->bus.write32(kPa + 0x1004u,
+                       18u << 26 | ((kA - (kB + 4u)) & 0x03FFFFFCu)); // b A
+        m->bus.write32(kPa + 0x2000u, dform(14, 6, 6, 1)); // C: addi r6, r6, 1
+        m->bus.write32(kPa + 0x2004u,
+                       18u << 26 | ((kA - (kC + 4u)) & 0x03FFFFFCu)); // b A
+        m->cpu.st.msr = msr::IR;
+        m->cpu.st.pc = kA;
+        m->cpu.st.gpr[3] = m->cpu.st.gpr[5] = m->cpu.st.gpr[6] = 0;
+    }
+    Rng r{0x1A6E5ull};
+    const char* diff = runTwins(memo, walk, 6000, r, false);
+    const std::string what = diff ? diff : "nothing";
+    CAPTURE(what);
+    CHECK(diff == nullptr);
+    CHECK(memo.cpu.excRingAt == 0u);
+    // A was entered about a thousand times, a quarter of them on the way to C.
+    CHECK(memo.cpu.st.gpr[3] > 900u);
+    CHECK(memo.cpu.st.gpr[6] * 4u >= memo.cpu.st.gpr[3] - 4u);
+    CHECK(memo.cpu.st.gpr[5] > memo.cpu.st.gpr[6]);
+    // The memo twin did hold the pages, and the walking twin held nothing.
+    u32 held = 0, heldWalk = 0;
+    for (u32 k = 0; k < Cpu::kImPages; ++k) {
+        held += memo.cpu.imPage[k].page != ~0u;
+        heldWalk += walk.cpu.imPage[k].page != ~0u;
+    }
+    CHECK(held >= 3u);
+    CHECK(heldWalk == 0u);
+}
+
 // ---- the line executor --------------------------------------------------------
 
 TEST_CASE("line executor: the same machine as one instruction at a time")

@@ -84,8 +84,15 @@
             </DockPanel>
         </Border>
 
-        <Grid RowDefinitions="*,4,240">
-            <Border x:Name="brdScreen" Grid.Row="0" Background="{DynamicResource Letterbox}" MinHeight="200">
+        <Grid x:Name="grdMain">
+            <!-- The limits are on the ROWS, so the splitter stops at them
+                 and a remembered console height can be held to them. -->
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" MinHeight="200" />
+                <RowDefinition Height="4" />
+                <RowDefinition Height="240" MinHeight="110" />
+            </Grid.RowDefinitions>
+            <Border x:Name="brdScreen" Grid.Row="0" Background="{DynamicResource Letterbox}">
                 <Grid>
                     <Image x:Name="imgScreen" Stretch="Uniform" Focusable="True"
                            RenderOptions.BitmapInterpolationMode="None" />
@@ -113,7 +120,7 @@
             <GridSplitter Grid.Row="1" ResizeDirection="Rows" Background="{DynamicResource BorderBrush}"
                           Focusable="False" />
 
-            <DockPanel Grid.Row="2" Background="{DynamicResource Surface}" MinHeight="110">
+            <DockPanel Grid.Row="2" Background="{DynamicResource Surface}">
                 <DockPanel DockPanel.Dock="Bottom" Margin="6,4,6,6">
                     <Button x:Name="btnSend" DockPanel.Dock="Right" Content="Send" MinWidth="70"
                             Margin="6,0,0,0" Click="OnSend" IsEnabled="False" />

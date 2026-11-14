@@ -38,6 +38,7 @@ public partial class MainWindow : Window
         miSound.IsChecked = _settings.Sound;
         UpdateTitle();
         UpdateNoVideoHint();
+        RestoreWindowLayout();
 
         // 60 Hz: the frame is copied only when the session published a new
         // one, and pointer travel gathered by the capture is handed over on
@@ -77,7 +78,95 @@ public partial class MainWindow : Window
             _grab?.Dispose();
             _grab = null;
             _timer.Stop();
+            // The window is really going now. Written here and not left to
+            // the pending background save: the process is about to end.
+            _layoutSave?.Stop();
+            CaptureWindowLayout();
+            _settings.Save();
         };
+    }
+
+    // ---- the window as the user left it ----
+    //
+    // Size, whether it was maximized, and the height of the console pane are
+    // put back at the next launch. The size remembered is the NORMAL one:
+    // while the window is maximized its size is the screen's, and saving
+    // that would make "restore" a window as big as the screen.
+
+    private DispatcherTimer? _layoutSave;
+    private Size _normalSize;
+    private bool _layoutReady;
+
+    private void RestoreWindowLayout()
+    {
+        if (_settings.WindowWidth >= MinWidth && _settings.WindowHeight >= MinHeight)
+        {
+            // Bounded, so a damaged settings file cannot ask for a window no
+            // screen can show; the window manager fits it to the real screen.
+            Width = Math.Min(_settings.WindowWidth, 16384);
+            Height = Math.Min(_settings.WindowHeight, 16384);
+        }
+        if (_settings.ConsoleHeight > 0)
+        {
+            RowDefinition console = grdMain.RowDefinitions[2];
+            console.Height = new GridLength(Math.Max(_settings.ConsoleHeight, console.MinHeight));
+        }
+        _normalSize = new Size(Width, Height);
+        if (_settings.WindowMaximized)
+            WindowState = WindowState.Maximized;
+
+        // Changes are saved a moment after they stop arriving: a drag sends a
+        // stream of sizes and only the last one is worth a write.
+        _layoutSave = new DispatcherTimer(TimeSpan.FromMilliseconds(800), DispatcherPriority.Background,
+            (_, _) =>
+            {
+                _layoutSave!.Stop();
+                CaptureWindowLayout();
+                _settings.SaveInBackground();
+            });
+        _layoutSave.Stop();
+        Opened += (_, _) => _layoutReady = true;
+        PropertyChanged += (_, e) =>
+        {
+            if (!_layoutReady)
+                return;
+            if (e.Property == ClientSizeProperty || e.Property == WindowStateProperty)
+                TouchLayout();
+        };
+        grdMain.RowDefinitions[2].PropertyChanged += (_, e) =>
+        {
+            if (_layoutReady && e.Property == RowDefinition.HeightProperty)
+                TouchLayout();
+        };
+    }
+
+    private void TouchLayout()
+    {
+        _layoutSave!.Stop();
+        _layoutSave.Start();
+    }
+
+    private void CaptureWindowLayout()
+    {
+        // The normal size is read HERE, once the changes have stopped, and
+        // only while the window is in its normal state. On the way to
+        // maximized the new size and the new state arrive as two events in
+        // an order the window manager picks, and a size taken between them
+        // would be the screen's.
+        if (WindowState == WindowState.Normal)
+            _normalSize = ClientSize;
+        // Minimized is not a state to come back to; it counts as whatever
+        // the window was before.
+        if (WindowState != WindowState.Minimized)
+            _settings.WindowMaximized = WindowState == WindowState.Maximized;
+        if (_normalSize.Width >= MinWidth && _normalSize.Height >= MinHeight)
+        {
+            _settings.WindowWidth = Math.Round(_normalSize.Width);
+            _settings.WindowHeight = Math.Round(_normalSize.Height);
+        }
+        GridLength console = grdMain.RowDefinitions[2].Height;
+        if (console.IsAbsolute && console.Value > 0)
+            _settings.ConsoleHeight = Math.Round(console.Value);
     }
 
     // ---- guest input ----

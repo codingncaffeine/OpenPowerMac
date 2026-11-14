@@ -114,6 +114,16 @@ public sealed class ShellSettings
     // recipe into a booting machine only disturbs it.
     public string BootScript { get; set; } = "";
 
+    // 🪟 The window as the user left it: the size of its content when it is
+    // not maximized, whether it was maximized, and how tall they made the
+    // console pane. Zero means "never set": the window's own default applies.
+    // Sizes are in the toolkit's layout units, so a saved size is the same
+    // size on screen at any scaling.
+    public double WindowWidth { get; set; }
+    public double WindowHeight { get; set; }
+    public bool WindowMaximized { get; set; }
+    public double ConsoleHeight { get; set; }
+
     private static string FilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "OpenPowerMac", "shell.json");
@@ -149,14 +159,47 @@ public sealed class ShellSettings
         return new ShellSettings();
     }
 
-    public void Save()
+    // Saves are ordered: a write that was queued before a newer one must not
+    // land after it and put the older settings back.
+    private static readonly object SaveLock = new();
+    private static int _saveSeq;
+
+    private string ToJson() =>
+        JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+
+    private static void Write(string json)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(
-                this, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(FilePath, json);
         }
         catch { /* settings loss is not fatal */ }
+    }
+
+    public void Save()
+    {
+        string json = ToJson();
+        Interlocked.Increment(ref _saveSeq);
+        lock (SaveLock)
+            Write(json);
+    }
+
+    /// <summary>Save without making the caller wait for the disk: the
+    /// settings are captured now, on the caller's thread, and written on a
+    /// worker. For changes that arrive in a stream — a window being dragged
+    /// to a new size — where the caller is the UI thread.</summary>
+    public void SaveInBackground()
+    {
+        string json = ToJson();
+        int seq = Interlocked.Increment(ref _saveSeq);
+        Task.Run(() =>
+        {
+            lock (SaveLock)
+            {
+                if (seq == Volatile.Read(ref _saveSeq))
+                    Write(json);
+            }
+        });
     }
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include "opm/types.hpp"
 
 #include <atomic>
@@ -273,6 +274,36 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out);
 // so a scan-out that reads VRAM alone shows no pointer at all. No-op unless
 // CRTC_GEN_CNTL bit 16 (cursor enable) is set.
 void r128ScanCursor(const R128Cell& c, const R128Scan& s, u8* bgra);
+
+// --- Who wrote this pixel ---------------------------------------------------
+//
+// A wrong pixel has three possible authors — the processor storing through
+// the frame buffer aperture, the 2D engine, the 3D rasterizer — and from the
+// picture they are indistinguishable: a sprite with a black box behind it
+// looks the same whether the game's own blitter, a colour-keyed engine blit
+// or a textured quad drew the box. This names the author. Every store path
+// into video memory asks r128PixelWatched() and, for the watched bytes, logs
+// who it is and what it was doing: the storing pc, the blit's operation and
+// colour-compare setting, the triangle's state.
+//
+// Off, it is one load and one branch per store. The first `budget` writes
+// are kept in order and the rest are counted per author. File-statics, like
+// every instrument on this card: a member would move sizeof(R128Cell).
+extern u32 gR128PwLo, gR128PwHi; // [lo, hi) in video-memory bytes; hi 0 = off
+void r128SetPixelWatch(u32 vramOff, u32 bytes, u32 budget);
+// Watch the pixel at (x, y) of the picture the card is scanning out now.
+// False if the display is not in a mode this can address.
+bool r128SetPixelWatchXY(const R128Cell& c, u32 x, u32 y, u32 budget);
+inline bool r128PixelWatched(u64 at, u64 n)
+{
+    return gR128PwHi && at < gR128PwHi && at + n > gR128PwLo;
+}
+#if defined(__GNUC__)
+__attribute__((format(printf, 2, 3)))
+#endif
+void r128PixelWatchNote(const char* who, const char* fmt, ...);
+// What was logged, as text: the kept lines, then the totals per author.
+std::string r128PixelWatchReport();
 
 // --- The engine command stream, in order ---------------------------------
 //

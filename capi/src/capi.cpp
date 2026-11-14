@@ -274,6 +274,26 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
 
 OPM_API uint64_t opm_restarts(const OpmMachine* m) { return m->restarts; }
 
+OPM_API int32_t opm_ati_pixel_watch(OpmMachine* m, uint32_t x, uint32_t y,
+                                    uint32_t budget)
+{
+    m->bus->atiDrain(); // the engine's own thread reads the watch
+    return r128SetPixelWatchXY(m->bus->ati(), x, y, budget) ? 1 : 0;
+}
+
+OPM_API uint32_t opm_ati_pixel_log(OpmMachine* m, char* buf, uint32_t cap)
+{
+    m->bus->atiDrain();
+    const std::string s = r128PixelWatchReport();
+    if (!buf || !cap)
+        return static_cast<uint32_t>(s.size());
+    const uint32_t n = s.size() < cap - 1u ? static_cast<uint32_t>(s.size())
+                                           : cap - 1u;
+    memcpy(buf, s.data(), n);
+    buf[n] = 0;
+    return n;
+}
+
 OPM_API void opm_set_rtc(OpmMachine* m, uint32_t macSeconds)
 {
     m->bus->pmuHost().rtcSetTo(macSeconds, m->cpu.tbNow());

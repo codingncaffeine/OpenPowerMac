@@ -1,5 +1,9 @@
 #include "opm/r128.hpp"
 
+#include <vector>
+#include <string>
+#include <map>
+#include <cstdarg>
 #include <cstdio> // the CRTC mode-change report; MSVC pulls this in, gcc does not
 #include "opm/bus.hpp" // SnoopSink: the bus-master fetch answers to it
 #include "opm/prof.hpp" // OPM_MARK(Cce): the engine's own profile bucket
@@ -447,6 +451,98 @@ const char* r128RegName(u32 off)
 // engine traffic under the driver's DDC bit-banging — which is exactly what
 // happened to the existing ring.
 static constexpr u32 kEngLo = 0x0700, kEngHi = 0x2000;
+// ---- the pixel watch (see the header) --------------------------------------
+u32 gR128PwLo = 0, gR128PwHi = 0;
+namespace {
+std::mutex gPwMu; // the engine's thread and the processor's both report
+// The first half of the budget in order, then a ring of the most recent:
+// "who drew what is there now" is the tail's question, "what happened when
+// it first went wrong" the head's, and a pixel redrawn every frame would
+// spend a head-only log on the first second.
+std::vector<std::string> gPwHead, gPwTail;
+size_t gPwTailAt = 0;
+u64 gPwTotal = 0;
+std::map<std::string, u64> gPwCount;
+u32 gPwBudget = 0;
+} // namespace
+
+void r128SetPixelWatch(u32 vramOff, u32 bytes, u32 budget)
+{
+    std::lock_guard<std::mutex> lk(gPwMu);
+    gPwHead.clear();
+    gPwTail.clear();
+    gPwTailAt = 0;
+    gPwTotal = 0;
+    gPwCount.clear();
+    gPwBudget = budget;
+    gR128PwLo = vramOff;
+    gR128PwHi = bytes ? vramOff + bytes : 0u;
+}
+
+bool r128SetPixelWatchXY(const R128Cell& c, u32 x, u32 y, u32 budget)
+{
+    const R128Scan s = r128ScanDecode(c);
+    if (!s.enabled || !s.bypp || x >= s.w || y >= s.h)
+        return false;
+    r128SetPixelWatch(s.offset + y * s.rowBytes + x * s.bypp, s.bypp, budget);
+    return true;
+}
+
+void r128PixelWatchNote(const char* who, const char* fmt, ...)
+{
+    char text[320];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof text, fmt, ap);
+    va_end(ap);
+    std::lock_guard<std::mutex> lk(gPwMu);
+    ++gPwCount[who];
+    ++gPwTotal;
+    const size_t half = gPwBudget / 2u;
+    if (!half)
+        return;
+    std::string line = "#" + std::to_string(gPwTotal) + " " + who + ": " + text;
+    if (gPwHead.size() < half) {
+        gPwHead.push_back(std::move(line));
+    } else if (gPwTail.size() < half) {
+        gPwTail.push_back(std::move(line));
+    } else {
+        gPwTail[gPwTailAt] = std::move(line);
+        gPwTailAt = (gPwTailAt + 1u) % half;
+    }
+}
+
+std::string r128PixelWatchReport()
+{
+    std::lock_guard<std::mutex> lk(gPwMu);
+    if (!gR128PwHi)
+        return "-- pixel watch: off\n";
+    char b[160];
+    snprintf(b, sizeof b,
+             "-- pixel watch on video memory %06x..%06x, writes in order:\n",
+             gR128PwLo, gR128PwHi - 1u);
+    std::string s = b;
+    for (const std::string& l : gPwHead)
+        s += "--   " + l + "\n";
+    if (gPwTotal > gPwHead.size() + gPwTail.size()) {
+        snprintf(b, sizeof b, "--   ... %llu not kept ...\n",
+                 static_cast<unsigned long long>(gPwTotal - gPwHead.size() -
+                                                 gPwTail.size()));
+        s += b;
+    }
+    for (size_t k = 0; k < gPwTail.size(); ++k)
+        s += "--   " + gPwTail[(gPwTailAt + k) % gPwTail.size()] + "\n";
+    s += "--   by author:";
+    if (gPwCount.empty())
+        s += " nothing wrote it";
+    for (const auto& [who, n] : gPwCount) {
+        snprintf(b, sizeof b, " %s %llu", who.c_str(),
+                 static_cast<unsigned long long>(n));
+        s += b;
+    }
+    return s + "\n";
+}
+
 static size_t gEngLogMax = 0;
 static std::vector<R128EngEv> gEngHead, gEngTail, gEngStitched;
 static size_t gEngTailAt = 0;
@@ -1145,6 +1241,15 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
                                    static_cast<u64>(px) * bpp;
                     if (at + bpp > c.vram.size())
                         continue;
+                    if (r128PixelWatched(at, bpp))
+                        r128PixelWatchNote(
+                            "2d host data",
+                            "colour pixels pushed to (%d,%d %ux%u), "
+                            "GUI_CONTROL %08x (rop %02x), colour compare "
+                            "%08x key %08x mask %08x",
+                            bx, by, wPx, hPx, gc, (gc >> 16) & 0xFFu,
+                            c.peek(0x15C0u), c.peek(0x15C4u),
+                            c.peek(0x15CCu));
                     for (u32 k = 0; k < bpp; ++k) {
                         const u64 s = sb + k;
                         c.vram[at + k] = static_cast<u8>(
@@ -1182,6 +1287,12 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
                 if (at + bpp > c.vram.size())
                     continue;
                 const u32 v = on ? fg : bk;
+                if (r128PixelWatched(at, bpp))
+                    r128PixelWatchNote(
+                        "2d host data",
+                        "1-bit pixels expanded to (%d,%d %ux%u), source type "
+                        "%u, wrote %x",
+                        bx, by, wPx, hPx, srcType, v);
                 for (u32 k = 0; k < bpp; ++k)
                     c.vram[at + k] =
                         static_cast<u8>(v >> (8u * (bpp - 1u - k)));
@@ -1303,6 +1414,10 @@ static void cceDrawMonoGlyph(R128Cell& c, const CceDst& d, int bx, int by,
                            static_cast<u64>(px) * d.bpp;
             if (at + d.bpp > c.vram.size())
                 continue;
+            if (r128PixelWatched(at, d.bpp))
+                r128PixelWatchNote("2d glyph", "a 1-bit glyph at (%d,%d), "
+                                               "wrote %x",
+                                   bx, by, fg);
             for (u32 k = 0; k < d.bpp; ++k)
                 c.vram[at + k] =
                     static_cast<u8>(fg >> (8u * (d.bpp - 1u - k)));
@@ -2237,6 +2352,13 @@ void R128Cell::engBlit()
     auto putPix = [&](size_t o, u32 v) {
         if (mask != 0xFFFFFFFFu)
             v = (pixAt(o) & ~mask) | (v & mask);
+        if (r128PixelWatched(o, bypp))
+            r128PixelWatchNote(
+                "2d blit",
+                "rop %02x %s to (%d,%d %dx%d), colour compare %08x key %08x, "
+                "wrote %x",
+                rop, usesSrc ? "from video memory" : "fill", dx0, dy0, w, h,
+                cmp, rd(0x15C4u), v);
         for (u32 k = 0; k < bypp; ++k)
             vram[o + k] = static_cast<u8>(v >> (8 * (bypp - 1 - k)));
     };

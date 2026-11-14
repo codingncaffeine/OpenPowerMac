@@ -1590,6 +1590,14 @@ private:
             const u32 fo = pa - atiFbBar_;
             if (fo < ati_.fbLo) ati_.fbLo = fo;
             if (fo > ati_.fbHi) ati_.fbHi = fo;
+            if (r128PixelWatched((pa - atiFbBar_) & 0x01FFFFFFu, len))
+                r128PixelWatchNote(
+                    "processor",
+                    "store of %0*llx through the frame buffer, pc=%08x "
+                    "lr=%08x",
+                    static_cast<int>(len * 2u),
+                    static_cast<unsigned long long>(v),
+                    pcRef ? *pcRef : 0u, lrRef ? *lrRef : 0u);
             put(ati_.vram.data() + ((pa - atiFbBar_) & 0x01FFFFFFu), v, len);
             return;
         }

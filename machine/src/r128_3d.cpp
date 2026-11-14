@@ -905,6 +905,14 @@ void dstWrite(const Pipe& P, u64 at, u32 v)
 {
     if (P.planeMask != 0xFFFFFFFFu)
         v = (dstRead(P, at) & ~P.planeMask) | (v & P.planeMask);
+    if (r128PixelWatched(at, P.bypp))
+        r128PixelWatchNote(
+            "3d",
+            "triangle %llu: TEX_CNTL %08x MISC %08x, texture %ux%u format %u "
+            "cntl %08x combine %08x, wrote %x",
+            static_cast<unsigned long long>(gTriSeq), P.texCntl, P.misc,
+            P.tex[0].wTex, P.tex[0].hTex, P.tex[0].fmt, P.tex[0].cntl,
+            P.tex[0].comb, v);
     for (u32 k = 0; k < P.bypp; ++k)
         P.c->vram[at + k] = static_cast<u8>(v >> (8u * (P.bypp - 1u - k)));
 }

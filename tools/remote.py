@@ -29,6 +29,10 @@ Commands (one per argument; times are GUEST seconds unless they say host):
   type TEXT         text as keystrokes
   snap NAME         save OUT/NAME.snap and the disk as it is now (OUT/NAME.hd.img)
   diag NAME         write the diagnostics to OUT/NAME.txt
+  watch X Y         from now on, log every write to the screen pixel (X, Y)
+                    with its author: the processor and its pc, a 2D engine
+                    operation, a triangle and its state
+  watchlog [NAME]   print that log (and write it to OUT/NAME.txt)
   stat              instructions, guest seconds, slips
   rt on|off         pace the guest's clock from the host (the app) or from
                     the instruction count (deterministic, the default)
@@ -99,6 +103,8 @@ opm_audio = fn("opm_audio", u32, P, ctypes.c_char_p, u32)
 opm_audio_rate = fn("opm_audio_rate", u32, P)
 opm_screen = fn("opm_screen", i32, P, ctypes.c_char_p, u32, ctypes.POINTER(u32), ctypes.POINTER(u32))
 opm_diag = fn("opm_diag", u32, P, ctypes.c_char_p, u32)
+opm_ati_pixel_watch = fn("opm_ati_pixel_watch", i32, P, u32, u32, u32)
+opm_ati_pixel_log = fn("opm_ati_pixel_log", u32, P, ctypes.c_char_p, u32)
 opm_mouse = fn("opm_mouse", None, P, i32, i32, u32)
 opm_key = fn("opm_key", None, P, ctypes.c_char_p)
 opm_key_event = fn("opm_key_event", None, P, u32, u32)
@@ -262,6 +268,17 @@ def do(line):
         with open(path, "w") as f:
             f.write(diag_text())
         return path
+    if cmd == "watch":
+        x, y = (int(v) for v in arg.split())
+        ok = opm_ati_pixel_watch(m, x, y, 400)
+        return f"watching ({x},{y})" if ok else "the display is in no mode a pixel can be addressed in"
+    if cmd == "watchlog":
+        buf = ctypes.create_string_buffer(1 << 18)
+        opm_ati_pixel_log(m, buf, len(buf))
+        text = buf.value.decode("utf-8", "replace")
+        if arg:
+            open(os.path.join(a.out, arg + ".txt"), "w").write(text)
+        return text.rstrip()
     if cmd == "stat": return stat()
     if cmd == "rt":
         state["rt"] = arg.strip() == "on"

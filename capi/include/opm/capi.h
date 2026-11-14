@@ -64,6 +64,16 @@ OPM_API void opm_set_rtc(OpmMachine* m, uint32_t macSeconds);
 // What the clock chip reads now, or 0 if it was never set.
 OPM_API uint32_t opm_rtc(const OpmMachine* m);
 
+// Who writes the pixel at (x, y) of the picture on screen now: from this call
+// on, every store into that pixel is logged with its author (the processor
+// and its pc, a 2D engine operation and its settings, a triangle and its
+// state), the first `budget` in order. opm_ati_pixel_log returns the report
+// as text, the same convention as opm_diag. Returns 0 if the display is in no
+// mode a pixel can be addressed in.
+OPM_API int32_t opm_ati_pixel_watch(OpmMachine* m, uint32_t x, uint32_t y,
+                                    uint32_t budget);
+OPM_API uint32_t opm_ati_pixel_log(OpmMachine* m, char* buf, uint32_t cap);
+
 // How many times the guest restarted the machine (Special > Restart, the end
 // of an installation, Open Firmware's reset-all). opm_run performs the restart
 // itself — every chip back at power-on values around the same RAM, flash and

@@ -249,6 +249,15 @@ OPM_API int32_t opm_screen(OpmMachine* m, uint8_t* bgra, uint32_t cap,
 OPM_API int32_t opm_snapshot_save(OpmMachine* m, const char* path, char* err,
                                   uint32_t errCap);
 
+// 📂 PUT A SAVED MACHINE BACK, into a machine created the way the saved one
+// was: the same ROM, the same RAM size, and the disk image as it was when the
+// snapshot was written (opm_snapshot_save's note). Call it after opm_create
+// and before the first opm_run. Returns 1 on success; 0 with the loader's
+// reason in `err` when the file does not line up with this machine, and the
+// machine is then not usable and must be destroyed.
+OPM_API int32_t opm_snapshot_load(OpmMachine* m, const char* path, char* err,
+                                  uint32_t errCap);
+
 // Machine state peeks for the shell's status line.
 OPM_API uint64_t opm_executed(const OpmMachine* m);
 OPM_API uint32_t opm_pc(const OpmMachine* m);

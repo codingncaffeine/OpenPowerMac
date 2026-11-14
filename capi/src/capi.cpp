@@ -1704,5 +1704,38 @@ OPM_API int32_t opm_snapshot_save(OpmMachine* m, const char* path, char* err,
     return 1;
 }
 
+OPM_API int32_t opm_snapshot_load(OpmMachine* m, const char* path, char* err,
+                                  uint32_t errCap)
+{
+    auto fail = [&](const char* why) {
+        if (err && errCap) {
+            uint32_t n = 0;
+            while (why[n] && n + 1 < errCap) {
+                err[n] = why[n];
+                ++n;
+            }
+            err[n] = 0;
+        }
+        return 0;
+    };
+    if (!m || !path || !*path)
+        return fail("no machine or no path");
+    std::vector<u8> blob;
+    if (!readSnapshotFile(path, blob))
+        return fail("could not read the snapshot file");
+    HarnessState h;
+    SnapReader r(blob.data(), blob.size());
+    if (!loadSnapshot(m->cpu, *m->bus, h, r))
+        return fail(r.err.c_str());
+    m->executed = h.executed;
+    m->consoleAt = 0;
+    // The clock is wherever the snapshot left it; real-time pacing carries on
+    // from there, not from the fresh machine's zero.
+    m->pace.anchor(m->cpu);
+    if (err && errCap)
+        err[0] = 0;
+    return 1;
+}
+
 OPM_API uint64_t opm_executed(const OpmMachine* m) { return m->executed; }
 OPM_API uint32_t opm_pc(const OpmMachine* m) { return m->cpu.st.pc; }

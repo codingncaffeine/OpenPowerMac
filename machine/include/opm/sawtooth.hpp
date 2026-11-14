@@ -220,6 +220,7 @@ public:
         for (u32 r = 0x04; r <= 0x38; r += 4)
             if (r != 0x08)
                 cfgSeed(0, 0x00010000u | r, 0);
+        cfgSeed(0, 0x00010010u, 0x00000008u); // MEM_BASE: PREFETCH_EN reads 1
         // The card's own AGP capability, at 0x50 exactly as on the real
         // 'PF': the ARM reads the MMIO mirror of PCI config 0x58
         // (AGP_COMMAND) at 0x0F58 — measured session 31 — which pins the
@@ -1146,8 +1147,11 @@ private:
             }
             return 0;
         }
+        // The 16 KB window holds TWO IDENTICAL 8 KB register apertures
+        // (Register Reference Guide 2.2); the same register answers at
+        // +off and at +0x2000+off. See R128Cell::regRead, CONFIG_REG_1_BASE.
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u)
-            return ati_.read(pa - atiRegBar_, len);
+            return ati_.read((pa - atiRegBar_) & 0x1FFFu, len);
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20))
             // Both halves address the same VRAM; the upper is the
             // big-endian alias.
@@ -1373,7 +1377,7 @@ private:
             return;
         }
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
-            const u32 off = pa - atiRegBar_;
+            const u32 off = (pa - atiRegBar_) & 0x1FFFu; // either aperture
             ati_.write(off, v, len);
             // The card is a BUS MASTER, and this is the one place it acts as
             // one: writing the transfer address starts a fetch out of system
@@ -1600,9 +1604,18 @@ private:
                     // Sized at 32 MiB, the aperture did not even cover the
                     // address the firmware publishes, so "0 framebuffer
                     // writes" was a window too small to see them.
-                    word &= 0xFC000000u;
-                    atiFbBar_ = (word != 0xFC000000u) ? word : atiFbBar_;
-                    ati_.fbBase = atiFbBar_;
+                    //
+                    // PREFETCH_EN (bit 3) is read-only and reads 1: this is
+                    // PREFETCHABLE memory (RAGE 128 PRO Register Reference
+                    // Guide, MEM_BASE CFG:0x0010), which REG_BASE at 0x18
+                    // is not. Read back as 0, Open Firmware published the
+                    // framebuffer to the OS as non-prefetchable.
+                    {
+                        const u32 base = word & 0xFC000000u;
+                        atiFbBar_ = (base != 0xFC000000u) ? base : atiFbBar_;
+                        ati_.fbBase = atiFbBar_;
+                        word = base | 0x00000008u;
+                    }
                     break;
                 case 0x14u:
                     // The I/O BAR is not decoration: Open Firmware drives

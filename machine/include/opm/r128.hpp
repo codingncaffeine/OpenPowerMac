@@ -30,7 +30,7 @@ public:
     // Framebuffer write census — see Sawtooth::write.
     u64 fbWrites = 0;
     u32 fbBase = 0; // CONFIG_APER_0_BASE: where the OS should paint
-    u32 regBase = 0; // CONFIG_REG_1_BASE: where its own registers live
+    u32 regBase = 0; // REG_BASE (the 16 KB BAR): aperture 0; aperture 1 is +0x2000
     u32 fbLo = 0xFFFFFFFFu, fbHi = 0;
 
     R128Cell() : vram(32u << 20, 0) {}

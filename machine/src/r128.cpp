@@ -1552,11 +1552,27 @@ u32 R128Cell::regRead(u32 idx)
         // the mildest symptom of it.
         return fbBase + kAper1Offset;
     case kConfigReg1Base:
-        // Same shape, for the register aperture: a driver that asks where
-        // its own registers are must not be told zero.
-        return regBase;
+        // The base of register aperture ONE, which is not the BAR. The chip
+        // has two identical copies of its register aperture so that "for the
+        // PowerMac environment ... one aperture [can] be marked as cacheable"
+        // (RAGE 128 PRO Register Reference Guide 2.2): aperture 0 sits at
+        // REG_BASE from PCI config space, aperture 1 at this register, whose
+        // field is bits 31:13 with its lowest bit HARDWIRED TO ONE — that is,
+        // the BAR plus 0x2000, the upper half of the 16 KB window.
+        //
+        // ⚠ Answering with the BAR itself, and 16 KB for the size below, told
+        // the driver that aperture 1 WAS the whole window. Mac OS 9.1's
+        // driver takes the guide at its word — SetProcessorCacheMode(this
+        // base, CONFIG_REG_APER_SIZE, copy-back) — so it made every register
+        // it owns cacheable, aperture 0 included. Its interrupt acknowledges
+        // and cursor-position stores then sat in the L1 instead of reaching
+        // the chip: 20,397 of 20,407 vertical blanks expired unanswered, the
+        // slot-VBL task never ran, and the pointer never moved.
+        return (regBase & 0xFFFFC000u) | 0x00002000u;
     case kConfigRegAperSize:
-        return 0x00004000u; // 16 KB, matching the BAR we advertise
+        // The size of EACH register aperture, not of the BAR that holds
+        // both: REG_APER_SIZE 13:0 reads 0x2000 (bits 12:0 hardwired zero).
+        return 0x00002000u;
     case kConfigMemsize:
     case kConfigAperSize: {
         // Power-on default 32 MB; if the init code programs the field,

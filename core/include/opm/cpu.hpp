@@ -869,7 +869,20 @@ struct Cpu {
     // --no-line-exec is for the line executor. Pure derived state: never
     // snapshotted, dropped on reset, re-keyed by the refill hook.
     std::unique_ptr<JitCache> jit;
+    //
+    // ⚠ ON BY DEFAULT ONLY WHERE IT HAS MEASURED FASTER. Built with MSVC the
+    // JIT took the in-game window from 68.8 to 85.6 MIPS. Built with GCC on
+    // Linux the same blocks run it at 86.4 against 89.0 for the line
+    // executor alone (two interleaved pairs, real time, 97.0% of instructions
+    // native, no bails): that compiler's interpreter is already where the
+    // blocks get to, and a block pays a call for every memory access. So it
+    // is compiled, tested and available there (g4run --jit) and off unless
+    // asked for.
+#if defined(_WIN32)
     bool jitOn = true;
+#else
+    bool jitOn = false;
+#endif
     // DIAGNOSTIC (--no-jit-chain): compile blocks without chain sites, so
     // every block exit returns to the dispatcher as v1 did. The control for
     // Stage B, exactly as --no-jit is for the JIT itself.

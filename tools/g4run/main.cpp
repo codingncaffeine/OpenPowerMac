@@ -582,6 +582,7 @@ int main(int argc, char** argv)
     bool lineExecOff = false;
     // --no-jit: interpret every line. The control for the compiled blocks.
     bool jitOff = false;
+    bool jitForce = false; // --jit
     // --no-jit-chain: compile blocks without chain sites, so every exit
     // returns to the dispatcher as v1 did. The control for Stage B.
     bool jitChainOff = false;
@@ -791,6 +792,8 @@ int main(int argc, char** argv)
         // The control for the JIT (opm/jit.hpp), same rule as every cache
         // and gate here: the claim ships with the switch that turns it off.
         if (!strcmp(a, "--no-jit")) { jitOff = true; continue; }
+        // ...and on, where it is not the default (Cpu::jitOn says where).
+        if (!strcmp(a, "--jit")) { jitForce = true; continue; }
         if (!strcmp(a, "--no-jit-chain")) { jitChainOff = true; continue; }
         // 🔬 The host-cycle split inside compiled blocks. Perturbs the run
         // (an rdtsc pair per shim call), so read it for SHARES and per-call
@@ -1527,7 +1530,10 @@ int main(int argc, char** argv)
     cpu.fetchCacheOff = !icache;
     cpu.dxlCacheOff = !dxlate;
     cpu.lineExecOff = lineExecOff;
-    cpu.jitOn = !jitOff;
+    if (jitOff)
+        cpu.jitOn = false;
+    else if (jitForce)
+        cpu.jitOn = true;
     cpu.jitChainOff = jitChainOff;
     cpu.jitTscOn = jitTsc; // JitCache is created lazily; carried on the Cpu
     cpu.jitDirectOff = jitDirectOff;

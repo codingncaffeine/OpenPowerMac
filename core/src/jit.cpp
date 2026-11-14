@@ -23,9 +23,13 @@
 //   dispatcher re-derives the same answers — but a skipped check never is,
 //   which is why every path out of an instruction runs the full tail.
 //
-//   ⚠ WIN64 ABI THROUGHOUT. Blocks run with rsp 16-aligned and a 40-byte
-//   outgoing area (32 shadow + 8 alignment) reserved by the trampoline, and
-//   call C++ shims with RCX/RDX/R8 arguments. Pinned callee-saved registers:
+//   ⚠ WIN64 ABI THROUGHOUT — ON EVERY HOST. Blocks run with rsp 16-aligned
+//   and a 40-byte outgoing area (32 shadow + 8 alignment) reserved by the
+//   trampoline, and set up a call's arguments in RCX/RDX/R8/R9. On a System
+//   V host (Linux) a block is written the same way and three things differ:
+//   every call moves those four registers across to RDI/RSI/RDX/RCX first
+//   (Emit::callAbs), the trampoline reads its own arguments from the System
+//   V registers, and the arena comes from mmap. See OPM_JIT_SYSV below. Pinned callee-saved registers:
 //   r13 = Cpu*, r14 = &stamp, r15 = insnCycles + extraCycles (constant for
 //   the length of a batch — only the harness writes those fields, never the
 //   guest). r12 stages the effective address across the one shim call of an
@@ -49,6 +53,7 @@
 
 #if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
 #define OPM_JIT_HOST 1
+#define OPM_JIT_SYSV 0
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -56,8 +61,27 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__linux__) && defined(__x86_64__) && \
+    (defined(__GNUC__) || defined(__clang__))
+// x86-64 with the System V calling convention. A block still stages a call's
+// arguments in rcx/rdx/r8/r9, and callAbs moves them to rdi/rsi/rdx/rcx on
+// the way. rbx, rbp and r12-r15 — everything a block pins — are callee-saved
+// in both conventions, and a block keeps nothing in rsi, rdi or any XMM
+// register, which are the ones System V lets a callee clobber and Win64 does
+// not.
+//
+// ⚠ NOT __attribute__((ms_abi)) ON THE SHIMS, which would have left the
+// emitted bytes identical and was tried first. A Win64 function must
+// preserve xmm6-xmm15, and a shim calls ordinary code that may clobber
+// them, so the compiler saves and restores all ten around every shim body:
+// measured on the in-game window, the machine ran at 85.8 MIPS with the JIT
+// built that way against 93.5 on the interpreter alone.
+#define OPM_JIT_HOST 1
+#define OPM_JIT_SYSV 1
+#include <sys/mman.h>
 #else
 #define OPM_JIT_HOST 0
+#define OPM_JIT_SYSV 0
 #endif
 
 namespace opm {
@@ -525,8 +549,19 @@ struct Emit {
         i32le(u32(i64(dst) - (i64(at) + 4)));
     }
 
+    // A call to C++, with up to four arguments staged the Win64 way in
+    // rcx/rdx/r8/r9 by the caller.
     void callAbs(const void* fn)
     {
+#if OPM_JIT_SYSV
+        // System V takes them in rdi/rsi/rdx/rcx. In this order each source
+        // is read before it is overwritten; the registers a call does not
+        // use carry junk across, which is what they hold on entry anyway.
+        bytes({0x48, 0x89, 0xCF}); // mov rdi, rcx
+        bytes({0x48, 0x89, 0xD6}); // mov rsi, rdx
+        bytes({0x4C, 0x89, 0xC2}); // mov rdx, r8
+        bytes({0x4C, 0x89, 0xC9}); // mov rcx, r9
+#endif
         b(0x48);
         b(0xB8);
         i64le(reinterpret_cast<u64>(fn)); // mov rax, imm64
@@ -1741,9 +1776,18 @@ void Compiler::word(u32 k, u32 insn, u32 row)
 JitCache::JitCache()
 {
 #if OPM_JIT_HOST
+#if OPM_JIT_SYSV
+    // Writable and executable at once, like the Windows arena. A system that
+    // forbids that (a hardened kernel policy) answers MAP_FAILED, the cache
+    // is not ready, and the machine runs on the interpreter.
+    void* p = mmap(nullptr, kArenaBytes, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    arena_ = p == MAP_FAILED ? nullptr : static_cast<u8*>(p);
+#else
     arena_ = static_cast<u8*>(VirtualAlloc(nullptr, kArenaBytes,
                                            MEM_COMMIT | MEM_RESERVE,
                                            PAGE_EXECUTE_READWRITE));
+#endif
     cap_ = arena_ ? kArenaBytes : 0;
 #endif
 }
@@ -1751,8 +1795,13 @@ JitCache::JitCache()
 JitCache::~JitCache()
 {
 #if OPM_JIT_HOST
+#if OPM_JIT_SYSV
+    if (arena_)
+        munmap(arena_, kArenaBytes);
+#else
     if (arena_)
         VirtualFree(arena_, 0, MEM_RELEASE);
+#endif
 #endif
 }
 
@@ -1841,6 +1890,19 @@ void JitCache::bind(Cpu& c)
     e.bytes({0x53, 0x55, 0x56, 0x57});                     // push rbx/rbp/rsi/rdi
     e.bytes({0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57}); // push r12..r15
     e.bytes({0x48, 0x83, 0xEC, 0x28});                     // sub rsp, 40
+#if OPM_JIT_SYSV
+    // The same trampoline, entered by a System V caller: enter(entry=rdi,
+    // cpu=rsi, stamp=rdx, cyc=rcx). The pushes stay as they are — rsi and rdi
+    // need no saving here, but the eight of them are what the alignment
+    // above is counted from.
+    e.bytes({0x49, 0x89, 0xF5});                           // mov r13, rsi
+    e.bytes({0x49, 0x89, 0xD6});                           // mov r14, rdx
+    e.bytes({0x49, 0x89, 0xCF});                           // mov r15, rcx
+    e.bytes({0x48, 0x8B, 0xAE});                           // mov rbp, [rsi+until]
+    e.i32le(u32(offs.until));                              // (the budget bound)
+    e.bytes({0x31, 0xDB});                                 // xor ebx, ebx
+    e.bytes({0xFF, 0xE7});                                 // jmp rdi
+#else
     e.bytes({0x49, 0x89, 0xD5});                           // mov r13, rdx
     e.bytes({0x4D, 0x89, 0xC6});                           // mov r14, r8
     e.bytes({0x4D, 0x89, 0xCF});                           // mov r15, r9
@@ -1848,6 +1910,7 @@ void JitCache::bind(Cpu& c)
     e.i32le(u32(offs.until));                              // (the budget bound)
     e.bytes({0x31, 0xDB});                                 // xor ebx, ebx
     e.bytes({0xFF, 0xE1});                                 // jmp rcx
+#endif
     epilogue_ = u32(e.at);
     e.bytes({0x48, 0x83, 0xC4, 0x28});                     // add rsp, 40
     e.bytes({0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C}); // pop r15..r12

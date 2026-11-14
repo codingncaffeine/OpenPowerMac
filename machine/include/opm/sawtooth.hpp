@@ -1283,10 +1283,10 @@ private:
         // (Register Reference Guide 2.2); the same register answers at
         // +off and at +0x2000+off. See R128Cell::regRead, CONFIG_REG_1_BASE.
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
-            const u32 off = (pa - atiRegBar_) & 0x1FFFu;
-            atiBeforeRead(off);
+            const u32 regOff = (pa - atiRegBar_) & 0x1FFFu;
+            atiBeforeRead(regOff);
             R128RegLock atiLock;
-            return ati_.read(off, len);
+            return ati_.read(regOff, len);
         }
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {
             // Both halves address the same VRAM; the upper is the

@@ -469,6 +469,7 @@ public sealed class MachineSession
             long lastShotMs = 0, lastStatMs = 0, lastStatInsns = 0;
             ulong executed = 0;
             int dropState = Native.opm_drop_state(m);
+            ulong restarts = 0;
 
             while (!_stop)
             {
@@ -490,6 +491,19 @@ public sealed class MachineSession
                     ConsoleQ.Enqueue($"\n[shell] machine halted @{executed:N0}\n");
                     reason = "halted";
                     break;
+                }
+
+                // A restart the guest asked for (Special ▸ Restart, the end
+                // of an installation) is carried out inside opm_run. Say so:
+                // the screen keeps its last picture until the firmware has
+                // the display up again, and without this line that looks
+                // like the machine freezing on the way down.
+                ulong restartsNow = Native.opm_restarts(m);
+                if (restartsNow != restarts)
+                {
+                    restarts = restartsNow;
+                    ConsoleQ.Enqueue($"\n[shell] the guest restarted the machine @{executed:N0} — "
+                                     + "same disks, same memory, booting again\n");
                 }
 
                 // Aim each chunk at ~15 ms so serial input and stop stay snappy.

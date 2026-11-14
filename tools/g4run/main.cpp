@@ -2411,6 +2411,16 @@ int main(int argc, char** argv)
         // state — this is the CPU restart the firmware is waiting for, not a
         // power cycle, and pretending otherwise would throw away the
         // attached media and the BAR assignments the next pass re-reads.
+        //
+        // ⚠ THAT IS ENOUGH FOR THE FIRMWARE'S OWN `reset-all`, AND NOT FOR A
+        // GUEST OS RESTART. Mac OS leaves every device programmed, and with
+        // the devices kept Open Firmware's second pass takes an external
+        // interrupt from one of them (`DEFAULT CATCH!, code=500`) and stops
+        // at its prompt. The app performs the reset the hardware does —
+        // SawtoothBus::afterSystemReset, a new board around the same RAM,
+        // flash and discs — and tools/capicheck.py is where a guest Restart
+        // is exercised. This loop owns its board by value with a harness's
+        // worth of knobs poked into it, so it keeps the processor restart.
         if (bus.pmu().resetRequest) {
             bus.pmu().resetRequest = false;
             printf("-- PMU reset @%llu: restarting the processor "

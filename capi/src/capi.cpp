@@ -13,6 +13,7 @@
 #include <utility>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,8 @@ struct OpmMachine {
     // half of the diagnostics' "reports delivered", so a dead pointer can be
     // told apart from a front end that never sent anything.
     uint64_t hidInjected[2] = {0, 0};
+    // Restarts the guest asked for and got (PMU_RESET). See opm_run.
+    uint64_t restarts = 0;
 
     ~OpmMachine() { delete bus; }
 };
@@ -68,6 +71,10 @@ static std::vector<u8> slurp(const char* path)
     fclose(f);
     return v;
 }
+
+// The wiring between the processor and the board. One function, used at
+// creation and again after a system reset, so the two cannot drift.
+static void wireMachine(OpmMachine* m);
 
 OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
                                const char* hdPath, const char* atiRomPath,
@@ -91,6 +98,37 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     if (atiRomPath && *atiRomPath)
         m->bus->attachAtiRom(atiRomPath);
     m->fastTb = fastTb;
+    wireMachine(m);
+    return m;
+}
+
+OPM_API void opm_destroy(OpmMachine* m) { delete m; }
+
+OPM_API void opm_ati_at(OpmMachine* m, uint64_t insn)
+{
+    m->bus->atiVisibleAt = insn;
+}
+
+// 🔁 THE RESTART THE GUEST ASKED FOR. PMU_RESET (0xD0) is how this machine
+// restarts: Open Firmware sends it from `reset-all`, and Mac OS sends it from
+// Special > Restart and at the end of an installation. Whoever sent it then
+// parks in a loop and waits for the machine to go away, so a front end that
+// only records the request leaves the guest spinning behind a blank screen
+// for ever — which is what the app did. Nothing in a boot from power-on sends
+// the command, so nothing showed it.
+//
+// The board is rebuilt at power-on values around its RAM, its flash and its
+// discs (SawtoothBus::afterSystemReset says why it is a rebuild and not a
+// list of things to clear), the processor restarts at the reset vector, and
+// the wiring opm_create does is done again by the same function.
+//
+// ⚠ TAKEN AT THE ENTRY OF opm_run, NEVER INSIDE IT. The run loops hold a
+// reference to the board, and between calls the caller drains the console,
+// the sound and the screen out of it; the loops end as soon as a reset is
+// requested, the caller takes what the old board still has, and the next
+// call starts on the new one.
+static void wireMachine(OpmMachine* m)
+{
     m->cpu.attach(*m->bus);
     m->snoop.cpu = &m->cpu;
     m->bus->attachSnoop(&m->snoop);
@@ -102,18 +140,26 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     // cannot read and offers to initialise.
     m->bus->setPcRef(&m->cpu.st.pc);
     m->bus->setStamp(&m->executed);
-    return m;
 }
 
-OPM_API void opm_destroy(OpmMachine* m) { delete m; }
-
-OPM_API void opm_ati_at(OpmMachine* m, uint64_t insn)
+static void takeRestart(OpmMachine* m)
 {
-    m->bus->atiVisibleAt = insn;
+    std::unique_ptr<SawtoothBus> old(m->bus);
+    m->bus = nullptr;
+    m->bus = SawtoothBus::afterSystemReset(std::move(old)).release();
+    // A command stream cut off mid-packet must not poison the next one, the
+    // same as on a fresh machine (see r128CceReset in opm/r128.hpp).
+    r128CceReset();
+    wireMachine(m);
+    m->consoleAt = 0; // the new board's console starts empty
+    m->pace.anchor(m->cpu); // the clock went back to zero with the processor
+    ++m->restarts;
 }
 
 OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
 {
+    if (m->bus->pmu().resetRequest)
+        takeRestart(m);
     const uint64_t until = m->executed + insns;
     Cpu& cpu = m->cpu;
     SawtoothBus& bus = *m->bus;
@@ -152,7 +198,8 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         // exactly that and would have stopped an idle machine.
         constexpr uint64_t kMaxIdleNsPerCall = 15000000; // 15 ms
         uint64_t idleNs = 0;
-        while (m->executed < until && !cpu.halted) {
+        while (m->executed < until && !cpu.halted &&
+               !bus.pmu().resetRequest) {
             // 1. THE CLOCK, FROM OUTSIDE. Nothing else moves it now.
             m->pace.sync(cpu);
             // 2. The devices, in the same breath, because the clock just
@@ -191,7 +238,7 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         }
         return m->executed;
     }
-    while (m->executed < until && !cpu.halted) {
+    while (m->executed < until && !cpu.halted && !bus.pmu().resetRequest) {
         // An asleep core executes nothing, and nothing that could wake it can
         // happen before the deadlines this asks about — so charge the whole
         // run of sleeping steps at once. At the Finder desktop that is most
@@ -212,6 +259,8 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     }
     return m->executed;
 }
+
+OPM_API uint64_t opm_restarts(const OpmMachine* m) { return m->restarts; }
 
 OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
 {
@@ -1402,6 +1451,32 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         detail("audio-out", 0x8800, m->bus->sndOut());
         detail("ata-hd", 0x8A00, m->bus->hdDma());
         detail("ata-cd", 0x8B00, m->bus->ataDma());
+    }
+    // 🔁 WHAT THE GUEST LAST ASKED OF THE POWER MANAGER. A restart or a shut
+    // down is one PMU command, after which the OS parks in a loop and waits
+    // for the machine to go away. From the window that is a guest that
+    // stopped responding with its picture intact; the last command bytes
+    // (0xD0 reset, 0x7E power down) say it stopped on purpose.
+    {
+        const auto& pl = m->bus->pmu().log;
+        std::string cmds;
+        int shown = 0;
+        for (size_t k = pl.size(); k-- > 0 && shown < 8;) {
+            if (pl[k].kind != 'c')
+                continue;
+            snprintf(b, sizeof b, " %02x@%llu", pl[k].val,
+                     static_cast<unsigned long long>(pl[k].at));
+            cmds = b + cmds;
+            ++shown;
+        }
+        snprintf(b, sizeof b,
+                 "-- pmu: %llu restart(s) performed, reset %s; last commands "
+                 "(oldest first, byte@tb):%s\n",
+                 static_cast<unsigned long long>(m->restarts),
+                 m->bus->pmu().resetRequest ? "REQUESTED AND NOT YET TAKEN"
+                                            : "not pending",
+                 cmds.empty() ? " (none)" : cmds.c_str());
+        s += b;
     }
     // 🖱 IS THE GUEST LISTENING TO ITS KEYBOARD AND MOUSE? "The pointer does
     // not move" has three causes that look the same from the window: the

@@ -54,6 +54,12 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns);
 // fastTb. Call it any time; it re-anchors. fastTb is ignored while it is on.
 OPM_API void opm_set_realtime(OpmMachine* m, int32_t on);
 
+// How many times the guest restarted the machine (Special > Restart, the end
+// of an installation, Open Firmware's reset-all). opm_run performs the restart
+// itself — every chip back at power-on values around the same RAM, flash and
+// discs — so this is only for a front end that wants to say it happened.
+OPM_API uint64_t opm_restarts(const OpmMachine* m);
+
 // How many times the machine could not keep up and the debt was forgiven. A
 // run with many slips is not running at real time and its tick rate is a lie.
 OPM_API uint64_t opm_rt_slips(const OpmMachine* m);

@@ -9,7 +9,8 @@ shows in the app can be reproduced and measured from a terminal.
 
     tools/capicheck.py --rom FILE --ati-rom FILE [--cd FILE] [--hd FILE]
         [--ram MB] [--seconds N] [--no-realtime] [--fast-tb N] [--no-drop]
-        [--mouse-at SECONDS] [--key-at SECONDS] [--out DIR] [--lib FILE]
+        [--mouse-at SECONDS] [--key-at SECONDS] [--press T:USAGE[,USAGE...]]...
+        [--out DIR] [--lib FILE]
 
   --hd          copied into --out first (sparse); the original is never written
   --no-realtime pace the timebase from the instruction count (--fast-tb), as
@@ -20,6 +21,10 @@ shows in the app can be reproduced and measured from a terminal.
                 whether the guest's cursor moved
   --key-at T    T seconds in: press and release Caps Lock (harmless), and say
                 whether the keyboard report was taken
+  --press T:U   T seconds in: press the HID usage(s) U, hold, release. The power
+                key (0x66) and then R (0x15) is a Restart from the keyboard;
+                the five-second lines and the final "-- pmu:" line then say
+                whether the machine came back up
 
 It opens no sound device (the codec is drained to nowhere, as the app does
 with Sound off) and no display, so it needs no wall around it. Prints a line
@@ -42,6 +47,9 @@ ap.add_argument("--fast-tb", type=int, default=4)
 ap.add_argument("--no-drop", action="store_true")
 ap.add_argument("--mouse-at", type=float)
 ap.add_argument("--key-at", type=float)
+ap.add_argument("--press", action="append", default=[], metavar="T:USAGE[,USAGE...]",
+                help="T seconds in: press these HID usages in order, hold, release in reverse (repeatable). "
+                     "0x66 is the power key, 0x15 is R.")
 ap.add_argument("--out", default=os.path.join(ROOT, "scratch", "capicheck"))
 ap.add_argument("--lib", default=os.path.join(ROOT, "build", "capi", "libopmcapi.so"))
 a = ap.parse_args()
@@ -138,7 +146,12 @@ if a.mouse_at is not None:
 if a.key_at is not None:
     events += [(a.key_at, "key-before"), (a.key_at + 0.5, "key-down"), (a.key_at + 0.6, "key-up"),
                (a.key_at + 2.0, "key-after")]
-events.sort()
+for spec in a.press:
+    t, _, keys = spec.partition(":")
+    usages = [int(k, 0) for k in keys.split(",") if k]
+    events += [(float(t) + 0.05 * i, ("down", u)) for i, u in enumerate(usages)]
+    events += [(float(t) + 0.4 + 0.05 * i, ("up", u)) for i, u in enumerate(reversed(usages))]
+events.sort(key=lambda e: e[0])
 before = {}
 verdicts = []
 
@@ -159,7 +172,10 @@ while True:
     now = time.monotonic() - t0
     while events and events[0][0] <= now:
         _, what = events.pop(0)
-        if what == "mouse-before":
+        if isinstance(what, tuple):
+            opm_key_event(m, what[1], 1 if what[0] == "down" else 0)
+            print(f"   t={now:5.1f}s  key {what[1]:#04x} {what[0]}", flush=True)
+        elif what == "mouse-before":
             before["mouse"] = diag("diag-mouse-before.txt")
         elif what == "mouse-move":
             opm_mouse(m, 6, 4, 0)
@@ -224,6 +240,8 @@ else:
     with open(os.path.join(a.out, "screen.ppm"), "wb") as f:
         f.write(b"P6\n%d %d\n255\n" % (W, H) + bytes(rgb))
 print(usb_part(final))
+for l in final.splitlines():
+    if l.startswith("-- pmu:"): print(l)
 for v in verdicts:
     print("--", v)
 print(f"-- reports and the last frame: {a.out}")

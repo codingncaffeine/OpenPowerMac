@@ -46,6 +46,12 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_rt_slips(IntPtr m);
 
+    // How many times the guest restarted the machine. opm_run performs the
+    // restart itself (every chip back at power-on values around the same
+    // RAM, flash and discs); this only lets the shell say that it happened.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong opm_restarts(IntPtr m);
+
     // Whether the machine STOPPED — which is not the same question as whether
     // it executed anything. An idle guest legitimately runs no instructions
     // for a whole opm_run call, because the machine spends the time waiting

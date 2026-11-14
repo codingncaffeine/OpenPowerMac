@@ -609,6 +609,8 @@ int main(int argc, char** argv)
     // tools/diffstate.sh runs the pair.
     u64 fpEvery = 0, fpNext = ~0ull;
     unsigned profHz = 0;               // --profile HZ (g4prof only)
+    bool rtcGiven = false;             // --rtc N
+    u32 rtcSeconds = 0;
     unsigned hostProfHz = 0;           // --profile-host HZ FILE
     const char* hostProfPath = nullptr;
     u64 verifyAt = 0, verifySteps = 0; // --verify-snapshot N M
@@ -849,6 +851,14 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--drop")) { dropPath = next(); continue; }
         if (!strcmp(a, "--drop-empty")) { dropEmpty = true; continue; }
         if (!strcmp(a, "--cd-empty")) { cdEmpty = true; continue; }
+        // --rtc N: set the clock chip to N seconds since 1904 before the
+        // first instruction. Not given, the chip is not set and answers
+        // zero, which keeps a measuring run reproducible.
+        if (!strcmp(a, "--rtc") && i + 1 < argc) {
+            rtcSeconds = static_cast<u32>(strtoul(argv[++i], nullptr, 0));
+            rtcGiven = true;
+            continue;
+        }
         if (!strcmp(a, "--drop-no-lock")) { dropNoLock = true; continue; }
         if (!strcmp(a, "--drop-swap-at")) { parseDropBeat(next(), dropBeats); continue; }
         if (!strcmp(a, "--drop-eject-at")) { parseDropBeat(next(), dropBeats, true); continue; }
@@ -1177,6 +1187,8 @@ int main(int argc, char** argv)
                     "snapshot, run M, restore,\n"
                     "                   run M again, compare "
                     "instruction-for-instruction)\n"
+                    "       clock: --rtc N (the clock chip reads N seconds "
+                    "since 1904 at the start; unset by default)\n"
                     "       speed: --bench (the loop the app runs, no "
                     "instrumentation)\n"
                     "              --profile HZ (g4prof only: sample where "
@@ -1589,6 +1601,8 @@ int main(int argc, char** argv)
     bus.setStamp(&executed);
     bus.lrRef = &cpu.st.lr;
     bus.pmu().portAIn = static_cast<u8>(viaA);
+    if (rtcGiven)
+        bus.pmuHost().rtcSetTo(rtcSeconds, 0);
     cpu.l2Inert = l2Inert;
     if (l2Inert)
         printf("-- DIAGNOSTIC --l2-inert: L2CR is honoured but the array holds "
@@ -5327,6 +5341,14 @@ int main(int argc, char** argv)
     {
         const u32 ticksPa = 0x4000u + 0x016Au; // 68K lowmem Ticks
         const u32 tk = bus.read32(ticksPa);
+        // The guest's own clock, in seconds since 1904, beside what its
+        // clock chip reads: Mac OS takes the chip's value once at startup
+        // and counts by itself afterwards.
+        printf("-- guest clock: Time=%u; clock chip %s",
+               bus.read32(0x4000u + 0x020Cu),
+               bus.pmuHost().rtcSet ? "reads " : "never set\n");
+        if (bus.pmuHost().rtcSet)
+            printf("%u\n", bus.pmuHost().rtcNow(cpu.st.tb));
         printf("-- guest time: Ticks=%u tb=%llu dec=%08x "
                "dec-writes=%llu dec-irqs=%llu last-reload=%u min-reload=%s\n",
                tk, static_cast<unsigned long long>(cpu.st.tb), cpu.st.dec,

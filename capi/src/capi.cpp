@@ -274,6 +274,17 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
 
 OPM_API uint64_t opm_restarts(const OpmMachine* m) { return m->restarts; }
 
+OPM_API void opm_set_rtc(OpmMachine* m, uint32_t macSeconds)
+{
+    m->bus->pmuHost().rtcSetTo(macSeconds, m->cpu.tbNow());
+}
+
+OPM_API uint32_t opm_rtc(const OpmMachine* m)
+{
+    const PmuHost& h = m->bus->pmuHost();
+    return h.rtcSet ? h.rtcNow(m->cpu.tbNow()) : 0u;
+}
+
 OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
 {
     m->realtime = on != 0;
@@ -672,6 +683,29 @@ static void dumpMmu(std::string& s, const Cpu& cpu, SawtoothBus& bus, u32 ea,
             s += b;
         }
     }
+}
+
+// Seconds since midnight, 1 January 1904, as a date. Civil-from-days by the
+// usual era arithmetic; no time zone, because the Mac's clock has none.
+static std::string macDate(u32 macSeconds)
+{
+    const u32 secs = macSeconds % 86400u;
+    // Days from 1904-01-01 to 1970-01-01 is 24107; shift to the 0000-03-01
+    // era origin the algorithm counts from (719468 days before 1970).
+    const i64 z = static_cast<i64>(macSeconds / 86400u) - 24107 + 719468;
+    const i64 era = z / 146097;
+    const u32 doe = static_cast<u32>(z - era * 146097);
+    const u32 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const u32 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const u32 mp = (5 * doy + 2) / 153;
+    const u32 d = doy - (153 * mp + 2) / 5 + 1;
+    const u32 mo = mp < 10 ? mp + 3 : mp - 9;
+    const i64 y = static_cast<i64>(yoe) + era * 400 + (mo <= 2 ? 1 : 0);
+    char out[64];
+    snprintf(out, sizeof out, "%04lld-%02u-%02u %02u:%02u:%02u",
+             static_cast<long long>(y), mo, d, secs / 3600u,
+             (secs / 60u) % 60u, secs % 60u);
+    return out;
 }
 
 OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
@@ -1591,6 +1625,28 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  cmds.empty() ? " (none)" : cmds.c_str());
         s += b;
     }
+    // 🕰 WHAT TIME THE GUEST THINKS IT IS, and what its clock chip says. The
+    // two are separate facts: Mac OS reads the chip once while starting up
+    // and counts seconds itself from then on (the low-memory long `Time`),
+    // so a wrong date is either a chip that was never set or a guest that
+    // read it and drifted, and the pair says which.
+    {
+        const PmuHost& h = m->bus->pmuHost();
+        if (h.rtcSet)
+            snprintf(b, sizeof b, "-- clock chip: reads %s\n",
+                     macDate(h.rtcNow(cpu.tbNow())).c_str());
+        else
+            snprintf(b, sizeof b,
+                     "-- clock chip: never set (the guest starts up on "
+                     "1 January 1904)\n");
+        s += b;
+        u32 pa = 0;
+        if (diagXlate(cpu, *m->bus, 0x20Cu, false, pa)) {
+            snprintf(b, sizeof b, "--   the guest's own clock (Time): %s\n",
+                     macDate(m->bus->read32(pa)).c_str());
+            s += b;
+        }
+    }
     // 🖱 IS THE GUEST LISTENING TO ITS KEYBOARD AND MOUSE? "The pointer does
     // not move" has three causes that look the same from the window: the
     // front end is not delivering motion, the guest never enumerated the
@@ -1770,8 +1826,13 @@ OPM_API int32_t opm_snapshot_load(OpmMachine* m, const char* path, char* err,
         return fail("could not read the snapshot file");
     HarnessState h;
     SnapReader r(blob.data(), blob.size());
+    // The clock chip is the session's and is not in the snapshot; the
+    // timebase it is read against is about to become the snapshot's.
+    const uint32_t clockWas = opm_rtc(m);
     if (!loadSnapshot(m->cpu, *m->bus, h, r))
         return fail(r.err.c_str());
+    if (m->bus->pmuHost().rtcSet)
+        opm_set_rtc(m, clockWas);
     m->executed = h.executed;
     m->consoleAt = 0;
     // The clock is wherever the snapshot left it; real-time pacing carries on

@@ -250,6 +250,11 @@ SawtoothBus::afterSystemReset(std::unique_ptr<SawtoothBus> old)
     void* const clockCtxWas = o.deviceClockCtx;
     const u64 visibleAt = o.atiVisibleAt, hideFrom = o.atiHideFrom,
               hideTo = o.atiHideTo, ataLogFromWas = o.ataLogFrom;
+    // The clock chip keeps time through a reset, and the timebase it is
+    // read against does not: the new board's starts again at zero.
+    PmuHost clock = o.pmuHost_;
+    if (clock.rtcSet)
+        clock.rtcSetTo(clock.rtcNow(o.nowTb_), 0);
     // What a reset leaves alone.
     std::vector<u8> ramImg = std::move(o.ram_);
     std::vector<u8> flashImg = std::move(o.rom_);
@@ -280,6 +285,7 @@ SawtoothBus::afterSystemReset(std::unique_ptr<SawtoothBus> old)
         if (dropPath.empty() || !b->drop_.attachIso(dropPath.c_str()))
             b->drop_.seat();
     }
+    b->pmuHost_ = clock;
     b->atiVisibleAt = visibleAt;
     b->atiHideFrom = hideFrom;
     b->atiHideTo = hideTo;

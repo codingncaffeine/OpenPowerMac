@@ -46,6 +46,13 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_rt_slips(IntPtr m);
 
+    // Set the machine's clock chip: seconds since midnight, 1 January 1904,
+    // in the local time the guest should show. Mac OS reads it once while
+    // starting up, so this goes before the first opm_run. Never set, the
+    // guest starts up on 1 January 1904.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void opm_set_rtc(IntPtr m, uint macSeconds);
+
     // How many times the guest restarted the machine. opm_run performs the
     // restart itself (every chip back at power-on values around the same
     // RAM, flash and discs); this only lets the shell say that it happened.

@@ -673,6 +673,10 @@ public:
 
     // The VIA cell (+0x16000..+0x17FFF) routes to the PMU99 model.
     PmuVia& pmu() { return pmu_; }
+    // The clock chip behind the PMU: the session's, not the snapshot's. See
+    // PmuHost. A system reset carries it to the new board.
+    PmuHost& pmuHost() { return pmuHost_; }
+    const PmuHost& pmuHost() const { return pmuHost_; }
 
     // OpenPIC at +0x40000 (the tree's interrupt-controller@40000).
     // Device level lines: ata-3@20000 = source 20, its DBDMA = 12;
@@ -1370,7 +1374,7 @@ private:
                 for (u32 k = 0; k < len; ++k)
                     pmu_.write(off - 0x16000u + k,
                                static_cast<u8>(v >> (8 * (len - 1 - k))),
-                               stamp ? *stamp : 0);
+                               stamp ? *stamp : 0, &pmuHost_);
                 return;
             }
             if (off >= 0x13000u && off < 0x14000u) {
@@ -2102,6 +2106,7 @@ private:
     u32 flashErase_ = 0;
     std::map<u32, Acc> log_, klLog_;
     PmuVia pmu_;
+    PmuHost pmuHost_;
     u32 sccPtr_[2] = {0, 0};
     u8 sccWr_[2][16] = {};
     u8 sccRr_[2][16] = {};

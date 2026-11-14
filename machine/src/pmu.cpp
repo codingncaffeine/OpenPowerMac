@@ -69,7 +69,7 @@ u8 PmuVia::read(u32 off, u64 now)
     }
 }
 
-void PmuVia::write(u32 off, u8 v, u64 now)
+void PmuVia::write(u32 off, u8 v, u64 now, PmuHost* host)
 {
     switch (regOf(off)) {
     case 0: {
@@ -79,7 +79,7 @@ void PmuVia::write(u32 off, u8 v, u64 now)
             lastReq_ = req;
             if (log.size() < 65536)
                 log.push_back({now, 'e', static_cast<u8>(req ? 1 : 0)});
-            reqEdge(!req, now); // asserted = line driven low
+            reqEdge(!req, now, host); // asserted = line driven low
         }
         break;
     }
@@ -117,7 +117,7 @@ void PmuVia::write(u32 off, u8 v, u64 now)
 // Request edges clock one byte each full assert/release cycle. The shift
 // direction comes from the ACR shift-register mode: out-modes latch the
 // host's SR byte, in-modes load the next reply byte for the host to read.
-void PmuVia::reqEdge(bool asserted, u64 now)
+void PmuVia::reqEdge(bool asserted, u64 now, PmuHost* host)
 {
     const bool shiftOut = (acr_ & 0x10u) != 0; // SR mode bit 4: 1 = out
     if (asserted) {
@@ -143,7 +143,7 @@ void PmuVia::reqEdge(bool asserted, u64 now)
             // receive drained; conversation idles until the next command
         }
         if (shiftOut && !frame_.empty())
-            buildReply(); // (re)compute what this frame would answer
+            buildReply(now, host); // (re)compute what this frame would answer
     }
 }
 
@@ -157,13 +157,43 @@ u8 PmuVia::nextReply()
 // Frame → reply. Founding placeholder: unknown commands answer a single
 // zero byte; specific commands earn real replies as the boot demands
 // them (the event log shows exactly what it asked).
-void PmuVia::buildReply()
+void PmuVia::buildReply(u64 now, PmuHost* host)
 {
     reply_.clear();
     replyAt_ = 0;
     if (frame_.empty())
         return;
+    // The clock is read in timebase, which the bus keeps current through
+    // tbRef; `now` is the instruction stamp and only stands in without one.
+    const u64 tb = tbRef ? *tbRef : now;
     switch (frame_[0]) {
+    case 0x38: // READ_RTC: four bytes, seconds since 1904, high byte first
+        if (host && host->rtcSet) {
+            const u32 t = host->rtcNow(tb);
+            reply_ = {static_cast<u8>(t >> 24), static_cast<u8>(t >> 16),
+                      static_cast<u8>(t >> 8), static_cast<u8>(t)};
+        } else {
+            reply_ = {0x00}; // no clock set: see PmuHost
+        }
+        break;
+    case 0x30: // SET_RTC: the same four bytes, from the guest
+        // This runs after every byte of the frame; the fifth completes it.
+        // ⚠ AND ENDS IT. The command has no reply, so no receive phase
+        // follows to mark the frame over, and the next command's byte would
+        // be taken for a sixth data byte of this one — a READ_RTC straight
+        // after a set answered nothing. The length is the command's own:
+        // four bytes in, none out.
+        if (frame_.size() == 5) {
+            if (host)
+                host->rtcSetTo((u32(frame_[1]) << 24) |
+                                   (u32(frame_[2]) << 16) |
+                                   (u32(frame_[3]) << 8) | u32(frame_[4]),
+                               tb);
+            frame_.clear();
+            return;
+        }
+        reply_ = {0x00};
+        break;
     case 0xEA: // GET_VERSION lineage: a PMU99-class version byte
         reply_ = {0x0C};
         break;

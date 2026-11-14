@@ -8,6 +8,39 @@ namespace opm {
 struct SnapWriter;
 struct SnapReader;
 
+// What the PMU keeps that is not the board's to snapshot: the clock chip.
+//
+// The real-time clock counts seconds since midnight, 1 January 1904, local
+// time, and keeps counting while the machine is off. So it is not machine
+// state in the sense a snapshot means: a machine resumed tomorrow should read
+// tomorrow's date. It is the SESSION's, owned by the board object and handed
+// to the PMU with each byte — which also keeps it out of sizeof(PmuVia), a
+// number the snapshot's layout digest hashes.
+//
+// ⚠ NOT SET IS A STATE, AND IT IS THE DEFAULT. A front end that wants the
+// guest to know the date sets it (the app does, from the host's clock); a
+// measuring run does not, because a clock that reads the host's time makes
+// two runs of the same program different machines. Not set, READ_RTC answers
+// what the founding model answered — a single zero byte — so every recorded
+// fingerprint stands.
+struct PmuHost {
+    bool rtcSet = false;
+    u32 rtcSeconds = 0; // the clock's reading…
+    u64 rtcAtTb = 0;    // …at this timebase value
+    // The timebase runs at 25 MHz (bus / 4), paced from the host in the app,
+    // so the clock advances with the guest's own idea of a second.
+    u32 rtcNow(u64 tb) const
+    {
+        return rtcSeconds + static_cast<u32>((tb - rtcAtTb) / 25000000ull);
+    }
+    void rtcSetTo(u32 seconds, u64 tb)
+    {
+        rtcSet = true;
+        rtcSeconds = seconds;
+        rtcAtTb = tb;
+    }
+};
+
 // KeyLargo VIA cell + PMU99 behind it (the Sawtooth's system-management
 // path: power, ADB, RTC, NVRAM-adjacent services). The VIA face is the
 // classic 6522 register file at stride 0x200 across mac-io +0x16000..
@@ -25,7 +58,9 @@ struct SnapReader;
 class PmuVia {
 public:
     u8 read(u32 off, u64 now);        // off: 0..0x1FFF within the cell
-    void write(u32 off, u8 v, u64 now);
+    // `host` is the board's PmuHost, or null for a PMU with no clock chip
+    // behind it (the unit tests that only exercise the VIA face).
+    void write(u32 off, u8 v, u64 now, PmuHost* host = nullptr);
 
     struct Ev {
         u64 at;
@@ -60,7 +95,7 @@ public:
     void snapLoad(SnapReader& r);
 
 private:
-    void reqEdge(bool asserted, u64 now);
+    void reqEdge(bool asserted, u64 now, PmuHost* host);
     u8 nextReply();
 
     // VIA registers
@@ -79,7 +114,7 @@ private:
     std::vector<u8> frame_;   // bytes received since frame start
     std::vector<u8> reply_;   // queued reply bytes
     u32 replyAt_ = 0;
-    void buildReply();
+    void buildReply(u64 now, PmuHost* host);
 };
 
 } // namespace opm

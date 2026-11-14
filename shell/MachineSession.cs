@@ -387,6 +387,19 @@ public sealed class MachineSession
             }
             if (!string.IsNullOrWhiteSpace(s.AtiRomPath) && s.AtiAt > 0)
                 Native.opm_ati_at(m, s.AtiAt);
+            // 🕰 The clock chip, from this computer's clock. The Mac keeps
+            // local time, counted in seconds from midnight, 1 January 1904,
+            // and reads the chip once while starting up — so this goes in
+            // before the first instruction. Without it every start was
+            // 12:00 AM on 1 January 1904: wrong dates on everything the guest
+            // saved, and software scheduled for midnight running at every
+            // start.
+            {
+                System.DateTime now = System.DateTime.Now;
+                double secs = (now - new System.DateTime(1904, 1, 1)).TotalSeconds;
+                if (secs > 0 && secs < uint.MaxValue)
+                    Native.opm_set_rtc(m, (uint)secs);
+            }
             // 📥 Seat the drop drive NOW, before the first instruction — the
             // guest enumerates drives exactly once. With content already in
             // the folder the disc is in from power-on (mounted during boot,

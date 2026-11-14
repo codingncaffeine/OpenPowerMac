@@ -54,6 +54,16 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns);
 // fastTb. Call it any time; it re-anchors. fastTb is ignored while it is on.
 OPM_API void opm_set_realtime(OpmMachine* m, int32_t on);
 
+// Set the machine's clock chip: seconds since midnight, 1 January 1904, in
+// the local time the guest should show. Mac OS reads it once while starting
+// up, so call this before the first opm_run. A machine whose clock was never
+// set answers zero, and starts up on 1 January 1904 — which is what a
+// measuring run wants, because a clock read from the host makes two runs of
+// the same program differ.
+OPM_API void opm_set_rtc(OpmMachine* m, uint32_t macSeconds);
+// What the clock chip reads now, or 0 if it was never set.
+OPM_API uint32_t opm_rtc(const OpmMachine* m);
+
 // How many times the guest restarted the machine (Special > Restart, the end
 // of an installation, Open Firmware's reset-all). opm_run performs the restart
 // itself — every chip back at power-on values around the same RAM, flash and

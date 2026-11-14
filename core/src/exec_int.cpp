@@ -1126,7 +1126,22 @@ void h_mftb(Cpu& c, u32 i, const InsnDesc&)
 void h_mfmsr(Cpu& c, u32 i, const InsnDesc&) { c.st.gpr[f_rt(i)] = c.st.msr; }
 void h_mtmsr(Cpu& c, u32 i, const InsnDesc&)
 {
+    const u32 old = c.st.msr;
     c.st.msr = c.st.gpr[f_rt(i)] & msr::VALID;
+    // ⚠ WHAT THE EXECUTORS DECIDED BEFORE THIS INSTRUCTION RAN. A block is
+    // resolved under one translation mode and entered only with nothing
+    // deliverable waiting; neither is asked again until the block ends. So
+    // an mtmsr that changes how instructions are fetched or traced, or that
+    // leaves interrupts enabled with one already waiting, ends the batch:
+    // the next instruction is then fetched under the new mode, and the
+    // interrupt is taken before it rather than up to seven instructions
+    // later. The line executor and a compiled block both leave on
+    // batchBreak, so they cannot disagree about where.
+    if (((old ^ c.st.msr) &
+         (msr::IR | msr::PR | msr::LE | msr::SE | msr::BE)) ||
+        ((c.st.msr & msr::EE) &&
+         (c.smiPending || c.extIrqLine || c.decPending || c.pmPending)))
+        c.batchBreak = true;
     // MSR[POW] with a HID0 power mode selected enters nap/doze/sleep: no
     // further instructions until an enabled interrupt (TB keeps ticking).
     if ((c.st.msr & msr::POW) &&

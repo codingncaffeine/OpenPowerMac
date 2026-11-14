@@ -321,7 +321,8 @@ u64 Cpu::run(u64 n)
 //   no async is pending       hoisted: nothing inside a batch can raise one
 //                             (see the contract on pendCycles), and the one
 //                             thing that could — enabling MSR[EE] with a line
-//                             already asserted — is an mtmsr, which ends it.
+//                             already asserted — is an mtmsr, which ends the
+//                             batch when it does that (h_mtmsr).
 //   no nap, no IABR, no
 //   trace, no perfmon         hoisted: all four are checked once per line and
 //                             hand the whole line back to step() if live.

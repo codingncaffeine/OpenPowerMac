@@ -1,16 +1,28 @@
-// The data memo against the path it stands in for.
+// Twin machines: everything that stands in for the full path, against the
+// full path.
 //
-// Cpu::readV / writeV answer a repeated access to the same 32 bytes from a
-// memo (Cpu::DmLine) that replays what the full path — translate(), then the
-// L1 model — would have done to the machine. Its claim is "the same machine,
-// bit for bit", and a claim like that is settled the way the line executor's
-// and the JIT's were: twin machines, the same guest program, one with the
-// memo and one walking every access (dxlCacheOff, which is what --no-dxlate
-// sets), compared state item for state item after every batch.
+// Three things in the processor answer a question from what they remember
+// instead of working it out again, and each claims to leave "the same
+// machine, bit for bit":
 //
-// The comparison covers what the memo touches and what it could get wrong:
-// the registers, both TLBs and their LRU bits, every L1 line with its tag,
-// age and dirty bit, the L1's clock, and all of memory.
+//   the data memo        Cpu::readV / writeV answer a repeated access to the
+//   (Cpu::DmLine)        same 32 bytes by replaying what translate() and the
+//                        L1 model would have done;
+//   the page memo        the same for the page an instruction is fetched
+//   (Cpu::ImPage)        from;
+//   the line executor    Cpu::runSteps executes straight-line code out of a
+//                        resident fetch block without the per-instruction
+//                        fetch path.
+//
+// A claim like that is settled the way the JIT's was: twin machines, the
+// same guest program, one with the shortcut and one without (dxlCacheOff,
+// which is what --no-dxlate sets, walks every access; lineExecOff, which is
+// --no-line-exec, takes one instruction per trip through step()), compared
+// state item for state item after every batch.
+//
+// The comparison covers what the shortcuts touch and what they could get
+// wrong: the registers, both TLBs and their LRU bits, every L1 line with its
+// tag, age and dirty bit, the L1's clock, and all of memory.
 //
 // The guest program is built to move every input a memo entry depends on
 // while entries for it are live: page-table and BAT mappings, real mode, two
@@ -130,11 +142,12 @@ struct Machine {
     Cpu& cpu = *cpuUp;
     u64 stamp = 0;
 
-    explicit Machine(bool memo)
+    explicit Machine(bool memo, bool lineExec = true)
     {
         cpu.attach(bus);
         cpu.jitOn = false; // one variable at a time: the JIT has its own twins
         cpu.dxlCacheOff = !memo;
+        cpu.lineExecOff = !lineExec;
     }
 
     // One page-table entry in the primary group, as the guest's OS would
@@ -539,5 +552,95 @@ TEST_CASE("data memo: off outside a batch and while a watch is armed")
         const u64 before = m.cpu.wpHits;
         m.run(30); // ten trips round the loop, one store each
         CHECK(m.cpu.wpHits - before == 10u);
+    }
+}
+
+// ---- the line executor --------------------------------------------------------
+
+TEST_CASE("line executor: the same machine as one instruction at a time")
+{
+    for (u32 iter = 0; iter < 6; ++iter) {
+        Rng r{0x11E3EC00ull + iter * 0x9E3779B9ull};
+        const std::vector<u32> prog = buildProgram(r, 500);
+        Machine line(true, true), single(true, false);
+        REQUIRE(line.setUp(prog));
+        REQUIRE(single.setUp(prog));
+        const char* diff = nullptr;
+        for (u32 batch = 0; batch < 220 && !diff; ++batch) {
+            const u64 n = 1u + r.next() % 3000u;
+            line.run(n);
+            single.run(n);
+            diff = firstDifference(line, single);
+        }
+        const std::string what = diff ? diff : "nothing";
+        CAPTURE(iter);
+        CAPTURE(what);
+        CHECK(diff == nullptr);
+        CHECK(line.cpu.excRingAt == 0u);
+    }
+}
+
+TEST_CASE("line executor: an interrupt enabled by mtmsr is taken before the next instruction")
+{
+    // An external interrupt is waiting with MSR[EE] clear. The mtmsr that
+    // sets EE is in the middle of a block; the interrupt belongs between it
+    // and the instruction after it, wherever in the block that falls.
+    const std::vector<u32> prog = {
+        dform(14, 3, 3, 1),               // 1000: addi r3, r3, 1
+        dform(14, 9, 0, 0),               // 1004: addi r9, 0, 0
+        dform(24, 9, 9, 0x8000),          // 1008: ori  r9, r9, EE
+        31u << 26 | 9u << 21 | 146u << 1, // 100c: mtmsr r9
+        dform(14, 3, 3, 1),               // 1010: addi r3, r3, 1
+        dform(14, 3, 3, 1),               // 1014
+        dform(14, 3, 3, 1),               // 1018
+        18u << 26,                        // 101c: b .
+    };
+    for (const bool lineExec : {true, false}) {
+        Machine m(true, lineExec);
+        REQUIRE(m.setUp(prog));
+        m.cpu.st.msr = 0;
+        m.cpu.st.gpr[3] = m.cpu.st.gpr[5] = 0;
+        m.bus.write32(0x500, dform(14, 5, 5, 1)); // the handler: addi r5, r5, 1
+        m.bus.write32(0x504, 18u << 26);          // b .
+        m.cpu.setExternalIrq(true);
+        // Several batches: the mtmsr ends the one it is in, and the handler
+        // spins once it has counted itself.
+        for (u32 k = 0; k < 4; ++k)
+            m.run(8);
+        CAPTURE(lineExec);
+        CHECK(m.cpu.st.srr0 == 0x1010u);
+        CHECK(m.cpu.st.gpr[3] == 1u);
+        CHECK(m.cpu.st.gpr[5] == 1u);
+    }
+}
+
+TEST_CASE("line executor: instructions after an mtmsr are fetched under the new translation")
+{
+    // The mtmsr turns instruction translation on, and with it on the next
+    // address maps somewhere else. What runs next is what is THERE, not the
+    // rest of the block the mtmsr was fetched from.
+    const std::vector<u32> prog = {
+        dform(14, 9, 0, 0x20),            // 1000: addi r9, 0, IR
+        31u << 26 | 9u << 21 | 146u << 1, // 1004: mtmsr r9
+        dform(14, 3, 3, 1),               // 1008: addi r3, r3, 1   (real)
+        dform(14, 3, 3, 1),               // 100c
+        18u << 26,                        // 1010: b .
+    };
+    for (const bool lineExec : {true, false}) {
+        Machine m(true, lineExec);
+        REQUIRE(m.setUp(prog));
+        m.cpu.st.msr = 0;
+        m.cpu.st.gpr[3] = m.cpu.st.gpr[4] = 0;
+        // IBAT0: the first 128 KB of effective addresses at 0x00200000.
+        m.cpu.st.ibatu[0] = 0x00000002u;
+        m.cpu.st.ibatl[0] = 0x00200000u | 2u;
+        m.bus.write32(0x00201008u, dform(14, 4, 4, 7)); // addi r4, r4, 7
+        m.bus.write32(0x0020100Cu, dform(14, 4, 4, 7));
+        m.bus.write32(0x00201010u, 18u << 26);          // b .
+        for (u32 k = 0; k < 4; ++k) // the mtmsr ends the batch it is in
+            m.run(8);
+        CAPTURE(lineExec);
+        CHECK(m.cpu.st.gpr[3] == 0u);
+        CHECK(m.cpu.st.gpr[4] == 14u);
     }
 }

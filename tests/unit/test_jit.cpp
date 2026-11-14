@@ -672,13 +672,12 @@ TEST_CASE("jit chain: severing a LIVE link — modify a successor after it linke
 
 TEST_CASE("jit chain: msr changes stop a chained run where the dispatcher would")
 {
-    // mtmsr does NOT break the batch (only its nap path does), so the
-    // dispatcher only notices a changed MSR at its next fetchBlockFast — and
-    // a chained hop must notice at the same boundary, through the same
-    // comparison (msr fetch bits vs xlMsr; EE against the pending lines).
-    // Case A: EE goes live with an external line already asserted — the hop
-    // must hand the line back so the interrupt delivers on the dispatcher's
-    // schedule, not a line late.
+    // An mtmsr that changes how instructions are fetched, or that leaves
+    // interrupts enabled with one already waiting, ends the batch (h_mtmsr),
+    // and a compiled block must leave on it exactly where the interpreter
+    // does: after the mtmsr, not at the end of the line.
+    // Case A: EE goes live with an external line already asserted — the
+    // interrupt is taken before the next instruction on both machines.
     {
         std::vector<u32> prog = {
             dform(14, 3, 3, 1),         // w0
@@ -702,10 +701,9 @@ TEST_CASE("jit chain: msr changes stop a chained run where the dispatcher would"
         CHECK_TWINS(ji, in);
     }
     // Case B: PR flips (user mode). Real-mode fetch is unchanged by PR, but
-    // xlMsr includes it, so the interpreter's next fetchBlockFast misses and
-    // refills — and the chained hop must fall back to the dispatcher through
-    // the same compare, after which the now-privileged mtmsr faults
-    // identically on both machines.
+    // the fetch translation is keyed on it, so both machines go back to the
+    // dispatcher at the mtmsr and refill — after which the now-privileged
+    // mtmsr faults identically on both.
     {
         std::vector<u32> prog = {
             dform(14, 3, 3, 1),         // w0

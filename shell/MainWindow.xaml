@@ -80,7 +80,7 @@
                     <MenuItem Header="1._5 GB" Tag="1536" Click="OnSetRam" />
                 </MenuItem>
                 <Separator />
-                <MenuItem x:Name="miSound" Header="_Sound" IsCheckable="True"
+                <MenuItem x:Name="miSound" Header="S_ound" IsCheckable="True"
                           Click="OnSoundToggled" />
                 <Separator />
                 <!-- For the machine that stopped doing anything. See opm_diag. -->

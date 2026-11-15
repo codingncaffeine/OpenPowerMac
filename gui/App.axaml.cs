@@ -16,6 +16,7 @@ public partial class App : Application
         Log.Line($"app startup: OpenPowerMac {Platform.NativeLibs.AppVersion} "
                  + $"({System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier}, "
                  + $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription})");
+        Log.Line(Platform.NativeLibs.HarfBuzzNote);
         // Loading a library is file work; keep it off the UI thread.
         Task.Run(() =>
         {

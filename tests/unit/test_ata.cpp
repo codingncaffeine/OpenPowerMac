@@ -349,3 +349,23 @@ TEST_CASE("a CD-class drive takes the power commands the standard requires of it
     CHECK(readIdentify(cd)[0] == 0x8580);
     remove(kIso);
 }
+
+TEST_CASE("a CD-class drive that aborts a command still completes it with an interrupt")
+{
+    // ATA/ATAPI-4 9.9, figure 14: the device sets its error status, clears
+    // BSY and asserts INTRQ. A driver that waits on the interrupt to learn
+    // the outcome otherwise waits out its whole timeout.
+    REQUIRE(makeIso());
+    AtaCell cd;
+    REQUIRE(cd.attachIso(kIso));
+    cd.write(0x060, 0x00, 1);
+    (void)cd.read(0x070, 1);
+    CHECK(!cd.irqLine());
+    cd.write(0x070, 0xC8, 1); // READ DMA: not a command of a packet device
+    const u32 status = cd.read(0x160, 1);
+    CHECK((status & 0x80u) == 0);
+    CHECK((status & 0x01u) != 0);            // ERR
+    CHECK((cd.read(0x010, 1) & 0x04u) != 0); // ABRT
+    CHECK(cd.irqLine());
+    remove(kIso);
+}

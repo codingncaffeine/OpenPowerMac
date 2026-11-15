@@ -901,6 +901,12 @@ void AtaCell::ataCommand(u8 cmd)
             log.push_back({stamp ? *stamp : 0, 'e', cmd, 0, 0, pcRef ? *pcRef : 0});
         error_ = 0x04; // ABRT
         status_ = kDrdy | kErr;
+        // An aborted command still completes, and completion is an
+        // interrupt (ATA/ATAPI-4 9.9, figure 14: set the error status, clear
+        // BSY, assert INTRQ). The disk's arm above learned this once; this
+        // one had not, and a driver waiting on INTRQ for the outcome sat out
+        // its whole timeout on every command this drive does not know.
+        irq_ = true;
         break;
     }
 }

@@ -281,6 +281,43 @@ OPM_API int32_t opm_ati_pixel_watch(OpmMachine* m, uint32_t x, uint32_t y,
     return r128SetPixelWatchXY(m->bus->ati(), x, y, budget) ? 1 : 0;
 }
 
+OPM_API int32_t opm_frame_record(OpmMachine* m, uint32_t frames,
+                                 const char* path, char* err, uint32_t errCap)
+{
+    std::string why;
+    const bool ok = path && m->bus->atiRecordStart(frames, path, why);
+    if (err && errCap)
+        snprintf(err, errCap, "%s", why.c_str());
+    return ok ? 1 : 0;
+}
+
+OPM_API void opm_frame_record_stop(OpmMachine* m) { m->bus->atiRecordStop(); }
+
+OPM_API uint32_t opm_frame_record_state(const OpmMachine*, char* buf,
+                                        uint32_t cap)
+{
+    const R128RecStatus st = r128RecStatus();
+    char line[512];
+    if (!st.on && !st.finished)
+        snprintf(line, sizeof line, "no recording");
+    else
+        snprintf(line, sizeof line,
+                 "%s: %u of %u frames, %llu stores and reads, %llu pages of "
+                 "system memory, %.1f MB%s%s",
+                 st.on ? "recording" : "recorded", st.frames, st.framesWanted,
+                 static_cast<unsigned long long>(st.events),
+                 static_cast<unsigned long long>(st.pages),
+                 static_cast<double>(st.bytes) / 1e6, st.on ? "" : ": ",
+                 st.on ? "" : st.note.c_str());
+    const uint32_t n = static_cast<uint32_t>(strlen(line));
+    if (!buf || !cap)
+        return n;
+    const uint32_t take = n < cap - 1u ? n : cap - 1u;
+    memcpy(buf, line, take);
+    buf[take] = 0;
+    return take;
+}
+
 OPM_API uint32_t opm_ati_pixel_log(OpmMachine* m, char* buf, uint32_t cap)
 {
     m->bus->atiDrain();
@@ -316,7 +353,9 @@ OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
     // engine on this thread, for telling the two apart from outside.
     m->bus->atiDrain();
     const char* env = getenv("OPM_ATI_THREAD");
-    r128AsyncEnable(m->realtime && !(env && env[0] == '0'));
+    // Not under a frame recording, which needs the engine on this thread and
+    // puts back the setting it found when it ends.
+    r128AsyncEnable(m->realtime && !(env && env[0] == '0') && !r128RecOn());
 }
 
 OPM_API uint64_t opm_rt_slips(const OpmMachine* m) { return m->pace.slips; }

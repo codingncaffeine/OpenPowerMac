@@ -51,6 +51,7 @@ add_subdirectory(tools/sstgen)
 add_subdirectory(tools/macrun)
 add_subdirectory(tools/g4run)
 add_subdirectory(tools/mkhfs)
+add_subdirectory(tools/framereplay)
 add_subdirectory(tools/ppcdis)
 
 if(OPM_BUILD_TESTS)

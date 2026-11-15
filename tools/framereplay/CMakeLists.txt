@@ -1,0 +1,5 @@
+add_executable(framereplay main.cpp)
+target_link_libraries(framereplay PRIVATE opmmachine)
+if(MSVC)
+  target_compile_definitions(framereplay PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()

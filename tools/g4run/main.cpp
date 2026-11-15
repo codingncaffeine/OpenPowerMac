@@ -495,6 +495,11 @@ int main(int argc, char** argv)
     // --uncached-from PA: DIAGNOSTIC, not machine truth. Force everything at
     // or above PA cache-inhibited (Cpu::diagUncachedBase).
     u32 uncachedFrom = 0;
+    // --frame-record N FILE: record what reaches the graphics card over the
+    // next N frames (opm/r128rec.hpp), from the start of the run or from the
+    // point a snapshot resumes at. tools/framereplay draws it again.
+    u32 frameRecN = 0;
+    const char* frameRecPath = nullptr;
     u64 wpFrom = 0;                       // --wp-from N: ignore stores < N
     u32 wpMaxArg = 0;                     // --wp-max N: raise the 64 cap
     u32 wpPa = 0, wpEnd = 0;              // --wp PA [--wp-end PA]: cached
@@ -839,6 +844,11 @@ int main(int argc, char** argv)
             continue;
         }
         if (!strcmp(a, "--mouse-beat")) { parseMouseAt(next(), mouseBeats); continue; }
+        if (!strcmp(a, "--frame-record")) {
+            frameRecN = static_cast<u32>(strtoul(next(), nullptr, 0));
+            frameRecPath = next();
+            continue;
+        }
         // --tri-dump N: print the next N textured triangles' raw vertices
         // (see r128Set3dTriDump). Hoisted: the else-if ladder is at C1061.
         if (!strcmp(a, "--tri-dump")) {
@@ -2410,6 +2420,15 @@ int main(int argc, char** argv)
     // The app's loop has the app's engine thread. Only here: every other
     // loop in this file is an instrument and has to be reproducible.
     r128AsyncEnable(bench && atiThread && (realtime || atiStrict), atiStrict);
+    if (frameRecPath) {
+        std::string why;
+        if (!bus.atiRecordStart(frameRecN, frameRecPath, why)) {
+            fprintf(stderr, "g4run: --frame-record: %s\n", why.c_str());
+            return 2;
+        }
+        printf("-- frame recorder: %u frame(s) into %s\n", frameRecN,
+               frameRecPath);
+    }
     if (bench)
         while (executed < maxInsns && !cpu.halted) {
             // The scripted pointer advances between batches: a batch is
@@ -6860,6 +6879,19 @@ int main(int argc, char** argv)
         // blanks generated, blanks the driver had enabled, and acknowledges it
         // wrote are three separate claims — and a raise on a source the
         // OpenPIC has MASKED reaches nobody at all (see the openpic state).
+        if (frameRecPath) {
+            const R128RecStatus rs = r128RecStatus();
+            if (rs.on)
+                bus.atiRecordStop();
+            const R128RecStatus re = r128RecStatus();
+            printf("-- frame recorder: %u of %u frames, %llu stores and "
+                   "reads, %llu pages of system memory, %.1f MB: %s\n",
+                   re.frames, re.framesWanted,
+                   static_cast<unsigned long long>(re.events),
+                   static_cast<unsigned long long>(re.pages),
+                   static_cast<double>(re.bytes) / 1e6,
+                   rs.on ? "the run ended first" : re.note.c_str());
+        }
         printf("-- ati vblank: %s period=%llutb GEN_INT_CNTL=%08x "
                "GEN_INT_STATUS=%08x "
                "blanks=%llu enabled=%llu acks=%llu expired=%llu line=%d\n",

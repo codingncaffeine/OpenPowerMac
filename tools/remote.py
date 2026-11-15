@@ -41,6 +41,10 @@ Commands (one per argument; times are GUEST seconds unless they say host):
                     and the sound the guest produced against what a speaker
                     consumes in that second
   wav NAME | wav off   keep the sound the guest produces in OUT/NAME.wav
+  record N NAME     record what reaches the graphics card over the next N
+                    frames into OUT/NAME.frec (replay: tools/framereplay);
+                    `record` alone says how far it is, `record stop` ends it
+                    (choose `rt on` or `rt off` before it, not during)
   drop IMAGE        hand a volume image to the drop-box drive, as the app does
                     after a drop (tools/mkhfs builds one from a folder);
                     `drop` alone says what the drive holds
@@ -94,6 +98,9 @@ opm_destroy = fn("opm_destroy", None, P)
 opm_set_realtime = fn("opm_set_realtime", None, P, i32)
 opm_ati_at = fn("opm_ati_at", None, P, u64)
 opm_drop_seat = fn("opm_drop_seat", i32, P)
+opm_frame_record = fn("opm_frame_record", i32, P, u32, ctypes.c_char_p, ctypes.c_char_p, u32)
+opm_frame_record_stop = fn("opm_frame_record_stop", None, P)
+opm_frame_record_state = fn("opm_frame_record_state", u32, P, ctypes.c_char_p, u32)
 opm_drop_swap = fn("opm_drop_swap", i32, P, ctypes.c_char_p)
 opm_drop_state = fn("opm_drop_state", i32, P)
 opm_drop_reads = fn("opm_drop_reads", u64, P)
@@ -291,6 +298,19 @@ def do(line):
         opm_set_realtime(m, 1 if state["rt"] else 0)
         return "clock paced from the host" if state["rt"] else f"clock paced from the instruction count (fast-tb {a.fast_tb})"
     if cmd == "perf": return perf(float(arg or 10))
+    if cmd == "record":
+        said = ""
+        if arg.strip() == "stop":
+            opm_frame_record_stop(m)
+        elif arg:
+            n, name = arg.split(None, 1)
+            path = os.path.join(a.out, name + ".frec")
+            if not opm_frame_record(m, int(n), path.encode(), errbuf, len(errbuf)):
+                return "NOT started: " + errbuf.value.decode(errors="replace")
+            said = f"{path}: "
+        buf = ctypes.create_string_buffer(600)
+        opm_frame_record_state(m, buf, len(buf))
+        return said + buf.value.decode(errors="replace")
     if cmd == "drop":
         names = ["no drive", "tray empty", "tray empty, a disc waiting to go in", "disc in, not read yet",
                  "disc in and read (mounted)", "disc in and read, a newer one waiting for the guest to put it away"]

@@ -74,6 +74,21 @@ OPM_API int32_t opm_ati_pixel_watch(OpmMachine* m, uint32_t x, uint32_t y,
                                     uint32_t budget);
 OPM_API uint32_t opm_ati_pixel_log(OpmMachine* m, char* buf, uint32_t cap);
 
+// Record everything that reaches the graphics card over the next `frames`
+// frames into the file `path`, starting with the card as it stands now. The
+// file replays into a card on its own (tools/framereplay), which is how one
+// frame is drawn twice: before a change to the drawing code and after it. A
+// frame ends where the program presents or wipes the displayed surface. The
+// recording ends by itself; opm_frame_record_stop ends it early. Returns 0
+// with the reason in `err` if it could not begin. opm_frame_record_state
+// writes one line of text: frames so far, size, and how it ended. Call these
+// from the thread that runs the machine.
+OPM_API int32_t opm_frame_record(OpmMachine* m, uint32_t frames,
+                                 const char* path, char* err, uint32_t errCap);
+OPM_API void opm_frame_record_stop(OpmMachine* m);
+OPM_API uint32_t opm_frame_record_state(const OpmMachine* m, char* buf,
+                                        uint32_t cap);
+
 // How many times the guest restarted the machine (Special > Restart, the end
 // of an installation, Open Firmware's reset-all). opm_run performs the restart
 // itself — every chip back at power-on values around the same RAM, flash and

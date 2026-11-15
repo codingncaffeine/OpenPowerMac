@@ -594,6 +594,7 @@ int main(int argc, char** argv)
     // returns to the dispatcher as v1 did. The control for Stage B.
     bool jitChainOff = false;
     bool jitInlineMemOff = false; // --no-jit-inline-mem
+    bool jitInlineFpOff = false; // --no-jit-inline-fp
     bool jitFullGate = false; // --jit-full-gate
     bool jitHopOff = false; // --no-jit-hop
     bool jitCountHops = false; // --jit-count-hops
@@ -825,6 +826,8 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--jit-full-gate")) { jitFullGate = true; continue; }
         // The control for loads and stores emitted inline: all through shims.
         if (!strcmp(a, "--no-jit-inline-mem")) { jitInlineMemOff = true; continue; }
+        // The control for floating-point arithmetic done in line: all calls.
+        if (!strcmp(a, "--no-jit-inline-fp")) { jitInlineFpOff = true; continue; }
         // 🔬 The host-cycle split inside compiled blocks. Perturbs the run
         // (an rdtsc pair per shim call), so read it for SHARES and per-call
         // costs — never quote its MIPS.
@@ -1588,6 +1591,7 @@ int main(int argc, char** argv)
         cpu.jitOn = true;
     cpu.jitChainOff = jitChainOff;
     cpu.jitInlineMemOff = jitInlineMemOff;
+    cpu.jitInlineFpOff = jitInlineFpOff;
     cpu.jitFullGate = jitFullGate;
     cpu.jitHopOff = jitHopOff;
     cpu.jitCountHops = jitCountHops;

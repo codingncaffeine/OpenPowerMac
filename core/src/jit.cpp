@@ -34,7 +34,8 @@
 //   batch's budget less what is settled (Compiler::settle), r15 = the page
 //   memo's table and r14 = its key (Compiler::memProbe). r12 stages the
 //   effective address across the one shim call of an update-form access.
-//   Blocks never touch XMM.
+//   xmm0-xmm5 are scratch for the floating-point arithmetic done in line
+//   (Compiler::fpSingle); nothing is kept in one across an instruction.
 
 #include "opm/jit.hpp"
 
@@ -136,6 +137,11 @@ enum class Lo : u8 {
     // block — 7% of what was left of the fallback between them, for a sign
     // bit and two condition-register field moves.
     Fneg, Fabs, Fnabs, Mcrf, Mtcrf,
+    // The single-precision arithmetic, the compares and the round to single:
+    // what a game's floating point is made of, and until now each one a call
+    // (Compiler::fpSingle, fpCompare).
+    Fadds, Fsubs, Fmuls, Fmadds, Fmsubs, Fnmadds, Fnmsubs, Frsp,
+    Fcmpu, Fcmpo,
 };
 
 // Row -> lowering, keyed by the ISA table's own mnemonics so the mapping can
@@ -206,6 +212,11 @@ const u8* loTable()
         set("fneg", Lo::Fneg);   set("fabs", Lo::Fabs);
         set("fnabs", Lo::Fnabs);
         set("mcrf", Lo::Mcrf);   set("mtcrf", Lo::Mtcrf);
+        set("fadds", Lo::Fadds);     set("fsubs", Lo::Fsubs);
+        set("fmuls", Lo::Fmuls);     set("fmadds", Lo::Fmadds);
+        set("fmsubs", Lo::Fmsubs);   set("fnmadds", Lo::Fnmadds);
+        set("fnmsubs", Lo::Fnmsubs); set("frsp", Lo::Frsp);
+        set("fcmpu", Lo::Fcmpu);     set("fcmpo", Lo::Fcmpo);
         return v;
     }();
     return t.data();
@@ -612,6 +623,28 @@ struct Emit {
         b(0x0F);
         b(u8(0x80 | cc));
         i32le(u32(i64(dst) - (i64(at) + 4)));
+    }
+
+    // SSE2 on xmm0-xmm7 (no REX): register to register, and with an
+    // operand at [r13+disp]. `prefix` is the mandatory one (66, F2, F3).
+    void sse(u8 prefix, u8 op, u32 dst, u32 src)
+    {
+        b(prefix);
+        b(0x0F);
+        b(op);
+        b(u8(0xC0 | (dst << 3) | src));
+    }
+    void sseM(u8 prefix, u8 op, u32 reg, i32 disp)
+    {
+        b(prefix);
+        b(0x41); // REX.B: r13
+        b(0x0F);
+        b(op);
+        disp8or32(reg, disp);
+    }
+    void movqToGpr(u32 gpr, u32 xmm) // movq r64, xmm (gpr: rax, rcx, rdx)
+    {
+        bytes({0x66, 0x48, 0x0F, 0x7E, u8(0xC0 | (xmm << 3) | gpr)});
     }
 
     // A call to C++, with up to four arguments staged the Win64 way in
@@ -1609,6 +1642,244 @@ struct Compiler {
         e.patch32(joinJ);
     }
 
+    // -- floating-point arithmetic in line -----------------------------------
+    //
+    // ⭐ THE ORDINARY CASE OF A SINGLE-PRECISION OPERATION, WITHOUT A CALL.
+    // A quarter of a game's instructions are fadds, fsubs, fmuls and the
+    // fused four, and each was a call to its handler: the handler, the
+    // model's entry, the host fast path (sf::hostSglFast in softfp.cpp), the
+    // FPSCR update (commit in fpu.cpp) — a third of the processor's thread.
+    // What those do for an ordinary operation is short, and this is it,
+    // transcribed. Whatever is not ordinary goes to `slow`, which is the
+    // call as it was, so the handler remains the one place that decides
+    // every other case.
+    //
+    // What is asked first (each a jump to `slow`):
+    //   MSR[FP]                 the call raises the unavailable exception;
+    //   FPSCR                   round to nearest, OE, UE, XE and NI clear,
+    //                           and FEX clear: the fast path's own gate
+    //                           (softfp.cpp fmaCore), and with XE and FEX
+    //                           clear an inexact result can neither set FEX
+    //                           nor trap, so commit's ordinary branch is all
+    //                           there is. (FEX and VX are kept current by
+    //                           everything that writes the FPSCR.)
+    //   each operand            is a single's value: narrowing it and
+    //                           widening it again gives it back. That fails
+    //                           for a NaN, a double denormal and a double no
+    //                           single holds. An infinity passes and fails
+    //                           the result's test instead.
+    //
+    // Then hostSglFast's arithmetic, in double precision throughout:
+    //   the product      a * c of two singles' values is exact in a double;
+    //   the sum          S = product + b, with the 2Sum residue T, and T != 0
+    //                    leaves (the addend reaches below the sum's 53 bits:
+    //                    the model's own ground, see the note there);
+    //   the result       r0 = S narrowed, which is the one correct rounding
+    //                    of the exact value because S IS the exact value
+    //                    (the same number the host's float add or fused
+    //                    multiply-add produces there);
+    //   it must be       a normal single of exponent 2 and up, which keeps
+    //                    clear of overflow, of a denormal and of the
+    //                    tininess boundary, or an exact zero from a zero S;
+    //   the flags        from S - r0 widened, exact by Sterbenz: nonzero is
+    //                    inexact (XX, FI, and FX if XX was clear), and its
+    //                    sign against the result's says whether the
+    //                    fraction was incremented (FR).
+    // And commit's ordinary branch: FR and FI rewritten, FPRF from the
+    // result's class (a normal number or a zero, by sign), the register.
+    //
+    // `shape`: 0 = a + b, 1 = a - b, 2 = a * c, 3 = a * c + b, 4 = a * c - b,
+    // 5 = round b to single. `negate` flips the result's sign (fnmadds,
+    // fnmsubs), a zero's included, as the handler does.
+    void fpSingle(u32 insn, u32 row, u32 nextVa, u32 shape, bool negate,
+                  const void* fn)
+    {
+        const i32 fa = fpr(f_ra(insn)), fb = fpr(f_rb(insn)),
+                  fc = fpr(f_rc_vec(insn)), ft = fpr(f_rt(insn));
+        const bool hasC = shape >= 2u && shape <= 4u;
+        const bool hasB = shape != 2u;
+        const bool sub = shape == 1u || shape == 4u;
+        mark(JitCache::kPartFp);
+        std::vector<size_t> slow;
+        e.loadR(RAX, o.msr);
+        e.b(0xA9); // test eax, msr::FP
+        e.i32le(msr::FP);
+        slow.push_back(e.j32(CC_Z));
+        e.mem13(0xF7, 0, o.fpscr); // test dword [r13+fpscr], FEX|OE|UE|XE|NI|RN
+        e.i32le(0x4000006Fu);
+        slow.push_back(e.j32(CC_NE));
+        u32 S; // the register the exact value ends up in
+        if (shape == 5u) {
+            e.sseM(0xF2, 0x10, 0, fb);          // movsd xmm0, [b]
+            S = 0;
+        } else {
+            e.sseM(0xF2, 0x10, 0, fa);          // movsd xmm0, [a]
+            if (hasC)
+                e.sseM(0xF2, 0x10, 1, fc);      // movsd xmm1, [c]
+            if (hasB)
+                e.sseM(0xF2, 0x10, 2, fb);      // movsd xmm2, [b]
+            // Every operand a single's value: all-ones in xmm3 where not.
+            e.sse(0xF2, 0x5A, 3, 0);            // cvtsd2ss xmm3, xmm0
+            e.sse(0xF3, 0x5A, 3, 3);            // cvtss2sd xmm3, xmm3
+            e.sse(0xF2, 0xC2, 3, 0);            // cmpneqsd xmm3, xmm0
+            e.b(4);
+            for (u32 x = 1; x <= 2; ++x) {
+                if (x == 1 ? !hasC : !hasB)
+                    continue;
+                e.sse(0xF2, 0x5A, 4, x);        // cvtsd2ss xmm4, x
+                e.sse(0xF3, 0x5A, 4, 4);        // cvtss2sd xmm4, xmm4
+                e.sse(0xF2, 0xC2, 4, x);        // cmpneqsd xmm4, x
+                e.b(4);
+                e.sse(0x66, 0x56, 3, 4);        // orpd xmm3, xmm4
+            }
+            e.movqToGpr(RAX, 3);                // movq rax, xmm3
+            e.bytes({0x48, 0x85, 0xC0});        // test rax, rax
+            slow.push_back(e.j32(CC_NE));
+            if (hasC)
+                e.sse(0xF2, 0x59, 0, 1);        // mulsd xmm0, xmm1 (exact)
+            if (hasB) {
+                // S = p + b (or p - b) and the 2Sum residue T; p in xmm0.
+                e.sse(0x66, 0x28, 3, 0);        // movapd xmm3, xmm0
+                e.sse(0xF2, sub ? 0x5C : 0x58, 3, 2); // S = p +- b
+                e.sse(0x66, 0x28, 4, 3);        // movapd xmm4, xmm3
+                e.sse(0xF2, 0x5C, 4, 0);        // bv = S - p
+                e.sse(0x66, 0x28, 5, 3);        // movapd xmm5, xmm3
+                e.sse(0xF2, 0x5C, 5, 4);        // S - bv
+                e.sse(0xF2, 0x5C, 0, 5);        // p - (S - bv)
+                e.sse(0xF2, sub ? 0x58 : 0x5C, 2, 4); // (+-b) - bv, as b -+ bv
+                e.sse(0xF2, sub ? 0x5C : 0x58, 0, 2); // T
+                e.movqToGpr(RDX, 0);            // movq rdx, xmm0
+                e.bytes({0x48, 0x01, 0xD2});    // add rdx, rdx (the sign off)
+                slow.push_back(e.j32(CC_NE));   // T != 0, or a NaN
+                S = 3;
+            } else {
+                S = 0;
+            }
+        }
+        e.sse(0xF2, 0x5A, 4, S);                // cvtsd2ss xmm4, S  (r0)
+        e.bytes({0x66, 0x0F, 0x7E, 0xE0});      // movd eax, xmm4
+        e.bytes({0x8D, 0x0C, 0x00});            // lea ecx, [rax+rax]
+        e.bytes({0x81, 0xE9});                  // sub ecx, exponent 2
+        e.i32le(0x04000000u);
+        e.bytes({0x81, 0xF9});                  // cmp ecx, (255 - 2) << 24
+        e.i32le(0xFB000000u);
+        const size_t oddJ = e.j32(3);           // jae: not such a normal
+        e.sse(0xF3, 0x5A, 4, 4);                // cvtss2sd xmm4, xmm4 (the result)
+        e.sse(0xF2, 0x5C, S, 4);                // S - result: the residue
+        e.loadR(RCX, o.fpscr);
+        e.bytes({0x81, 0xE1});                  // and ecx, ~(FR|FI|FPRF)
+        e.i32le(0xFFF80FFFu);
+        e.movqToGpr(RDX, S);                    // movq rdx, residue
+        e.bytes({0x48, 0x01, 0xD2});            // add rdx, rdx: CF its sign, ZF exact
+        const size_t exactJ = e.j8(CC_Z);
+        e.bytes({0x19, 0xD2});                  // sbb edx, edx (residue < 0)
+        e.bytes({0x31, 0xC2});                  // xor edx, eax (against r0's sign)
+        e.bytes({0xC1, 0xEA, 0x1F});            // shr edx, 31
+        e.bytes({0xC1, 0xE2, 0x12});            // shl edx, 18 (FR)
+        e.bytes({0x09, 0xD1});                  // or ecx, edx
+        e.bytes({0xF7, 0xC1});                  // test ecx, XX
+        e.i32le(0x02000000u);
+        const size_t hadJ = e.j8(CC_NE);
+        e.bytes({0x81, 0xC9});                  // or ecx, FX (XX goes 0 -> 1)
+        e.i32le(0x80000000u);
+        e.patch8(hadJ);
+        e.bytes({0x81, 0xC9});                  // or ecx, XX|FI
+        e.i32le(0x02020000u);
+        e.patch8(exactJ);
+        e.movqToGpr(RAX, 4);                    // movq rax, xmm4
+        if (negate)
+            e.bytes({0x48, 0x0F, 0xBA, 0xF8, 0x3F}); // btc rax, 63
+        e.mem13W(0x89, RAX, ft);                // mov [fpr t], rax
+        e.bytes({0x48, 0xC1, 0xE8, 0x3F});      // shr rax, 63
+        e.bytes({0xFF, 0xC0});                  // inc eax
+        e.bytes({0xC1, 0xE0, 0x0E});            // shl eax, 14 (FPRF: +/- normal)
+        e.bytes({0x09, 0xC1});                  // or ecx, eax
+        e.storeR(o.fpscr, RCX);
+        bump();
+        const size_t doneJ = e.jmp32f();
+        // Not a normal single of exponent 2 and up: an exact zero is ours.
+        e.patch32(oddJ);
+        e.bytes({0x8D, 0x0C, 0x00});            // lea ecx, [rax+rax]
+        e.bytes({0x85, 0xC9});                  // test ecx, ecx
+        slow.push_back(e.j32(CC_NE));           // not a zero: the handler's
+        e.movqToGpr(RDX, S);                    // movq rdx, S
+        e.bytes({0x48, 0x01, 0xD2});            // add rdx, rdx
+        slow.push_back(e.j32(CC_NE));           // S itself is not zero
+        e.bytes({0x48, 0xC1, 0xE0, 0x20});      // shl rax, 32 (the signed zero)
+        if (negate)
+            e.bytes({0x48, 0x0F, 0xBA, 0xF8, 0x3F}); // btc rax, 63
+        e.mem13W(0x89, RAX, ft);                // mov [fpr t], rax
+        e.loadR(RCX, o.fpscr);
+        e.bytes({0x81, 0xE1});                  // and ecx, ~(FR|FI|FPRF)
+        e.i32le(0xFFF80FFFu);
+        e.bytes({0x48, 0xC1, 0xE8, 0x3F});      // shr rax, 63
+        e.bytes({0xC1, 0xE0, 0x10});            // shl eax, 16
+        e.b(0x0D);                              // or eax, 0x2000 (FPRF: +/- zero)
+        e.i32le(0x2000u);
+        e.bytes({0x09, 0xC1});                  // or ecx, eax
+        e.storeR(o.fpscr, RCX);
+        bump();
+        const size_t done2J = e.jmp32f();
+        for (size_t j : slow)
+            e.patch32(j);
+        fallbackDirect(insn, row, nextVa, fn, true, true);
+        e.patch32(doneJ);
+        e.patch32(done2J);
+    }
+
+    // fcmpu and fcmpo of two numbers (compare in fpu.cpp): the answer goes
+    // to the CR field and to FPSCR[FPCC]. A NaN on either side is the
+    // handler's (the two instructions differ only there), and so is
+    // everything while FEX is set, since the handler would then trap.
+    void fpCompare(u32 insn, u32 row, u32 nextVa, const void* fn)
+    {
+        mark(JitCache::kPartFp);
+        std::vector<size_t> slow;
+        e.loadR(RAX, o.msr);
+        e.b(0xA9); // test eax, msr::FP
+        e.i32le(msr::FP);
+        slow.push_back(e.j32(CC_Z));
+        e.mem13(0xF7, 0, o.fpscr); // test dword [r13+fpscr], FEX
+        e.i32le(0x40000000u);
+        slow.push_back(e.j32(CC_NE));
+        e.sseM(0xF2, 0x10, 0, fpr(f_ra(insn)));  // movsd xmm0, [a]
+        e.sseM(0x66, 0x2E, 0, fpr(f_rb(insn)));  // ucomisd xmm0, [b]
+        slow.push_back(e.j32(0xA));              // jp: unordered
+        e.movEaxI(2u);                           // equal
+        e.movEdxI(4u);
+        e.bytes({0x0F, 0x47, 0xC2});             // cmova eax, edx (greater)
+        e.movEdxI(8u);
+        e.bytes({0x0F, 0x42, 0xC2});             // cmovb eax, edx (less)
+        e.loadR(RCX, o.fpscr);
+        e.bytes({0x81, 0xE1});                   // and ecx, ~FPCC
+        e.i32le(0xFFFF0FFFu);
+        e.bytes({0x89, 0xC2});                   // mov edx, eax
+        e.bytes({0xC1, 0xE2, 0x0C});             // shl edx, 12
+        e.bytes({0x09, 0xD1});                   // or ecx, edx
+        e.storeR(o.fpscr, RCX);
+        const u32 sh = (7u - f_crfd(insn)) * 4u;
+        e.loadR(RCX, o.cr);
+        e.bytes({0x81, 0xE1});                   // and ecx, ~field
+        e.i32le(~(0xFu << sh));
+        if (sh)
+            e.bytes({0xC1, 0xE0, u8(sh)});       // shl eax, sh
+        e.bytes({0x09, 0xC1});                   // or ecx, eax
+        e.storeR(o.cr, RCX);
+        bump();
+        const size_t doneJ = e.jmp32f();
+        for (size_t j : slow)
+            e.patch32(j);
+        fallbackDirect(insn, row, nextVa, fn, true, true);
+        e.patch32(doneJ);
+    }
+    // In line unless switched off (--no-jit-inline-fp), compiled with the
+    // shim calls, or the host fast path it transcribes is itself off.
+    bool inlineFp(u32 offBit) const
+    {
+        return direct && !jc->tscOn && !c.jitFullGate && !c.jitInlineFpOff &&
+               !(sf::gHostFastOff & offBit);
+    }
+
     // -- branches ------------------------------------------------------------
     //
     // bcTaken transcribed: the CTR decrement happens whether or not the
@@ -2167,6 +2438,45 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         return;
     }
 
+    // ---- single-precision arithmetic, compares, round to single ------------
+    case Lo::Fadds:
+    case Lo::Fsubs:
+    case Lo::Fmuls:
+    case Lo::Fmadds:
+    case Lo::Fmsubs:
+    case Lo::Fnmadds:
+    case Lo::Fnmsubs:
+    case Lo::Frsp: {
+        // The record form (CR1 from the FPSCR) is the handler's. So is the
+        // fused family on a host without a fused multiply-add: the handler
+        // leaves those to the model there, and this follows the handler.
+        const bool fused = lo == Lo::Fmadds || lo == Lo::Fmsubs ||
+                           lo == Lo::Fnmadds || lo == Lo::Fnmsubs;
+        if (f_rcbit(insn) ||
+            !inlineFp(lo == Lo::Frsp ? sf::kFastOffDbl : sf::kFastOffSgl) ||
+            (fused && !sf::hostHasFma())) {
+            fallbackBest();
+            return;
+        }
+        const u32 shape = lo == Lo::Fadds ? 0u : lo == Lo::Fsubs ? 1u
+                        : lo == Lo::Fmuls ? 2u
+                        : (lo == Lo::Fmadds || lo == Lo::Fnmadds) ? 3u
+                        : lo == Lo::Frsp ? 5u : 4u;
+        fpSingle(insn, row, nextVa, shape,
+                 lo == Lo::Fnmadds || lo == Lo::Fnmsubs,
+                 reinterpret_cast<const void*>(c.dispFn[row]));
+        return;
+    }
+    case Lo::Fcmpu:
+    case Lo::Fcmpo:
+        if (!inlineFp(0u)) {
+            fallbackBest();
+            return;
+        }
+        fpCompare(insn, row, nextVa,
+                  reinterpret_cast<const void*>(c.dispFn[row]));
+        return;
+
     // ---- condition-register field moves (h_mcrf, h_mtcrf) ------------------
     case Lo::Mcrf: { // cr[crfD] = cr[crfS]
         const u32 shD = (7u - f_crfd(insn)) * 4u;
@@ -2333,6 +2643,7 @@ void JitCache::bind(Cpu& c)
     offs.batchBreak = d32(&c.batchBreak);
     offs.msr = d32(&c.st.msr);
     offs.fpr0 = d32(&c.st.fpr[0]);
+    offs.fpscr = d32(&c.st.fpscr);
     offs.fetchLine0 = d32(&c.fetchBase[0]);
     offs.flStride = i32(sizeof(c.fetchBase[0]));
     // Chain-gate fields (Stage B). The four pending bools are declared

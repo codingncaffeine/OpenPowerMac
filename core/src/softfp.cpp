@@ -79,6 +79,15 @@ static double hwFmad(double a, double b, double c)
 }
 #endif
 
+bool hostHasFma()
+{
+#if OPM_SF_X64
+    return kHaveFma;
+#else
+    return true; // the C runtime's routine: see fmaExact
+#endif
+}
+
 // One name for "a*b+c with a single rounding", whatever the host is. On x64
 // this is the FMA3 unit and the caller has already checked kHaveFma; anywhere
 // else it is the C runtime's correctly-rounded routine, which is right but

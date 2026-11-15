@@ -918,3 +918,224 @@ TEST_CASE("jit direct: a floating-point operation that traps leaves the counts s
     CHECK(ji.cpu.st.fpr[4] == in.cpu.st.fpr[4]);
     }
 }
+
+// ---- floating-point arithmetic in line ---------------------------------------
+
+namespace {
+
+// One long straight-line program: for every pair of the values below (and a
+// third picked from the same list), each operation the translator does in
+// line, its result stored, and the FPSCR after it stored beside it; for the
+// compares, the CR too. Both machines run it and every byte they wrote is
+// compared. The FPSCR is put back to `fpscr0` before each pair, so that a
+// first inexact result (FX with XX) happens again and again.
+struct FpProgram {
+    static constexpr u32 kCodeAt = 0x00100000u;
+    static constexpr u32 kTable = 0x4000u;     // the values, 8 bytes each
+    static constexpr u32 kOut = 0x00800000u;   // results
+    std::vector<u32> code;
+    std::vector<u64> vals;
+    u64 steps = 0;
+
+    static u32 fp(u32 op, u32 frt, u32 fra, u32 frb, u32 frc, u32 xo, bool rc = false)
+    {
+        return op << 26 | frt << 21 | fra << 16 | frb << 11 | frc << 6 | xo << 1 |
+               (rc ? 1u : 0u);
+    }
+    void emit(u32 w) { code.push_back(w); }
+
+    explicit FpProgram(Rng& r, bool recordForms)
+    {
+        static const u64 fixed[] = {
+            0x3FF0000000000000ull, 0xBFF0000000000000ull, 0x3FF8000000000000ull,
+            0x3FB99999A0000000ull, 0x417C9C3800000000ull, 0x3E45798EE0000000ull,
+            0x4170000000000000ull, 0x400921FB60000000ull, 0x3FE0000000000000ull,
+            0x0000000000000000ull, 0x8000000000000000ull,
+            0x3810000000000000ull, // 2^-126, the smallest normal single
+            0x3820000000000000ull, // 2^-125
+            0x3800000000000000ull, // 2^-127, a single denormal's value
+            0x36A0000000000000ull, // 2^-149
+            0x47EFFFFFE0000000ull, // the largest single
+            0x47E0000000000000ull, // 2^127
+            0x3FEFFFFFE0000000ull, // 1 - 2^-24
+            0x3FF0000020000000ull, // 1 + 2^-23
+            0x3E70000000000000ull, // 2^-24
+            0x3FF0000000000001ull, // not a single's value
+            0x400921FB54442D18ull, // pi, a double
+            0x7E37E43C8800759Cull, // 1e300
+            0x01A56E1FC2F8F359ull, // 1e-300
+            0x0000000000000001ull, // a double denormal
+            0x7FF0000000000000ull, 0xFFF0000000000000ull, // infinities
+            0x7FF8000000012345ull, 0x7FF4000000012345ull, // quiet, signaling
+        };
+        for (u64 v : fixed)
+            vals.push_back(v);
+        for (u32 k = 0; k < 35; ++k) { // singles of ordinary size
+            const u32 bits = (r.next() & 0x807FFFFFu) | ((100u + r.next() % 56u) << 23);
+            float f;
+            std::memcpy(&f, &bits, 4);
+            const double d = f;
+            u64 q;
+            std::memcpy(&q, &d, 8);
+            vals.push_back(q);
+        }
+        const u32 n = u32(vals.size()); // 64
+        emit(dform(15, 10, 0, 0));                 // lis  r10, 0
+        emit(dform(24, 10, 10, kTable));           // ori  r10, r10, kTable
+        emit(dform(15, 11, 0, kOut >> 16));        // lis  r11, kOut >> 16
+        emit(dform(15, 12, 0, (kOut >> 16) + 0x40)); // lis r12, … (the CRs)
+        emit(dform(50, 31, 10, i32(n * 8u)));      // lfd  f31, the FPSCR to start from
+        for (u32 i = 0; i < n; ++i)
+            for (u32 j = 0; j < n; ++j) {
+                if (i >= 29 && j >= 29 && ((i * 7u + j) % 5u) != 0u)
+                    continue; // a fifth of the random-with-random pairs
+                const u32 k = (i * 7u + j * 3u + 1u) % n;
+                emit(63u << 26 | 0xFFu << 17 | 31u << 11 | 711u << 1); // mtfsf 0xFF, f31
+                emit(dform(50, 1, 10, i32(i * 8u)));   // lfd f1 (a)
+                emit(dform(50, 2, 10, i32(j * 8u)));   // lfd f2 (b)
+                emit(dform(50, 3, 10, i32(k * 8u)));   // lfd f3 (c)
+                const u32 ops[8] = {
+                    fp(59, 4, 1, 2, 0, 21, recordForms), // fadds
+                    fp(59, 4, 1, 2, 0, 20, recordForms), // fsubs
+                    fp(59, 4, 1, 0, 3, 25, recordForms), // fmuls
+                    fp(59, 4, 1, 2, 3, 29, recordForms), // fmadds
+                    fp(59, 4, 1, 2, 3, 28, recordForms), // fmsubs
+                    fp(59, 4, 1, 2, 3, 31, recordForms), // fnmadds
+                    fp(59, 4, 1, 2, 3, 30, recordForms), // fnmsubs
+                    fp(63, 4, 0, 2, 0, 12, recordForms), // frsp
+                };
+                for (u32 w : ops) {
+                    emit(w);
+                    emit(dform(55, 4, 11, 8));            // stfdu f4, 8(r11)
+                    emit(63u << 26 | 5u << 21 | 583u << 1); // mffs f5
+                    emit(dform(55, 5, 11, 8));            // stfdu f5, 8(r11)
+                }
+                emit(63u << 26 | 3u << 23 | 1u << 16 | 2u << 11);            // fcmpu cr3, f1, f2
+                emit(63u << 26 | 6u << 23 | 1u << 16 | 2u << 11 | 32u << 1); // fcmpo cr6, f1, f2
+                emit(31u << 26 | 7u << 21 | 19u << 1);    // mfcr r7
+                emit(dform(37, 7, 12, 4));                // stwu r7, 4(r12)
+                emit(63u << 26 | 5u << 21 | 583u << 1);   // mffs f5
+                emit(dform(55, 5, 11, 8));                // stfdu f5, 8(r11)
+            }
+        steps = code.size();
+        emit(b(0));
+    }
+};
+
+struct BigTwin {
+    FlatBus bus{16u << 20};
+    std::unique_ptr<Cpu> cpuUp = std::make_unique<Cpu>();
+    Cpu& cpu = *cpuUp;
+    u64 stamp = 0;
+    explicit BigTwin(bool jitOn)
+    {
+        cpu.attach(bus);
+        cpu.jitOn = jitOn;
+    }
+    void load(const FpProgram& p, u32 fpscr0, u32 msrBits)
+    {
+        for (size_t k = 0; k < p.code.size(); ++k)
+            bus.write32(FpProgram::kCodeAt + u32(k) * 4u, p.code[k]);
+        for (size_t k = 0; k < p.vals.size(); ++k)
+            bus.write64(FpProgram::kTable + u32(k) * 8u, p.vals[k]);
+        bus.write64(FpProgram::kTable + u32(p.vals.size()) * 8u, fpscr0);
+        cpu.st.pc = FpProgram::kCodeAt;
+        cpu.st.msr = msrBits;
+    }
+    void run(u64 n)
+    {
+        while (stamp < n)
+            cpu.runSteps(n - stamp, stamp);
+    }
+};
+
+// Runs the program on a translating machine and an interpreting one from the
+// same start and returns how many of the bytes they wrote differ.
+size_t fpTwinsDiffer(const FpProgram& p, u32 fpscr0, u32 msrBits, bool inlineFp,
+                     u64* inLine = nullptr)
+{
+    BigTwin ji(true), in(false);
+    ji.cpu.jitInlineFpOff = !inlineFp;
+    ji.load(p, fpscr0, msrBits);
+    in.load(p, fpscr0, msrBits);
+    ji.run(p.steps);
+    in.run(p.steps);
+    size_t differ = 0;
+    for (size_t k = 0; k < ji.bus.m.size(); ++k)
+        differ += ji.bus.m[k] != in.bus.m[k];
+    for (u32 k = 0; k < 32; ++k)
+        differ += ji.cpu.st.fpr[k] != in.cpu.st.fpr[k];
+    differ += ji.cpu.st.fpscr != in.cpu.st.fpscr;
+    differ += ji.cpu.st.cr != in.cpu.st.cr;
+    differ += ji.cpu.st.pc != in.cpu.st.pc;
+    differ += ji.cpu.st.srr0 != in.cpu.st.srr0;
+    if (inLine && ji.cpu.jit) {
+        // What the translating machine still called a handler for, of the
+        // operations this program is made of.
+        u64 called = 0;
+        for (u32 row = 0; row < kIsaCount; ++row) {
+            const char* mn = kIsa[row].mnem;
+            if (!std::strcmp(mn, "fadds") || !std::strcmp(mn, "fsubs") ||
+                !std::strcmp(mn, "fmuls") || !std::strcmp(mn, "fmadds") ||
+                !std::strcmp(mn, "fmsubs") || !std::strcmp(mn, "fnmadds") ||
+                !std::strcmp(mn, "fnmsubs") || !std::strcmp(mn, "frsp") ||
+                !std::strcmp(mn, "fcmpu") || !std::strcmp(mn, "fcmpo"))
+                called += ji.cpu.jit->fbByRow[row];
+        }
+        *inLine = called;
+    }
+    return differ;
+}
+
+} // namespace
+
+TEST_CASE("jit: single-precision arithmetic in line is the handler's, value by value")
+{
+    // Every class of operand against every other (ordinary singles, both
+    // zeros, the smallest normal and its neighbors, single denormals'
+    // values, the largest single, doubles no single holds, a double
+    // denormal, infinities, both kinds of NaN), through the seven
+    // arithmetic operations, the round to single and the two compares.
+    Rng r{0xF1047ull};
+    const FpProgram p(r, false);
+    const u32 fpOn = msr::FP;
+    u64 called = 0, calledOff = 0;
+    // The FPSCR as a program leaves it alone: round to nearest, nothing
+    // enabled. And with XX already set, so that FX does not move.
+    CHECK(fpTwinsDiffer(p, 0x00000000u, fpOn, true, &called) == 0u);
+    CHECK(fpTwinsDiffer(p, 0x82000000u, fpOn, true) == 0u);
+    // What the in-line form declines as a whole: another rounding mode, the
+    // non-IEEE mode, an enabled inexact exception (FEX rises on the first
+    // inexact result), an invalid-operation bit standing from before.
+    CHECK(fpTwinsDiffer(p, 0x00000001u, fpOn, true) == 0u);
+    CHECK(fpTwinsDiffer(p, 0x00000002u, fpOn, true) == 0u);
+    CHECK(fpTwinsDiffer(p, 0x00000003u, fpOn, true) == 0u);
+    CHECK(fpTwinsDiffer(p, 0x00000004u, fpOn, true) == 0u);
+    CHECK(fpTwinsDiffer(p, 0x00000008u, fpOn, true) == 0u);
+    CHECK(fpTwinsDiffer(p, 0xA1000000u, fpOn, true) == 0u);
+    CHECK(fpTwinsDiffer(p, 0x00000060u, fpOn, true) == 0u); // OE, UE
+    // The control: the same program with every operation called.
+    CHECK(fpTwinsDiffer(p, 0x00000000u, fpOn, false, &calledOff) == 0u);
+    // …and the comparison means something only if the first run did most of
+    // them in line: the calls left are the operands the handler keeps.
+    MESSAGE("handler calls: " << called << " with the in-line form, "
+                              << calledOff << " without");
+    CHECK(calledOff > 30000u);
+    CHECK(called < calledOff / 2u);
+    // The record forms are never done in line; they must still agree.
+    Rng r2{0xF1048ull};
+    const FpProgram rec(r2, true);
+    CHECK(fpTwinsDiffer(rec, 0x00000000u, fpOn, true) == 0u);
+}
+
+TEST_CASE("jit: floating-point in line, with the exception taken and with FP off")
+{
+    Rng r{0xF1049ull};
+    const FpProgram p(r, false);
+    // MSR[FP] clear: the first lfd raises, both machines at the vector.
+    CHECK(fpTwinsDiffer(p, 0x00000000u, 0u, true) == 0u);
+    // An enabled inexact exception with MSR[FE0]: the first inexact result
+    // traps (vectors at 0x700, where memory holds zeros: both machines then
+    // take the program exception again and again, identically).
+    CHECK(fpTwinsDiffer(p, 0x00000008u, msr::FP | msr::FE0, true) == 0u);
+}

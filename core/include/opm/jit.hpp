@@ -167,7 +167,7 @@ class JitCache {
     struct Offs {
         i32 gpr0 = 0, pc = 0, cr = 0, xer = 0, lr = 0, ctr = 0;
         i32 pend = 0, curInsn = 0, halted = 0, batchBreak = 0;
-        i32 msr = 0, fpr0 = 0;
+        i32 msr = 0, fpr0 = 0, fpscr = 0;
         i32 fetchLine0 = 0; // fetchBase[0]; slot k at +k*flStride
         i32 flStride = 0;
         // Chain-gate fields (Stage B): the dispatcher's own `slow` inputs,

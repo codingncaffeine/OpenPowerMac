@@ -1232,6 +1232,10 @@ struct Cpu {
     // call to its shim, as before memory could be read directly. The control
     // for the inline form (Compiler::memProbe in jit.cpp).
     bool jitInlineMemOff = false;
+    // DIAGNOSTIC (--no-jit-inline-fp): compile floating-point arithmetic as
+    // calls to the handlers. The control for the form done in line
+    // (Compiler::fpSingle in jit.cpp).
+    bool jitInlineFpOff = false;
     // DIAGNOSTIC (--no-jit-direct): compile fallbacks as the execRow shim
     // call instead of a direct call to the bound handler. The control for the
     // direct-call lowering, which is the only way its speed claim can be

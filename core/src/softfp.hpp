@@ -70,6 +70,9 @@ u32 storeSingle(u64 f);  // PEM D.7 (truncating conversion)
 inline constexpr u32 kFastOffSgl = 1u;
 inline constexpr u32 kFastOffDbl = 2u;
 extern u32 gHostFastOff;
+// Whether the single fast path computes the fused family on this host (it
+// needs a hardware fused multiply-add); otherwise the model has those rows.
+bool hostHasFma();
 extern u64 gFastHits, gFastMiss;   // single-target: taken vs bailed
 extern u64 gFastHitsD, gFastMissD; // double-target (incl. frsp); g4run reports both
 // Why a fast path declined (the multiply/add/fused ones; divide keeps its

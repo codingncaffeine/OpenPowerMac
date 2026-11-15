@@ -2356,6 +2356,7 @@ class RowQueue {
     void add(const Pipe& P, const TriSetup& T, int minY, int maxY)
     {
         if (!pending_) {
+            lone_ = 0.0;
             const int want = threads() - 1;
             if (static_cast<int>(crew_.size()) < want) {
                 std::lock_guard<std::mutex> lk(mu_);
@@ -2457,11 +2458,18 @@ class RowQueue {
     }
 
     bool pending() const { return pending_; }
-    // Whether a drawing thread is awake with nothing to do: a small triangle
-    // is worth handing to it, and not worth waking it for.
-    bool hot() const
+    // Whether an empty queue should be started for a triangle of about
+    // `pixels`. Waking a thread costs the caller several microseconds, which
+    // one small triangle does not repay; so: for a large one, for a small
+    // one if a drawing thread is awake with nothing to do, and for a small
+    // one once the small ones drawn here since the queue was last empty
+    // come to a large one between them.
+    bool worth(double pixels)
     {
-        return !crew_.empty() &&
+        lone_ += pixels;
+        if (lone_ >= kStartPixels)
+            return true;
+        return pixels >= kStartHotPixels && !crew_.empty() &&
                sleepers_.load(std::memory_order_relaxed) <
                    static_cast<int>(crew_.size());
     }
@@ -2471,6 +2479,7 @@ class RowQueue {
     // its number's.
     static constexpr u64 kJobs = 1024;
     static constexpr u32 kLanes = 32;
+    static constexpr double kStartPixels = 2048.0, kStartHotPixels = 64.0;
     static constexpr int kBandShift = 1; // rows to a band, as a shift
     // Jobs a thread draws of one lane before it lets the lane go and looks
     // for the one furthest behind.
@@ -2616,6 +2625,7 @@ class RowQueue {
     u64 posted_ = 0, passed_ = 0, pipeAt_ = 0;
     u32 batch_ = 0;
     bool pending_ = false;
+    double lone_ = 0.0; // pixels drawn by the caller since the queue emptied
     Reach reach_;
     Hand mine_; // the caller's own, for when it draws
     // `posted_` again, for the threads.
@@ -2643,15 +2653,6 @@ void flushTally(const Pipe& P)
     es.texUnimpl += P.tally.texUnimpl;
     P.tally = Pipe::Tally{};
 }
-
-// The size of a triangle, in pixels, from which an empty queue is started
-// for it: with the drawing threads asleep, and with one of them awake.
-// Waking a thread costs the caller several microseconds, which a smaller
-// triangle does not repay. Once something waits, whatever can wait behind it
-// does, at any size, because the order within a row is the order of the
-// queue.
-constexpr double kQueuePixels = 2048.0;
-constexpr double kQueueHotPixels = 64.0;
 
 void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
 {
@@ -2850,8 +2851,9 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
         if (!start) {
             const double box = (static_cast<double>(maxX) - minX + 1.0) *
                                (static_cast<double>(maxY) - minY + 1.0);
-            const double est = area2 * 0.5 < box ? area2 * 0.5 : box;
-            start = est >= kQueuePixels || (est >= kQueueHotPixels && q.hot());
+            // Once something waits, whatever can wait behind it does, at
+            // any size: the order within a row is the order of the queue.
+            start = q.worth(area2 * 0.5 < box ? area2 * 0.5 : box);
         }
         if (start && q.admit(P, maxX, minY, maxY)) {
             q.add(P, T, minY, maxY);

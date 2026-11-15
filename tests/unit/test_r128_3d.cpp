@@ -1117,3 +1117,136 @@ TEST_CASE("3d: table dither and a 32 bpp destination are drawn as with "
     for (u32 x = 0; x < 8; ++x)
         CHECK(deep.pix32(x, 1) == colour);
 }
+
+// ── Sub-pixel precision (r128_3d.cpp snapVertex) ──────────────────────────
+
+namespace {
+
+constexpr u32 kFpuSetup = 0x071Cu, kWindowXyOffset = 0x1BCCu;
+constexpr u32 kFpuBoth = (3u << 1) | (3u << 3) | (2u << 5); // fpuSolidBoth's
+constexpr u32 kFpuSub4 = 1u << 7, kFpuNearest = 1u << 15;
+
+// A rectangle from the origin to (right, 8) in solid blue, as two triangles
+// that share the upright edge at x = right.
+void rectTo(Rig3d& r, float right)
+{
+    std::vector<u32> v;
+    Rig3d::vtx(v, 0, 0, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, right, 0, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, 0, 8, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, right, 0, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, right, 8, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, 0, 8, 0.5f, 0xFF0000FFu);
+    r.prim(0x9u, 4u, 6u, v);
+}
+
+} // namespace
+
+TEST_CASE("3d: a corner is placed on the sub-pixel grid the guest selects")
+{
+    // The edge is asked for at x = 10.7. Pixel 10's centre is 10.5: inside
+    // an edge at 10.7 or 10.6875 or 10.75, and ON an edge at 10.5, which a
+    // right-hand edge does not take.
+    {
+        Rig3d r; // two fractional bits, cut: the edge is at 10.5
+        r.dst32();
+        r.openGate();
+        r.reg(kFpuSetup, kFpuBoth);
+        rectTo(r, 10.7f);
+        CHECK(r.pix32(9, 3) == 0xFF0000FFu);
+        CHECK(r.pix32(10, 3) == 0u);
+    }
+    {
+        Rig3d r; // four fractional bits: 10.6875
+        r.dst32();
+        r.openGate();
+        r.reg(kFpuSetup, kFpuBoth | kFpuSub4);
+        rectTo(r, 10.7f);
+        CHECK(r.pix32(10, 3) == 0xFF0000FFu);
+        CHECK(r.pix32(11, 3) == 0u);
+    }
+    {
+        Rig3d r; // two bits, rounded to the nearest step: 10.75
+        r.dst32();
+        r.openGate();
+        r.reg(kFpuSetup, kFpuBoth | kFpuNearest);
+        rectTo(r, 10.7f);
+        CHECK(r.pix32(10, 3) == 0xFF0000FFu);
+        CHECK(r.pix32(11, 3) == 0u);
+    }
+}
+
+TEST_CASE("3d: two triangles that share snapped corners still meet exactly")
+{
+    // The shared diagonal runs between corners that are not on the grid.
+    // Each pixel of the rectangle must be drawn once: a gap would leave a
+    // zero, and a pixel drawn by both would show in the count.
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.reg(kFpuSetup, kFpuBoth);
+    const auto before = r128EngStats();
+    std::vector<u32> v;
+    const float l = 1.3f, t = 2.6f, rt = 21.9f, b = 13.1f;
+    Rig3d::vtx(v, l, t, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, rt, t, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, l, b, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, rt, t, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, rt, b, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, l, b, 0.5f, 0xFF0000FFu);
+    r.prim(0x9u, 4u, 6u, v);
+    // Snapped: x from 1.25 to 21.75, y from 2.5 to 13.0. Centres taken:
+    // x 1..21 (1.5 .. 21.5), y 2..12 (2.5 on the top edge, which a top edge
+    // takes, to 12.5).
+    u32 drawn = 0;
+    for (u32 y = 0; y < 20; ++y)
+        for (u32 x = 0; x < 30; ++x) {
+            const bool inside = x >= 1 && x <= 21 && y >= 2 && y <= 12;
+            CAPTURE(x);
+            CAPTURE(y);
+            CHECK(r.pix32(x, y) == (inside ? 0xFF0000FFu : 0u));
+            drawn += inside;
+        }
+    CHECK(r128EngStats().triPixels - before.triPixels == drawn);
+}
+
+TEST_CASE("3d: the window offset is in the vertices' own fixed point")
+{
+    // X = 8, Y = 4 in the two halves of WINDOW_XY_OFFSET (guide: S.12.2 or
+    // S.11.4 with the sub-pixel amount).
+    auto draw = [](Rig3d& r, u32 fpu) {
+        r.dst32();
+        r.openGate();
+        r.reg(kFpuSetup, fpu);
+        r.reg(kWindowXyOffset, (8u << 16) | 4u);
+        std::vector<u32> v;
+        Rig3d::vtx(v, 0, 0, 0.5f, 0xFF0000FFu);
+        Rig3d::vtx(v, 6, 0, 0.5f, 0xFF0000FFu);
+        Rig3d::vtx(v, 0, 6, 0.5f, 0xFF0000FFu);
+        r.prim(0x9u, 4u, 3u, v);
+    };
+    Rig3d two; // two fractional bits: 2 pixels across, 1 down
+    draw(two, kFpuBoth);
+    CHECK(two.pix32(0, 0) == 0u);
+    CHECK(two.pix32(1, 1) == 0u);
+    CHECK(two.pix32(2, 0) == 0u);
+    CHECK(two.pix32(2, 1) == 0xFF0000FFu);
+    CHECK(two.pix32(6, 1) == 0xFF0000FFu); // the far corner moved with it
+    Rig3d four; // four bits: half a pixel across, a quarter down
+    draw(four, kFpuBoth | kFpuSub4);
+    CHECK(four.pix32(0, 0) == 0xFF0000FFu);
+    CHECK(four.pix32(6, 1) == 0u);
+    // A negative offset is negative: -4 steps across is one pixel left.
+    Rig3d neg;
+    neg.dst32();
+    neg.openGate();
+    neg.reg(kFpuSetup, kFpuBoth);
+    neg.reg(kWindowXyOffset, 0xFFFC0000u);
+    std::vector<u32> v;
+    Rig3d::vtx(v, 4, 0, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, 10, 0, 0.5f, 0xFF0000FFu);
+    Rig3d::vtx(v, 4, 6, 0.5f, 0xFF0000FFu);
+    neg.prim(0x9u, 4u, 3u, v);
+    CHECK(neg.pix32(2, 0) == 0u);
+    CHECK(neg.pix32(3, 0) == 0xFF0000FFu);
+}

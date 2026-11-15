@@ -114,12 +114,14 @@ constexpr Setting kSettings[] = {
     // dithering were off (r128_3d.cpp, "Dithering").
     {"dither method", bit(0), "error diffusion|table"},
     {"dither, error at the start of a line", upTo(1), "kept|reset"},
-    // Vertices are used at the precision they arrive with.
-    {"vertex position precision", 0, "quarter pixel|sixteenth of a pixel"},
+    {"vertex position precision", upTo(1),
+     "quarter pixel|sixteenth of a pixel"},
     {"texture coordinates", bit(1), "multiplied by W|as given"},
     {"shading", upTo(3), "constant colour|flat|Gouraud|Gouraud"},
     {"back faces", upTo(3), kFace},
     {"front faces", upTo(3), kFace},
+    // TEX_CNTL_C bit 21. Nothing says what the card does with it, so "on"
+    // is not drawn; no draw of either game studied has it on.
     {"texture anti-alias bit", bit(0), "off|on"},
     // CLR_CMP_FCN_3D (guide, MISC_3D_STATE_CNTL_REG 31:30): the texel that
     // equals the key colour is not drawn, whatever this says.

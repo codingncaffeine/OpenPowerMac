@@ -277,7 +277,14 @@ struct Pipe {
     // destination
     u32 bypp = 0, dstType = 0, dstOff = 0, dstStride = 0;
     int scL = 0, scR = 0, scT = 0, scB = 0;
-    int winX = 0, winY = 0;
+    // The window origin added to every vertex, in pixels: it carries the
+    // vertices' own sub-pixel bits, so it need not be whole.
+    double winX = 0, winY = 0;
+    // Vertex positions reach the setup engine in fixed point, with two
+    // fractional bits or four: the steps in a pixel, and whether the
+    // conversion rounds to the nearest step or cuts. See snapVertex.
+    float subSteps = 4.0f;
+    bool subNearest = false;
     u32 planeMask = 0xFFFFFFFFu;
     // Z / stencil
     bool zEn = false, zWr = false, stEn = false;
@@ -417,17 +424,24 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     P.scR = sx14c(c.peek(kScRight));
     P.scT = sx14c(c.peek(kScTop));
     P.scB = sx14c(c.peek(kScBottom));
-    const u32 win = c.peek(kWindowXyOffset);
-    // 12-bit fields, sign-extended: a window origin is non-negative on a Mac
-    // desktop but the field format allows the guard band.
-    P.winX = static_cast<int>((win >> 20) & 0xFFFu);
-    if (P.winX >= 0x800) P.winX -= 0x1000;
-    P.winY = static_cast<int>((win >> 4) & 0xFFFu);
-    if (P.winY >= 0x800) P.winY -= 0x1000;
     const u32 pm = c.peek(kPlane3dMaskC);
     P.planeMask = pm ? pm : 0xFFFFFFFFu; // reset-zero must not mean "write
                                          // nothing", the 2D mask's own rule
     P.fpu = c.peek(kFpuSetup);
+    // PM4_VC_FPU_SETUP bit 7 (r128_reg.h FPU_SUB_PIX_2BITS / _4BITS) and bit
+    // 15 (FPU_ROUND_TRUNCATE / _NEAREST).
+    P.subSteps = (P.fpu >> 7) & 1u ? 16.0f : 4.0f;
+    P.subNearest = (P.fpu >> 15) & 1u;
+    // WINDOW_XY_OFFSET (guide 3-248): X in 31:16 and Y in 15:0, signed, "in
+    // S.12.2 format or S.11.4 format depending on SUB_PIX_AMNT", which is to
+    // say in the vertices' own fixed point. (It was read as whole pixels
+    // from the top twelve bits of each half: right only at four fractional
+    // bits, and a quarter of the offset at two, which is what the Mac driver
+    // runs with.)
+    const u32 win = c.peek(kWindowXyOffset);
+    P.winX = static_cast<double>(static_cast<int16_t>(win >> 16)) / P.subSteps;
+    P.winY = static_cast<double>(static_cast<int16_t>(win & 0xFFFFu)) /
+             P.subSteps;
     P.texCntl = c.peek(kTexCntlC);
     P.misc = c.peek(kMisc3dStateCntl);
     // Z / stencil
@@ -1645,8 +1659,8 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
 // ── Lines and points ──────────────────────────────────────────────────────
 void rasterPoint(const Pipe& P, const Vtx& v)
 {
-    const int px = static_cast<int>(std::floor(v.x)) + P.winX;
-    const int py = static_cast<int>(std::floor(v.y)) + P.winY;
+    const int px = static_cast<int>(std::floor(v.x + P.winX));
+    const int py = static_cast<int>(std::floor(v.y + P.winY));
     if (px < P.scL || px > P.scR || py < P.scT || py > P.scB || px < 0 ||
         py < 0)
         return;
@@ -1706,8 +1720,8 @@ void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b)
         v.s2 = a.s2 + (b.s2 - a.s2) * f;
         v.t2 = a.t2 + (b.t2 - a.t2) * f;
         v.rhw = a.rhw + (b.rhw - a.rhw) * f;
-        const int px = static_cast<int>(std::floor(v.x)) + P.winX;
-        const int py = static_cast<int>(std::floor(v.y)) + P.winY;
+        const int px = static_cast<int>(std::floor(v.x + P.winX));
+        const int py = static_cast<int>(std::floor(v.y + P.winY));
         if (px < P.scL || px > P.scR || py < P.scT || py > P.scB ||
             px < 0 || py < 0)
             continue;
@@ -1795,6 +1809,26 @@ struct VtxSource {
     }
 };
 
+// A vertex's position as the setup engine receives it: in fixed point with
+// two or four fractional bits, so a corner sits on a quarter or a sixteenth
+// of a pixel and nowhere between. r128_reg.h names the two choices in
+// PM4_VC_FPU_SETUP (and SETUP_CNTL repeats the first for a setup engine
+// driven through its registers), and the register guide gives the formats
+// S.12.2 and S.11.4 for the window offset that is added to them. Corners
+// shared by two triangles land on the same step, so the pair still meets
+// without a gap; what changes against exact positions is which pixel centres
+// an edge takes when it passes within a step of them.
+void snapVertex(const Pipe& P, Vtx& v)
+{
+    const auto snap = [&P](float at) {
+        const float steps = at * P.subSteps;
+        return (P.subNearest ? std::floor(steps + 0.5f) : std::trunc(steps)) /
+               P.subSteps;
+    };
+    v.x = snap(v.x);
+    v.y = snap(v.y);
+}
+
 // Assemble and draw every primitive the packet describes. `idx` maps
 // primitive-order position to vertex index (identity for LIST/RING walks,
 // the packed index list for the IND walk).
@@ -1807,7 +1841,10 @@ void assemble(const Pipe& P, const VtxSource& src, u32 primType, u32 count,
             const u32 w = indexWords[i >> 1];
             vi = (i & 1u) ? (w >> 16) : (w & 0xFFFFu);
         }
-        return src.fetch(vi, v);
+        if (!src.fetch(vi, v))
+            return false;
+        snapVertex(P, v);
+        return true;
     };
     switch (primType) {
     case 1u: // points
@@ -2001,9 +2038,10 @@ bool r128Reg3dDecodedBits(u32 off, u32& mask)
     }
     switch (off) {
     // PM4_VC_FPU_SETUP: front direction, back and front face functions, the
-    // shade function, the flat-shade vertex. Bit 8 selects 3D mode, which is
-    // the only mode this file is reached in.
-    case kFpuSetup: mask = 0x0000417Fu; return true;
+    // shade function, the sub-pixel precision, the flat-shade vertex, the
+    // rounding of a position. Bit 8 selects 3D mode, which is the only mode
+    // this file is reached in.
+    case kFpuSetup: mask = 0x0000C1FFu; return true;
     // Z_STEN_CNTL_C: depth width and test, the stencil test and its three
     // operations.
     case kZStenCntlC: mask = 0x07777076u; return true;
@@ -2012,8 +2050,11 @@ bool r128Reg3dDecodedBits(u32 off, u32& mask)
     // TEX_CNTL_C: Z enable and write, stencil, the two texture enables, fog,
     // dither, alpha blend and test, specular, chroma key, the texel alpha
     // mask, the two lighting functions, the LOD bias. Bit 23 flushes the
-    // texel cache, which this model does not have.
-    case kTexCntlC: mask = 0xFF9FFFBBu; return true;
+    // texel cache, which this model does not have. Bit 21 (r128_reg.h
+    // ANTI_ALIAS; the books are silent) is in the value census, which says
+    // whether a DRAW was made with it: one game sets it between two screens
+    // and clears it before it draws anything.
+    case kTexCntlC: mask = 0xFFBFFFBBu; return true;
     // MISC_3D_STATE_CNTL: reference alpha, the 3D function, the alpha
     // combine, table fog, the two blend factors, the alpha test.
     case kMisc3dStateCntl: mask = 0x07FF73FFu; return true;

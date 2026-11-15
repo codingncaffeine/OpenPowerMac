@@ -361,6 +361,37 @@ inline void r128SettingUsed(R128Setting s, u32 value)
 void r128SettingsReset();
 std::string r128SettingsReport();
 
+// Where a texture lies and which way round its texels are stored are two
+// more things a wrong picture does not name. With the census on, every
+// distinct texture the 3D pipeline draws with is listed: unit, memory (video
+// memory or AGP space), base, size, format, and for a 16-bit color format
+// how rough its top level reads with the first byte as the high one and as
+// the low one (a picture is smoother the right way round), and how much of
+// it is not zero. With `pictures` each one's top level is kept as this model
+// decodes it, to be looked at. Switching the census on or off empties it.
+// Off, it is one test a packet.
+void r128TextureCensus(bool on, bool pictures = false);
+std::string r128TextureReport();
+struct R128TexturePicture {
+    std::string name; // order first drawn with, unit, memory, base, size
+    u32 w = 0, h = 0;
+    std::vector<u8> rgb; // w * h * 3
+};
+std::vector<R128TexturePicture> r128TexturePictures();
+// The 3D pipeline's side of it: one unit of a packet about to be drawn, and
+// the pipeline's own readers lent for the length of the call (a byte at an
+// engine address, and a texel of the top level decoded to red, green, blue).
+struct R128TexSeen {
+    u32 unit = 0, base = 0, w = 0, h = 0, pitch = 0, fmt = 0;
+    u32 texCntl = 0, unitCntl = 0, dpDatatype = 0;
+    bool agp = false;
+    void* ctx = nullptr;
+    bool (*byteAt)(void* ctx, u32 addr, u8& out) = nullptr;
+    bool (*texelAt)(void* ctx, u32 x, u32 y, u8 rgb[3]) = nullptr;
+};
+extern bool gR128TexCensusOn;
+void r128TextureSeen(const R128TexSeen& t);
+
 // --- Who wrote this pixel ---------------------------------------------------
 //
 // A wrong pixel has three possible authors — the processor storing through

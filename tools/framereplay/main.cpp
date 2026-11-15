@@ -9,8 +9,11 @@
 //       DIR/frame-K.png for each frame, DIR/end.png for the last state.
 //       Says, per frame, whether video memory came out as the recording
 //       says it stood. --strict: exit 1 unless every one did. --census:
-//       also print which settings these frames were drawn with, and which
-//       of them the model does not draw as the manuals say.
+//       also print which settings these frames were drawn with, which of
+//       them the model does not draw as the manuals say, and every texture
+//       drawn with (where it lies, its byte order, how much of it is
+//       filled). --textures DIR: the census, and each texture's top level
+//       as DIR/NAME.png.
 //   framereplay --diff A.png B.png [MAP.png]
 //       Count the pixels that differ between two pictures this tool wrote,
 //       and paint them red over a dimmed A in MAP.png.
@@ -287,6 +290,7 @@ int main(int argc, char** argv)
         return diff(a[1], a[2], a.size() > 3 ? a[3].c_str() : nullptr);
     std::string file, out = ".";
     bool strict = false, census = false, hashes = false;
+    std::string texDir;
     unsigned bench = 0, profHz = 0;
     std::string profOut;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -302,6 +306,10 @@ int main(int argc, char** argv)
             strict = true;
         else if (a[i] == "--census")
             census = true;
+        else if (a[i] == "--textures" && i + 1 < a.size()) {
+            census = true;
+            texDir = a[++i];
+        }
         else if (a[i] == "--hashes")
             hashes = true;
         else if (a[i] == "--threads" && i + 1 < a.size())
@@ -313,7 +321,8 @@ int main(int argc, char** argv)
     }
     if (file.empty()) {
         std::fprintf(stderr,
-                     "usage: framereplay FILE [--out DIR] [--strict] [--census]\n"
+                     "usage: framereplay FILE [--out DIR] [--strict] [--census] "
+                     "[--textures DIR]\n"
                      "       (any of these with --threads N: the threads that "
                      "draw a large triangle)\n"
                      "       framereplay FILE --hashes\n"
@@ -386,6 +395,7 @@ int main(int argc, char** argv)
     std::error_code ec;
     std::filesystem::create_directories(out, ec);
     auto cell = std::make_unique<R128Cell>();
+    r128TextureCensus(census, !texDir.empty());
     std::vector<std::string> wrote;
     const R128EdgeFn onEdge = [&](u32 index, char, const R128Cell& c) {
         Picture pic;
@@ -446,7 +456,20 @@ int main(int argc, char** argv)
                                                 es.texGartMiss),
                 static_cast<unsigned long long>(es.gated3d));
     if (census)
-        std::printf("%s%s", r128UndecodedReport(*cell).c_str(),
-                    r128SettingsReport().c_str());
+        std::printf("%s%s%s", r128UndecodedReport(*cell).c_str(),
+                    r128SettingsReport().c_str(),
+                    r128TextureReport().c_str());
+    if (!texDir.empty()) {
+        std::filesystem::create_directories(texDir, ec);
+        size_t n = 0;
+        for (const R128TexturePicture& t : r128TexturePictures()) {
+            Picture pic;
+            pic.w = t.w;
+            pic.h = t.h;
+            pic.rgb = t.rgb;
+            n += writePng(texDir + "/" + t.name + ".png", pic);
+        }
+        std::printf("  %zu texture(s) written to %s\n", n, texDir.c_str());
+    }
     return strict && !allEqual ? 1 : 0;
 }

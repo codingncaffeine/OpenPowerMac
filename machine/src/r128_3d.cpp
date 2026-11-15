@@ -63,6 +63,11 @@
 #else
 #define OPM_FORCE_INLINE inline __attribute__((always_inline))
 #endif
+#if defined(_MSC_VER)
+#define OPM_NOINLINE __declspec(noinline)
+#else
+#define OPM_NOINLINE __attribute__((noinline))
+#endif
 #if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
 #define OPM_ROWS_X86 1
 #include <xmmintrin.h>
@@ -459,6 +464,10 @@ void noteSettings(const R128Cell& c, const Pipe& P)
     }
 }
 
+// The texture census's view of a packet (opm/r128.hpp), defined after the
+// texel reader it lends out.
+void noteTextures(const R128Cell& c, const Pipe& P);
+
 bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
 {
     P.c = &c;
@@ -646,6 +655,8 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     }
     P.texAny = P.tex[0].on;
     noteSettings(c, P);
+    if (gR128TexCensusOn)
+        noteTextures(c, P);
     return true;
 }
 
@@ -988,6 +999,55 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     default: // VQ (0): "2 bpp", and no word anywhere on its code book
         ++P.tally.texUnimpl;
         return false;
+    }
+}
+
+// The texture census's view of this pipeline (opm/r128.hpp): each unit that
+// is on, and the two readers the census looks at its top level through,
+// which are the readers every sample uses. Out of line, and the census's own
+// work in r128_census.cpp: nothing of it is in the way of the pixel path.
+OPM_NOINLINE void noteTextures(const R128Cell& c, const Pipe& P)
+{
+    struct Lent {
+        const Pipe* P;
+        const TexUnit* t;
+    };
+    for (u32 u = 0; u < 2u; ++u) {
+        const TexUnit& t = P.tex[u];
+        if (!t.on)
+            continue;
+        Lent lent{&P, &t};
+        R128TexSeen s;
+        s.unit = u;
+        s.base = t.offs[0] & 0x07FFFFFFu;
+        s.agp = s.base >= kAgpWindow;
+        s.w = t.wTex;
+        s.h = t.hTex;
+        s.pitch = t.pitchTex;
+        s.fmt = t.fmt;
+        s.texCntl = P.texCntl;
+        s.unitCntl = t.cntl;
+        s.dpDatatype = c.peek(kDpDatatype);
+        s.ctx = &lent;
+        s.byteAt = [](void* x, u32 addr, u8& out) {
+            return texByte(*static_cast<Lent*>(x)->P, addr, out);
+        };
+        s.texelAt = [](void* x, u32 tx, u32 ty, u8 rgb[3]) {
+            const Lent& k = *static_cast<Lent*>(x);
+            // The pixel path's counts are put back as they were: a census
+            // must not move what it reports on.
+            const Pipe::Tally kept = k.P->tally;
+            Rgba o;
+            const bool ok = fetchTexelBytes(*k.P, *k.t, 0, tx, ty, o);
+            k.P->tally = kept;
+            if (ok) {
+                rgb[0] = static_cast<u8>(clamp255(o.r));
+                rgb[1] = static_cast<u8>(clamp255(o.g));
+                rgb[2] = static_cast<u8>(clamp255(o.b));
+            }
+            return ok;
+        };
+        r128TextureSeen(s);
     }
 }
 

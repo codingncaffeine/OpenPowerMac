@@ -4,13 +4,19 @@
 
 #include "opm/r128.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
+#include <tuple>
+#include <vector>
 
 namespace opm {
 
 u32 gR128SettingSeen[static_cast<size_t>(R128Setting::Count)] = {};
+bool gR128TexCensusOn = false;
 
 namespace {
 
@@ -259,6 +265,249 @@ std::string r128UndecodedReport(const R128Cell& a)
                         : miss;
     if (!unaudited.empty())
         out += "--   not audited (bits ever set):" + unaudited + "\n";
+    return out;
+}
+
+// ── The texture census ────────────────────────────────────────────────────
+//
+// Every distinct texture a packet of primitives is drawn with, and what can
+// be read off its own bytes about how they are laid down. A 16-bit texel is
+// two bytes and nothing in the stream says which is the high one; a picture,
+// though, is smoother read the right way round, because the wrong way puts
+// the low bits of green beside the high bits of red. So the top level's
+// first rows are decoded both ways and the channel differences between
+// horizontal neighbors are summed for each: the smaller sum is the order the
+// texture was written in. A flat texture says nothing and is listed so.
+namespace {
+
+struct TexKey {
+    u32 unit, where, base, w, h, fmt; // where: 0 video memory, 1 AGP space
+    bool operator<(const TexKey& o) const
+    {
+        return std::tie(unit, where, base, w, h, fmt) <
+               std::tie(o.unit, o.where, o.base, o.w, o.h, o.fmt);
+    }
+};
+struct TexFacts {
+    u64 packets = 0, order = 0;
+    u32 texCntl = 0, unitCntl = 0, dpDatatype = 0;
+    u64 roughHighFirst = 0, roughLowFirst = 0;
+    // 32-bit texels: how many have 0x00 or 0xFF as their first byte and as
+    // their last, which is where an alpha channel shows.
+    u64 flatFirst = 0, flatLast = 0, texels = 0;
+    // The whole top level: how many of its bytes are not zero. A texture
+    // that was never filled draws black and looks like a lighting fault.
+    u64 bytes = 0, bytesSet = 0;
+    bool unread = false;
+    // The top level as the pipeline decodes it, three bytes a texel, when
+    // pictures were asked for.
+    std::vector<u8> rgb;
+};
+bool gTexPictures = false;
+std::mutex gTexLock;
+std::map<TexKey, TexFacts> gTexSeen;
+
+constexpr u8 kTexelBytes[16] = {1, 1, 1, 2, 2, 3, 4, 1, 1, 1, 2, 2, 2, 2, 4, 2};
+
+void texRoughness(const R128TexSeen& t, TexFacts& f)
+{
+    const u32 rows = t.h < 32u ? t.h : 32u;
+    const u32 cols = t.w < 64u ? t.w : 64u;
+    const u32 bytes = t.fmt == 6u ? 4u : 2u;
+    for (u32 y = 0; y < rows; ++y) {
+        u32 prev[2] = {0, 0};
+        for (u32 x = 0; x < cols; ++x) {
+            u8 b[4] = {0, 0, 0, 0};
+            const u32 at = t.base + (y * t.pitch + x) * bytes;
+            for (u32 k = 0; k < bytes; ++k)
+                if (!t.byteAt(t.ctx, at + k, b[k])) {
+                    f.unread = true;
+                    return;
+                }
+            ++f.texels;
+            if (bytes == 4u) {
+                f.flatFirst += b[0] == 0u || b[0] == 0xFFu;
+                f.flatLast += b[3] == 0u || b[3] == 0xFFu;
+                continue;
+            }
+            const u32 v[2] = {(static_cast<u32>(b[0]) << 8) | b[1],
+                              (static_cast<u32>(b[1]) << 8) | b[0]};
+            if (x) {
+                for (int o = 0; o < 2; ++o) {
+                    u32 d = 0;
+                    const auto ch = [&](u32 shift, u32 mask) {
+                        const int a0 = static_cast<int>((v[o] >> shift) & mask);
+                        const int a1 =
+                            static_cast<int>((prev[o] >> shift) & mask);
+                        d += static_cast<u32>(a0 > a1 ? a0 - a1 : a1 - a0);
+                    };
+                    if (t.fmt == 4u) { // 565: green halved to weigh as red
+                        ch(11, 31);
+                        ch(6, 31);
+                        ch(0, 31);
+                    } else if (t.fmt == 15u) {
+                        ch(12, 15);
+                        ch(8, 15);
+                        ch(4, 15);
+                        ch(0, 15);
+                    } else {
+                        ch(10, 31);
+                        ch(5, 31);
+                        ch(0, 31);
+                    }
+                    (o ? f.roughLowFirst : f.roughHighFirst) += d;
+                }
+            }
+            prev[0] = v[0];
+            prev[1] = v[1];
+        }
+    }
+}
+
+// A verdict needs a margin: a fifth less rough one way than the other.
+int texVerdict(const TexFacts& f)
+{
+    if (f.unread)
+        return 3;
+    const u64 hi = f.roughHighFirst, lo = f.roughLowFirst;
+    if (hi * 5u < lo * 4u)
+        return 0; // high byte first
+    if (lo * 5u < hi * 4u)
+        return 1; // low byte first
+    return 2;     // no telling
+}
+
+} // namespace
+
+void r128TextureSeen(const R128TexSeen& t)
+{
+    std::lock_guard<std::mutex> lock(gTexLock);
+    const TexKey key{t.unit, t.agp ? 1u : 0u, t.base, t.w, t.h, t.fmt};
+    auto [it, fresh] = gTexSeen.try_emplace(key);
+    TexFacts& f = it->second;
+    ++f.packets;
+    if (!fresh)
+        return;
+    f.order = gTexSeen.size();
+    f.texCntl = t.texCntl;
+    f.unitCntl = t.unitCntl;
+    f.dpDatatype = t.dpDatatype;
+    if (t.fmt == 3u || t.fmt == 4u || t.fmt == 15u || t.fmt == 6u)
+        texRoughness(t, f);
+    const u32 n = kTexelBytes[t.fmt & 15u];
+    for (u32 y = 0; y < t.h && !f.unread; ++y)
+        for (u32 x = 0; x < t.w * n; ++x) {
+            u8 b = 0;
+            if (!t.byteAt(t.ctx, t.base + y * t.pitch * n + x, b)) {
+                f.unread = true;
+                break;
+            }
+            ++f.bytes;
+            f.bytesSet += b != 0u;
+        }
+    if (!gTexPictures || f.unread)
+        return;
+    f.rgb.assign(static_cast<size_t>(t.w) * t.h * 3u, 0);
+    for (u32 y = 0; y < t.h; ++y)
+        for (u32 x = 0; x < t.w; ++x)
+            t.texelAt(t.ctx, x, y,
+                      &f.rgb[(static_cast<size_t>(y) * t.w + x) * 3u]);
+}
+
+void r128TextureCensus(bool on, bool pictures)
+{
+    std::lock_guard<std::mutex> lock(gTexLock);
+    gR128TexCensusOn = on;
+    gTexPictures = on && pictures;
+    gTexSeen.clear();
+}
+
+std::vector<R128TexturePicture> r128TexturePictures()
+{
+    std::lock_guard<std::mutex> lock(gTexLock);
+    std::vector<R128TexturePicture> out;
+    for (const auto& [k, f] : gTexSeen) {
+        if (f.rgb.empty())
+            continue;
+        char name[96];
+        std::snprintf(name, sizeof name, "%03llu-unit%u-%s-%08x-%ux%u-fmt%u",
+                      static_cast<unsigned long long>(f.order), k.unit + 1u,
+                      k.where ? "agp" : "vram", k.base, k.w, k.h, k.fmt);
+        out.push_back({name, k.w, k.h, f.rgb});
+    }
+    return out;
+}
+
+std::string r128TextureReport()
+{
+    std::lock_guard<std::mutex> lock(gTexLock);
+    std::string out = "-- textures drawn with, and the byte order a 16-bit "
+                      "one reads smoother in:\n";
+    if (gTexSeen.empty())
+        return out + "--   none (or the census is off)\n";
+    static const char* const kWhere[2] = {"video memory", "AGP space"};
+    static const char* const kVerdict[4] = {"high byte first",
+                                            "low byte first", "no telling",
+                                            "not readable"};
+    // The totals first, split by where the texture lies and by the control
+    // bits a driver might be choosing the order with.
+    std::map<std::tuple<u32, u32, u32, u32, int>, u32> totals;
+    for (const auto& [k, f] : gTexSeen) {
+        if (k.fmt == 6u)
+            continue;
+        ++totals[{k.where, (f.texCntl >> 21) & 1u, (f.dpDatatype >> 29) & 1u,
+                  (f.unitCntl >> 15) & 1u, texVerdict(f)}];
+    }
+    char b[280];
+    for (const auto& [k, n] : totals) {
+        std::snprintf(b, sizeof b,
+                      "--   %-12s TEX_CNTL_C.21=%u DP_DATATYPE.29=%u "
+                      "unit cntl.15=%u: %4u 16-bit texture(s) %s\n",
+                      kWhere[std::get<0>(k)], std::get<1>(k), std::get<2>(k),
+                      std::get<3>(k), n, kVerdict[std::get<4>(k)]);
+        out += b;
+    }
+    std::vector<std::pair<TexKey, const TexFacts*>> rows;
+    for (const auto& [k, f] : gTexSeen)
+        rows.push_back({k, &f});
+    std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) {
+        return x.second->order < y.second->order;
+    });
+    size_t shown = 0;
+    for (const auto& [k, fp] : rows) {
+        const TexFacts& f = *fp;
+        if (++shown > 48u) {
+            std::snprintf(b, sizeof b, "--   ... and %zu more\n",
+                          rows.size() - 48u);
+            out += b;
+            break;
+        }
+        const unsigned long long set =
+            f.bytes ? f.bytesSet * 100u / f.bytes : 0u;
+        if (k.fmt == 6u)
+            std::snprintf(b, sizeof b,
+                          "--   unit %u %-12s %08x %4ux%-4u fmt %2u, %6llu "
+                          "packet(s), %3llu%% of its bytes set: of %llu "
+                          "texels 00/FF in the first byte %llu, in the last "
+                          "%llu\n",
+                          k.unit + 1u, kWhere[k.where], k.base, k.w, k.h,
+                          k.fmt, static_cast<unsigned long long>(f.packets),
+                          set, static_cast<unsigned long long>(f.texels),
+                          static_cast<unsigned long long>(f.flatFirst),
+                          static_cast<unsigned long long>(f.flatLast));
+        else
+            std::snprintf(b, sizeof b,
+                          "--   unit %u %-12s %08x %4ux%-4u fmt %2u, %6llu "
+                          "packet(s), %3llu%% of its bytes set: rough %llu "
+                          "high first, %llu low first: %s\n",
+                          k.unit + 1u, kWhere[k.where], k.base, k.w, k.h,
+                          k.fmt, static_cast<unsigned long long>(f.packets),
+                          set,
+                          static_cast<unsigned long long>(f.roughHighFirst),
+                          static_cast<unsigned long long>(f.roughLowFirst),
+                          kVerdict[texVerdict(f)]);
+        out += b;
+    }
     return out;
 }
 

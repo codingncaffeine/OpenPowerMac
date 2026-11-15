@@ -582,3 +582,164 @@ TEST_CASE("cce: an indirect body drives the 2D engine through PACKET0")
     CHECK(e.fills - before.fills == 1);
     CHECK(e.pixels - before.pixels == 16);
 }
+
+// ── The scanline packets, the transparent copy, the 24 bpp flag ───────────
+
+namespace {
+
+// A 32-px-wide 32 bpp surface at the start of video memory.
+constexpr size_t kStride32 = 4u * 8u * 4u;
+u32 pix32(const R128Cell& c, u32 x, u32 y)
+{
+    const size_t o = y * kStride32 + static_cast<size_t>(x) * 4u;
+    return (u32(c.vram[o]) << 24) | (u32(c.vram[o + 1]) << 16) |
+           (u32(c.vram[o + 2]) << 8) | c.vram[o + 3];
+}
+void setPix32(R128Cell& c, u32 x, u32 y, u32 v)
+{
+    const size_t o = y * kStride32 + static_cast<size_t>(x) * 4u;
+    for (u32 k = 0; k < 4; ++k)
+        c.vram[o + k] = static_cast<u8>(v >> (8u * (3u - k)));
+}
+// SETTINGS for a solid PATCOPY fill of that surface: five words.
+void solidSettings(CceRig& r, u32 colour)
+{
+    r.fifo(2u | 8u | (13u << 4) | (6u << 8) | (0xF0u << 16));
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET: pitch8 = 4, offset 0
+    r.fifo(0x00000000u); // SC_TOP_LEFT
+    r.fifo(0x001F001Fu); // SC_BOT_RITE (31,31)
+    r.fifo(colour);
+}
+
+} // namespace
+
+TEST_CASE("cce: POLYSCANLINES (0x98) paints each run of each scanline")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    // Two scanlines: one run on the first, two on the second (a
+    // polyscanline), the second two pixels thick.
+    r.fifo(0xC0009800u | (12u << 16)); // 13-DWord body
+    solidSettings(r, 0x00445566u);
+    r.fifo(2u);          // SCAN_COUNT
+    r.fifo(1u);          //   NUM_LINE
+    r.fifo(0x00010003u); //   HEIGHT=1 TOP=3
+    r.fifo(0x00090004u); //   END=9 START=4
+    r.fifo(2u);          //   NUM_LINE
+    r.fifo(0x00020005u); //   HEIGHT=2 TOP=5
+    r.fifo(0x00030001u); //   END=3 START=1
+    r.fifo(0x00140010u); //   END=20 START=16
+    const auto& e = r128EngStats();
+    CHECK(e.ccePkt3 - before.ccePkt3 == 1);
+    CHECK(e.fills - before.fills == 3);
+    CHECK(e.pixels - before.pixels == 5u + 2u * 2u + 4u * 2u);
+    CHECK(pix32(r.c, 3, 3) == 0u);
+    CHECK(pix32(r.c, 4, 3) == 0x00445566u);
+    CHECK(pix32(r.c, 8, 3) == 0x00445566u);
+    CHECK(pix32(r.c, 9, 3) == 0u); // END is the pixel after the run
+    CHECK(pix32(r.c, 4, 4) == 0u); // one pixel thick
+    CHECK(pix32(r.c, 1, 5) == 0x00445566u);
+    CHECK(pix32(r.c, 2, 6) == 0x00445566u);
+    CHECK(pix32(r.c, 3, 5) == 0u);
+    CHECK(pix32(r.c, 16, 6) == 0x00445566u);
+    CHECK(pix32(r.c, 19, 5) == 0x00445566u);
+    CHECK(pix32(r.c, 20, 5) == 0u);
+    CHECK(pix32(r.c, 1, 7) == 0u);
+    CHECK(r128CceP3Skipped().count(0x98u) == 0);
+}
+
+TEST_CASE("cce: PLY_NEXTSCAN (0x1D) paints one more scanline with the "
+          "settings in force")
+{
+    CceRig r;
+    // A PAINT sets the surface, the scissor, the brush and the ROP...
+    r.fifo(0xC0009100u | (6u << 16));
+    solidSettings(r, 0x00778899u);
+    r.fifo(0x00000000u); // TOP=0 LEFT=0
+    r.fifo(0x00010001u); // BOTM=1 RITE=1: one pixel
+    const auto before = r128EngStats();
+    // ...and the next scanline needs only its own three words.
+    r.fifo(0xC0001D00u | (2u << 16));
+    r.fifo(0x00010008u); // HEIGHT=1 TOP=8
+    r.fifo(0x00060002u); // END=6 START=2
+    r.fifo(0x000C000Au); // END=12 START=10
+    const auto& e = r128EngStats();
+    CHECK(e.fills - before.fills == 2);
+    CHECK(e.pixels - before.pixels == 6);
+    CHECK(pix32(r.c, 2, 8) == 0x00778899u);
+    CHECK(pix32(r.c, 5, 8) == 0x00778899u);
+    CHECK(pix32(r.c, 6, 8) == 0u);
+    CHECK(pix32(r.c, 10, 8) == 0x00778899u);
+    CHECK(pix32(r.c, 11, 8) == 0x00778899u);
+    CHECK(pix32(r.c, 12, 8) == 0u);
+    CHECK(r128CceP3Skipped().count(0x1Du) == 0);
+}
+
+TEST_CASE("cce: TRANS_BITBLT (0x9C) copies all but the source's key colour")
+{
+    CceRig r;
+    // A 3x1 source at (2,1): a pixel, the key colour, a pixel. The
+    // destination row at (10,5) already holds something.
+    setPix32(r.c, 2, 1, 0x00112233u);
+    setPix32(r.c, 3, 1, 0x00FF00FFu);
+    setPix32(r.c, 4, 1, 0x00445566u);
+    for (u32 x = 10; x < 13; ++x)
+        setPix32(r.c, x, 5, 0x00ABABABu);
+    const auto before = r128EngStats();
+    // SETTINGS: both pitch/offsets and the clip supplied, no brush, 32 bpp,
+    // source of the destination's type, SRCCOPY, from video memory, and
+    // GMC_WR_MSK_DIS, which sets the compare mask to every bit (a mask of
+    // zero compares nothing, and every pixel then equals the reference).
+    r.fifo(0xC0009C00u | (10u << 16)); // 11-DWord body
+    r.fifo(1u | 2u | 8u | (15u << 4) | (6u << 8) | (3u << 12) | (0xCCu << 16) |
+           (2u << 24) | (1u << 30));
+    r.fifo(0x00800000u); // SRC_PITCH_OFFSET
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET
+    r.fifo(0x00000000u); // SC_TOP_LEFT
+    r.fifo(0x001F001Fu); // SC_BOT_RITE
+    r.fifo(0x01000005u); // CLR_CMP_CNTL: the source function, 5 = write the
+                         // pixels that are NOT the reference colour
+    r.fifo(0x00FF00FFu); // SRC_REF_CLR
+    r.fifo(0x00000000u); // DST_REF_CLR
+    r.fifo(0x00010002u); // SRC_Y=1 | SRC_X=2
+    r.fifo(0x0005000Au); // DST_Y=5 | DST_X=10
+    r.fifo(0x00010003u); // DST_H=1 | DST_W=3
+    const auto& e = r128EngStats();
+    CHECK(e.copies - before.copies == 1);
+    CHECK(pix32(r.c, 10, 5) == 0x00112233u);
+    CHECK(pix32(r.c, 11, 5) == 0x00ABABABu); // keyed out: what was there
+    CHECK(pix32(r.c, 12, 5) == 0x00445566u);
+    CHECK(r128CceP3Skipped().count(0x9Cu) == 0);
+    // The other source function, 4, writes ONLY the reference colour.
+    for (u32 x = 10; x < 13; ++x)
+        setPix32(r.c, x, 6, 0x00ABABABu);
+    r.fifo(0xC0009C00u | (10u << 16));
+    r.fifo(1u | 2u | 8u | (15u << 4) | (6u << 8) | (3u << 12) | (0xCCu << 16) |
+           (2u << 24) | (1u << 30));
+    r.fifo(0x00800000u);
+    r.fifo(0x00800000u);
+    r.fifo(0x00000000u);
+    r.fifo(0x001F001Fu);
+    r.fifo(0x01000004u);
+    r.fifo(0x00FF00FFu);
+    r.fifo(0x00000000u);
+    r.fifo(0x00010002u);
+    r.fifo(0x0006000Au); // DST_Y=6
+    r.fifo(0x00010003u);
+    CHECK(pix32(r.c, 10, 6) == 0x00ABABABu);
+    CHECK(pix32(r.c, 11, 6) == 0x00FF00FFu);
+    CHECK(pix32(r.c, 12, 6) == 0x00ABABABu);
+}
+
+TEST_CASE("cce: SET_MODE_24BPP (0x1F) is taken, and the stream stays in step")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    r.fifo(0xC0001F00u); // one-DWord body
+    r.fifo(1u);          // FLAG
+    r.fifo(0x00000578u); // a register write that must not be swallowed
+    r.fifo(0x24242424u);
+    CHECK(r128EngStats().ccePkt3 - before.ccePkt3 == 1);
+    CHECK(r128CceP3Skipped().count(0x1Fu) == 0);
+    CHECK(r.c.peek(0x15E0u) == 0x24242424u);
+}

@@ -1556,6 +1556,106 @@ struct CceDst {
     u32 bpp = 0, dstOff = 0, pitchBytes = 0;
     int scL = 0, scR = 0, scT = 0, scB = 0;
 };
+// ── Scanlines (SDK F.15 POLYSCANLINES, F.20 PLY_NEXTSCAN) ────────────────
+//
+// A scanline is [HEIGHT | TOP] and then one [END | START] pair for each run
+// along it: a band HEIGHT pixels thick, painted from START to END with the
+// brush and ROP in force, which is a rectangle to this engine. The manual
+// does not say whether END is the last pixel painted or the one after it;
+// it is taken as the one after, the way PAINT's right and bottom edges are
+// in the same family of packets. Returns the index past the scanline, or
+// n + 1 if the body ends inside it.
+static u32 cceScanline(R128Cell& c, const u32* body, u32 i, u32 n, u32 runs)
+{
+    if (i >= n)
+        return n + 1u;
+    const u32 ht = body[i++];
+    const u32 top = ht & 0xFFFFu, height = (ht >> 16) & 0x3FFFu;
+    for (u32 k = 0; k < runs; ++k) {
+        if (i >= n)
+            return n + 1u;
+        const u32 se = body[i++];
+        const u32 start = se & 0xFFFFu, end = se >> 16;
+        const u32 w = (end - start) & 0x3FFFu;
+        if (!w || !height || end < start)
+            continue;
+        cceRegWrite(c, 0x1438u, (top << 16) | start); // DST_Y_X
+        cceRegWrite(c, 0x143Cu, (height << 16) | w);  // DST_HEIGHT_WIDTH: draw
+    }
+    return i;
+}
+
+// POLYSCANLINES (0x98): SETTINGS, [SCAN_COUNT], then that many scanlines,
+// each led by its own [NUM_LINE], the number of runs.
+static bool cceOpPolyScanlines(R128Cell& c, const u32* body, u32 n)
+{
+    u32 i = cceSettings(c, body, n);
+    if (i >= n)
+        return false;
+    const u32 scans = body[i++];
+    for (u32 s = 0; s < scans; ++s) {
+        if (i >= n)
+            return false;
+        const u32 runs = body[i++];
+        i = cceScanline(c, body, i, n, runs);
+        if (i > n)
+            return false;
+    }
+    return true;
+}
+
+// PLY_NEXTSCAN (0x1D): one more scanline "using the current settings": no
+// SETTINGS, no counts; the runs are whatever the packet has left.
+static bool cceOpPlyNextScan(R128Cell& c, const u32* body, u32 n)
+{
+    return n >= 1u && cceScanline(c, body, 0, n, n - 1u) <= n;
+}
+
+static u32 cceConvColor(u32 rgbq, u32 dstType);
+
+// TRANS_BITBLT (0x9C, SDK F.19): a copy from video memory with a colour
+// compare. After SETTINGS: [CLR_CMP_CNTL], the source and destination
+// reference colours as RGBQUADs, then [SRC_Y | SRC_X], [DST_Y | DST_X] and
+// [DST_H | DST_W], each with its first-named half in the high word. The
+// compare word has CLR_CMP_CNTL's own layout (functions in 2:0 and 10:8,
+// which of them in 25:24), so the packet is the three compare registers and
+// one blit. They are left as the packet set them: the manual says nothing
+// of putting them back, and a driver that wants the compare off afterwards
+// has GMC_CLR_CMP_CNTL_DIS in its next GUI_CONTROL.
+static bool cceOpTransBitblt(R128Cell& c, const u32* body, u32 n)
+{
+    const u32 i = cceSettings(c, body, n);
+    if (i > n || i + 6u > n)
+        return false;
+    const u32 dstType = c.peek(kDpDatatype) & 0xFu;
+    cceRegWrite(c, 0x15C4u, cceConvColor(body[i + 1u], dstType));
+    cceRegWrite(c, 0x15C8u, cceConvColor(body[i + 2u], dstType));
+    cceRegWrite(c, kClrCmpCntl, body[i]);
+    const u32 s = body[i + 3u], d = body[i + 4u], hw = body[i + 5u];
+    const u32 w = hw & 0x3FFFu, h = (hw >> 16) & 0x3FFFu;
+    if (!w || !h)
+        return true;
+    u32 sx = s & 0xFFFFu, sy = s >> 16;
+    u32 dx = d & 0xFFFFu, dy = d >> 16;
+    // Walk away from the source, as BITBLT_MULTI does, so an overlapping
+    // copy reads each pixel before it is written.
+    const bool l2r = dx <= sx, t2b = dy <= sy;
+    if (!l2r) {
+        sx += w - 1u;
+        dx += w - 1u;
+    }
+    if (!t2b) {
+        sy += h - 1u;
+        dy += h - 1u;
+    }
+    cceRegWrite(c, kDpCntl, (c.peek(kDpCntl) & ~3u) | (l2r ? 1u : 0u) |
+                                (t2b ? 2u : 0u));
+    cceRegWrite(c, 0x1434u, (sy << 16) | sx); // SRC_Y_X
+    cceRegWrite(c, 0x1438u, (dy << 16) | dx); // DST_Y_X
+    cceRegWrite(c, 0x143Cu, (h << 16) | w);   // DST_HEIGHT_WIDTH: draw
+    return true;
+}
+
 static bool cceDstState(R128Cell& c, u32 dstType, CceDst& d)
 {
     switch (dstType) {
@@ -1885,6 +1985,19 @@ static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
             done = cceOpNextChar(c, body, n);
         else if (op == 0x1Eu) // SET_SCISSORS — SDK F.22
             done = cceOpSetScissors(c, body, n);
+        else if (op == 0x98u) // POLYSCANLINES — SDK F.15
+            done = cceOpPolyScanlines(c, body, n);
+        else if (op == 0x1Du) // PLY_NEXTSCAN — SDK F.20
+            done = cceOpPlyNextScan(c, body, n);
+        else if (op == 0x9Cu) // TRANS_BITBLT — SDK F.19
+            done = cceOpTransBitblt(c, body, n);
+        else if (op == 0x1Fu)
+            // SET_MODE_24BPP — SDK F.23: "the 24bpp flag in the microcode
+            // engine", one word. The manual gives the flag no effect a
+            // packet's result could show, and the packets here take the
+            // pixel width from GUI_CONTROL's destination type, 24 bpp
+            // included. Taken and counted, so the stream stays in step.
+            done = n == 1u;
         else if (op3d) { // the 3D packets — SDK F.24/F.26/F.27/F.21
             CceMem pm = m;
             pm.worker = worker;

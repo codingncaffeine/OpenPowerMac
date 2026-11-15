@@ -103,6 +103,15 @@ class JitCache {
     // the report prints them only when populated).
     u64 tscProbe = 0, tscNative = 0;
     u64 fallbacks = 0;
+    // Every instruction a block called out for, by either path: the rows'
+    // own counts added up (the direct call keeps only those).
+    u64 fallbackTotal() const
+    {
+        u64 n = 0;
+        for (u64 v : fbByRow)
+            n += v;
+        return n;
+    }
     u64 memOps = 0;
     u64 fbByRow[1024] = {};
     // 🔬 --jit-tsc: THE HOST-CYCLE SPLIT. Counting calls says which rows are

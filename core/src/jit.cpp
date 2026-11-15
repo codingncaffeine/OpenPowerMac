@@ -1025,8 +1025,8 @@ struct Compiler {
     // thing an FP handler can reach, raiseExc's exception-ring record of
     // st.tb, reads the RAW timebase — which the interpreter leaves equally
     // un-advanced mid-batch — so both machines record the same value.
-    void fallbackDirect(u32 insn, u32 row, u32 nextVa, const void* fn,
-                        bool fpGate, bool keepBatch)
+    void fallbackDirectFull(u32 insn, u32 row, u32 nextVa, const void* fn,
+                            bool fpGate, bool keepBatch)
     {
         size_t coldJ = size_t(-1);
         if (fpGate) { // execRow's kPreFp arm, tested before anything is written
@@ -1093,6 +1093,66 @@ struct Compiler {
             const size_t joinJ = e.jmp32f();
             e.patch32(coldJ);
             fallback(insn, row, nextVa); // FP unavailable: the generic path
+            e.patch32(joinJ);
+        }
+    }
+    void fallbackDirect(u32 insn, u32 row, u32 nextVa, const void* fn,
+                        bool fpGate, bool keepBatch)
+    {
+        if (c.jitFullGate) {
+            fallbackDirectFull(insn, row, nextVa, fn, fpGate, keepBatch);
+            return;
+        }
+        // ⭐ THE LINE EXECUTOR'S CALL, NOT execRow's. Every row admitted
+        // here is one the line executor runs through its own fast path (a
+        // bound handler, no gate but FP availability), and that path is:
+        // clear raisedThisStep, set curInsn and the pc, call the handler,
+        // charge, then leave if the batch ended, the pc moved or the line
+        // was dropped. execRow's perfmon and trace tails are not on it: a
+        // line is only ever entered with MMCR0 clear and tracing off, and
+        // the writers of both end the batch. The first version of this
+        // emitted those tails' tests anyway (fallbackDirectFull), with a
+        // test of `halted` that batchBreak already covers, after each of
+        // the 100 M floating-point operations in a game's 400 M.
+        //
+        // With `keepBatch` (the FP compute rows, whose handlers touch the
+        // FPRs, FPSCR, CR and, to trap, the pc, and nothing else) the batch
+        // cannot have ended and no line can have been dropped: the pc is
+        // the one thing left to ask.
+        size_t coldJ = size_t(-1);
+        if (fpGate) { // FP unavailable is execRow's to raise: the cold arm
+            e.loadR(RAX, o.msr);
+            e.b(0xA9); // test eax, msr::FP
+            e.i32le(0x2000u);
+            coldJ = e.j32(CC_Z);
+        }
+        // The census, one increment: which rows a block still calls out for.
+        e.bytes({0x48, 0xB8});       // mov rax, imm64 &fbByRow[row]
+        e.i64le(reinterpret_cast<u64>(&jc->fbByRow[row < 1024u ? row : 1023u]));
+        e.bytes({0x48, 0xFF, 0x00}); // inc qword [rax]
+        e.mem13(0xC6, 0, o.raisedThis); // mov byte [r13+raisedThisStep], 0
+        e.b(0);
+        e.storeI(o.curInsn, insn);
+        if (keepBatch)
+            e.storeI(o.pc, nextVa); // the handler's NIA; the counts stay in rbx
+        else
+            flushPc(nextVa);
+        e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
+        e.movEdxI(insn);             // (no handler reads its third argument)
+        e.callAbs(fn);
+        if (keepBatch) {
+            bump();
+            pcCheck(nextVa);
+        } else {
+            chargeInc();
+            byteCheck(o.batchBreak); // halt() sets it too
+            pcCheck(nextVa);
+            flCheck();
+        }
+        if (coldJ != size_t(-1)) {
+            const size_t joinJ = e.jmp32f();
+            e.patch32(coldJ);
+            fallback(insn, row, nextVa);
             e.patch32(joinJ);
         }
     }

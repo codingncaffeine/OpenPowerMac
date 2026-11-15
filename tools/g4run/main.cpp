@@ -5648,7 +5648,7 @@ int main(int argc, char** argv)
                              static_cast<double>(cpu.jit->enters +
                                                  cpu.jitChainHops)
                        : 0.0);
-        if (cpu.jit && (cpu.jit->fallbacks || cpu.jit->memOps))
+        if (cpu.jit && (cpu.jit->fallbackTotal() || cpu.jit->memOps))
             printf("--   jit mix: %llu mem ops (%.1f%% of native insns) "
                    "+ %llu fp mem ops (%.1f%%), %llu fallback insns (%.1f%%)\n",
                    static_cast<unsigned long long>(cpu.jit->memOps),
@@ -5660,12 +5660,12 @@ int main(int argc, char** argv)
                        ? 100.0 * static_cast<double>(cpu.jit->fpMemOps) /
                              static_cast<double>(cpu.jit->insns)
                        : 0.0,
-                   static_cast<unsigned long long>(cpu.jit->fallbacks),
+                   static_cast<unsigned long long>(cpu.jit->fallbackTotal()),
                    cpu.jit->insns
-                       ? 100.0 * static_cast<double>(cpu.jit->fallbacks) /
+                       ? 100.0 * static_cast<double>(cpu.jit->fallbackTotal()) /
                              static_cast<double>(cpu.jit->insns)
                        : 0.0);
-        if (cpu.jit && cpu.jit->fallbacks) {
+        if (cpu.jit && cpu.jit->fallbackTotal()) {
             std::vector<std::pair<u64, u32>> fb;
             for (u32 k = 0; k < 1024; ++k)
                 if (cpu.jit->fbByRow[k])
@@ -5761,10 +5761,10 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(calls),
                    static_cast<unsigned long long>(fbk),
                    nat ? 100.0 * static_cast<double>(fbk) / nat : 0.0,
-                   J.fallbacks ? static_cast<double>(fbk) /
-                                     static_cast<double>(J.fallbacks)
+                   J.fallbackTotal() ? static_cast<double>(fbk) /
+                                     static_cast<double>(J.fallbackTotal())
                                : 0.0,
-                   static_cast<unsigned long long>(J.fallbacks),
+                   static_cast<unsigned long long>(J.fallbackTotal()),
                    nat ? 100.0 * (nat - static_cast<double>(mem + fbk)) / nat
                        : 0.0);
         }

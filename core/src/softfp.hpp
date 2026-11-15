@@ -72,5 +72,37 @@ inline constexpr u32 kFastOffDbl = 2u;
 extern u32 gHostFastOff;
 extern u64 gFastHits, gFastMiss;   // single-target: taken vs bailed
 extern u64 gFastHitsD, gFastMissD; // double-target (incl. frsp); g4run reports both
+// Why a fast path declined (the multiply/add/fused ones; divide keeps its
+// own count in the misses above). kFastWhyName is the same list in words.
+enum : u32 {
+    kWhySglOperand,   // an operand is a NaN, an infinity or a denormal
+    kWhySglNotSingle, // an operand is not a single's value
+    kWhySglOverflow,  // the result overflowed
+    kWhySglDenormal,  // the result is a denormal
+    kWhySglResidue,   // the addend reaches below the product's 53 bits
+    kWhySglToZero,    // the result underflowed to zero
+    kWhyDblOperand,   // an operand is outside the admitted band
+    kWhyDblAddWindow, // an add whose smaller operand falls off the window
+    kWhyDblFmaWindow, // a fused op whose addend or product does
+    kWhyDblTiny,      // the result is tiny, a denormal, or an inexact zero
+    kWhyDblOverflow,  // the result overflowed
+    kWhyNoFma,        // this host has no fused multiply-add
+    kFastWhyN
+};
+extern u64 gFastWhy[kFastWhyN];
+inline constexpr const char* kFastWhyName[kFastWhyN] = {
+    "single: operand NaN/infinity/denormal",
+    "single: operand not a single's value",
+    "single: result overflowed",
+    "single: result denormal",
+    "single: addend below the product's 53 bits",
+    "single: result underflowed to zero",
+    "double: operand denormal/NaN/infinity/out of band",
+    "double: add, smaller operand falls off the window",
+    "double: fused, addend or product falls off the window",
+    "double: result tiny or denormal",
+    "double: result overflowed",
+    "no fused multiply-add on this host",
+};
 
 } // namespace opm::sf

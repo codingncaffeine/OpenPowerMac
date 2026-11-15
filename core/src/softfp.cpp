@@ -39,6 +39,10 @@ namespace opm::sf {
 u32 gHostFastOff = 0;
 u64 gFastHits = 0, gFastMiss = 0;
 u64 gFastHitsD = 0, gFastMissD = 0;
+// Why a fast path declined, by reason (kFastWhy in softfp.hpp names them):
+// "it bailed 45% of the time" says the model did the work, not what would
+// have to be answered for the host to do it instead.
+u64 gFastWhy[kFastWhyN] = {};
 
 #if OPM_SF_X64
 // The fused path of the fast case wants a HARDWARE fma: the C runtime's
@@ -299,6 +303,13 @@ inline U128 add128(U128 a, U128 b, bool& carry)
     return r;
 }
 
+// A fast path declining, counted by its reason.
+inline bool why(u32 reason)
+{
+    ++gFastWhy[reason];
+    return false;
+}
+
 // The one generic path: rounded( (a*c) [+/- b] ), optionally negated.
 // Handles fadd/fsub (c = 1.0), fmul (no addend), and the fmadd family.
 // NaN precedence is frA, frB, frC (PEM 3.3.4); only frsp truncates payloads.
@@ -334,7 +345,7 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
         return e ? e != 0x7FFu : (x & ~kSignBit) == 0;
     };
     if (!nzD(fa) || !nzD(fc) || (hasAddend && !nzD(fb)))
-        return false;
+        return why(kWhySglOperand);
     const double da = std::bit_cast<double>(fa);
     const double dc = std::bit_cast<double>(fc);
     const double db = hasAddend ? std::bit_cast<double>(fb) : 0.0;
@@ -343,7 +354,7 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
     const float sb = static_cast<float>(db);
     if (static_cast<double>(sa) != da || static_cast<double>(sc) != dc ||
         (hasAddend && static_cast<double>(sb) != db))
-        return false; // not single-valued: the model's territory
+        return why(kWhySglNotSingle); // not single-valued: the model's territory
     const double pd = static_cast<double>(sa) * static_cast<double>(sc);
     float r0;
     double S, T;
@@ -357,7 +368,7 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
         } else {
 #if OPM_SF_X64
             if (!kHaveFma)
-                return false;
+                return why(kWhyNoFma);
             r0 = hwFmaf(sa, sc, sb);
 #else
             r0 = std::fmaf(sa, sc, sb);
@@ -374,10 +385,11 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
     const u32 rbits = std::bit_cast<u32>(r0);
     const u32 rexp = (rbits >> 23) & 0xFFu;
     if (rexp == 0xFFu)
-        return false; // overflowed: the model owns OX and the defaults
+        return why(kWhySglOverflow); // overflowed: the model owns OX and the defaults
     if (rexp == 0u && (rbits & 0x007FFFFFu))
-        return false; // denormal result: left to the model (measured: the
-                      // host is no faster than the model on these)
+        return why(kWhySglDenormal); // denormal result: left to the model
+                                     // (measured: the host is no faster than
+                                     // the model on these)
     // ⚠ ANY 2Sum RESIDUE BAILS. T != 0 means the addend reaches below the
     // 53-bit window of the sum — jam territory in the model's aligned-add,
     // where BOTH deliverables leave ideal arithmetic behind: the jam is an
@@ -389,11 +401,11 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
     // the exact value IS the double S, the model's 106-bit accumulator
     // holds it entirely, and model == ideal — provably.
     if (T != 0.0)
-        return false;
+        return why(kWhySglResidue);
     const double r0d = static_cast<double>(r0); // exact widening
     const double resid = S - r0d; // exact: Sterbenz (S, r0d agree to 2^-23)
     if (r0 == 0.0f && resid != 0.0)
-        return false; // underflowed to zero: UX belongs to the model
+        return why(kWhySglToZero); // underflowed to zero: UX belongs to the model
     u32 fl = 0;
     if (resid != 0.0) {
         fl |= kXx;
@@ -504,7 +516,7 @@ inline bool finishD(double r0, double resid, bool negResult, R& out)
         // it is what every zero-operand shape produces and its sign already
         // matches the model's rules.
         if (!(re == 0u && (rb << 1) == 0 && resid == 0.0))
-            return false;
+            return why(re == 0x7FFu ? kWhyDblOverflow : kWhyDblTiny);
     }
     u32 fl = 0;
     if (resid != 0.0) {
@@ -528,10 +540,10 @@ bool dblMulFast(u64 fa, u64 fc, R& out)
 {
 #if OPM_SF_X64
     if (!kHaveFma)
-        return false; // the residue needs a real fma; the model keeps the row
+        return why(kWhyNoFma); // the residue needs a real fma; the model keeps the row
 #endif
     if (!admitD(fa) || !admitD(fc))
-        return false;
+        return why(kWhyDblOperand);
     const double da = std::bit_cast<double>(fa);
     const double dc = std::bit_cast<double>(fc);
     const double r0 = da * dc;
@@ -543,11 +555,11 @@ bool dblMulFast(u64 fa, u64 fc, R& out)
 bool dblAddFast(u64 fa, u64 fb, R& out)
 {
     if (!admitD(fa) || !admitD(fb))
-        return false;
+        return why(kWhyDblOperand);
     if ((fa << 1) != 0 && (fb << 1) != 0) {
         const i32 d = i32(u32(fa >> 52) & 0x7FFu) - i32(u32(fb >> 52) & 0x7FFu);
         if (d > i32(lowBitOne(fb)) || d < -i32(lowBitOne(fa)))
-            return false; // a bit would fall off the accumulator and be jammed
+            return why(kWhyDblAddWindow); // a bit would fall off the accumulator and be jammed
     }
     const double da = std::bit_cast<double>(fa);
     const double db = std::bit_cast<double>(fb);
@@ -561,10 +573,10 @@ bool dblFmaFast(u64 fa, u64 fc, u64 fb, bool negResult, R& out)
 {
 #if OPM_SF_X64
     if (!kHaveFma)
-        return false;
+        return why(kWhyNoFma);
 #endif
     if (!admitD(fa) || !admitD(fc) || !admitD(fb))
-        return false;
+        return why(kWhyDblOperand);
     if ((fa << 1) != 0 && (fc << 1) != 0 && (fb << 1) != 0) {
         // d = the model's product exponent minus the addend's. The product
         // exponent is ea+ec or ea+ec+1 (the normalization shift), so both
@@ -572,7 +584,7 @@ bool dblFmaFast(u64 fa, u64 fc, u64 fb, bool negResult, R& out)
         const i32 d = i32(u32(fa >> 52) & 0x7FFu) + i32(u32(fc >> 52) & 0x7FFu) -
                       i32(u32(fb >> 52) & 0x7FFu) - 1023;
         if (d + 1 > i32(lowBitOne(fb)) || d < -i32(lowBitProd(fa, fc)))
-            return false;
+            return why(kWhyDblFmaWindow);
     }
     const double da = std::bit_cast<double>(fa);
     const double dc = std::bit_cast<double>(fc);

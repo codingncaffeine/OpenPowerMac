@@ -5709,6 +5709,18 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(sf::gFastMissD),
                    100.0 * static_cast<double>(sf::gFastHitsD) /
                        static_cast<double>(sf::gFastHitsD + sf::gFastMissD));
+        {
+            // Why the fast paths declined, most frequent first: each line is
+            // a class of operation the generic model still computes.
+            std::vector<std::pair<u64, u32>> why;
+            for (u32 k = 0; k < sf::kFastWhyN; ++k)
+                if (sf::gFastWhy[k])
+                    why.push_back({sf::gFastWhy[k], k});
+            std::sort(why.rbegin(), why.rend());
+            for (const auto& [n, k] : why)
+                printf("--     declined, %s: %llu\n", sf::kFastWhyName[k],
+                       static_cast<unsigned long long>(n));
+        }
         if (cpu.jit && cpu.jit->tscProbe) { // populated only by --jit-tsc
             const JitCache& J = *cpu.jit;
             printf("--   jit tsc: probe %.1f/enter, native %.1f/enter "

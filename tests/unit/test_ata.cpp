@@ -316,3 +316,36 @@ TEST_CASE("an ATA command asserts BSY and completes only after its delay")
 
     remove(kIso);
 }
+
+TEST_CASE("a CD-class drive takes the power commands the standard requires of it")
+{
+    // ATA/ATAPI-4 (T13/1153D revision 18) 6.8: a device with the PACKET
+    // Command feature set that implements the Power Management feature set
+    // shall implement CHECK POWER MODE, IDLE IMMEDIATE, SLEEP and STANDBY
+    // IMMEDIATE. Mac OS sends SLEEP to its CD drives once the machine has
+    // sat idle long enough, and a drive that aborts it is retried for
+    // minutes with the Finder waiting on every attempt.
+    REQUIRE(makeIso());
+    AtaCell cd;
+    REQUIRE(cd.attachIso(kIso));
+    cd.write(0x060, 0x00, 1); // select device 0
+    for (const u32 cmd : {0xE0u, 0xE1u, 0xE6u, 0xE5u, 0xE2u, 0xE3u}) {
+        CAPTURE(cmd);
+        (void)cd.read(0x070, 1);         // the status read takes INTRQ away
+        CHECK(!cd.irqLine());
+        cd.write(0x020, 0x00, 1);
+        cd.write(0x070, cmd, 1);
+        const u32 status = cd.read(0x160, 1); // alternate status: no side effect
+        CHECK((status & 0x80u) == 0);    // not busy
+        CHECK((status & 0x40u) != 0);    // DRDY
+        CHECK((status & 0x08u) == 0);    // no data phase
+        CHECK((status & 0x01u) == 0);    // no error
+        CHECK(cd.irqLine());             // 9.9: completion is an interrupt
+        if (cmd == 0xE5u)
+            CHECK(cd.read(0x020, 1) == 0xFFu); // 8.6: active or idle
+    }
+    // The drive is still the drive: it identifies itself afterwards.
+    cd.write(0x070, 0xA1, 1);
+    CHECK(readIdentify(cd)[0] == 0x8580);
+    remove(kIso);
+}

@@ -867,6 +867,33 @@ void AtaCell::ataCommand(u8 cmd)
         status_ = kDrdy;
         irq_ = true;
         break;
+    // Power management, as the disk has it above. ATA/ATAPI-4 6.8: a device
+    // with the PACKET Command feature set that implements the Power
+    // Management feature set shall implement CHECK POWER MODE, IDLE
+    // IMMEDIATE, SLEEP and STANDBY IMMEDIATE (the two forms with a timer
+    // are the disk's minimum, and are taken here as well). Mac OS sends
+    // SLEEP to its CD drives when the machine has sat idle long enough;
+    // every one was ABORTED because this arm did not exist, the driver
+    // tried again some eight times, and the Finder waited on each try:
+    // measured, a machine left alone for twenty minutes then answered
+    // nothing for minutes.
+    //
+    // 8.40: SLEEP completes with DRDY set and no error. A drive in Sleep
+    // mode answers nothing until it is reset; this one goes on answering,
+    // which a host that resets before its next command cannot tell apart.
+    case 0xE0: // STANDBY IMMEDIATE
+    case 0xE1: // IDLE IMMEDIATE
+    case 0xE2: // STANDBY
+    case 0xE3: // IDLE
+    case 0xE6: // SLEEP
+        status_ = kDrdy;
+        irq_ = true;
+        break;
+    case 0xE5: // CHECK POWER MODE
+        nsect_ = 0xFF; // 8.6: active or idle. There is no spin-up here.
+        status_ = kDrdy;
+        irq_ = true;
+        break;
     default:
         if (log.size() >= 4096)
         log.erase(log.begin(), log.begin() + 2048);

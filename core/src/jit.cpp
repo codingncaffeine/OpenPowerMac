@@ -30,10 +30,10 @@
 //   every call moves those four registers across to RDI/RSI/RDX/RCX first
 //   (Emit::callAbs), the trampoline reads its own arguments from the System
 //   V registers, and the arena comes from mmap. See OPM_JIT_SYSV below. Pinned callee-saved registers:
-//   r13 = Cpu*, r14 = &stamp, r15 = insnCycles + extraCycles (constant for
-//   the length of a batch — only the harness writes those fields, never the
-//   guest). r12 stages the effective address across the one shim call of an
-//   update-form access. Blocks never touch XMM.
+//   r13 = Cpu*, rbx = instructions run and not yet settled, rbp = the
+//   batch's budget less what is settled (Compiler::settle). r12 stages the
+//   effective address across the one shim call of an update-form access.
+//   Blocks never touch XMM.
 
 #include "opm/jit.hpp"
 
@@ -87,15 +87,15 @@
 namespace opm {
 
 // A chain site's rel32 states (Stage B). The site is `jmp rel32`; relative to
-// its end sit, in fixed layout, a 12-byte parking block (dec hops + jmp
-// epilogue) and then the resolver thunk. So rel32 = 0 parks the site on the
+// its end sit, in fixed layout, a 5-byte parking block (one jump to the
+// way out) and then the resolver thunk. So rel32 = 0 parks the site on the
 // dispatcher exit (backref capacity exhausted — permanent until the block
-// recompiles), rel32 = 12 lands on the thunk (initial state, and the severed
+// recompiles), rel32 = 5 lands on the thunk (initial state, and the severed
 // state: re-resolve on next traversal), and anything else is a live link to
 // the successor's segment. The emitter, the resolver and sever() all speak
 // this encoding, so it lives here, once.
 inline constexpr i32 kChainRelPark = 0;
-inline constexpr i32 kChainRelThunk = 12;
+inline constexpr i32 kChainRelThunk = 5;
 
 namespace {
 
@@ -319,6 +319,8 @@ void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
 {
     JitCache& J = *c->jit;
     ++J.chainResolves;
+    if (c->jitCountHops)
+        --c->jitChainHops; // the site counted a hop on its way here
     const u32 slot = Cpu::fetchSlot(tgtPaLine);
     JitLine* ways = &J.line[slot * JitCache::kWays];
     const u32 vaLine = tgtVa & ~31u;
@@ -358,9 +360,11 @@ void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
 // the block with the pc already stored and the counts settled, and it
 // answers with the next block's entry or with null ("ask the dispatcher"):
 //
-//   the gate       as a linked hop has it (Compiler::chainChecks): the batch
-//                  has not ended, MSR is the one the dispatcher entered
-//                  under, a line's worth of budget remains;
+//   the gate       a line's worth of budget remains: tested by the block
+//                  before it calls (Compiler::chainChecks). The batch has
+//                  not ended and MSR is the one the dispatcher entered
+//                  under: both hold in a running block (see chainChecks)
+//                  and are asked again here, where asking is free;
 //   the page       unchanged: the one-page fetch translation must still
 //                  stand for it, by the same four compares fetchBlockFast
 //                  makes. Changed: the page memo, through fetchPageProbe,
@@ -375,9 +379,9 @@ void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
 //
 // Nothing here is new machine behavior: each step is one the interpreter
 // takes at the same point, or a refusal.
-const void* opmJitHop(Cpu* c, u64* stamp)
+const void* opmJitHop(Cpu* c)
 {
-    if (c->batchBreak || c->st.msr != c->jitMsr || c->jitUntil - *stamp < 8u)
+    if (c->batchBreak || c->st.msr != c->jitMsr)
         return nullptr;
     const u32 pc = c->st.pc;
     u32 paPage = c->xlPa;
@@ -399,7 +403,8 @@ const void* opmJitHop(Cpu* c, u64* stamp)
     const JitLine* ways = &J.line[slot * JitCache::kWays];
     for (u32 k = 0; k < JitCache::kWays; ++k)
         if (ways[k].base == base && ways[k].va == va) {
-            ++c->jitChainHops;
+            if (c->jitCountHops)
+                ++c->jitChainHops;
             return J.arena_ + ways[k].off[(pc >> 2) & 7u];
         }
     return nullptr;
@@ -643,6 +648,7 @@ struct Compiler {
     bool chain;         // Stage B on (compile chain sites at eligible exits)
     bool direct;        // call bound handlers directly (else the execRow shim)
     JitCache* jc;       // for the census counters' absolute addresses
+    u32 parkCounted;    // --jit-count-hops: the way out that takes a hop back
     // Forward intra-line chain jumps: the target segment's offset is not
     // known until its word is emitted, so compileLine patches these after
     // the loop. {position of the rel32, target word}.
@@ -662,42 +668,45 @@ struct Compiler {
 
     // -- shared fragments ----------------------------------------------------
 
-    // charge(insnCycles + extraCycles) + ++stamp — the execFast tail, in its
-    // direct form: two read-modify-writes. Used on the call-dominated paths
-    // (memory ops, fallbacks), where two RMWs are noise.
-    void chargeInc()
-    {
-        e.bytes({0x4D, 0x01, 0xBD});   // add [r13+pend], r15
-        e.i32le(u32(o.pend));
-        e.bytes({0x49, 0xFF, 0x06});   // inc qword [r14]
-    }
-    // ⭐ THE BATCHED FORM, for the pure-register instructions. Three
-    // serialized memory RMWs per instruction (pc, pendCycles, stamp) cost
-    // more than the instructions they book-kept — measured: the JIT beat the
-    // interpreter by 2% with them and the whole point without them. Between
-    // observation points nothing can read st.pc, the stamp or pendCycles —
-    // the only readers are the shims (device clocks, event logs, exception
-    // srr0) and the dispatcher — so instructions completed since the last
-    // flush ride in rbx (callee-saved, zeroed by the trampoline, preserved
-    // by every shim), and a flush settles all three in one go at exactly the
-    // points where the interpreter's values are observable: before every
-    // shim call, and on every exit. The flushed values are bit-identical to
-    // per-instruction accounting — under batching the interpreter itself
-    // only accumulates pendCycles and defers the clock to the batch edge.
+    // ⭐ INSTRUCTIONS ARE COUNTED IN A REGISTER AND SETTLED WHERE SOMETHING
+    // CAN LOOK. Three memory updates per instruction (pc, pendCycles, the
+    // instruction count) cost more than the instructions they book-kept.
+    // Nothing reads any of the three between observation points: the readers
+    // are the C++ a block calls (device clocks, event logs, an exception's
+    // srr0) and the dispatcher. So a completed instruction is one `inc rbx`,
+    // and the count is settled into the caller's counter and into pendCycles
+    // before every call that can observe them and on the one way out (the
+    // epilogue settles, so an exit is a jump and nothing more). The settled
+    // values are bit-identical to per-instruction accounting: under batching
+    // the interpreter itself only accumulates pendCycles and defers the
+    // clock to the batch edge.
+    //
+    // rbp is the batch's budget less everything settled: `until` minus the
+    // caller's counter. A hop to another block needs a line's worth left,
+    // which is rbx + 8 <= rbp, and settles nothing.
     void bump() { e.bytes({0x48, 0xFF, 0xC3}); } // inc rbx
-    void flushNoPc()
+    void settle()
     {
-        e.bytes({0x49, 0x01, 0x1E});         // add [r14], rbx
-        e.bytes({0x48, 0x89, 0xD8});         // mov rax, rbx
-        e.bytes({0x49, 0x0F, 0xAF, 0xC7});   // imul rax, r15
-        e.bytes({0x49, 0x01, 0x85});         // add [r13+pend], rax
-        e.i32le(u32(o.pend));
+        e.mem13W(0x8B, RAX, o.stampPtr);     // mov rax, [r13+stampPtr]
+        e.bytes({0x48, 0x01, 0x18});         // add [rax], rbx
+        e.bytes({0x48, 0x29, 0xDD});         // sub rbp, rbx
+        e.bytes({0x49, 0x0F, 0xAF});         // imul rbx, [r13+cyc]
+        e.disp8or32(3, o.cyc);
+        e.mem13W(0x01, 3, o.pend);           // add [r13+pend], rbx
         e.bytes({0x31, 0xDB});               // xor ebx, ebx
     }
-    void flushPc(u32 pcImm)
+    void settlePc(u32 pcImm)
     {
         e.storeI(o.pc, pcImm);
-        flushNoPc();
+        settle();
+    }
+    // One instruction that settled itself (execRow charges its own cycles):
+    // the caller's counter and the budget move by it.
+    void countSettled()
+    {
+        e.mem13W(0x8B, RAX, o.stampPtr);     // mov rax, [r13+stampPtr]
+        e.bytes({0x48, 0xFF, 0x00});         // inc qword [rax]
+        e.bytes({0x48, 0xFF, 0xCD});         // dec rbp
     }
     void flCheck() // the block under our feet is still the compiled block
     {
@@ -717,17 +726,15 @@ struct Compiler {
         e.cmpEaxI(nextVa);
         e.jccTo(CC_NE, epi);
     }
-    // The same where instructions are still counted only in rbx: they are
-    // settled on the way out. (The pc is the handler's own: an exception's
-    // vector.)
-    void pcCheckSettling(u32 nextVa)
+    // MSR is the one the dispatcher entered under (Cpu::jitMsr), or leave.
+    // Asked after every call that can change MSR and come back to the next
+    // instruction, which is what lets a hop and a memory probe take it as
+    // settled: see chainChecks.
+    void msrCheck()
     {
-        e.loadR(RAX, o.pc);
-        e.cmpEaxI(nextVa);
-        const size_t okJ = e.j8(CC_E);
-        flushNoPc();
-        e.jmpTo(epi);
-        e.patch8(okJ);
+        e.loadR(RAX, o.msr);
+        e.mem13(0x3B, RAX, o.jitMsr);      // cmp eax, [r13+jitMsr]
+        e.jccTo(CC_NE, epi);
     }
 
     // CR field from the FLAGS of a just-executed cmp/test: call zero3()
@@ -804,60 +811,59 @@ struct Compiler {
     // cross-page target — which would need the full xlate check re-emitted —
     // is simply not chained.
     //
-    // ⚠ THE BUDGET BOUND RIDES IN RBP (Cpu::jitUntil, loaded by the
-    // trampoline): a hop requires until - stamp >= 8, the dispatcher's own
-    // JIT-entry condition, and a block runs at most 8 instructions between
-    // checks — so a chained run can never overrun the batch, which is what
-    // fpClamp exactness rides on. Preconditions at every chain point: pc
-    // stored (immediate), counters flushed (rbx == 0) — every caller sits
-    // right after flushPc/flushNoPc.
+    // ⚠ THE BUDGET RIDES IN RBP (see settle): a hop requires a line's worth
+    // left, the dispatcher's own JIT-entry condition, and a block runs at
+    // most 8 instructions between checks — so a chained run can never
+    // overrun the batch, which is what fpClamp exactness rides on.
+    // Precondition at every chain point: the pc stored (an immediate).
 
-    void hopInc()
+    void hopInc() // --jit-count-hops only: the report's hop count
     {
+        if (!c.jitCountHops)
+            return;
         e.bytes({0x49, 0xFF, 0x85}); // inc qword [r13+chainHops]
         e.i32le(u32(o.chainHops));
     }
-    void hopDec() // the cold arms of a site take back the hop it charged
-    {
-        e.bytes({0x49, 0xFF, 0x8D}); // dec qword [r13+chainHops]
-        e.i32le(u32(o.chainHops));
-    }
 
-    // ⭐ THE GATE AT A HOP, AS THE LINE EXECUTOR HAS IT. Leaving a block for
-    // the next one skips the dispatcher, so whatever the dispatcher would
-    // have checked has to hold. It checks a list (chainChecksFull below:
-    // the executor's `slow`, the fetch translation's MSR key, a deliverable
-    // interrupt), and the first version of this gate re-tested that list
-    // term by term at every hop, every 4.2 instructions in a game.
+    // ⭐ THE GATE AT A HOP IS THE BUDGET. Leaving a block for the next one
+    // skips the dispatcher, so whatever the dispatcher would have checked
+    // has to hold. It checks a list (chainChecksFull below: the executor's
+    // `slow`, the fetch translation's MSR key, a deliverable interrupt).
     //
-    // The line executor does not. Its own entry to the next line asks one
-    // thing, "is MSR what it was when the list was last checked" (lxValid
-    // in Cpu::runSteps), because every other term of the list has a writer
-    // that ends the batch: MMCR0 and IABR in mtspr, a nap in mtmsr, an
-    // interrupt line through the device access that raised it, the
+    // The line executor does not re-ask the list at its own entry to the
+    // next line. It asks "is MSR what it was when the list was last
+    // checked" (lxValid in Cpu::runSteps), because every other term has a
+    // writer that ends the batch: MMCR0 and IABR in mtspr, a nap in mtmsr,
+    // an interrupt line through the device access that raised it, the
     // decrementer through the batch's own length. Same batch and same MSR,
-    // same answers. So a hop tests that the batch has not ended (halt()
-    // ends it too), that MSR is the dispatcher's (Cpu::jitMsr), and that a
-    // line's worth of budget remains. --jit-full-gate compiles the list.
+    // same answers.
+    //
+    // And inside a block neither can have moved unnoticed. The batch ends
+    // and MSR changes only in C++, and a block tests after every call that
+    // could have done either: batchBreak after each memory call and each
+    // handler call (a floating-point compute handler can do neither and
+    // come back to the next instruction: it ends the batch or changes MSR
+    // only by raising, which moves the pc, which is tested); MSR after each
+    // call that can write it and fall through (msrCheck). A block that is
+    // still running is therefore in the batch it was entered in, under the
+    // MSR it was entered under (Cpu::jitMsr), and a hop tests the one thing
+    // left: that a line's worth of budget remains. --jit-full-gate settles
+    // and compiles the dispatcher's list.
     void chainChecks()
     {
         if (c.jitFullGate) {
             chainChecksFull();
             return;
         }
-        byteCheck(o.batchBreak);
-        e.loadR(RAX, o.msr);
-        e.mem13(0x3B, RAX, o.jitMsr);      // cmp eax, [r13+jitMsr]
-        e.jccTo(CC_NE, epi);
-        e.bytes({0x48, 0x89, 0xE8});       // mov rax, rbp (until)
-        e.bytes({0x49, 0x2B, 0x06});       // sub rax, [r14]
-        e.bytes({0x48, 0x83, 0xF8, 0x08}); // cmp rax, 8
-        e.jccTo(CC_B, epi);                // budget < a line: dispatcher
+        e.bytes({0x48, 0x8D, 0x43, 0x08}); // lea rax, [rbx+8]
+        e.bytes({0x48, 0x39, 0xE8});       // cmp rax, rbp
+        e.jccTo(7, epi);                   // ja: less than a line left
     }
     void chainChecksFull() // the dispatcher's own gate, in test form
     {
+        settle();
         byteCheck(o.halted);      // post-run break test
-        byteCheck(o.batchBreak);  // (provably false here, checked anyway)
+        byteCheck(o.batchBreak);
         byteCheck(o.lineExecOff); // `slow`, term by term
         byteCheck(o.napping);
         e.mem13(0x83, 7, o.mmcr0); // cmp dword [r13+mmcr0], 0
@@ -867,6 +873,8 @@ struct Compiler {
         e.b(2);
         e.jccTo(CC_NE, epi);
         e.loadR(RAX, o.msr);
+        e.mem13(0x3B, RAX, o.jitMsr); // cmp eax, [r13+jitMsr]
+        e.jccTo(CC_NE, epi);
         e.b(0xA9);                 // test eax, SE|BE
         e.i32le(msr::SE | msr::BE);
         e.jccTo(CC_NE, epi);
@@ -889,9 +897,7 @@ struct Compiler {
             byteCheck(o.pmP);
         }
         e.patch8(noEe);
-        e.bytes({0x48, 0x89, 0xE8});       // mov rax, rbp (until)
-        e.bytes({0x49, 0x2B, 0x06});       // sub rax, [r14]
-        e.bytes({0x48, 0x83, 0xF8, 0x08}); // cmp rax, 8
+        e.bytes({0x48, 0x83, 0xFD, 0x08}); // cmp rbp, 8 (settled above)
         e.jccTo(CC_B, epi);                // budget < a line: dispatcher
     }
 
@@ -930,18 +936,16 @@ struct Compiler {
         const u32 siteOff = u32(e.at);
         e.i32le(u32(kChainRelThunk));
         const size_t parkAt = e.at;
-        hopDec();      // parking block: not a hop after all
-        e.jmpTo(epi);
+        e.jmpTo(c.jitCountHops ? parkCounted : epi); // parked: the dispatcher
         // ⚠ THE PARKING BLOCK'S LENGTH *IS* kChainRelThunk. The site's three
-        // states are encoded as rel32 values (0 = park, 12 = thunk, anything
-        // else = a live link), so the thunk only sits at +12 while these two
-        // instructions are exactly twelve bytes. Nothing else would notice if
+        // states are encoded as rel32 values (0 = park, 5 = thunk, anything
+        // else = a live link), so the thunk only sits at +5 while the parking
+        // block is exactly one five-byte jump. Nothing else would notice if
         // an emitter helper changed size — the site would simply jump into
         // the middle of an instruction — so it is checked, not assumed.
         if (e.at - parkAt != size_t(kChainRelThunk))
             e.ok = false;
-        hopDec();      // thunk: a resolve is not a hop either
-        e.movEdxI(siteOff);
+        e.movEdxI(siteOff); // the thunk (the resolver takes the hop back)
         e.bytes({0x41, 0xB8}); // mov r8d, paLine'
         e.i32le(tgtPaLine);
         e.bytes({0x41, 0xB9}); // mov r9d, tgtVa
@@ -965,17 +969,18 @@ struct Compiler {
             hopOrExit();
     }
     // An exit whose successor this block cannot name: on another page, or
-    // read from LR or CTR. The pc is stored and the counts are settled, as
-    // at every exit. Ask opmJitHop for the next block and go there, or leave
-    // for the dispatcher as before.
+    // read from LR or CTR. The pc is stored, as at every exit. Ask
+    // opmJitHop for the next block and go there, or leave for the
+    // dispatcher as before. (The helper looks at neither the instruction
+    // count nor the clock, so nothing is settled for it.)
     void hopOrExit()
     {
         if (!chain || c.jitHopOff) {
             e.jmpTo(epi);
             return;
         }
+        chainChecks();
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
-        e.bytes({0x4C, 0x89, 0xF2}); // mov rdx, r14 (the instruction count)
         e.callAbs(reinterpret_cast<const void*>(&opmJitHop));
         e.bytes({0x48, 0x85, 0xC0}); // test rax, rax
         e.jccTo(CC_Z, epi);
@@ -1003,17 +1008,18 @@ struct Compiler {
     void fallback(u32 insn, u32 row, u32 nextVa)
     {
         mark(JitCache::kPartCall);
-        flushPc(nextVa - 4); // execRow's contract: st.pc == CIA at entry
+        settlePc(nextVa - 4); // execRow's contract: st.pc == CIA at entry
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.movEdxI(insn);
         e.bytes({0x41, 0xB8});       // mov r8d, imm32
         e.i32le(row);
         e.callAbs(reinterpret_cast<const void*>(&shimExecRow));
-        e.bytes({0x49, 0xFF, 0x06}); // inc qword [r14] (execRow charged)
+        countSettled();              // execRow charged its cycles itself
         byteCheck(o.halted);
         byteCheck(o.batchBreak);
         pcCheck(nextVa);
         flCheck();
+        msrCheck(); // the one way an mtmsr runs
     }
 
     // ⭐⭐ THE DIRECT-CALL FALLBACK — execRow, specialized to the row.
@@ -1076,16 +1082,13 @@ struct Compiler {
         if (keepBatch)
             e.storeI(o.pc, nextVa); // execRow's `st.pc += 4`, counters batched
         else
-            flushPc(nextVa);
+            settlePc(nextVa);
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.movEdxI(insn);
         e.bytes({0x49, 0xB8});       // mov r8, imm64 &kIsa[row]
         e.i64le(reinterpret_cast<u64>(&kIsa[row]));
         e.callAbs(fn);               // DIRECT: no dispFn indirection
-        if (keepBatch)
-            bump();      // execRow's charge(), batched like every inlined op
-        else
-            chargeInc(); // …or settled now, for a handler that could observe
+        bump();          // execRow's charge(), counted like every inlined op
         // The two rare tails, behind execRow's own conditions.
         e.mem13(0x83, 7, o.mmcr0); // cmp dword [r13+mmcr0], 0
         e.b(0);
@@ -1097,8 +1100,7 @@ struct Compiler {
         const size_t doneJ = e.jmp32f();
         e.patch32(tailJ);
         e.patch32(tail2J);
-        if (keepBatch)
-            flushNoPc(); // the tail can raise: settle before it observes
+        settle();        // the tail can raise: settle before it observes
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.movEdxI(insn);
         e.bytes({0x41, 0xB8});       // mov r8d, row
@@ -1108,16 +1110,13 @@ struct Compiler {
         e.callAbs(reinterpret_cast<const void*>(&shimFbTail));
         e.patch32(doneJ);
         // The line executor's exit tests, exactly as the generic path runs
-        // them. (The instruction count is already carried: bump/chargeInc
-        // above did what the generic path's `inc [r14]` does after execRow.)
-        // Every one of them leaves the block, so what rbx still holds is
-        // settled first.
-        if (keepBatch)
-            flushNoPc();
+        // them. (The instruction is already counted: the bump above.)
         byteCheck(o.halted);
         byteCheck(o.batchBreak);
         pcCheck(nextVa);
         flCheck();
+        if (!keepBatch)
+            msrCheck();
         if (coldJ != size_t(-1)) {
             const size_t joinJ = e.jmp32f();
             e.patch32(coldJ);
@@ -1166,18 +1165,18 @@ struct Compiler {
         if (keepBatch)
             e.storeI(o.pc, nextVa); // the handler's NIA; the counts stay in rbx
         else
-            flushPc(nextVa);
+            settlePc(nextVa);
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.movEdxI(insn);             // (no handler reads its third argument)
         e.callAbs(fn);
+        bump();
         if (keepBatch) {
-            bump();
-            pcCheckSettling(nextVa); // a trap leaves with rbx still counting
+            pcCheck(nextVa);
         } else {
-            chargeInc();
             byteCheck(o.batchBreak); // halt() sets it too
             pcCheck(nextVa);
             flCheck();
+            msrCheck();
         }
         if (coldJ != size_t(-1)) {
             const size_t joinJ = e.jmp32f();
@@ -1333,7 +1332,7 @@ struct Compiler {
         e.mem13(0x81, 7, flBase);                // cmp dword [fl], paBase
         e.i32le(paBase);
         const size_t oursJ = e.j8(CC_E);
-        flushPc(nextVa);
+        e.storeI(o.pc, nextVa);
         e.jmpTo(epi);
         e.patch8(oursJ);
     }
@@ -1374,7 +1373,7 @@ struct Compiler {
                 e.patch32(j);
         }
         mark(JitCache::kPartShim);
-        flushPc(nextVa); // handlers see NIA; readV can observe all three
+        settlePc(nextVa); // handlers see NIA; readV can observe all three
         e.storeI(o.curInsn, insn); // a faulting access builds DSISR from it
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         const void* shim = kind == 0 ? reinterpret_cast<const void*>(&shimRead8)
@@ -1383,7 +1382,7 @@ struct Compiler {
         e.callAbs(shim);
         e.bytes({0x48, 0x83, 0xF8, 0xFF}); // cmp rax, -1
         const size_t okJ = e.j8(CC_NE);
-        chargeInc();                       // fault: charge + count, no write
+        bump();                            // fault: counted, no write
         e.jmpTo(epi);
         e.patch8(okJ);
         if (sext)
@@ -1397,7 +1396,7 @@ struct Compiler {
         e.storeR(gpr(f_rt(insn)), RAX);
         if (update)
             e.bytes({0x45, 0x89, 0xA5}), e.i32le(u32(gpr(f_ra(insn))));
-        chargeInc();
+        bump();
         byteCheck(o.batchBreak);
         flCheck();
         if (endJ != size_t(-1))
@@ -1449,7 +1448,7 @@ struct Compiler {
                 e.patch32(j);
         }
         mark(JitCache::kPartShim);
-        flushPc(nextVa); // handlers see NIA; writeV can observe all three
+        settlePc(nextVa); // handlers see NIA; writeV can observe all three
         e.storeI(o.curInsn, insn);
         e.bytes({0x45, 0x8B, 0x85}); // mov r8d, [r13+gpr rs]
         e.i32le(u32(gpr(f_rt(insn))));
@@ -1466,12 +1465,12 @@ struct Compiler {
         e.callAbs(shim);
         e.bytes({0x48, 0x83, 0xF8, 0xFF}); // cmp rax, -1
         const size_t okJ = e.j8(CC_NE);
-        chargeInc();                       // fault: charge + count, no rA update
+        bump();                            // fault: counted, no rA update
         e.jmpTo(epi);
         e.patch8(okJ);
         if (update)
             e.bytes({0x45, 0x89, 0xA5}), e.i32le(u32(gpr(f_ra(insn))));
-        chargeInc();
+        bump();
         byteCheck(o.batchBreak);
         flCheck();
         if (endJ != size_t(-1))
@@ -1607,7 +1606,7 @@ struct Compiler {
                 e.patch32(j);
         }
         mark(JitCache::kPartShim);
-        flushPc(nextVa); // the shim can fault: pc/stamp/cycles must be true
+        settlePc(nextVa); // the shim can fault: pc/stamp/cycles must be true
         e.bytes({0x41, 0xB8}); // mov r8d, insn (the shim decodes frt/DSISR)
         e.i32le(insn);
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
@@ -1619,14 +1618,14 @@ struct Compiler {
         e.callAbs(shim);
         e.bytes({0x48, 0x83, 0xF8, 0xFF}); // cmp rax, -1
         const size_t okJ = e.j8(CC_NE);
-        chargeInc(); // fault: charge + count, no rA update
+        bump(); // fault: counted, no rA update
         e.jmpTo(epi);
         e.patch8(okJ);
         if (update) {
             e.bytes({0x45, 0x89, 0xA5}); // mov [gpr ra], r12d
             e.i32le(u32(gpr(f_ra(insn))));
         }
-        chargeInc();
+        bump();
         byteCheck(o.batchBreak);
         flCheck();
         if (endJ != size_t(-1))
@@ -2059,7 +2058,6 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         if (target != nextVa) {
             mark(JitCache::kPartHop);
             e.storeI(o.pc, target);
-            flushNoPc();
             chainOrExit(target, k);
         }
         return; // b .+4 falls through to the next segment, pc deferred
@@ -2077,7 +2075,6 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         mark(JitCache::kPartHop);
         bump();
         e.storeI(o.pc, target);
-        flushNoPc();
         if (chained)
             chainOrExit(target, k);
         else if (target != nextVa)
@@ -2106,7 +2103,6 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         mark(JitCache::kPartHop);
         bump();
         e.storeR(o.pc, RAX);
-        flushNoPc();
         hopOrExit();
         if (nt != size_t(-1)) {
             e.patch8(nt);
@@ -2385,6 +2381,8 @@ void JitCache::bind(Cpu& c)
                    offs.decP == offs.extIrq + 2 &&
                    offs.pmP == offs.extIrq + 3;
     offs.until = d32(&c.jitUntil);
+    offs.stampPtr = d32(&c.jitStampPtr);
+    offs.cyc = d32(&c.jitCyc);
     offs.chainHops = d32(&c.jitChainHops);
     offs.jitMsr = d32(&c.jitMsr);
     offs.dmLive = d32(&c.dmLive);
@@ -2393,36 +2391,46 @@ void JitCache::bind(Cpu& c)
     offs.dpTable = reinterpret_cast<u64>(c.dpPage.get());
 
     // The trampoline and the shared epilogue, emitted like everything else.
-    // enter(entry=rcx, cpu=rdx, stamp=r8, cyc=r9). Eight callee-saved pushes
-    // plus the 40-byte outgoing area leave rsp 16-aligned inside a block, so
-    // a block's `call shim` puts the callee at the ABI's rsp%16==8, with the
-    // reserved bytes serving as its shadow space.
+    // enter(entry=rcx, cpu=rdx). Eight callee-saved pushes plus the 40-byte
+    // outgoing area leave rsp 16-aligned inside a block, so a block's
+    // `call shim` puts the callee at the ABI's rsp%16==8, with the reserved
+    // bytes serving as its shadow space. The budget (rbp) is what the
+    // batch has left: `until` less the caller's counter.
     Emit e{arena_, cap_, 0};
     e.bytes({0x53, 0x55, 0x56, 0x57});                     // push rbx/rbp/rsi/rdi
     e.bytes({0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57}); // push r12..r15
     e.bytes({0x48, 0x83, 0xEC, 0x28});                     // sub rsp, 40
 #if OPM_JIT_SYSV
     // The same trampoline, entered by a System V caller: enter(entry=rdi,
-    // cpu=rsi, stamp=rdx, cyc=rcx). The pushes stay as they are — rsi and rdi
-    // need no saving here, but the eight of them are what the alignment
-    // above is counted from.
+    // cpu=rsi). The pushes stay as they are — rsi and rdi need no saving
+    // here, but the eight of them are what the alignment above is counted
+    // from.
     e.bytes({0x49, 0x89, 0xF5});                           // mov r13, rsi
-    e.bytes({0x49, 0x89, 0xD6});                           // mov r14, rdx
-    e.bytes({0x49, 0x89, 0xCF});                           // mov r15, rcx
-    e.bytes({0x48, 0x8B, 0xAE});                           // mov rbp, [rsi+until]
-    e.i32le(u32(offs.until));                              // (the budget bound)
-    e.bytes({0x31, 0xDB});                                 // xor ebx, ebx
-    e.bytes({0xFF, 0xE7});                                 // jmp rdi
 #else
     e.bytes({0x49, 0x89, 0xD5});                           // mov r13, rdx
-    e.bytes({0x4D, 0x89, 0xC6});                           // mov r14, r8
-    e.bytes({0x4D, 0x89, 0xCF});                           // mov r15, r9
-    e.bytes({0x48, 0x8B, 0xAA});                           // mov rbp, [rdx+until]
-    e.i32le(u32(offs.until));                              // (the budget bound)
+#endif
+    e.mem13W(0x8B, 5, offs.until);                         // mov rbp, [r13+until]
+    e.mem13W(0x8B, RAX, offs.stampPtr);                    // mov rax, [r13+stampPtr]
+    e.bytes({0x48, 0x2B, 0x28});                           // sub rbp, [rax]
     e.bytes({0x31, 0xDB});                                 // xor ebx, ebx
+#if OPM_JIT_SYSV
+    e.bytes({0xFF, 0xE7});                                 // jmp rdi
+#else
     e.bytes({0xFF, 0xE1});                                 // jmp rcx
 #endif
+    // --jit-count-hops: a parked site counted a hop it did not make.
+    parkCounted_ = u32(e.at);
+    e.bytes({0x49, 0xFF, 0x8D});                           // dec qword [r13+chainHops]
+    e.i32le(u32(offs.chainHops));
+    // The one way out. What rbx still counts is settled here (see
+    // Compiler::settle, of which this is a copy), so an exit anywhere in a
+    // block is a jump and nothing else.
     epilogue_ = u32(e.at);
+    e.mem13W(0x8B, RAX, offs.stampPtr);                    // mov rax, [r13+stampPtr]
+    e.bytes({0x48, 0x01, 0x18});                           // add [rax], rbx
+    e.bytes({0x49, 0x0F, 0xAF});                           // imul rbx, [r13+cyc]
+    e.disp8or32(3, offs.cyc);
+    e.mem13W(0x01, 3, offs.pend);                          // add [r13+pend], rbx
     e.bytes({0x48, 0x83, 0xC4, 0x28});                     // add rsp, 40
     e.bytes({0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C}); // pop r15..r12
     e.bytes({0x5F, 0x5E, 0x5D, 0x5B});                     // pop rdi/rsi/rbp/rbx
@@ -2476,19 +2484,19 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
                 !c.jitChainOff,
                 !c.jitDirectOff,
                 this,
+                parkCounted_,
                 {}, // fixes: named, because gcc requires every member here
                 JitCache::kMapNoRow};
     for (u32 k = 0; k < 8; ++k) {
         jl.off[k] = u32(cp.e.at);
         cp.word(k, w[k], rows[k]);
     }
-    // Word 7's fallthrough is the line end: settle the deferred pc (the word
-    // after the line) and the batched counters, then chain to the next line
-    // — the other half of every dispatcher round trip — or leave. Every
-    // other path out of the block flushed at its own exit.
+    // Word 7's fallthrough is the line end: store the deferred pc (the word
+    // after the line), then chain to the next line — the other half of
+    // every dispatcher round trip — or leave.
     cp.curRow = kMapNoRow;
     cp.mark(kPartHop);
-    cp.flushPc(vaBase + 32u);
+    cp.e.storeI(offs.pc, vaBase + 32u);
     cp.chainOrExit(vaBase + 32u, 7u);
     // Forward intra-line chain targets, now that every segment has a home.
     for (const auto& f : cp.fixes)
@@ -2550,7 +2558,9 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
         }
     }
     ++J.enters;
-    c.jitUntil = until; // the trampoline pins it in rbp for the chain hops
+    c.jitUntil = until; // the trampoline makes rbp of these two: the budget
+    c.jitStampPtr = &stamp;
+    c.jitCyc = u64(c.insnCycles) + c.extraCycles; // constant for a batch
     c.jitMsr = c.st.msr; // what runSteps just checked its entry conditions under
     const u64 before = stamp;
     if (J.tscOn) {
@@ -2559,12 +2569,10 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
         // dispatcher's own overhead), tscNative is the emitted code itself.
         const u64 t1 = __rdtsc();
         J.tscProbe += t1 - tsc0;
-        J.enterFn(J.arena_ + jl->off[word], &c, &stamp,
-                  u64(c.insnCycles) + c.extraCycles);
+        J.enterFn(J.arena_ + jl->off[word], &c);
         J.tscNative += __rdtsc() - t1;
     } else {
-        J.enterFn(J.arena_ + jl->off[word], &c, &stamp,
-                  u64(c.insnCycles) + c.extraCycles);
+        J.enterFn(J.arena_ + jl->off[word], &c);
     }
     J.insns += stamp - before;
     return true;

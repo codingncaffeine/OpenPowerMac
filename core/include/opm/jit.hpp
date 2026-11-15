@@ -179,6 +179,7 @@ class JitCache {
         i32 raisedThis = 0; // execRow clears it before every handler
         i32 pend4 = 0, extIrq = 0, smi = 0, decP = 0, pmP = 0;
         i32 until = 0, chainHops = 0;
+        i32 stampPtr = 0, cyc = 0; // Cpu::jitStampPtr, Cpu::jitCyc
         bool pend4Ok = false;
         // Memory read directly (Cpu::DpPage), for the loads and stores a
         // block makes without a call: the memo's live key, the TLB stamps
@@ -190,7 +191,7 @@ class JitCache {
         u64 dpTable = 0;
     } offs;
 
-    using EnterFn = void (*)(const void* entry, Cpu*, u64* stamp, u64 cyc);
+    using EnterFn = void (*)(const void* entry, Cpu*);
     EnterFn enterFn = nullptr;
 
     // Wire the cache to one Cpu: measure offsets, emit trampoline/epilogue.
@@ -208,6 +209,7 @@ class JitCache {
     size_t cap_ = 0, at_ = 0;
     size_t firstCode_ = 0; // end of trampoline+epilogue; resets rewind here
     u32 epilogue_ = 0;     // arena offset every exit jumps to
+    u32 parkCounted_ = 0;  // …and a parked chain site's, under --jit-count-hops
     bool live_ = false;
 };
 
@@ -215,10 +217,11 @@ class JitCache {
 // from entry word `word`; returns false when the JIT cannot serve (wrong
 // arch, arena exhausted mid-compile) and the caller falls back to the
 // interpreter for this line. `stamp` is the caller's instruction counter —
-// advanced per instruction by the emitted code, exactly as the line executor
-// advances it. `until` is the batch's budget bound (runSteps' own local):
-// chained hops re-check `until - stamp >= 8` exactly where the dispatcher
-// would have, so a chained run can never overrun the batch.
+// advanced by the emitted code wherever something can read it and on the
+// way out, to exactly what the line executor would have made it. `until` is
+// the batch's budget bound (runSteps' own local): chained hops re-check
+// `until - stamp >= 8` exactly where the dispatcher would have, so a chained
+// run can never overrun the batch.
 bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until);
 
 // fetchDecoded's refill hook: a line was just (re)filled. Identical content

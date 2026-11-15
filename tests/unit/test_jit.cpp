@@ -133,6 +133,7 @@ struct Twin {
     {
         cpu.attach(bus);
         cpu.jitOn = jitOn;
+        cpu.jitCountHops = true; // the chain tests ask whether hops happened
         cpu.st.pc = kBase;
     }
     void poke(const std::vector<u32>& words)

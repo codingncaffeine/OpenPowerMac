@@ -1174,10 +1174,16 @@ struct Cpu {
     // `until - stamp >= 8` without returning to C++. Written by jitRunLine on
     // every enter; meaningless between enters.
     u64 jitUntil = 0;
-    // Block-to-block transfers that skipped the dispatcher (emitted code
-    // increments this at every successful chain hop). The measure of Stage B:
-    // insns / (enters + hops) is the true scaffold amortization.
+    // The caller's instruction counter and what one instruction is charged,
+    // for the same enter: a block settles its counts through these.
+    u64* jitStampPtr = nullptr;
+    u64 jitCyc = 0;
+    // Block-to-block transfers that skipped the dispatcher. The measure of
+    // Stage B: insns / (enters + hops) is the true scaffold amortization.
+    // Counted only when asked (g4run --jit-count-hops): the count is a
+    // memory update at every hop, one every four instructions.
     u64 jitChainHops = 0;
+    bool jitCountHops = false;
     static_assert(JitCache::kLines == kFetchLines,
                   "the JIT cache is slot-parallel to the fetch lines");
     void fetchDrop()

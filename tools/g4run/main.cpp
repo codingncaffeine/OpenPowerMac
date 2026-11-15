@@ -596,6 +596,7 @@ int main(int argc, char** argv)
     bool jitInlineMemOff = false; // --no-jit-inline-mem
     bool jitFullGate = false; // --jit-full-gate
     bool jitHopOff = false; // --no-jit-hop
+    bool jitCountHops = false; // --jit-count-hops
     // --jit-tsc: rdtsc the shims and the block entries (opm/jit.hpp).
     bool jitTsc = false;
     // --no-jit-direct: fallbacks go through the execRow shim, as before the
@@ -816,6 +817,9 @@ int main(int argc, char** argv)
         // The control for hops found at run time (another page, blr, bctr):
         // those exits go to the dispatcher.
         if (!strcmp(a, "--no-jit-hop")) { jitHopOff = true; continue; }
+        // Count the hops between blocks for the report (a memory update at
+        // every hop, so not while measuring speed).
+        if (!strcmp(a, "--jit-count-hops")) { jitCountHops = true; continue; }
         // The control for the hop gate that compares MSR: every condition
         // re-tested by name at every hop between blocks.
         if (!strcmp(a, "--jit-full-gate")) { jitFullGate = true; continue; }
@@ -1586,6 +1590,7 @@ int main(int argc, char** argv)
     cpu.jitInlineMemOff = jitInlineMemOff;
     cpu.jitFullGate = jitFullGate;
     cpu.jitHopOff = jitHopOff;
+    cpu.jitCountHops = jitCountHops;
     cpu.jitTscOn = jitTsc; // JitCache is created lazily; carried on the Cpu
     cpu.jitMapOn = hostProfHz != 0; // a host profile names the emitted code
     cpu.jitDirectOff = jitDirectOff;
@@ -5633,7 +5638,21 @@ int main(int argc, char** argv)
         // Stage B: hops are dispatcher round trips the chained exits saved.
         // insns per (enter + hop) is the true scaffold amortization — the
         // number that was 4.3 when every block exit paid the full round trip.
-        if (cpu.jit && (cpu.jitChainHops || cpu.jit->chainResolves))
+        if (cpu.jit && !cpu.jitCountHops && cpu.jit->chainResolves)
+            printf("--   jit chain: %llu links, %llu severs, %llu resolves "
+                   "(%llu misses, %llu giveups); %.1f insns/dispatch-enter "
+                   "(--jit-count-hops counts the hops)\n",
+                   static_cast<unsigned long long>(cpu.jit->chainLinks),
+                   static_cast<unsigned long long>(cpu.jit->chainSevers),
+                   static_cast<unsigned long long>(cpu.jit->chainResolves),
+                   static_cast<unsigned long long>(cpu.jit->chainMisses),
+                   static_cast<unsigned long long>(cpu.jit->chainGiveups),
+                   cpu.jit->enters
+                       ? static_cast<double>(cpu.jit->insns) /
+                             static_cast<double>(cpu.jit->enters)
+                       : 0.0);
+        if (cpu.jit && cpu.jitCountHops &&
+            (cpu.jitChainHops || cpu.jit->chainResolves))
             printf("--   jit chain: %llu hops, %llu links, %llu severs, "
                    "%llu resolves (%llu misses, %llu giveups); "
                    "%.1f insns/dispatch-enter, %.1f insns/native-entry\n",

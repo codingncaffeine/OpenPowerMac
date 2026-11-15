@@ -770,40 +770,38 @@ struct Compiler {
         e.jccTo(CC_NE, epi);
     }
 
-    // CR field from the FLAGS of a just-executed cmp/test: call zero3()
-    // BEFORE the compare (xor clobbers flags), crInsert after. Mirrors
-    // setCr0/setCrField plus the SO bit from XER, bit for bit.
-    void zero3()
-    {
-        e.bytes({0x45, 0x31, 0xC0});   // xor r8d, r8d
-        e.bytes({0x45, 0x31, 0xC9});   // xor r9d, r9d
-        e.bytes({0x45, 0x31, 0xD2});   // xor r10d, r10d
-    }
+    // CR field from the FLAGS of a just-executed cmp/test. Mirrors
+    // setCr0/setCrField plus the SO bit from XER, bit for bit: the field is
+    // LT, GT or EQ, already in its place in the register, chosen by two
+    // conditional moves (which leave the flags alone, as loading a constant
+    // does), then XER[SO] beside it, which is hardly ever set and so is a
+    // test and a jump over one instruction. eax, r8 and r9 are spent, eax
+    // only after the flags are used.
     void crInsert(u32 field, bool sgn)
     {
-        e.bytes({0x41, 0x0F, sgn ? u8(0x9C) : u8(0x92), 0xC0}); // setl/setb r8b
-        e.bytes({0x41, 0x0F, sgn ? u8(0x9F) : u8(0x97), 0xC1}); // setg/seta r9b
-        e.bytes({0x41, 0x0F, 0x94, 0xC2});                      // sete  r10b
-        e.bytes({0x41, 0xC1, 0xE0, 0x03}); // shl r8d, 3  (LT -> 8)
-        e.bytes({0x41, 0xC1, 0xE1, 0x02}); // shl r9d, 2  (GT -> 4)
-        e.bytes({0x45, 0x01, 0xC8});       // add r8d, r9d
-        e.bytes({0x45, 0x01, 0xD2});       // add r10d, r10d (EQ -> 2)
-        e.bytes({0x45, 0x01, 0xD0});       // add r8d, r10d
-        e.loadR(RDX, o.xer);
-        e.bytes({0xC1, 0xEA, 0x1F});       // shr edx, 31 (SO)
-        e.bytes({0x41, 0x01, 0xD0});       // add r8d, edx
-        e.loadR(RAX, o.cr);
         const u32 sh = (7u - field) * 4u;
+        e.bytes({0x41, 0xB8});             // mov r8d, EQ
+        e.i32le(2u << sh);
+        e.bytes({0x41, 0xB9});             // mov r9d, GT
+        e.i32le(4u << sh);
+        e.bytes({0x45, 0x0F, sgn ? u8(0x4F) : u8(0x47), 0xC1}); // cmovg/cmova r8d, r9d
+        e.bytes({0x41, 0xB9});             // mov r9d, LT
+        e.i32le(8u << sh);
+        e.bytes({0x45, 0x0F, sgn ? u8(0x4C) : u8(0x42), 0xC1}); // cmovl/cmovb r8d, r9d
+        e.mem13(0xF7, 0, o.xer);           // test dword [r13+xer], SO
+        e.i32le(0x80000000u);
+        const size_t noSo = e.j8(CC_Z);
+        e.bytes({0x41, 0x81, 0xC8});       // or r8d, SO in the field
+        e.i32le(1u << sh);
+        e.patch8(noSo);
+        e.loadR(RAX, o.cr);
         e.andEaxI(~(0xFu << sh));
-        if (sh)
-            e.bytes({0x41, 0xC1, 0xE0, u8(sh)}); // shl r8d, sh
         e.bytes({0x44, 0x09, 0xC0});       // or eax, r8d
         e.storeR(o.cr, RAX);
     }
     void setCr0FromEax() // result still in eax; crInsert only clobbers it
     {                    // after the setcc trio captured the flags
         mark(JitCache::kPartCr);
-        zero3();
         e.bytes({0x85, 0xC0}); // test eax, eax
         crInsert(0, true);
         mark(JitCache::kPartBody);
@@ -2074,7 +2072,6 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     case Lo::Cmpli: {
         mark(JitCache::kPartCr);
         e.loadR(RAX, gpr(ra));
-        zero3();
         e.cmpEaxI(lo == Lo::Cmpi ? u32(sext16(f_d(insn))) : f_d(insn));
         crInsert(f_crfd(insn), lo == Lo::Cmpi);
         bump();
@@ -2085,7 +2082,6 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         mark(JitCache::kPartCr);
         e.loadR(RAX, gpr(ra));
         e.loadR(RDX, gpr(rb));
-        zero3();
         e.bytes({0x39, 0xD0}); // cmp eax, edx
         crInsert(f_crfd(insn), lo == Lo::Cmp);
         bump();

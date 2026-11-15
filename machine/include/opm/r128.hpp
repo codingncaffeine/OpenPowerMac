@@ -292,6 +292,42 @@ u32 r128RegEverSet(u32 off);
 void r128RegEverReset();
 // The bits of register `off` this model decodes. False if it has no entry.
 bool r128RegDecodedBits(u32 off, u32& mask);
+// The list above as the diagnostics print it.
+std::string r128UndecodedReport(const R128Cell& c);
+
+// The bit census cannot see a setting that takes one of several VALUES, some
+// of which the model draws and some not, and least of all one whose zero is
+// a mode (the dither method, the vertex precision, how texture coordinates
+// are given). So each such setting is noted with its value WHEN A DRAW USES
+// IT: the 2D engine notes its own at every operation, the 3D pipeline at
+// every packet of primitives, and only the settings that are in force (the
+// depth test when depth is on, a unit's filter when the unit is on). The
+// report names every value drawn with, and marks the ones this model draws
+// some other way. The table is in r128_census.cpp.
+enum class R128Setting : u8 {
+    Dst2d, Brush2d, SrcFormat2d, SrcFrom2d, Tile2d, Gmc3dFn,
+    Dst3d, ZWidth, ZTest, StencilTest, StencilFail, StencilZPass,
+    StencilZFail, BlendSrc, BlendDst, BlendCombine, AlphaTest, DitherMethod,
+    DitherInit, SubPixel, TexCoords, Shading, BackFace, FrontFace,
+    TexAntiAlias, TexColorKey, EdgeAntiAlias, Supersample, LightColor,
+    LightAlpha,
+    // One run per texture unit, in this order; the second unit's begin at
+    // Tex2MinFilter.
+    Tex1MinFilter, Tex1MagFilter, Tex1ClampS, Tex1ClampT, Tex1Format,
+    Tex1PalEntries, Tex1Combine, Tex1ColorFactor, Tex1ColorInput,
+    Tex1CombineAlpha, Tex1AlphaFactor, Tex1AlphaInput,
+    Tex2MinFilter, Tex2MagFilter, Tex2ClampS, Tex2ClampT, Tex2Format,
+    Tex2PalEntries, Tex2Combine, Tex2ColorFactor, Tex2ColorInput,
+    Tex2CombineAlpha, Tex2AlphaFactor, Tex2AlphaInput,
+    Count
+};
+extern u32 gR128SettingSeen[static_cast<size_t>(R128Setting::Count)];
+inline void r128SettingUsed(R128Setting s, u32 value)
+{
+    gR128SettingSeen[static_cast<size_t>(s)] |= 1u << (value & 31u);
+}
+void r128SettingsReset();
+std::string r128SettingsReport();
 
 // --- Who wrote this pixel ---------------------------------------------------
 //

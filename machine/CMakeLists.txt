@@ -14,6 +14,7 @@ set(OPM_MACHINE_SRC
   src/r128.cpp
   src/r128_3d.cpp
   src/r128rec.cpp
+  src/r128_census.cpp
   src/dbdma.cpp
   src/snapshot.cpp
   src/hostclock.cpp

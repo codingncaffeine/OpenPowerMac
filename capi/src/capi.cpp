@@ -93,6 +93,9 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     // stopped mid-packet would otherwise poison the new stream (see
     // r128CceReset in opm/r128.hpp).
     r128CceReset();
+    // The censuses of what a guest asked the card for are this machine's.
+    r128RegEverReset();
+    r128SettingsReset();
     // ...and its engine is on this thread until opm_set_realtime says the
     // clock comes from the host: the switch is process-wide, and a previous
     // machine in this process may have left it on.
@@ -1172,50 +1175,12 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                 s += b;
             }
             // 🔎 …AND WHAT THE GUEST ASKED FOR THAT NOTHING HERE READS: the
-            // bits it has written as one, outside the bits this model
-            // decodes. See r128RegDecodedBits. An empty list is the claim
-            // "every control bit this guest uses is modelled", for the
-            // registers that have a mask; the others are named so the claim
-            // is not read as wider than it is.
-            {
-                std::string miss, unaudited;
-                // The second texture unit's registers are written with
-                // defaults by a driver that never switches the unit on
-                // (TEX_CNTL_C bit 5); what they hold then asks for nothing.
-                const bool secOn = (r128RegEverSet(0x1C9Cu) & 0x20u) != 0;
-                for (const auto& [off, n] : a.writeCount) {
-                    if (off < 0x0700u || off > 0x1DFFu)
-                        continue;
-                    if (!secOn && off >= 0x1D00u && off <= 0x1D30u)
-                        continue;
-                    const u32 ever = r128RegEverSet(off);
-                    u32 mask = 0;
-                    const char* nm = r128RegName(off);
-                    if (r128RegDecodedBits(off, mask)) {
-                        if (ever & ~mask) {
-                            snprintf(b, sizeof b,
-                                     "--   %04x %-28s set %08x, of which NOT "
-                                     "DECODED: %08x\n",
-                                     off, nm ? nm : "(unnamed)", ever,
-                                     ever & ~mask);
-                            miss += b;
-                        }
-                    } else if (off >= 0x1A00u || off == 0x146Cu ||
-                               off == 0x16C0u || off == 0x16C4u ||
-                               off == 0x16C8u) {
-                        snprintf(b, sizeof b, " %04x=%08x", off, ever);
-                        unaudited += b;
-                    }
-                }
-                s += "-- control bits the guest set that this model does "
-                     "not decode:\n";
-                s += miss.empty() ? "--   none, in the registers that are "
-                                    "audited\n"
-                                  : miss;
-                if (!unaudited.empty())
-                    s += "--   not audited (bits ever set):" + unaudited +
-                         "\n";
-            }
+            // control bits it set outside what this model decodes, and the
+            // values of the multi-valued settings its draws used, each
+            // marked when the model draws it some other way. See "The
+            // census" in opm/r128.hpp.
+            s += r128UndecodedReport(a);
+            s += r128SettingsReport();
             // Said plainly, because this is the one question the capture
             // exists to answer.
             const auto it = a.writeCount.find(0x1CBCu);

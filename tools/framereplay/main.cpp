@@ -8,7 +8,9 @@
 //   framereplay FILE [--out DIR] [--strict]
 //       DIR/frame-K.png for each frame, DIR/end.png for the last state.
 //       Says, per frame, whether video memory came out as the recording
-//       says it stood. --strict: exit 1 unless every one did.
+//       says it stood. --strict: exit 1 unless every one did. --census:
+//       also print which settings these frames were drawn with, and which
+//       of them the model does not draw as the manuals say.
 //   framereplay --diff A.png B.png [MAP.png]
 //       Count the pixels that differ between two pictures this tool wrote,
 //       and paint them red over a dimmed A in MAP.png.
@@ -276,12 +278,14 @@ int main(int argc, char** argv)
     if (a.size() >= 3 && a[0] == "--diff")
         return diff(a[1], a[2], a.size() > 3 ? a[3].c_str() : nullptr);
     std::string file, out = ".";
-    bool strict = false;
+    bool strict = false, census = false;
     for (size_t i = 0; i < a.size(); ++i) {
         if (a[i] == "--out" && i + 1 < a.size())
             out = a[++i];
         else if (a[i] == "--strict")
             strict = true;
+        else if (a[i] == "--census")
+            census = true;
         else if (file.empty() && a[i].rfind("--", 0) != 0)
             file = a[i];
         else
@@ -289,7 +293,7 @@ int main(int argc, char** argv)
     }
     if (file.empty()) {
         std::fprintf(stderr,
-                     "usage: framereplay FILE [--out DIR] [--strict]\n"
+                     "usage: framereplay FILE [--out DIR] [--strict] [--census]\n"
                      "       framereplay --diff A.png B.png [MAP.png]\n");
         return 2;
     }
@@ -353,5 +357,8 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(es.cceGartMiss +
                                                 es.vtxGartMiss +
                                                 es.texGartMiss));
+    if (census)
+        std::printf("%s%s", r128UndecodedReport(*cell).c_str(),
+                    r128SettingsReport().c_str());
     return strict && !allEqual ? 1 : 0;
 }

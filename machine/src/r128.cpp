@@ -471,6 +471,24 @@ bool r128RegDecodedBits(u32 off, u32& mask)
     // counted there; this only says the fields are read.
     case 0x15C0u: mask = 0x03000707u; return true;
     case 0x15C4u: case 0x15C8u: case 0x15CCu: mask = 0xFFFFFFFFu; return true;
+    // DP_GUI_MASTER_CNTL and its context copy (guide 3-171): the four
+    // "leave alone" controls, the brush, destination and source datatypes,
+    // the ROP, the source select, and the three clear-on-write controls.
+    // Bit 27 set means "leave the 3D function alone", which is what happens;
+    // its zero is an action not taken, and the value census has it. Not
+    // read: 14 (bit order of a mono source), 15 (colour temperature) and 31
+    // (load the brush origin).
+    case 0x146Cu: case 0x1C84u: mask = 0x7FFF3FFFu; return true;
+    // DP_CNTL: the two directions, and the raster stall (an operation here
+    // is complete before the store returns). Not read: the rectangle tiling
+    // bits (the value census has them), the line and trapezoid fields.
+    case 0x16C0u: mask = 0x00010003u; return true;
+    // DP_DATATYPE: destination, brush and source types. Not read: 29
+    // (big-endian host data), 30 and 31 (as bits 14 and 15 above).
+    case 0x16C4u: mask = 0x00030F0Fu; return true;
+    // DST_PITCH_OFFSET_C: offset and pitch. Bit 31 tiles the destination.
+    case 0x1C80u: mask = 0x7FFFFFFFu; return true;
+    case 0x1C88u: case 0x1C8Cu: mask = 0x3FFF3FFFu; return true;
     default: return false;
     }
 }
@@ -2355,6 +2373,7 @@ void R128Cell::engBlit()
 {
     // --- how wide is a pixel ------------------------------------------
     const u32 dt = rd(kDpDatatype);
+    r128SettingUsed(R128Setting::Dst2d, dt & 0xFu);
     u32 bpp = 0;
     switch (dt & 0xFu) {
     case 2: case 7: case 8: case 9: bpp = 8; break;  // pseudocolor, 332, Y8
@@ -2373,6 +2392,8 @@ void R128Cell::engBlit()
     const u32 mix = rd(kDpMix);
     const u32 rop = (mix >> 16) & 0xFFu;
     const u32 srcSource = (mix >> 8) & 0x7u;
+    r128SettingUsed(R128Setting::SrcFrom2d, srcSource);
+    r128SettingUsed(R128Setting::Tile2d, (rd(kDpCntl) >> 3) & 3u);
     // 3 and 4 are "loaded thru hostdata": the CPU feeds pixels through
     // HOST_DATA0..7 after the trigger, which is a stream, not a rectangle
     // copy. Stage 3 of the plan. Counted rather than half-drawn.
@@ -2392,6 +2413,7 @@ void R128Cell::engBlit()
     u32 pat = 0;
     if (usesPat) {
         const u32 brush = (dt >> 8) & 0xFu;
+        r128SettingUsed(R128Setting::Brush2d, brush);
         if (brush != 13u && brush != 15u) {
             ++gEng.brushUnimpl;
             return;
@@ -2401,6 +2423,8 @@ void R128Cell::engBlit()
     // The source operand must be colour pixels from memory. A MONO source is
     // a 1-bit mask expanded through DP_SRC_FRGD_CLR/BKGD_CLR, which is its
     // own path and belongs with host-data blits.
+    if (usesSrc)
+        r128SettingUsed(R128Setting::SrcFormat2d, (dt >> 16) & 0x3u);
     if (usesSrc && ((dt >> 16) & 0x3u) != 3u) {
         ++gEng.monoSrc;
         return;
@@ -2683,6 +2707,7 @@ bool R128Cell::engWrite(u32 off, u32 v)
     // --- the master control, and its side effects -----------------------
     case kDpGuiMasterCntlC: // CCE context alias: same control, same effects
     case kDpGuiMasterCntl: {
+        r128SettingUsed(R128Setting::Gmc3dFn, (v >> 27) & 1u);
         regs_[kDpGuiMasterCntl] = v;
         // The GMC word CARRIES the datapath fields; writing it is how a
         // driver sets datatype and mix in one store. Field positions are the

@@ -55,6 +55,7 @@ namespace {
 // SDK's field tables where the books redact them) ─────────────────────────
 constexpr u32 kFpuSetup = 0x071C;        // PM4_VC_FPU_SETUP
 constexpr u32 kScale3dCntl = 0x1A00;     // SCALE_3D_CNTL
+constexpr u32 kSetupCntl = 0x1BC4;       // SETUP_CNTL
 constexpr u32 kFogTableIndex = 0x1A14;   // SDK ch 6 example's own offsets
 constexpr u32 kFogTableData = 0x1A18;
 constexpr u32 kWindowXyOffset = 0x1BCC;  // x 31:20, y 15:4
@@ -278,11 +279,91 @@ int sx14c(u32 v)
 
 u32 log2Field(u32 v, u32 shift) { return (v >> shift) & 0xFu; }
 
+// The value census (opm/r128.hpp): every multi-valued setting this packet's
+// primitives are drawn with, each only when it is in force.
+void noteSettings(const R128Cell& c, const Pipe& P)
+{
+    using S = R128Setting;
+    const u32 zs = c.peek(kZStenCntlC);
+    if (P.zEn) {
+        r128SettingUsed(S::ZWidth, (zs >> 1) & 3u);
+        r128SettingUsed(S::ZTest, P.zTest);
+    }
+    if (P.stEn) {
+        r128SettingUsed(S::StencilTest, P.stTest);
+        r128SettingUsed(S::StencilFail, P.stSFail);
+        r128SettingUsed(S::StencilZPass, P.stZPass);
+        r128SettingUsed(S::StencilZFail, P.stZFail);
+    }
+    if (P.blendEn) {
+        r128SettingUsed(S::BlendSrc, P.blendSrc);
+        r128SettingUsed(S::BlendDst, P.blendDst);
+        r128SettingUsed(S::BlendCombine, P.blendComb);
+    }
+    if (P.alphaTestEn)
+        r128SettingUsed(S::AlphaTest, P.alphaOp);
+    if (P.ditherEn) {
+        const u32 sc = c.peek(kScale3dCntl);
+        r128SettingUsed(S::DitherMethod, (sc >> 1) & 1u);
+        r128SettingUsed(S::DitherInit, (sc >> 3) & 1u);
+    }
+    r128SettingUsed(S::SubPixel, (P.fpu >> 7) & 1u);
+    r128SettingUsed(S::EdgeAntiAlias, (P.fpu >> 10) & 1u);
+    r128SettingUsed(S::Supersample, (P.fpu >> 11) & 1u);
+    if (P.fpu) { // zero is the walker's "draw everything, as given"
+        r128SettingUsed(S::Shading, (P.fpu >> 5) & 3u);
+        r128SettingUsed(S::BackFace, (P.fpu >> 1) & 3u);
+        r128SettingUsed(S::FrontFace, (P.fpu >> 3) & 3u);
+    }
+    r128SettingUsed(S::TexAntiAlias, (P.texCntl >> 21) & 1u);
+    if (!P.texAny)
+        return;
+    if (P.chromaEn) {
+        // The driver here writes the function in SCALE_3D_CNTL's top bits;
+        // the guide places the field in MISC_3D_STATE_CNTL_REG.
+        const u32 fnScale = c.peek(kScale3dCntl) >> 30;
+        r128SettingUsed(S::TexColorKey, fnScale ? fnScale : P.misc >> 30);
+    }
+    r128SettingUsed(S::TexCoords, (c.peek(kSetupCntl) >> 9) & 1u);
+    r128SettingUsed(S::LightColor, (P.texCntl >> 14) & 0xFu);
+    r128SettingUsed(S::LightAlpha, (P.texCntl >> 18) & 7u);
+    for (int u = 0; u < 2; ++u) {
+        const TexUnit& t = P.tex[u];
+        if (!t.on)
+            continue;
+        const auto at = [u](S first, u32 k) {
+            return static_cast<S>(static_cast<u32>(first) + k +
+                                  (u ? static_cast<u32>(S::Tex2MinFilter) -
+                                           static_cast<u32>(S::Tex1MinFilter)
+                                     : 0u));
+        };
+        r128SettingUsed(at(S::Tex1MinFilter, 0), (t.cntl >> 1) & 7u);
+        r128SettingUsed(at(S::Tex1MagFilter, 0), (t.cntl >> 4) & 7u);
+        r128SettingUsed(at(S::Tex1ClampS, 0), (t.cntl >> 8) & 3u);
+        r128SettingUsed(at(S::Tex1ClampT, 0), (t.cntl >> 11) & 3u);
+        r128SettingUsed(at(S::Tex1Format, 0), t.fmt);
+        if (t.fmt == 1u || t.fmt == 2u)
+            r128SettingUsed(at(S::Tex1PalEntries, 0), (t.cntl >> 24) & 3u);
+        const u32 comb = t.comb & 0xFu, combA = (t.comb >> 14) & 0xFu;
+        r128SettingUsed(at(S::Tex1Combine, 0), comb);
+        if (comb) {
+            r128SettingUsed(at(S::Tex1ColorFactor, 0), (t.comb >> 4) & 0xFu);
+            r128SettingUsed(at(S::Tex1ColorInput, 0), (t.comb >> 10) & 0xFu);
+        }
+        r128SettingUsed(at(S::Tex1CombineAlpha, 0), combA);
+        if (combA) {
+            r128SettingUsed(at(S::Tex1AlphaFactor, 0), (t.comb >> 18) & 0xFu);
+            r128SettingUsed(at(S::Tex1AlphaInput, 0), (t.comb >> 25) & 7u);
+        }
+    }
+}
+
 bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
 {
     P.c = &c;
     P.m = m;
     const u32 dt = c.peek(kDpDatatype) & 0xFu;
+    r128SettingUsed(R128Setting::Dst3d, dt);
     switch (dt) {
     case 3u: case 4u: P.bypp = 2; break; // aRGB1555 / RGB565
     case 6u: P.bypp = 4; break;          // aRGB8888 (X byte stored)
@@ -421,6 +502,7 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
         t.useSecondSt = u && (t.cntl & 1u);
     }
     P.texAny = P.tex[0].on;
+    noteSettings(c, P);
     return true;
 }
 
@@ -1832,6 +1914,16 @@ void r128Set3dTriDump(int n) { gTriDump = n; }
 // not get. ⚠ Change a decoder, change its line here.
 bool r128Reg3dDecodedBits(u32 off, u32& mask)
 {
+    // The texture offset slots. A driver writes all eleven in one burst and
+    // means only the slot of the texture's size (see gatherPipe); the others
+    // carry whatever was in its buffer, so "bits ever set" says nothing
+    // here. The tiling mode in the top two bits is counted where a level is
+    // fetched.
+    if ((off >= kPrimTex0OffsetC && off <= kPrimTex0OffsetC + 40u) ||
+        (off >= kSecTex0OffsetC && off <= kSecTex0OffsetC + 40u)) {
+        mask = 0xFFFFFFFFu;
+        return true;
+    }
     switch (off) {
     // PM4_VC_FPU_SETUP: front direction, back and front face functions, the
     // shade function, the flat-shade vertex. Bit 8 selects 3D mode, which is
@@ -1862,6 +1954,21 @@ bool r128Reg3dDecodedBits(u32 off, u32& mask)
     // function and its two factors.
     case kPrimTexCombineCntlC:
     case kSecTexCombineCntlC: mask = 0x0E3FFCFFu; return true;
+    // SCALE_3D_CNTL (r128_reg.h; the books give two of its fields): the 3D
+    // function, which gates the block, and the texel cache's four settings,
+    // which have nothing to act on here. The dither method (1) and the error
+    // reset (3) are in the value census, as is the colour key function the
+    // Mac driver writes in the top two bits. Not read: 4 (24-bit rounding),
+    // 8 (scaler pixel replication), 10 (a YUV mode), and 12 to 29, which
+    // repeat MISC_3D_STATE_CNTL's fields: this model takes those from that
+    // register alone.
+    case kScale3dCntl: mask = 0xC0000AEEu; return true;
+    // SETUP_CNTL (r128_reg.h): everything the header names. The setup engine
+    // is driven here by the vertex walker, which takes the shading and the
+    // primitive from PM4_VC_FPU_SETUP and the packet; the two fields that
+    // change a picture (9, how texture coordinates are given, and 19, the
+    // sub-pixel precision) are in the value census.
+    case kSetupCntl: mask = 0x800FC3FDu; return true;
     case kTexSizePitchC:
     case kFogColorC:
     case kConstantColorC:

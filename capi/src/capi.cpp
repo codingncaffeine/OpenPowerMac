@@ -1174,13 +1174,6 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                          static_cast<unsigned long long>(n), a.peek(off));
                 s += b;
             }
-            // 🔎 …AND WHAT THE GUEST ASKED FOR THAT NOTHING HERE READS: the
-            // control bits it set outside what this model decodes, and the
-            // values of the multi-valued settings its draws used, each
-            // marked when the model draws it some other way. See "The
-            // census" in opm/r128.hpp.
-            s += r128UndecodedReport(a);
-            s += r128SettingsReport();
             // Said plainly, because this is the one question the capture
             // exists to answer.
             const auto it = a.writeCount.find(0x1CBCu);
@@ -1195,6 +1188,14 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                          : "written: the value is being lost or overwritten");
             s += b;
         }
+        // 🔎 …AND WHAT THE GUEST ASKED FOR THAT NOTHING HERE READS: the
+        // control bits it set outside what this model decodes, and the
+        // values of the multi-valued settings its draws used, each marked
+        // when the model draws it some other way. See "The census" in
+        // opm/r128.hpp. Printed whether or not anything 3D was drawn: a
+        // desktop asks the 2D engine for things too.
+        s += r128UndecodedReport(a);
+        s += r128SettingsReport();
     }
     // 📊 WHAT IS ACTUALLY ON THE SCREEN, AS NUMBERS.
     //
@@ -1300,6 +1301,19 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  (unsigned long long)e.blits, (unsigned long long)e.copies,
                  (unsigned long long)e.fills, (unsigned long long)e.pixels,
                  (unsigned long long)e.hostData, (unsigned long long)e.badBpp);
+        s += b;
+        // The rest of what the 2D engine was asked for and did not draw:
+        // each of these is a rectangle missing from the picture.
+        snprintf(b, sizeof b,
+                 "--   2d not drawn: %llu pattern brush, %llu one-bit "
+                 "source, %llu to system memory, %llu off video memory, "
+                 "%llu zero pitch; %llu colour compares not applied; %llu "
+                 "clipped away\n",
+                 (unsigned long long)e.brushUnimpl,
+                 (unsigned long long)e.monoSrc, (unsigned long long)e.agpTarget,
+                 (unsigned long long)e.offVram, (unsigned long long)e.zeroPitch,
+                 (unsigned long long)e.colorCompare,
+                 (unsigned long long)e.clippedOut);
         s += b;
         if (e.cceRingKicks || e.cceRingStall) {
             snprintf(b, sizeof b,

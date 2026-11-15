@@ -88,16 +88,12 @@
 
 namespace opm {
 
-// A chain site's rel32 states (Stage B). The site is `jmp rel32`; relative to
-// its end sit, in fixed layout, a 5-byte parking block (one jump to the
-// way out) and then the resolver thunk. So rel32 = 0 parks the site on the
-// dispatcher exit (backref capacity exhausted — permanent until the block
-// recompiles), rel32 = 5 lands on the thunk (initial state, and the severed
-// state: re-resolve on next traversal), and anything else is a live link to
-// the successor's segment. The emitter, the resolver and sever() all speak
-// this encoding, so it lives here, once.
-inline constexpr i32 kChainRelPark = 0;
-inline constexpr i32 kChainRelThunk = 5;
+// A chain site's rel32 states (Stage B). The site is `jmp rel32` and the
+// resolver thunk follows it directly. So rel32 = 0 lands on the thunk
+// (initial state, and the severed state: re-resolve on next traversal), and
+// anything else is a live link to the successor's block. The emitter, the
+// resolver and sever() all speak this encoding, so it lives here, once.
+inline constexpr i32 kChainRelThunk = 0;
 
 namespace {
 
@@ -327,12 +323,18 @@ void shimExecRow(Cpu* c, u32 insn, u32 row)
 // second traversal in the common case. Patching its own block's bytes here
 // is safe: the rel32 was consumed by the jump that brought us in, and no
 // other block's code is touched.
-void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
+void opmJitChainResolve(Cpu* c, u32 site, u32 tgtPaLine, u32 tgtVa)
 {
     JitCache& J = *c->jit;
     ++J.chainResolves;
     if (c->jitCountHops)
         --c->jitChainHops; // the site counted a hop on its way here
+    // The top bit says the site is in a block of the very line it targets.
+    // Such a link needs no record: nothing outlives the line that could
+    // take it (the line's blocks go together, and every way into them from
+    // elsewhere is recorded and severed).
+    const bool ownLine = (site >> 31) != 0;
+    const u32 siteOff = site & 0x7FFFFFFFu;
     const u32 slot = Cpu::fetchSlot(tgtPaLine);
     JitLine* ways = &J.line[slot * JitCache::kWays];
     const u32 vaLine = tgtVa & ~31u;
@@ -340,19 +342,21 @@ void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
         JitLine& jl = ways[k];
         if (jl.base != tgtPaLine || jl.va != vaLine)
             continue;
-        if (jl.nBref >= JitLine::kBrefs) {
-            // No room to record the unlink — and a link that cannot be
-            // severed is a use-after-invalidate waiting to happen. Park the
-            // site on the dispatcher exit instead, permanently (until the
-            // SITE's own block recompiles): a parked traversal costs what
-            // v1 cost, and the counter names how often it happens.
-            ++J.chainGiveups;
-            const i32 rel = kChainRelPark;
-            std::memcpy(J.arena_ + siteOff, &rel, 4);
-            return;
+        const u32 to = jl.off[(tgtVa >> 2) & 7u];
+        if (!to)
+            break; // no block for that entry yet: the dispatcher compiles it
+        if (!ownLine) { // recorded, so that sever() can take the link back
+            u32 n = J.brefFree;
+            if (n) {
+                J.brefFree = J.brefPool[n].next;
+            } else {
+                n = u32(J.brefPool.size());
+                J.brefPool.push_back({});
+            }
+            J.brefPool[n] = {siteOff, jl.brefHead};
+            jl.brefHead = n;
         }
-        jl.bref[jl.nBref++] = siteOff;
-        const i32 rel = i32(jl.off[(tgtVa >> 2) & 7u]) - i32(siteOff + 4u);
+        const i32 rel = i32(to) - i32(siteOff + 4u);
         std::memcpy(J.arena_ + siteOff, &rel, 4);
         ++J.chainLinks;
         return;
@@ -386,8 +390,8 @@ void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
 //                  does not hold is the fetch path's to walk: null;
 //   the line       resident under that address, or null (the fetch path
 //                  fills it);
-//   the block      compiled for that line and address, or null (the
-//                  dispatcher compiles it).
+//   the block      compiled for that line, address and entry word, or null
+//                  (the dispatcher compiles it).
 //
 // Nothing here is new machine behavior: each step is one the interpreter
 // takes at the same point, or a refusal.
@@ -415,9 +419,12 @@ const void* opmJitHop(Cpu* c)
     const JitLine* ways = &J.line[slot * JitCache::kWays];
     for (u32 k = 0; k < JitCache::kWays; ++k)
         if (ways[k].base == base && ways[k].va == va) {
+            const u32 to = ways[k].off[(pc >> 2) & 7u];
+            if (!to)
+                return nullptr; // that entry has no block yet
             if (c->jitCountHops)
                 ++c->jitChainHops;
-            return J.arena_ + ways[k].off[(pc >> 2) & 7u];
+            return J.arena_ + to;
         }
     return nullptr;
 }
@@ -674,18 +681,40 @@ struct Compiler {
     Emit e;
     const Cpu& c;
     const JitCache::Offs& o;
-    u32 epi;
+    u32 epilogue;       // arena offset of the shared way out
     u32 paBase;
     u32 vaBase;
     i32 flBase;         // r13-relative disp of fetchLine[slot].base
-    const u32* segOff;  // jl.off — valid for words already emitted
     bool chain;         // Stage B on (compile chain sites at eligible exits)
     bool direct;        // call bound handlers directly (else the execRow shim)
     JitCache* jc;       // for the census counters' absolute addresses
-    // Forward intra-line chain jumps: the target segment's offset is not
-    // known until its word is emitted, so compileLine patches these after
-    // the loop. {position of the rel32, target word}.
-    std::vector<std::pair<size_t, u32>> fixes;
+    u32 entryWord;      // the word this block is entered at (its only entry)
+    u32 blockStart;     // arena offset of that word's code
+    u32 curK = 0;       // the word being compiled
+    bool ended = false; // …and it never falls through: the block ends with it
+    // ⭐ EVERY WAY OUT OF A BLOCK IS A JUMP FORWARD, to a few bytes placed
+    // after the block's last instruction: one small exit per word that has
+    // any, which stores that word in Cpu::curInsn and goes on to the shared
+    // way out. The interpreter writes "the instruction being executed"
+    // before every instruction and it is part of a snapshot, so two machines
+    // that stop at the same instruction have to agree on it; a block writes
+    // it only where C++ needs it, so the way out says which instruction was
+    // the last. Nothing is added to a path that stays in translated code,
+    // and the exits are out of the way of the code that runs.
+    std::vector<std::pair<size_t, u32>> exits; // {rel32 position, word}
+    void xcc(u8 cc)
+    {
+        e.b(0x0F);
+        e.b(u8(0x80 | cc));
+        exits.push_back({e.at, curK});
+        e.i32le(0);
+    }
+    void xjmp()
+    {
+        e.b(0xE9);
+        exits.push_back({e.at, curK});
+        e.i32le(0);
+    }
 
     i32 gpr(u32 r) const { return o.gpr0 + i32(r * 4u); }
     i32 fpr(u32 r) const { return o.fpr0 + i32(r * 8u); }
@@ -745,19 +774,19 @@ struct Compiler {
     {
         e.mem13(0x81, 7, flBase);      // cmp dword [r13+d], imm32
         e.i32le(paBase);
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
     }
     void byteCheck(i32 disp) // exit if a bool member went true
     {
         e.mem13(0x80, 7, disp);        // cmp byte [r13+d], imm8
         e.b(0);
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
     }
     void pcCheck(u32 nextVa) // exit unless the pc fell through
     {
         e.loadR(RAX, o.pc);
         e.cmpEaxI(nextVa);
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
     }
     // MSR is the one the dispatcher entered under (Cpu::jitMsr), or leave.
     // Asked after every call that can change MSR and come back to the next
@@ -767,7 +796,7 @@ struct Compiler {
     {
         e.loadR(RAX, o.msr);
         e.mem13(0x3B, RAX, o.jitMsr);      // cmp eax, [r13+jitMsr]
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
     }
 
     // CR field from the FLAGS of a just-executed cmp/test. Mirrors
@@ -888,7 +917,7 @@ struct Compiler {
         }
         e.bytes({0x48, 0x8D, 0x43, 0x08}); // lea rax, [rbx+8]
         e.bytes({0x48, 0x39, 0xE8});       // cmp rax, rbp
-        e.jccTo(7, epi);                   // ja: less than a line left
+        xcc(7);                   // ja: less than a line left
     }
     void chainChecksFull() // the dispatcher's own gate, in test form
     {
@@ -899,28 +928,28 @@ struct Compiler {
         byteCheck(o.napping);
         e.mem13(0x83, 7, o.mmcr0); // cmp dword [r13+mmcr0], 0
         e.b(0);
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
         e.mem13(0xF6, 0, o.iabr);  // test byte [r13+iabr], 2
         e.b(2);
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
         e.loadR(RAX, o.msr);
         e.mem13(0x3B, RAX, o.jitMsr); // cmp eax, [r13+jitMsr]
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
         e.b(0xA9);                 // test eax, SE|BE
         e.i32le(msr::SE | msr::BE);
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
         e.bytes({0x89, 0xC2});     // mov edx, eax
         e.bytes({0x81, 0xE2});     // and edx, IR|PR|LE
         e.i32le(msr::IR | msr::PR | msr::LE);
         e.mem13(0x3B, RDX, o.xlMsr); // cmp edx, [r13+xlMsr] — the mtmsr hole
-        e.jccTo(CC_NE, epi);
+        xcc(CC_NE);
         e.b(0xA9);                 // test eax, EE
         e.i32le(msr::EE);
         const size_t noEe = e.j8(CC_Z);
         if (o.pend4Ok) {           // the four pending bools, one dword
             e.mem13(0x83, 7, o.pend4);
             e.b(0);
-            e.jccTo(CC_NE, epi);
+            xcc(CC_NE);
         } else {
             byteCheck(o.extIrq);
             byteCheck(o.smi);
@@ -929,73 +958,65 @@ struct Compiler {
         }
         e.patch8(noEe);
         e.bytes({0x48, 0x83, 0xFD, 0x08}); // cmp rbp, 8 (settled above)
-        e.jccTo(CC_B, epi);                // budget < a line: dispatcher
+        xcc(CC_B);                // budget < a line: dispatcher
     }
 
-    // Intra-line hop: target segment in this same block. No residency or
-    // linking machinery — the block's own validity covers it (mem ops and
-    // fallbacks re-check fl.base at their own tails) — but the FULL gate
-    // runs, because the interpreter passes through the dispatcher on every
-    // taken branch, intra-line included.
-    void chainIntra(u32 tgtWord, u32 curWord)
+    // A hop to this block's own first instruction: the loop that closes on
+    // the word the block was entered at. Nothing to find and nothing to
+    // link; the gate runs, because the interpreter passes through the
+    // dispatcher on every taken branch, this one included.
+    void chainSelf()
     {
         chainChecks();
         hopInc();
-        if (tgtWord <= curWord) { // emitted already (self-loop included)
-            e.jmpTo(segOff[tgtWord]);
-        } else {
-            e.b(0xE9);
-            fixes.push_back({e.at, tgtWord});
-            e.i32le(0);
-        }
+        e.jmpTo(blockStart);
     }
 
-    // Cross-line hop, same page: successor residency check + the patchable
-    // site. Layout after the site's rel32 is fixed (kChainRel*): a parking
-    // block, then the resolver thunk. Initial rel32 = thunk.
-    void chainCross(u32 tgtVa)
+    // A hop to another block on this page (another line's, or this line's
+    // own block for another entry word): the patchable site, with the
+    // resolver thunk directly after it. A target on another line is
+    // entered only while that line is resident, as the dispatcher would
+    // have it; this line is, or the block would have left already (a store
+    // into it is the slow path, which tests).
+    void chainSite(u32 tgtVa)
     {
+        const bool ownLine = (tgtVa & ~31u) == vaBase;
         const u32 tgtPaLine = (paBase & ~0xFFFu) | (tgtVa & 0xFE0u);
         const u32 slot = (tgtPaLine >> 5) & (JitCache::kLines - 1u);
         const i32 flD = i32(i64(o.fetchLine0) + i64(slot) * o.flStride);
         chainChecks();
-        e.mem13(0x81, 7, flD); // cmp dword [fl'], paLine' — resident + same
-        e.i32le(tgtPaLine);
-        e.jccTo(CC_NE, epi);
+        if (!ownLine) {
+            e.mem13(0x81, 7, flD); // cmp dword [fl'], paLine' — resident + same
+            e.i32le(tgtPaLine);
+            xcc(CC_NE);
+        }
         hopInc();
         e.b(0xE9); // the site
         const u32 siteOff = u32(e.at);
         e.i32le(u32(kChainRelThunk));
-        const size_t parkAt = e.at;
-        e.jmpTo(epi); // parked: the dispatcher
-        // ⚠ THE PARKING BLOCK'S LENGTH *IS* kChainRelThunk. The site's three
-        // states are encoded as rel32 values (0 = park, 5 = thunk, anything
-        // else = a live link), so the thunk only sits at +5 while the parking
-        // block is exactly one five-byte jump. Nothing else would notice if
-        // an emitter helper changed size — the site would simply jump into
-        // the middle of an instruction — so it is checked, not assumed.
-        if (e.at - parkAt != size_t(kChainRelThunk))
-            e.ok = false;
-        e.movEdxI(siteOff); // the thunk (the resolver takes the hop back)
+        // The thunk, directly after (the resolver takes the hop back). The
+        // top bit of the site's offset tells it the target is this line.
+        e.movEdxI(siteOff | (ownLine ? 0x80000000u : 0u));
         e.bytes({0x41, 0xB8}); // mov r8d, paLine'
         e.i32le(tgtPaLine);
         e.bytes({0x41, 0xB9}); // mov r9d, tgtVa
         e.i32le(tgtVa);
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.callAbs(reinterpret_cast<const void*>(&opmJitChainResolve));
-        e.jmpTo(epi);
+        xjmp();
     }
 
-    // The one door: chain if eligible, else the v1 exit. Same-line targets
-    // are intra (a line never spans pages); same-page targets cross-chain;
-    // anything else — and everything under --no-jit-chain — exits to the
-    // dispatcher exactly as v1 did.
-    void chainOrExit(u32 target, u32 curWord)
+    // The one door: chain if eligible, else the v1 exit. A target on this
+    // page is a block this one can name (a line never spans pages);
+    // anything else — and everything under --no-jit-chain — asks at run
+    // time or exits to the dispatcher.
+    void chainOrExit(u32 target)
     {
-        if (chain && (target & ~31u) == vaBase)
-            chainIntra((target >> 2) & 7u, curWord);
+        if (chain && (target & ~31u) == vaBase &&
+            ((target >> 2) & 7u) == entryWord)
+            chainSelf();
         else if (chain && (target >> 12) == (vaBase >> 12))
-            chainCross(target);
+            chainSite(target);
         else
             hopOrExit();
     }
@@ -1007,14 +1028,14 @@ struct Compiler {
     void hopOrExit()
     {
         if (!chain || c.jitHopOff) {
-            e.jmpTo(epi);
+            xjmp();
             return;
         }
         chainChecks();
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.callAbs(reinterpret_cast<const void*>(&opmJitHop));
         e.bytes({0x48, 0x85, 0xC0}); // test rax, rax
-        e.jccTo(CC_Z, epi);
+        xcc(CC_Z);
         e.bytes({0xFF, 0xE0});       // jmp rax
     }
 
@@ -1421,7 +1442,7 @@ struct Compiler {
         e.bytes({0x48, 0x83, 0xF8, 0xFF}); // cmp rax, -1
         const size_t okJ = e.j8(CC_NE);
         bump();                            // fault: counted, no write
-        e.jmpTo(epi);
+        xjmp();
         e.patch8(okJ);
         if (sext)
             e.b(0x98); // cwde — lha's sext16 (only the halfword forms set it)
@@ -1485,7 +1506,7 @@ struct Compiler {
         e.bytes({0x48, 0x83, 0xF8, 0xFF}); // cmp rax, -1
         const size_t okJ = e.j8(CC_NE);
         bump();                            // fault: counted, no rA update
-        e.jmpTo(epi);
+        xjmp();
         e.patch8(okJ);
         if (update)
             e.bytes({0x45, 0x89, 0xA5}), e.i32le(u32(gpr(f_ra(insn))));
@@ -1623,7 +1644,7 @@ struct Compiler {
         e.bytes({0x48, 0x83, 0xF8, 0xFF}); // cmp rax, -1
         const size_t okJ = e.j8(CC_NE);
         bump(); // fault: counted, no rA update
-        e.jmpTo(epi);
+        xjmp();
         e.patch8(okJ);
         if (update) {
             e.bytes({0x45, 0x89, 0xA5}); // mov [gpr ra], r12d
@@ -2298,9 +2319,10 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         if (target != nextVa) {
             mark(JitCache::kPartHop);
             e.storeI(o.pc, target);
-            chainOrExit(target, k);
+            chainOrExit(target);
+            ended = true;
         }
-        return; // b .+4 falls through to the next segment, pc deferred
+        return; // b .+4 falls through to the next word, pc deferred
     }
     case Lo::Bc: {
         const u32 disp = u32(sext14(ppcbits(insn, 16, 29)) * 4);
@@ -2316,11 +2338,11 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         bump();
         e.storeI(o.pc, target);
         if (chained)
-            chainOrExit(target, k);
+            chainOrExit(target);
         else if (target != nextVa)
             hopOrExit();
         else
-            e.jmpTo(epi);
+            xjmp();
         if (nt != size_t(-1)) {
             if (chained)
                 e.patch32(nt);
@@ -2328,6 +2350,8 @@ void Compiler::word(u32 k, u32 insn, u32 row)
                 e.patch8(nt);
             mark(JitCache::kPartBody);
             bump(); // not taken: fall through, pc deferred
+        } else {
+            ended = true; // always taken
         }
         return;
     }
@@ -2348,6 +2372,8 @@ void Compiler::word(u32 k, u32 insn, u32 row)
             e.patch8(nt);
             mark(JitCache::kPartBody);
             bump();
+        } else {
+            ended = true; // always taken
         }
         return;
     }
@@ -2581,8 +2607,10 @@ void JitCache::dropAll()
         // jumps between the dead blocks are unreachable and need no arena
         // rewrites — but the backref lists must not survive into the lines'
         // next lives, where the offsets would point at unrelated code.
-        l.nBref = 0;
+        l.brefHead = 0;
     }
+    brefPool.resize(1);
+    brefFree = 0;
     std::memset(rr, 0, sizeof rr);
 }
 
@@ -2603,16 +2631,20 @@ u32 JitCache::mapAt(u32 off) const
 void JitCache::sever(JitLine& jl)
 {
 #if OPM_JIT_HOST
-    for (u32 k = 0; k < jl.nBref; ++k) {
-        const u32 s = jl.bref[k];
+    for (u32 n = jl.brefHead; n;) {
+        const u32 s = brefPool[n].site;
         if (size_t(s) + 4 <= cap_) {
             const i32 rel = kChainRelThunk; // back to "resolve me"
             std::memcpy(arena_ + s, &rel, 4);
             ++chainSevers;
         }
+        const u32 next = brefPool[n].next;
+        brefPool[n].next = brefFree; // handed back
+        brefFree = n;
+        n = next;
     }
 #endif
-    jl.nBref = 0;
+    jl.brefHead = 0;
 }
 
 void JitCache::bind(Cpu& c)
@@ -2732,22 +2764,16 @@ void JitCache::bind(Cpu& c)
 #endif
 }
 
-bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
-                           const u16* rows, u32 vaBase)
+// The way that holds this line's blocks, made if there is none.
+JitLine* JitCache::lineFor(u32 slot, u32 paBase, u32 vaBase, const u32* w)
 {
-#if OPM_JIT_HOST
-    if (!ready())
-        return false;
-    if (cap_ - at_ < 8192) { // a full arena: drop everything, start over
-        dropAll();
-        at_ = firstCode_;
-        ++resets;
-        map.clear();
-    }
+    JitLine* ways = &line[slot * kWays];
+    for (u32 k = 0; k < kWays; ++k)
+        if (ways[k].base == paBase && ways[k].va == vaBase)
+            return &ways[k];
     // The victim way: an invalid way if one exists, else round-robin. The
     // ways are what keep a fetch-slot conflict from being a compile storm —
     // see the field comment in the header.
-    JitLine* ways = &line[slot * kWays];
     u32 way = kWays;
     for (u32 k = 0; k < kWays; ++k)
         if (ways[k].base == 1u) {
@@ -2759,62 +2785,89 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
         rr[slot] = u8((rr[slot] + 1u) % kWays);
     }
     JitLine& jl = ways[way];
-    sever(jl); // way reuse: chains into the OLD block must re-resolve
-    jl.base = 1;
+    sever(jl); // way reuse: chains into the OLD blocks must re-resolve
+    std::memset(jl.off, 0, sizeof jl.off);
+    std::memcpy(jl.srcW, w, 32);
+    jl.va = vaBase;
+    jl.base = paBase;
+    return &jl;
+}
+
+// ⭐ ONE BLOCK PER ENTRY. A block is compiled for the word it is entered at
+// and runs from there to the end of its line, and nothing else enters it:
+// a branch to another word of the same line is a hop to that word's own
+// block, compiled when it is first wanted. So inside a block the code is a
+// straight line with side exits, and what one instruction established the
+// next may use (see Compiler::Known). A line entered at three words costs
+// its tail three times over; a line entered at one costs less than the
+// eight segments it used to.
+bool JitCache::compileEntry(Cpu& c, JitLine& jl, u32 slot, u32 word,
+                            const u32* w, const u16* rows)
+{
+#if OPM_JIT_HOST
+    if (!ready())
+        return false;
     Compiler cp{Emit{arena_, cap_, at_},
                 c,
                 offs,
                 epilogue_,
-                paBase,
-                vaBase,
+                jl.base,
+                jl.va,
                 i32(i64(offs.fetchLine0) + i64(slot) * offs.flStride),
-                jl.off,
                 !c.jitChainOff,
                 !c.jitDirectOff,
                 this,
-                {}, // fixes: named, because gcc requires every member here
+                word,
+                0u,
+                0u,
+                false,
+                {},
                 JitCache::kMapNoRow};
-    // ⭐ THE WAY OUT RECORDS THE LAST INSTRUCTION. Cpu::curInsn is "the
-    // instruction being executed", the interpreter writes it before every
-    // one, and it is part of a snapshot: so two machines that stop at the
-    // same instruction have to agree on it. A block writes it only where
-    // C++ needs it (before a call), and left for the dispatcher after an
-    // instruction done in line with the word of whatever it last called
-    // out for. Eight small exits ahead of the block's code, one per word:
-    // each stores its word and goes on to the shared way out, and every
-    // exit compiled for word k is a jump to the k-th. Nothing is added to
-    // any path that stays in translated code.
-    u32 wayOut[8];
-    for (u32 k = 0; k < 8; ++k) {
-        wayOut[k] = u32(cp.e.at);
-        cp.e.storeI(offs.curInsn, w[k]);
-        cp.e.jmpTo(epilogue_);
-    }
-    for (u32 k = 0; k < 8; ++k) {
-        jl.off[k] = u32(cp.e.at);
-        cp.epi = wayOut[k];
+    const u32 start = u32(cp.e.at);
+    cp.blockStart = start;
+    // To the end of the line, or to the first instruction nothing falls
+    // through (an unconditional branch, a call, a return): what follows
+    // that is reached only as an entry of its own, and gets its own block.
+    u32 last = word;
+    for (u32 k = word; k < 8; ++k) {
+        cp.curK = last = k;
         cp.word(k, w[k], rows[k]);
+        if (cp.ended)
+            break;
     }
-    // Word 7's fallthrough is the line end: store the deferred pc (the word
-    // after the line), then chain to the next line — the other half of
-    // every dispatcher round trip — or leave.
+    if (!cp.ended) {
+        // Word 7's fallthrough is the line end: store the deferred pc (the
+        // word after the line), then chain to the next line — the other
+        // half of every dispatcher round trip — or leave.
+        cp.curRow = kMapNoRow;
+        cp.mark(kPartHop);
+        cp.e.storeI(offs.pc, jl.va + 32u);
+        cp.chainOrExit(jl.va + 32u);
+    }
+    // The ways out (see Compiler::exits).
     cp.curRow = kMapNoRow;
     cp.mark(kPartHop);
-    cp.e.storeI(offs.pc, vaBase + 32u);
-    cp.chainOrExit(vaBase + 32u, 7u);
-    // Forward intra-line chain targets, now that every segment has a home.
-    for (const auto& f : cp.fixes)
-        cp.e.patchRel32To(f.first, jl.off[f.second]);
+    for (u32 k = word; k <= last; ++k) {
+        const u32 at = u32(cp.e.at);
+        bool any = false;
+        for (const auto& x : cp.exits)
+            if (x.second == k) {
+                cp.e.patchRel32To(x.first, at);
+                any = true;
+            }
+        if (any) {
+            cp.e.storeI(offs.curInsn, w[k]);
+            cp.e.jmpTo(epilogue_);
+        }
+    }
     if (!cp.e.ok)
         return false; // ran out mid-compile; the next touch retries fresh
     at_ = cp.e.at;
-    std::memcpy(jl.srcW, w, 32);
-    jl.va = vaBase;
-    jl.base = paBase;
+    jl.off[word] = start;
     ++compiles;
     return true;
 #else
-    (void)c; (void)slot; (void)paBase; (void)w; (void)rows; (void)vaBase;
+    (void)c; (void)jl; (void)slot; (void)word; (void)w; (void)rows;
     return false;
 #endif
 }
@@ -2846,18 +2899,18 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
             jl = &ways[k];
             break;
         }
-    if (!jl) {
-        if (!J.compileLine(c, slot, flBase, fl.w, fl.row, vaBase)) {
-            ++J.bails;
-            return false;
+    if (!jl || !jl->off[word]) {
+        if (J.cap_ - J.at_ < 8192) { // a full arena: drop everything, start over
+            J.dropAll();
+            J.at_ = J.firstCode_;
+            ++J.resets;
+            J.map.clear();
+            jl = nullptr;
         }
-        for (u32 k = 0; k < JitCache::kWays; ++k)
-            if (ways[k].base == flBase && ways[k].va == vaBase) {
-                jl = &ways[k];
-                break;
-            }
-        if (!jl) { // compile succeeded but the way is unfindable: impossible,
-            ++J.bails; // but a wrong branch here must fail safe
+        if (!jl)
+            jl = J.lineFor(slot, flBase, vaBase, fl.w);
+        if (!J.compileEntry(c, *jl, slot, word, fl.w, fl.row)) {
+            ++J.bails;
             return false;
         }
     }

@@ -2,8 +2,8 @@
 // The JIT: a native x86-64 transcription of Cpu::runSteps' line executor.
 // Design and correctness argument: _plans/JIT_PLAN.md. The short form:
 //
-//   - One compiled block per 32-byte FetchLine, eight entry points (one per
-//     word), segments laid out adjacently so fallthrough is literal adjacency.
+//   - Compiled blocks belong to a 32-byte FetchLine: one per word the line
+//     is entered at, each running from its word to the end of the line.
 //   - Hot execFast-eligible instructions are inlined; everything else calls
 //     execRow — the SAME dispatch tail the interpreter uses — and then runs
 //     the line executor's own exit tests (batchBreak/halted, pc fell through,
@@ -46,17 +46,15 @@ struct JitLine {
     u32 srcW[8]{};   // the eight words compiled, so a refill with identical
                      // content KEEPS the block (instrument-era flushes would
                      // otherwise recompile the world)
-    u32 off[8]{};    // arena offset of each word's segment
-    // Chain backrefs: arena offsets of the rel32 words in OTHER blocks that
-    // jump into this one (JIT_PLAN §7 Stage B). Severed — rewritten so the
-    // site re-resolves — the moment this JitLine stops describing its line
-    // (refill with different content, way eviction, dropAll), which is the
-    // whole of what makes a chained entry equivalent to the dispatcher's
-    // ways probe. Fixed capacity: a site that finds the list full parks
-    // itself on the dispatcher exit permanently (counted, chainGiveups).
-    static constexpr u32 kBrefs = 8;
-    u32 bref[kBrefs]{};
-    u8 nBref = 0;
+    u32 off[8]{};    // arena offset of the block compiled for an entry at
+                     // each word, or 0: none yet (compiled when first wanted)
+    // Chain backrefs: the rel32 words in OTHER lines' blocks that jump into
+    // this line's (JIT_PLAN §7 Stage B), as a list in JitCache::brefPool.
+    // Severed — rewritten so the site re-resolves — the moment this JitLine
+    // stops describing its line (refill with different content, way
+    // eviction, dropAll), which is the whole of what makes a chained entry
+    // equivalent to the dispatcher's ways probe.
+    u32 brefHead = 0; // index of the first record, or 0
 };
 
 class JitCache {
@@ -77,11 +75,12 @@ class JitCache {
     // that comparison is also what catches code modified while its line was
     // not resident — the refill always precedes the next execution).
     static constexpr u32 kWays = 4;
-    // 32 MB of code, bump-allocated; full -> drop everything and start over.
-    // At the ~300 B/segment this emitter produces, a wholesale reset is a
-    // rare event and a recompile is microseconds, so simplicity wins over an
-    // eviction policy.
-    static constexpr size_t kArenaBytes = 32u << 20;
+    // 128 MB of code, bump-allocated; full -> drop everything and start
+    // over. A block is one to two kilobytes and a game's flyby compiles
+    // some forty thousand of them, so a wholesale reset is a rare event and
+    // a recompile is microseconds: simplicity wins over an eviction policy.
+    // (At 32 MB that flyby reset the arena every two seconds.)
+    static constexpr size_t kArenaBytes = 128u << 20;
 
     bool ready() const { return arena_ != nullptr && live_; }
 
@@ -94,8 +93,14 @@ class JitCache {
 
     // Chain lifecycle (Stage B). Hops themselves are counted by emitted code
     // into Cpu::jitChainHops (r13-addressable); everything here is C++-side.
-    u64 chainLinks = 0, chainSevers = 0, chainResolves = 0, chainMisses = 0,
-        chainGiveups = 0;
+    u64 chainLinks = 0, chainSevers = 0, chainResolves = 0, chainMisses = 0;
+    // The records of who jumps into a line: {the site's rel32, the next
+    // record}. Index 0 is "none"; brefFree heads the records handed back.
+    struct Bref {
+        u32 site, next;
+    };
+    std::vector<Bref> brefPool = std::vector<Bref>(1);
+    u32 brefFree = 0;
     // The mix census. What the blocks actually executed is the aim point
     // for the next lowering round: memOps counts shim round trips, fallbacks
     // counts execRow calls from inside blocks, and fbByRow names the rows —
@@ -201,8 +206,9 @@ class JitCache {
     // thunk. Must run before the JitLine stops describing its (base, va) —
     // see the field comment on JitLine::bref.
     void sever(JitLine& jl);
-    bool compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
-                     const u16* rows, u32 vaBase);
+    JitLine* lineFor(u32 slot, u32 paBase, u32 vaBase, const u32* w);
+    bool compileEntry(Cpu& c, JitLine& jl, u32 slot, u32 word, const u32* w,
+                      const u16* rows);
 
     bool movbe = false; // the host loads and stores byte-reversed in one step
     u8* arena_ = nullptr;

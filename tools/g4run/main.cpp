@@ -5639,18 +5639,26 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(cpu.jit->refillDrops),
                    static_cast<unsigned long long>(cpu.jit->bails),
                    static_cast<unsigned long long>(cpu.jit->resets));
+        if (cpu.jit)
+            printf("--   jit code: %.1f MB of %.0f in use, %.0f bytes a "
+                   "block\n",
+                   static_cast<double>(cpu.jit->at_) / 1048576.0,
+                   static_cast<double>(cpu.jit->cap_) / 1048576.0,
+                   cpu.jit->compiles && !cpu.jit->resets
+                       ? static_cast<double>(cpu.jit->at_) /
+                             static_cast<double>(cpu.jit->compiles)
+                       : 0.0);
         // Stage B: hops are dispatcher round trips the chained exits saved.
         // insns per (enter + hop) is the true scaffold amortization — the
         // number that was 4.3 when every block exit paid the full round trip.
         if (cpu.jit && !cpu.jitCountHops && cpu.jit->chainResolves)
             printf("--   jit chain: %llu links, %llu severs, %llu resolves "
-                   "(%llu misses, %llu giveups); %.1f insns/dispatch-enter "
+                   "(%llu misses); %.1f insns/dispatch-enter "
                    "(--jit-count-hops counts the hops)\n",
                    static_cast<unsigned long long>(cpu.jit->chainLinks),
                    static_cast<unsigned long long>(cpu.jit->chainSevers),
                    static_cast<unsigned long long>(cpu.jit->chainResolves),
                    static_cast<unsigned long long>(cpu.jit->chainMisses),
-                   static_cast<unsigned long long>(cpu.jit->chainGiveups),
                    cpu.jit->enters
                        ? static_cast<double>(cpu.jit->insns) /
                              static_cast<double>(cpu.jit->enters)
@@ -5658,14 +5666,13 @@ int main(int argc, char** argv)
         if (cpu.jit && cpu.jitCountHops &&
             (cpu.jitChainHops || cpu.jit->chainResolves))
             printf("--   jit chain: %llu hops, %llu links, %llu severs, "
-                   "%llu resolves (%llu misses, %llu giveups); "
+                   "%llu resolves (%llu misses); "
                    "%.1f insns/dispatch-enter, %.1f insns/native-entry\n",
                    static_cast<unsigned long long>(cpu.jitChainHops),
                    static_cast<unsigned long long>(cpu.jit->chainLinks),
                    static_cast<unsigned long long>(cpu.jit->chainSevers),
                    static_cast<unsigned long long>(cpu.jit->chainResolves),
                    static_cast<unsigned long long>(cpu.jit->chainMisses),
-                   static_cast<unsigned long long>(cpu.jit->chainGiveups),
                    cpu.jit->enters
                        ? static_cast<double>(cpu.jit->insns) /
                              static_cast<double>(cpu.jit->enters)

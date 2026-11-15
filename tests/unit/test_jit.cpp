@@ -181,6 +181,7 @@ void seedRegs(Cpu& c, Rng& r)
         CHECK((a).cpu.st.dec == (b).cpu.st.dec);                              \
         CHECK((a).stamp == (b).stamp);                                        \
         CHECK((a).cpu.halted == (b).cpu.halted);                              \
+        CHECK((a).cpu.curInsn == (b).cpu.curInsn);                            \
     } while (0)
 
 // Run one program on both machines with one register seed; RAM compared too.

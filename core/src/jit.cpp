@@ -648,7 +648,6 @@ struct Compiler {
     bool chain;         // Stage B on (compile chain sites at eligible exits)
     bool direct;        // call bound handlers directly (else the execRow shim)
     JitCache* jc;       // for the census counters' absolute addresses
-    u32 parkCounted;    // --jit-count-hops: the way out that takes a hop back
     // Forward intra-line chain jumps: the target segment's offset is not
     // known until its word is emitted, so compileLine patches these after
     // the loop. {position of the rel32, target word}.
@@ -817,8 +816,8 @@ struct Compiler {
     // overrun the batch, which is what fpClamp exactness rides on.
     // Precondition at every chain point: the pc stored (an immediate).
 
-    void hopInc() // --jit-count-hops only: the report's hop count
-    {
+    void hopInc() // --jit-count-hops only: the report's hop count (a
+    {             // traversal of a parked site is counted with them)
         if (!c.jitCountHops)
             return;
         e.bytes({0x49, 0xFF, 0x85}); // inc qword [r13+chainHops]
@@ -936,7 +935,7 @@ struct Compiler {
         const u32 siteOff = u32(e.at);
         e.i32le(u32(kChainRelThunk));
         const size_t parkAt = e.at;
-        e.jmpTo(c.jitCountHops ? parkCounted : epi); // parked: the dispatcher
+        e.jmpTo(epi); // parked: the dispatcher
         // ⚠ THE PARKING BLOCK'S LENGTH *IS* kChainRelThunk. The site's three
         // states are encoded as rel32 values (0 = park, 5 = thunk, anything
         // else = a live link), so the thunk only sits at +5 while the parking
@@ -2418,10 +2417,6 @@ void JitCache::bind(Cpu& c)
 #else
     e.bytes({0xFF, 0xE1});                                 // jmp rcx
 #endif
-    // --jit-count-hops: a parked site counted a hop it did not make.
-    parkCounted_ = u32(e.at);
-    e.bytes({0x49, 0xFF, 0x8D});                           // dec qword [r13+chainHops]
-    e.i32le(u32(offs.chainHops));
     // The one way out. What rbx still counts is settled here (see
     // Compiler::settle, of which this is a copy), so an exit anywhere in a
     // block is a jump and nothing else.
@@ -2484,11 +2479,27 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
                 !c.jitChainOff,
                 !c.jitDirectOff,
                 this,
-                parkCounted_,
                 {}, // fixes: named, because gcc requires every member here
                 JitCache::kMapNoRow};
+    // ⭐ THE WAY OUT RECORDS THE LAST INSTRUCTION. Cpu::curInsn is "the
+    // instruction being executed", the interpreter writes it before every
+    // one, and it is part of a snapshot: so two machines that stop at the
+    // same instruction have to agree on it. A block writes it only where
+    // C++ needs it (before a call), and left for the dispatcher after an
+    // instruction done in line with the word of whatever it last called
+    // out for. Eight small exits ahead of the block's code, one per word:
+    // each stores its word and goes on to the shared way out, and every
+    // exit compiled for word k is a jump to the k-th. Nothing is added to
+    // any path that stays in translated code.
+    u32 wayOut[8];
+    for (u32 k = 0; k < 8; ++k) {
+        wayOut[k] = u32(cp.e.at);
+        cp.e.storeI(offs.curInsn, w[k]);
+        cp.e.jmpTo(epilogue_);
+    }
     for (u32 k = 0; k < 8; ++k) {
         jl.off[k] = u32(cp.e.at);
+        cp.epi = wayOut[k];
         cp.word(k, w[k], rows[k]);
     }
     // Word 7's fallthrough is the line end: store the deferred pc (the word

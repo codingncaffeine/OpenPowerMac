@@ -399,6 +399,7 @@ const char* firstDifference(Machine& a, Machine& b)
     if (x.tb != y.tb || x.dec != y.dec) return "the clock";
     if (a.stamp != b.stamp) return "the instruction count";
     if (a.cpu.halted != b.cpu.halted) return "halted";
+    if (a.cpu.curInsn != b.cpu.curInsn) return "the last instruction's word";
     if (!sameTlb(a.cpu.dtlb, b.cpu.dtlb)) return "the data TLB";
     if (!sameTlb(a.cpu.itlb, b.cpu.itlb)) return "the instruction TLB";
     if (std::memcmp(a.cpu.dtlbLru, b.cpu.dtlbLru, 64) != 0) return "the data TLB's LRU bits";
@@ -510,6 +511,7 @@ const char* firstGuestDifference(Machine& a, Machine& b)
     if (x.tb != y.tb || x.dec != y.dec) return "the clock";
     if (a.stamp != b.stamp) return "the instruction count";
     if (a.cpu.halted != b.cpu.halted) return "halted";
+    if (a.cpu.curInsn != b.cpu.curInsn) return "the last instruction's word";
     if (!sameTlb(a.cpu.dtlb, b.cpu.dtlb)) return "the data TLB";
     if (!sameTlb(a.cpu.itlb, b.cpu.itlb)) return "the instruction TLB";
     if (std::memcmp(a.cpu.dtlbLru, b.cpu.dtlbLru, 64) != 0) return "the data TLB's LRU bits";

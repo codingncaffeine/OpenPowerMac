@@ -208,8 +208,7 @@ class JitCache {
     u8* arena_ = nullptr;
     size_t cap_ = 0, at_ = 0;
     size_t firstCode_ = 0; // end of trampoline+epilogue; resets rewind here
-    u32 epilogue_ = 0;     // arena offset every exit jumps to
-    u32 parkCounted_ = 0;  // …and a parked chain site's, under --jit-count-hops
+    u32 epilogue_ = 0;     // arena offset every exit ends at
     bool live_ = false;
 };
 

@@ -1224,3 +1224,215 @@ TEST_CASE("translator: inline loads and stores are the interpreter's, value by v
     CHECK(jit.cpu.jit->fpMemOps < jit.cpu.jit->insns / 8u);
     CHECK(interp.cpu.jit == nullptr);
 }
+
+// ---- what a block has established --------------------------------------------------
+
+namespace {
+
+constexpr u32 kApart = 0x00900000u; // two pages side by side, mapped far apart
+
+// A loop made of lines of eight instructions, each line one compiled block
+// that leans on what its own earlier instructions established
+// (Compiler::Known in jit.cpp): the page of the last access, a register
+// known to hold a single's value, floating point known to be on and the
+// FPSCR known to be plain. In each line one of those is then made untrue.
+std::vector<u32> knownProgram(u32& topWord)
+{
+    auto fp = [](u32 op, u32 frt, u32 fra, u32 frb, u32 frc, u32 xo) {
+        return op << 26 | frt << 21 | fra << 16 | frb << 11 | frc << 6 | xo << 1;
+    };
+    auto mtfsf = [](u32 frb) { return 63u << 26 | 0xFFu << 17 | frb << 11 | 711u << 1; };
+    auto fmr = [](u32 frt, u32 frb) { return 63u << 26 | frt << 21 | frb << 11 | 72u << 1; };
+    auto fneg = [](u32 frt, u32 frb) { return 63u << 26 | frt << 21 | frb << 11 | 40u << 1; };
+    auto add = [](u32 rt, u32 ra, u32 rb) { return x31(rt, ra, rb, 266); };
+    const u32 nop = dform(24, 0, 0, 0);
+    std::vector<u32> p;
+    auto line = [&](std::initializer_list<u32> words) {
+        REQUIRE(words.size() <= 8u);
+        REQUIRE(p.size() % 8u == 0u);
+        for (u32 w : words)
+            p.push_back(w);
+        while (p.size() % 8u)
+            p.push_back(nop);
+    };
+    line({dform(15, 14, 20, 4),       // addis r14, r20, 4: the next data page
+          dform(15, 15, 20, 8),       // addis r15, r20, 8: and the one after
+          dform(50, 20, 20, 0x300),   // lfd f20: an FPSCR with nothing set
+          dform(50, 21, 20, 0x308),   // lfd f21: one that rounds toward zero
+          dform(15, 18, 0, kApart >> 16),  // lis r18
+          dform(24, 18, 18, 0x0FF0)});     // ori r18: 16 bytes before a page's end
+    topWord = u32(p.size());
+    // A chain on singles: every operand after the first three is known.
+    line({dform(14, 11, 11, 1),       // addi r11, r11, IMM: rewritten below
+          mtfsf(20),
+          dform(48, 1, 20, 0),        // lfs f1, 0(r20)
+          dform(48, 2, 20, 4),        // lfs f2, 4(r20): the same page
+          dform(48, 3, 14, 8),        // lfs f3, 8(r14): another
+          fp(59, 4, 1, 0, 2, 25),     // fmuls  f4 = f1 * f2
+          fp(59, 5, 4, 3, 0, 21),     // fadds  f5 = f4 + f3
+          fp(59, 6, 5, 1, 4, 29)});   // fmadds f6 = f5 * f4 + f1
+    // A zero made in line, stored and used; a store to the page a load
+    // found, and a second store to it.
+    line({dform(48, 1, 20, 0),        // lfs f1
+          fp(59, 7, 1, 1, 0, 20),     // fsubs f7 = f1 - f1: a zero
+          dform(52, 7, 20, 0x104),    // stfs f7
+          dform(52, 1, 20, 0x10C),    // stfs f1
+          fp(59, 9, 7, 1, 1, 30),     // fnmsubs f9 = -(f7 * f1 - f1)
+          dform(54, 9, 14, 0x108),    // stfd f9
+          fp(63, 10, 0, 9, 0, 12),    // frsp f10, f9
+          63u << 26 | 1u << 23 | 1u << 16 | 9u << 11}); // fcmpu cr1, f1, f9
+    // A register that held a single's value takes a double no single holds:
+    // the product of two such must be rounded once (0x3F800003), which only
+    // the handler does.
+    line({dform(48, 11, 20, 0),       // lfs f11
+          dform(48, 16, 20, 4),       // lfs f16
+          dform(50, 11, 20, 0x210),   // lfd f11
+          dform(50, 16, 20, 0x218),   // lfd f16
+          fp(59, 17, 11, 0, 16, 25),  // fmuls f17 = f11 * f16
+          dform(52, 17, 20, 0x120)}); // stfs f17
+    // The same two through fmr and fneg, which pass on what their source is.
+    line({dform(50, 14, 20, 0x210),   // lfd f14
+          dform(50, 15, 20, 0x218),   // lfd f15
+          fmr(12, 14),
+          fneg(13, 15),
+          fp(59, 19, 12, 0, 13, 25),  // fmuls f19 = f12 * f13
+          dform(52, 19, 20, 0x124)}); // stfs f19
+    // …and a single's value through them.
+    line({dform(48, 1, 20, 0),        // lfs f1
+          fmr(22, 1),
+          fneg(23, 22),
+          fp(59, 24, 23, 22, 0, 21),  // fadds f24 = f23 + f22: a zero
+          dform(52, 24, 20, 0x128),   // stfs f24
+          dform(48, 2, 20, 4),        // lfs f2
+          fp(59, 25, 22, 0, 2, 25),   // fmuls f25 = f22 * f2
+          dform(52, 25, 20, 0x12C)}); // stfs f25
+    // The rounding mode changed in the middle of a line: the two operations
+    // after it round toward zero.
+    line({dform(48, 1, 20, 0x30),     // lfs f1: 3.3
+          dform(48, 2, 20, 0x34),     // lfs f2: 0.7
+          fp(59, 26, 1, 0, 2, 25),    // fmuls f26 = f1 * f2, to nearest
+          mtfsf(21),
+          fp(59, 27, 1, 0, 2, 25),    // fmuls f27: toward zero
+          fp(59, 28, 1, 2, 0, 21),    // fadds f28: toward zero
+          dform(52, 27, 20, 0x130),   // stfs f27
+          dform(52, 28, 20, 0x134)}); // stfs f28
+    line({mtfsf(20),
+          dform(52, 26, 20, 0x138),   // stfs f26
+          fp(59, 29, 1, 2, 0, 21),    // fadds f29, to nearest again
+          dform(52, 29, 20, 0x13C)});
+    // The end of a page whose neighbor is mapped somewhere else: an access
+    // that runs over it is not the page the last one found.
+    line({dform(32, 7, 18, 12),       // lwz r7, 0xFFC: the page's last word
+          dform(32, 9, 18, 13),       // lwz r9, 0xFFD: one byte over
+          dform(34, 10, 18, 15),      // lbz r10, 0xFFF
+          dform(40, 12, 18, 15),      // lhz r12, 0xFFF: over
+          add(8, 8, 7),
+          add(8, 8, 9),
+          add(8, 8, 10),
+          add(8, 8, 12)});
+    line({dform(32, 12, 18, 16),      // lwz r12, 0x1000: the neighbor
+          dform(36, 8, 18, 12),       // stw r8, 0xFFC
+          dform(36, 8, 18, 13),       // stw r8, 0xFFD: over
+          dform(44, 8, 18, 15),       // sth r8, 0xFFF: over
+          dform(38, 8, 18, 15),       // stb r8, 0xFFF
+          dform(36, 8, 18, 16),       // stw r8, 0x1000
+          dform(32, 7, 18, 12),       // lwz r7, 0xFFC
+          add(8, 8, 12)});
+    // Three pages of one TLB set, which has two ways: the third takes the
+    // first's entry, and the memo's with it.
+    line({dform(32, 7, 20, 0x10),
+          dform(32, 9, 14, 0x10),
+          dform(32, 10, 15, 0x10),
+          dform(32, 12, 20, 0x14),
+          dform(36, 8, 20, 0x18),
+          dform(36, 8, 15, 0x18),
+          dform(36, 8, 14, 0x18),
+          dform(32, 12, 15, 0x1C)});
+    // A load and then a store through the alias of the code's own page: the
+    // entry the load found is not good for a store without a look at the
+    // fetch buffer, and the store rewrites the addi at the top.
+    line({add(8, 8, 7),
+          add(8, 8, 9),
+          add(8, 8, 10),
+          dform(14, 13, 13, 3),                  // addi r13, r13, 3
+          rlwinm(13, 12, 0, 17, 31),             // r12 = r13 & 0x7FFF
+          dform(25, 12, 12, 0x396B),             // oris: "addi r11, r11, r12"
+          dform(32, 7, 22, topWord * 4u),        // lwz r7: the word as it stands
+          dform(36, 12, 22, topWord * 4u)});     // stw r12: the word rewritten
+    // The results back into the operands, so that the values move.
+    {
+        REQUIRE(p.size() % 8u == 0u);
+        p.push_back(add(8, 8, 7));
+        p.push_back(dform(52, 5, 20, 0));        // stfs f5 -> the first operand
+        p.push_back(dform(36, 8, 20, 0x40));     // stw r8
+        const i32 back = (i32(topWord) - i32(p.size())) * 4;
+        p.push_back(18u << 26 | (u32(back) & 0x03FFFFFCu)); // b top
+    }
+    return p;
+}
+
+void knownSetUp(Machine& m, const std::vector<u32>& prog)
+{
+    m.batEa = kBatInRam;
+    REQUIRE(m.setUp(prog));
+    REQUIRE(m.map(kVsidA, kApart, kPhys + 0x5000u));
+    REQUIRE(m.map(kVsidA, kApart + 0x1000u, kPhys + 0x2000u));
+    m.normalCaches(true);
+    m.bus.write32(kPhys + 0, 0x3FC00000u);               // 1.5
+    m.bus.write32(kPhys + 4, 0x3F400000u);               // 0.75
+    m.bus.write32(kPhys + 0x1000u + 8, 0x40500000u);     // 3.25
+    m.bus.write32(kPhys + 0x30, 0x40533333u);            // 3.3
+    m.bus.write32(kPhys + 0x34, 0x3F333333u);            // 0.7
+    // Two doubles whose product lies just above the middle of two singles
+    // and, rounded to a double first, exactly on it.
+    m.bus.write64(kPhys + 0x210, 0x3FF000004FBFFFFFull);
+    m.bus.write64(kPhys + 0x218, 0x3FF0000000400000ull);
+    m.bus.write64(kPhys + 0x300, 0x0000000000000000ull);
+    m.bus.write64(kPhys + 0x308, 0x0000000000000001ull);
+}
+
+} // namespace
+
+TEST_CASE("translator: what a block has established is used only while it holds")
+{
+    u32 topWord = 0;
+    const std::vector<u32> prog = knownProgram(topWord);
+    // The translator as it ships, the translator asking everything at every
+    // instruction (the control), and the interpreter for each.
+    for (const bool known : {true, false}) {
+        CAPTURE(known);
+        Machine jit(true, true, true), interp(true, true, false);
+        jit.cpu.jitKnownOff = !known;
+        knownSetUp(jit, prog);
+        knownSetUp(interp, prog);
+        // The whole machine after every batch, and short batches: a value
+        // wrong for one trip of the loop is put right by the next, so a
+        // comparison now and then (runTwins) would walk past it.
+        Rng r{0xB10C5ull};
+        const char* diff = nullptr;
+        while (jit.stamp < 60000 && !diff) {
+            const u64 n = 1u + r.next() % 400u;
+            jit.run(n);
+            interp.run(n);
+            diff = firstDifference(jit, interp);
+            if (!diff)
+                diff = jit.cpu.dpConsistent();
+        }
+        const std::string what = diff ? diff : "nothing";
+        CAPTURE(what);
+        CHECK(diff == nullptr);
+        CHECK(jit.cpu.excRingAt == 0u);
+        CHECK(jit.cpu.st.gpr[13] > 1500u); // some hundreds of trips
+        CHECK(jit.cpu.dmDirect);
+        // What the handlers decide, in the bytes they left: the product
+        // rounded once, with either sign; the two operations after the mode
+        // changed rounded toward zero, and the two outside it to nearest.
+        CHECK(jit.bus.read32(kPhys + 0x120) == 0x3F800003u);
+        CHECK(jit.bus.read32(kPhys + 0x124) == 0xBF800003u);
+        CHECK(jit.bus.read32(kPhys + 0x130) == 0x4013D709u);
+        CHECK(jit.bus.read32(kPhys + 0x134) == 0x407FFFFFu);
+        CHECK(jit.bus.read32(kPhys + 0x138) == 0x4013D70Au);
+        CHECK(jit.bus.read32(kPhys + 0x13C) == 0x40800000u);
+        CHECK(jit.bus.read32(kPhys + 0x128) == 0x00000000u); // x + (-x)
+    }
+}

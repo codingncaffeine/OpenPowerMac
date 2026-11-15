@@ -595,6 +595,7 @@ int main(int argc, char** argv)
     bool jitChainOff = false;
     bool jitInlineMemOff = false; // --no-jit-inline-mem
     bool jitInlineFpOff = false; // --no-jit-inline-fp
+    bool jitKnownOff = false; // --no-jit-known
     bool jitFullGate = false; // --jit-full-gate
     bool jitHopOff = false; // --no-jit-hop
     bool jitCountHops = false; // --jit-count-hops
@@ -828,6 +829,9 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--no-jit-inline-mem")) { jitInlineMemOff = true; continue; }
         // The control for floating-point arithmetic done in line: all calls.
         if (!strcmp(a, "--no-jit-inline-fp")) { jitInlineFpOff = true; continue; }
+        // The control for what a block takes as established by its earlier
+        // instructions: every test compiled at every instruction.
+        if (!strcmp(a, "--no-jit-known")) { jitKnownOff = true; continue; }
         // 🔬 The host-cycle split inside compiled blocks. Perturbs the run
         // (an rdtsc pair per shim call), so read it for SHARES and per-call
         // costs — never quote its MIPS.
@@ -1592,6 +1596,7 @@ int main(int argc, char** argv)
     cpu.jitChainOff = jitChainOff;
     cpu.jitInlineMemOff = jitInlineMemOff;
     cpu.jitInlineFpOff = jitInlineFpOff;
+    cpu.jitKnownOff = jitKnownOff;
     cpu.jitFullGate = jitFullGate;
     cpu.jitHopOff = jitHopOff;
     cpu.jitCountHops = jitCountHops;

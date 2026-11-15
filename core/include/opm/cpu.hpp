@@ -1236,6 +1236,10 @@ struct Cpu {
     // calls to the handlers. The control for the form done in line
     // (Compiler::fpSingle in jit.cpp).
     bool jitInlineFpOff = false;
+    // DIAGNOSTIC (--no-jit-known): compile every test at every instruction,
+    // whatever an earlier instruction of the block established. The control
+    // for Compiler::Known in jit.cpp.
+    bool jitKnownOff = false;
     // DIAGNOSTIC (--no-jit-direct): compile fallbacks as the execRow shim
     // call instead of a direct call to the bound handler. The control for the
     // direct-call lowering, which is the only way its speed claim can be

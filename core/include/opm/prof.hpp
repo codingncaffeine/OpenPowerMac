@@ -127,7 +127,13 @@ size_t topPcs(u32* pc, u64* hits, size_t cap);
 // It needs no markers, so it measures the SHIPPING build — and it counts CPU
 // time, not wall time, so a paced machine's sleeps are not in it. Linux only;
 // elsewhere hostStart returns false and nothing else happens.
-bool hostStart(unsigned hz);
+//
+// `guestPc`, when given, is read at every sample too: the same samples as a
+// histogram of where the GUEST was, written by hostDump beside the host one as
+// PATH.guest ("pc hits" lines, hex pc). Weighted by host time, so it says
+// which guest code the emulator is spending its time on, which is not the
+// same as which guest code runs most instructions.
+bool hostStart(unsigned hz, const u32* guestPc = nullptr);
 void hostStop();
 // Returns the number of samples written, 0 when there were none or the file
 // could not be opened.

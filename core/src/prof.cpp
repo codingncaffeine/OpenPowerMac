@@ -171,6 +171,8 @@ namespace {
 // no two writers ever race; read only after the timer is gone.
 constexpr size_t kHostCap = 1u << 21;
 std::vector<u64> gHostBuf;
+std::vector<u32> gGuestBuf;       // the guest's pc at the same samples
+const u32* volatile gGuestPc = nullptr;
 volatile size_t gHostN = 0;
 volatile size_t gHostLost = 0;
 timer_t gHostTimer;
@@ -182,6 +184,8 @@ void onHostSample(int, siginfo_t*, void* ctx)
     const size_t n = gHostN;
     if (n < kHostCap) {
         gHostBuf[n] = static_cast<u64>(uc->uc_mcontext.gregs[REG_RIP]);
+        if (const u32* g = gGuestPc)
+            gGuestBuf[n] = *g;
         gHostN = n + 1;
     } else {
         gHostLost = gHostLost + 1;
@@ -209,11 +213,15 @@ int collectModules(struct dl_phdr_info* info, size_t, void* out)
 
 } // namespace
 
-bool hostStart(unsigned hz)
+bool hostStart(unsigned hz, const u32* guestPc)
 {
     if (gHostOn || !hz)
         return false;
     gHostBuf.assign(kHostCap, 0);
+    gGuestBuf.clear();
+    if (guestPc)
+        gGuestBuf.assign(kHostCap, 0);
+    gGuestPc = guestPc;
     gHostN = 0;
     gHostLost = 0;
     struct sigaction sa {};
@@ -290,13 +298,26 @@ size_t hostDump(const char* path)
                      static_cast<unsigned long long>(key.second),
                      static_cast<unsigned long long>(hits));
     std::fclose(f);
+    if (!gGuestBuf.empty()) {
+        std::map<u32, u64> guest;
+        for (size_t k = 0; k < n; ++k)
+            ++guest[gGuestBuf[k]];
+        const std::string gpath = std::string(path) + ".guest";
+        if (FILE* g = std::fopen(gpath.c_str(), "w")) {
+            std::fprintf(g, "# samples %zu\n", n);
+            for (const auto& [pc, hits] : guest)
+                std::fprintf(g, "%08x %llu\n", pc,
+                             static_cast<unsigned long long>(hits));
+            std::fclose(g);
+        }
+    }
     return n;
 }
 
 } // namespace prof
 } // namespace opm
 #else
-bool hostStart(unsigned) { return false; }
+bool hostStart(unsigned, const u32*) { return false; }
 void hostStop() {}
 size_t hostDump(const char*) { return 0; }
 

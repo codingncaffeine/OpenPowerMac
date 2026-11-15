@@ -4,6 +4,7 @@
 
 #include "opm/snapshot.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -409,6 +410,7 @@ bool r128Replay(const std::string& path, R128Cell& c, const R128EdgeFn& onEdge,
     gR128FrameEdge = replayEdge;
     std::vector<std::pair<char, u64>> wanted;
     bool bad = false;
+    const auto playFrom = std::chrono::steady_clock::now();
     while (r.ok && r.p < r.end && !bad) {
         const u8 tag = r.u8v();
         switch (tag) {
@@ -469,6 +471,10 @@ bool r128Replay(const std::string& path, R128Cell& c, const R128EdgeFn& onEdge,
             break;
         }
     }
+    rep.playNs = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - playFrom)
+            .count());
     gR128FrameEdge = nullptr;
     gReplay = nullptr;
     r128AsyncEnable(wasAsync, wasStrict);

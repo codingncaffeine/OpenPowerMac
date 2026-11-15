@@ -14,14 +14,22 @@
 //   framereplay --diff A.png B.png [MAP.png]
 //       Count the pixels that differ between two pictures this tool wrote,
 //       and paint them red over a dimmed A in MAP.png.
+//   framereplay FILE --bench N [--profile-host HZ OUT]
+//       Draw the recording N times with no pictures written and say how
+//       long the drawing took (best and median of the N), and what the last
+//       state's video memory hashes to. --profile-host samples this thread
+//       meanwhile; tools/hostprof.py OUT BINARY names the functions.
 //
 // The use: record once, replay with the build before a change to the drawing
 // code and with the build after it, and --diff the two. The input is the same
 // to the byte, so every differing pixel is the change's.
 
+#include "opm/prof.hpp"
 #include "opm/r128rec.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -279,9 +287,17 @@ int main(int argc, char** argv)
         return diff(a[1], a[2], a.size() > 3 ? a[3].c_str() : nullptr);
     std::string file, out = ".";
     bool strict = false, census = false;
+    unsigned bench = 0, profHz = 0;
+    std::string profOut;
     for (size_t i = 0; i < a.size(); ++i) {
         if (a[i] == "--out" && i + 1 < a.size())
             out = a[++i];
+        else if (a[i] == "--bench" && i + 1 < a.size())
+            bench = static_cast<unsigned>(std::strtoul(a[++i].c_str(), nullptr, 0));
+        else if (a[i] == "--profile-host" && i + 2 < a.size()) {
+            profHz = static_cast<unsigned>(std::strtoul(a[++i].c_str(), nullptr, 0));
+            profOut = a[++i];
+        }
         else if (a[i] == "--strict")
             strict = true;
         else if (a[i] == "--census")
@@ -294,8 +310,41 @@ int main(int argc, char** argv)
     if (file.empty()) {
         std::fprintf(stderr,
                      "usage: framereplay FILE [--out DIR] [--strict] [--census]\n"
+                     "       framereplay FILE --bench N [--profile-host HZ OUT]\n"
                      "       framereplay --diff A.png B.png [MAP.png]\n");
         return 2;
+    }
+    if (bench) {
+        auto cell = std::make_unique<R128Cell>();
+        const R128EdgeFn none = [](u32, char, const R128Cell&) {};
+        std::vector<u64> ns;
+        R128ReplayReport rep;
+        std::string err;
+        if (profHz && !prof::hostStart(profHz))
+            std::fprintf(stderr, "framereplay: no sampler on this host\n");
+        for (unsigned k = 0; k < bench; ++k) {
+            if (!r128Replay(file, *cell, none, rep, err)) {
+                std::fprintf(stderr, "framereplay: %s\n", err.c_str());
+                return 2;
+            }
+            ns.push_back(rep.playNs);
+        }
+        if (profHz) {
+            prof::hostStop();
+            const size_t n = prof::hostDump(profOut.c_str());
+            std::printf("  %zu samples in %s\n", n, profOut.c_str());
+        }
+        std::sort(ns.begin(), ns.end());
+        const R128EngStats& es = r128EngStats();
+        std::printf("%s: %u frames drawn %u times: best %.2f ms, median %.2f ms "
+                    "a pass; %llu triangles and %llu pixels a pass; video "
+                    "memory ends as %016llx\n",
+                    file.c_str(), rep.edges, bench, ns.front() / 1e6,
+                    ns[ns.size() / 2] / 1e6,
+                    static_cast<unsigned long long>(es.tris / bench),
+                    static_cast<unsigned long long>(es.triPixels / bench),
+                    static_cast<unsigned long long>(r128VramHash(*cell)));
+        return 0;
     }
     std::error_code ec;
     std::filesystem::create_directories(out, ec);

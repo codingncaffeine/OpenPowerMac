@@ -479,6 +479,7 @@ int main(int argc, char** argv)
                              // scheduler off the DEC and livelocks if
                              // the timebase runs tens of times fast
     const char* ramDumpPath = nullptr;
+    bool ramDumpFull = false;          // --dump-ram-full: all of RAM, not 64 MB
     bool serialCr = false;
     const char* cdPath = nullptr;
     const char* hdPath = nullptr;
@@ -884,6 +885,7 @@ int main(int argc, char** argv)
             profHz = static_cast<unsigned>(strtoul(next(), nullptr, 0));
             continue;
         }
+        if (!strcmp(a, "--dump-ram-full")) { ramDumpFull = true; continue; }
         if (!strcmp(a, "--profile-host") && i + 2 < argc) {
             hostProfHz = static_cast<unsigned>(strtoul(argv[++i], nullptr, 0));
             hostProfPath = argv[++i];
@@ -2396,10 +2398,10 @@ int main(int argc, char** argv)
     // as built. It samples THIS thread, which is the one the processor runs
     // on.
     if (hostProfHz) {
-        if (prof::hostStart(hostProfHz))
+        if (prof::hostStart(hostProfHz, &cpu.st.pc))
             printf("-- sampling host addresses at %u Hz of this thread's CPU "
-                   "time -> %s\n",
-                   hostProfHz, hostProfPath);
+                   "time -> %s (and the guest's pc -> %s.guest)\n",
+                   hostProfHz, hostProfPath, hostProfPath);
         else
             printf("-- --profile-host ignored: not available on this host\n");
     }
@@ -5090,9 +5092,10 @@ int main(int argc, char** argv)
     if (ramDumpPath) {
         FILE* f = fopen(ramDumpPath, "wb");
         if (f) {
-            const size_t n = bus.ram().size() < (64u << 20)
-                                 ? bus.ram().size()
-                                 : size_t(64u << 20);
+            const size_t n =
+                ramDumpFull || bus.ram().size() < (64u << 20)
+                    ? bus.ram().size()
+                    : size_t(64u << 20);
             fwrite(bus.ram().data(), 1, n, f);
             fclose(f);
             printf("-- ram dumped (%zu bytes): %s\n", n, ramDumpPath);
@@ -5756,6 +5759,50 @@ int main(int argc, char** argv)
         printf("-- host profile: %zu samples -> %s (tools/hostprof.py reads "
                "it)\n",
                n, hostProfPath);
+        // The guest's code at the sampled pcs, read through the translation
+        // as it stands now: every sampled 4 KB page and its two neighbors,
+        // as "virtual page, 4096 bytes" records. An application's address is
+        // not its place in memory (Mac OS maps the system heap elsewhere), so
+        // a dump of RAM cannot be read at a pc. tools/guestprof.py reads this.
+        const std::string gpath = std::string(hostProfPath) + ".guest";
+        if (FILE* gf = fopen(gpath.c_str(), "r")) {
+            std::set<u32> pages;
+            char line[64];
+            while (fgets(line, sizeof line, gf)) {
+                if (line[0] == '#')
+                    continue;
+                const u32 pg = static_cast<u32>(strtoul(line, nullptr, 16)) >> 12;
+                pages.insert(pg);
+                pages.insert(pg - 1u);
+                pages.insert(pg + 1u);
+            }
+            fclose(gf);
+            cpu.l1dFlushAll(true);
+            cpu.l2FlushAll(true);
+            const std::string mpath = std::string(hostProfPath) + ".guestmem";
+            size_t wrote = 0;
+            if (FILE* mf = fopen(mpath.c_str(), "wb")) {
+                for (const u32 pg : pages) {
+                    u32 pa0 = 0, pa1 = 0;
+                    bool flat = false;
+                    const u32 va = pg << 12;
+                    if (!xlateRange(va, va + 0xFFFu, pa0, pa1, flat) || !flat ||
+                        static_cast<u64>(pa0) + 0x1000u > bus.ram().size())
+                        continue;
+                    const u8 hdr[4] = {static_cast<u8>(va >> 24),
+                                       static_cast<u8>(va >> 16),
+                                       static_cast<u8>(va >> 8),
+                                       static_cast<u8>(va)};
+                    fwrite(hdr, 1, 4, mf);
+                    fwrite(bus.ram().data() + pa0, 1, 0x1000, mf);
+                    ++wrote;
+                }
+                fclose(mf);
+            }
+            printf("-- guest code at the sampled pcs: %zu pages -> %s "
+                   "(tools/guestprof.py reads it)\n",
+                   wrote, mpath.c_str());
+        }
     }
     // Where the host time went. Sampled, so it is a distribution and not a
     // ledger: percentages under about 1% are noise at any realistic rate.

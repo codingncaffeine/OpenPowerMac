@@ -721,10 +721,10 @@ TEST_CASE("3d: an AGP-resident texture is fetched through the GART")
     r.fpuSolidBoth();
     // Texels live in system RAM at 2 MB, reached via AGP page 0x300.
     r.mapPage(0x00300000u, 0x00200000u);
-    // One 565 texel, red, in MEMORY byte order (MSB first — the convention
-    // the whole engine stores pixels in).
-    r.ram[0x00200000u] = 0xF8;
-    r.ram[0x00200001u] = 0x00;
+    // One 565 texel, red (0xF800), as the chip holds it: system memory is
+    // read with no aperture in between, so the low byte comes first.
+    r.ram[0x00200000u] = 0x00;
+    r.ram[0x00200001u] = 0xF8;
     r.reg(0x1C9Cu, 1u << 4);
     r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11));
     r.reg(0x1CB8u, 0x000u); // 1x1
@@ -1480,6 +1480,143 @@ TEST_CASE("3d: a triangle covers exactly the pixels its three edges pass")
     // fall exactly on edges.
     CHECK(drawn > 20000u);
     CHECK(onEdge > 500u);
+}
+
+TEST_CASE("3d: a texel's bytes are high first in video memory and low first "
+          "in AGP space")
+{
+    // The chip's memory is little-endian and the big-endian aperture swaps
+    // what a host stores in video memory; AGP space is system memory, read
+    // with nothing in between. So one texture drawn from each place, its
+    // texels' bytes the other way round in AGP space, is one picture: for
+    // every format of more than a byte, on the byte-by-byte path and in
+    // place, point sampled and filtered.
+    struct NeverCurrent final : SnoopSink {
+        void snoopRead(u32, u32) override {}
+        void snoopWrite(u32, u32) override {}
+    } sink;
+    u32 cases = 0;
+    for (u32 fmt : {3u, 4u, 5u, 6u, 10u, 11u, 12u, 13u, 14u, 15u}) {
+        // A texel's size, and the size of the unit its bytes are ordered
+        // in: the packed 4:2:2 formats hold two texels in four bytes.
+        const u32 n = fmt == 5u ? 3u : fmt == 6u || fmt == 14u ? 4u : 2u;
+        const u32 unit = fmt == 11u || fmt == 12u ? 4u : n;
+        for (u32 bilinear = 0; bilinear < 2; ++bilinear)
+            for (u32 byBytes = 0; byBytes < 2; ++byBytes) {
+                u32 hash[2] = {0, 0};
+                u64 lit[2] = {0, 0};
+                for (u32 agp = 0; agp < 2; ++agp) {
+                    Rig3d r;
+                    if (byBytes)
+                        r.snoop = &sink;
+                    r.dst32();
+                    r.openGate();
+                    r.fpuSolidBoth();
+                    r.mapPage(0x00300000u, 0x00200000u);
+                    // A palette for the format that indexes one: every
+                    // entry its own color (LOAD_PALETTE, 256 entries).
+                    if (fmt == 10u) {
+                        r.fifo(0xC0002C00u | ((257u - 1u) << 16));
+                        r.fifo(2u);
+                        for (u32 i = 0; i < 256u; ++i)
+                            r.fifo(0xFF000000u | (i << 16) |
+                                   ((255u - i) << 8) | (i * 7u & 0xFFu));
+                    }
+                    // An 8x8 texture, no two bytes of a unit alike.
+                    for (u32 k = 0; k < 64u * n; ++k) {
+                        const u8 b = static_cast<u8>(k * 53u + fmt * 29u + 7u);
+                        if (!agp)
+                            r.c.vram[0x80000u + k] = b;
+                        else
+                            r.ram[0x00200000u + (k / unit) * unit +
+                                  (unit - 1u - k % unit)] = b;
+                    }
+                    r.reg(0x1C9Cu, 1u << 4);
+                    r.reg(0x1CB0u, (fmt << 16) | (bilinear << 1) |
+                                       (bilinear << 4));
+                    r.reg(0x1CB8u, (3u << 8) | (3u << 4) | 3u); // 8x8
+                    r.reg(0x1CC8u, agp ? 0x02000000u + 0x00300000u
+                                       : 0x80000u); // slot 3
+                    std::vector<u32> v;
+                    auto vtxSt = [&](float x, float y, float s, float t) {
+                        v.push_back(f2u(x));
+                        v.push_back(f2u(y));
+                        v.push_back(f2u(0.5f));
+                        v.push_back(f2u(1.0f));
+                        v.push_back(0xFFFFFFFFu);
+                        v.push_back(f2u(s));
+                        v.push_back(f2u(t));
+                    };
+                    vtxSt(0, 0, 0, 0);
+                    vtxSt(64, 0, 1, 0);
+                    vtxSt(0, 64, 0, 1);
+                    vtxSt(64, 0, 1, 0);
+                    vtxSt(64, 64, 1, 1);
+                    vtxSt(0, 64, 0, 1);
+                    r.prim(0x9u | 0x80u, 4u, 6u, v);
+                    for (u32 y = 0; y < 64u; ++y)
+                        for (u32 x = 0; x < 64u; ++x) {
+                            const u32 p = r.pix32(x, y);
+                            hash[agp] = hash[agp] * 16777619u ^ p;
+                            lit[agp] += (p & 0x00FFFFFFu) != 0u;
+                        }
+                }
+                CAPTURE(fmt);
+                CAPTURE(bilinear);
+                CAPTURE(byBytes);
+                CHECK(hash[0] == hash[1]);
+                // And it was a picture: most of the quad is not black.
+                CHECK(lit[0] > 2000u);
+                ++cases;
+            }
+    }
+    CHECK(cases == 40u);
+}
+
+TEST_CASE("3d: a 1555 texel in AGP space, by the bytes a driver stores")
+{
+    // Four texels of a light map as a driver laid them down in system
+    // memory: 21 04, c4 18, a3 14, 82 10. Low byte first they are 0x0421,
+    // 0x18C4, 0x14A3 and 0x1082: red, green and blue levels of 31 of
+    // (1,1,1), (6,6,4), (5,5,3) and (4,4,2), a dim warm ramp. High byte
+    // first the same bytes are four unrelated colors.
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
+    r.mapPage(0x00300000u, 0x00200000u);
+    const u8 tex[8] = {0x21, 0x04, 0xC4, 0x18, 0xA3, 0x14, 0x82, 0x10};
+    for (u32 i = 0; i < 8u; ++i)
+        r.ram[0x00200000u + i] = tex[i];
+    r.reg(0x1C9Cu, 1u << 4);
+    r.reg(0x1CB0u, (3u << 16) | (2u << 8) | (2u << 11)); // 1555, point
+    r.reg(0x1CB8u, (0u << 8) | (2u << 4) | 2u); // 4 wide, 1 high
+    r.reg(0x1CC4u, 0x02000000u + 0x00300000u);  // slot 2
+    std::vector<u32> v;
+    auto vtxSt = [&](float x, float y, float s, float t) {
+        v.push_back(f2u(x));
+        v.push_back(f2u(y));
+        v.push_back(f2u(0.5f));
+        v.push_back(f2u(1.0f));
+        v.push_back(0xFFFFFFFFu);
+        v.push_back(f2u(s));
+        v.push_back(f2u(t));
+    };
+    vtxSt(0, 0, 0, 0);
+    vtxSt(64, 0, 1, 0);
+    vtxSt(0, 64, 0, 1);
+    vtxSt(64, 0, 1, 0);
+    vtxSt(64, 64, 1, 1);
+    vtxSt(0, 64, 0, 1);
+    r.prim(0x9u | 0x80u, 4u, 6u, v);
+    const auto rgb = [](u32 red, u32 green, u32 blue) {
+        return ((red * 255u / 31u) << 16) | ((green * 255u / 31u) << 8) |
+               (blue * 255u / 31u);
+    };
+    CHECK((r.pix32(8, 8) & 0x00FFFFFFu) == rgb(1, 1, 1));
+    CHECK((r.pix32(24, 8) & 0x00FFFFFFu) == rgb(6, 6, 4));
+    CHECK((r.pix32(40, 8) & 0x00FFFFFFu) == rgb(5, 5, 3));
+    CHECK((r.pix32(56, 8) & 0x00FFFFFFu) == rgb(4, 4, 2));
 }
 
 namespace {

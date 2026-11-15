@@ -24,7 +24,8 @@
 // desktop olive), the Z buffer uses the same byte order because the guest
 // CLEARS Z with 2D PAINT ops through the same store path, and every counter
 // lives in a file-static so sizeof(R128Cell) — and with it every snapshot —
-// never moves.
+// never moves. A texture in AGP space is the exception to the first: its
+// texels are least significant byte first (texelLowFirst).
 //
 // Known simplifications, each visible rather than silent: dithering rounds
 // instead of patterning (DITHER_ENABLE is honored as "convert with
@@ -667,6 +668,50 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
 // above it from system memory through the GART (fetched as the LE dword the
 // bus would return, then the addressed lane extracted — memory byte order is
 // preserved either way).
+//
+// ⭐ WHICH BYTE OF A TEXEL COMES FIRST DEPENDS ON WHERE THE TEXTURE LIES.
+// The chip's own memory is little-endian (SDK 2.5.4 gives every pixel
+// format "in the little endian representation"), and a big-endian host sees
+// video memory the right way round only because the linear aperture swaps
+// on the way in and out (register guide, CONFIG_CNTL APER_0/1_ENDIAN: "big
+// endian: 16 bpp swapping", "32 bpp swapping"; the second copy of the
+// aperture exists "to allow each to be independently marked as big-endian
+// or little-endian in the PowerMac environment"). This model keeps video
+// memory as the host wrote it, most significant byte first, and does not
+// swap: the convention at the top of this file. A texture in AGP space is
+// in system memory, which the chip reads itself with no aperture between,
+// so a driver has to lay its texels down as the chip holds them: LEAST
+// significant byte first. A game's own traffic says the same: of the
+// 16-bit textures it drew with in one session, the 25 in video memory that
+// were not flat all read smoother high byte first and the 62 in AGP space
+// all low byte first, the same control bits set for both (the texture
+// census, r128TextureReport). Read high byte first, those light maps were
+// bands of every color.
+//
+// So a texel of several bytes is read in the order texelLowFirst says, in
+// all three places a texel is decoded: fetchTexelBytes, fetchTexel and the
+// four texels of sampleLevel. The 1555 format is the one traffic has shown
+// in AGP space; the others follow from the same rule.
+inline bool texelLowFirst(u32 base) { return base >= kAgpWindow; }
+// A texel of two or of four bytes as a number, from a pointer to its first.
+// Both orders are one load of the same bytes, so the choice costs a select
+// and not a second way of addressing them.
+OPM_FORCE_INLINE u32 texel16(const u8* p, bool low)
+{
+    const u32 lo = static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8);
+    const u32 hi = (static_cast<u32>(p[0]) << 8) | p[1];
+    return low ? lo : hi;
+}
+OPM_FORCE_INLINE u32 texel32(const u8* p, bool low)
+{
+    const u32 lo = static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
+                   (static_cast<u32>(p[2]) << 16) |
+                   (static_cast<u32>(p[3]) << 24);
+    const u32 hi = (static_cast<u32>(p[0]) << 24) |
+                   (static_cast<u32>(p[1]) << 16) |
+                   (static_cast<u32>(p[2]) << 8) | p[3];
+    return low ? lo : hi;
+}
 bool texByte(const Pipe& P, u32 addr, u8& out)
 {
     if (addr < kAgpWindow) {
@@ -844,7 +889,18 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         ++P.tally.texUnimpl;
     ++P.tally.texSamples;
     auto b8 = [&](u32 at, u8& v) { return texByte(P, at, v); };
-    u8 b0, b1, b2, b3;
+    u8 b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+    // The n bytes of a texel at `at`, into b0.. with the most significant
+    // in b0 wherever the texture lies (texelLowFirst). Memory is read in
+    // rising order either way, so a miss is counted at the same byte.
+    const bool low = texelLowFirst(base);
+    auto rd = [&](u32 at, u32 n) {
+        u8* const b[4] = {&b0, &b1, &b2, &b3};
+        for (u32 k = 0; k < n; ++k)
+            if (!texByte(P, at + k, *b[low ? n - 1u - k : k]))
+                return false;
+        return true;
+    };
     switch (t.fmt) {
     case 2u: { // CI8 through the CCE palette
         if (!b8(base + y * pitch + x, b0))
@@ -875,9 +931,9 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         out.b = static_cast<float>(e & 0xFFu);
         return true;
     }
-    case 3u: { // ARGB1555, MSB-first bytes
+    case 3u: { // ARGB1555
         const u32 at = base + (y * pitch + x) * 2u;
-        if (!b8(at, b0) || !b8(at + 1u, b1))
+        if (!rd(at, 2u))
             return false;
         const u32 p = (static_cast<u32>(b0) << 8) | b1;
         out.a = (p & 0x8000u) ? 255.0f : 0.0f;
@@ -888,7 +944,7 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     }
     case 4u: { // RGB565
         const u32 at = base + (y * pitch + x) * 2u;
-        if (!b8(at, b0) || !b8(at + 1u, b1))
+        if (!rd(at, 2u))
             return false;
         const u32 p = (static_cast<u32>(b0) << 8) | b1;
         out.a = 255;
@@ -897,9 +953,9 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         out.b = static_cast<float>((p & 0x1Fu) * 255u / 31u);
         return true;
     }
-    case 5u: { // RGB888, three bytes, R first (MSB-first convention)
+    case 5u: { // RGB888, three bytes, R the most significant
         const u32 at = base + (y * pitch + x) * 3u;
-        if (!b8(at, b0) || !b8(at + 1u, b1) || !b8(at + 2u, b2))
+        if (!rd(at, 3u))
             return false;
         out.a = 255;
         out.r = b0;
@@ -909,8 +965,7 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     }
     case 6u: { // ARGB8888
         const u32 at = base + (y * pitch + x) * 4u;
-        if (!b8(at, b0) || !b8(at + 1u, b1) || !b8(at + 2u, b2) ||
-            !b8(at + 3u, b3))
+        if (!rd(at, 4u))
             return false;
         out.a = b0;
         out.r = b1;
@@ -935,11 +990,10 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         out.r = out.g = out.b = b0;
         return true;
     }
-    case 11u:  // YVYU 422: pairs [Y0 V Y1 U] in MSB-first byte order
+    case 11u:  // YVYU 422: pairs [Y0 V Y1 U], most significant byte first
     case 12u: { // VYUY 422: pairs [V Y0 U Y1]
         const u32 at = base + (y * pitch + (x & ~1u)) * 2u;
-        if (!b8(at, b0) || !b8(at + 1u, b1) || !b8(at + 2u, b2) ||
-            !b8(at + 3u, b3))
+        if (!rd(at, 4u))
             return false;
         float Y, U, V;
         if (t.fmt == 11u) {
@@ -956,15 +1010,14 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     }
     case 14u: { // AYUV 444
         const u32 at = base + (y * pitch + x) * 4u;
-        if (!b8(at, b0) || !b8(at + 1u, b1) || !b8(at + 2u, b2) ||
-            !b8(at + 3u, b3))
+        if (!rd(at, 4u))
             return false;
         out = yuvToRgb(b1, b2, b3, static_cast<float>(b0));
         return true;
     }
     case 15u: { // ARGB4444
         const u32 at = base + (y * pitch + x) * 2u;
-        if (!b8(at, b0) || !b8(at + 1u, b1))
+        if (!rd(at, 2u))
             return false;
         const u32 p = (static_cast<u32>(b0) << 8) | b1;
         out.a = static_cast<float>(((p >> 12) & 0xFu) * 17u);
@@ -979,7 +1032,7 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     // alpha bit on top, and a palette index or a gray level in its low one.
     case 10u: {
         const u32 at = base + (y * pitch + x) * 2u;
-        if (!b8(at, b0) || !b8(at + 1u, b1))
+        if (!rd(at, 2u))
             return false;
         const u32 e = gPalette[((t.cntl >> 20) & 3u) == 2u ? 1 : 0][b1];
         out.a = static_cast<float>(b0);
@@ -990,7 +1043,7 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     }
     case 13u: {
         const u32 at = base + (y * pitch + x) * 2u;
-        if (!b8(at, b0) || !b8(at + 1u, b1))
+        if (!rd(at, 2u))
             return false;
         out.a = static_cast<float>(b0);
         out.r = out.g = out.b = static_cast<float>(b1);
@@ -1132,12 +1185,13 @@ inline bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
 {
     const u32 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
     const u32 base = t.offs[l] & 0x07FFFFFFu;
+    const bool low = texelLowFirst(base);
     const u8* p;
     switch (t.fmt) {
     case 3u: { // ARGB1555
         if (!texSpan(P, base + (y * pitch + x) * 2u, 2u, p))
             break;
-        const u32 v = (static_cast<u32>(p[0]) << 8) | p[1];
+        const u32 v = texel16(p, low);
         out.a = (v & 0x8000u) ? 255.0f : 0.0f;
         out.r = kLevels.k5[(v >> 10) & 0x1Fu];
         out.g = kLevels.k5[(v >> 5) & 0x1Fu];
@@ -1147,7 +1201,7 @@ inline bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     case 4u: { // RGB565
         if (!texSpan(P, base + (y * pitch + x) * 2u, 2u, p))
             break;
-        const u32 v = (static_cast<u32>(p[0]) << 8) | p[1];
+        const u32 v = texel16(p, low);
         out.a = 255;
         out.r = kLevels.k5[(v >> 11) & 0x1Fu];
         out.g = kLevels.k6[(v >> 5) & 0x3Fu];
@@ -1157,16 +1211,17 @@ inline bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     case 6u: { // ARGB8888
         if (!texSpan(P, base + (y * pitch + x) * 4u, 4u, p))
             break;
-        out.a = p[0];
-        out.r = p[1];
-        out.g = p[2];
-        out.b = p[3];
+        const u32 v = texel32(p, low);
+        out.a = static_cast<float>(v >> 24);
+        out.r = static_cast<float>((v >> 16) & 0xFFu);
+        out.g = static_cast<float>((v >> 8) & 0xFFu);
+        out.b = static_cast<float>(v & 0xFFu);
         goto counted;
     }
     case 15u: { // ARGB4444
         if (!texSpan(P, base + (y * pitch + x) * 2u, 2u, p))
             break;
-        const u32 v = (static_cast<u32>(p[0]) << 8) | p[1];
+        const u32 v = texel16(p, low);
         out.a = kLevels.k4[(v >> 12) & 0xFu];
         out.r = kLevels.k4[(v >> 8) & 0xFu];
         out.g = kLevels.k4[(v >> 4) & 0xFu];
@@ -1228,6 +1283,31 @@ Rgba borderColor(const TexUnit& t)
     o.g = static_cast<float>((t.border >> 8) & 0xFFu);
     o.b = static_cast<float>(t.border & 0xFFu);
     return o;
+}
+
+// A texel's number as a color, for the formats read in place: the levels
+// fetchTexel gives, in a register.
+OPM_FORCE_INLINE F4 texelColor1555(u32 v)
+{
+    return F4::set((v & 0x8000u) ? 255.0f : 0.0f, kLevels.k5[(v >> 10) & 0x1Fu],
+                   kLevels.k5[(v >> 5) & 0x1Fu], kLevels.k5[v & 0x1Fu]);
+}
+OPM_FORCE_INLINE F4 texelColor565(u32 v)
+{
+    return F4::set(255.0f, kLevels.k5[(v >> 11) & 0x1Fu],
+                   kLevels.k6[(v >> 5) & 0x3Fu], kLevels.k5[v & 0x1Fu]);
+}
+OPM_FORCE_INLINE F4 texelColor8888(u32 v)
+{
+    return F4::set(static_cast<float>(v >> 24),
+                   static_cast<float>((v >> 16) & 0xFFu),
+                   static_cast<float>((v >> 8) & 0xFFu),
+                   static_cast<float>(v & 0xFFu));
+}
+OPM_FORCE_INLINE F4 texelColor4444(u32 v)
+{
+    return F4::set(kLevels.k4[(v >> 12) & 0xFu], kLevels.k4[(v >> 8) & 0xFu],
+                   kLevels.k4[(v >> 4) & 0xFu], kLevels.k4[v & 0xFu]);
 }
 
 // Sample one unit at (s,t) in texture space (0..1 per tile), mip level l,
@@ -1297,49 +1377,35 @@ F4 sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
             break;
         }
         if (direct) {
-            const auto be16 = [](const u8* p) {
-                return (static_cast<u32>(p[0]) << 8) | p[1];
-            };
+            // Each texel as a number in the order its memory keeps
+            // (texelLowFirst), then into a register (texelColor*, forced in
+            // line: four calls a sample is what this path is here to avoid).
+            const bool low = texelLowFirst(base);
             switch (t.fmt) {
-            case 3u: { // ARGB1555
-                const auto dec = [&](const u8* p) {
-                    const u32 v = be16(p);
-                    return F4::set((v & 0x8000u) ? 255.0f : 0.0f,
-                                   kLevels.k5[(v >> 10) & 0x1Fu],
-                                   kLevels.k5[(v >> 5) & 0x1Fu],
-                                   kLevels.k5[v & 0x1Fu]);
-                };
-                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+            case 3u: // ARGB1555
+                q00 = texelColor1555(texel16(p00, low));
+                q01 = texelColor1555(texel16(p01, low));
+                q10 = texelColor1555(texel16(p10, low));
+                q11 = texelColor1555(texel16(p11, low));
                 break;
-            }
-            case 4u: { // RGB565
-                const auto dec = [&](const u8* p) {
-                    const u32 v = be16(p);
-                    return F4::set(255.0f, kLevels.k5[(v >> 11) & 0x1Fu],
-                                   kLevels.k6[(v >> 5) & 0x3Fu],
-                                   kLevels.k5[v & 0x1Fu]);
-                };
-                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+            case 4u: // RGB565
+                q00 = texelColor565(texel16(p00, low));
+                q01 = texelColor565(texel16(p01, low));
+                q10 = texelColor565(texel16(p10, low));
+                q11 = texelColor565(texel16(p11, low));
                 break;
-            }
-            case 6u: { // ARGB8888
-                const auto dec = [](const u8* p) {
-                    return F4::set(p[0], p[1], p[2], p[3]);
-                };
-                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+            case 6u: // ARGB8888
+                q00 = texelColor8888(texel32(p00, low));
+                q01 = texelColor8888(texel32(p01, low));
+                q10 = texelColor8888(texel32(p10, low));
+                q11 = texelColor8888(texel32(p11, low));
                 break;
-            }
-            default: { // 15: ARGB4444
-                const auto dec = [&](const u8* p) {
-                    const u32 v = be16(p);
-                    return F4::set(kLevels.k4[(v >> 12) & 0xFu],
-                                   kLevels.k4[(v >> 8) & 0xFu],
-                                   kLevels.k4[(v >> 4) & 0xFu],
-                                   kLevels.k4[v & 0xFu]);
-                };
-                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+            default: // 15: ARGB4444
+                q00 = texelColor4444(texel16(p00, low));
+                q01 = texelColor4444(texel16(p01, low));
+                q10 = texelColor4444(texel16(p10, low));
+                q11 = texelColor4444(texel16(p11, low));
                 break;
-            }
             }
             if (t.tileCount[l]) // four fetches' worth, as fetchTexel counts
                 P.tally.texUnimpl += 4;

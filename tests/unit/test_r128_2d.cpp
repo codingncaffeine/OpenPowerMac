@@ -19,6 +19,8 @@
 #include "doctest.h"
 #include "opm/r128.hpp"
 
+#include <string>
+
 using namespace opm;
 
 namespace {
@@ -628,4 +630,130 @@ TEST_CASE("r128 2d: the composite registers decompose into the canonical set")
     wr(c, 0x1438u, 5u | (6u << 16)); // DST_Y_X: X in 13:0, Y in 29:16
     CHECK(be(c.read(0x141Cu, 4)) == 5u);
     CHECK(be(c.read(0x1420u, 4)) == 6u);
+}
+
+// ── Lines (r128.cpp engLine says where the stepping rule comes from) ──────
+
+namespace {
+
+constexpr u32 kDstBresErr = 0x1628, kDstBresInc = 0x162C;
+constexpr u32 kDstBresDec = 0x1630, kDstBresLnth = 0x1634;
+constexpr u32 kDpCntlLine = 0x16D0; // DP_CNTL_XDIR_YDIR_YMAJOR
+
+// A solid PATCOPY line from (x0, y0) toward (x1, y1), `count` pixels, with
+// the terms the SDK's sample computes.
+void line(R128Cell& c, int x0, int y0, int x1, int y1, u32 count,
+          u32 rop3 = 0xF0u, u32 colour = 0x00C0FFEEu)
+{
+    const int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    const int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    const int large = dx < dy ? dy : dx, small = dx < dy ? dx : dy;
+    wr(c, kGmc, gmc(rop3, 3u, 2u));
+    surface(c);
+    wr(c, kBrushFrgd, colour);
+    wr(c, kDpCntlLine, (x0 < x1 ? 1u << 31 : 0u) | (y0 < y1 ? 1u << 15 : 0u) |
+                           (dx < dy ? 4u : 0u));
+    wr(c, kDstYX, static_cast<u32>(x0) | (static_cast<u32>(y0) << 16));
+    wr(c, kDstBresErr, static_cast<u32>(-large) & 0xFFFFFu);
+    wr(c, kDstBresInc, static_cast<u32>(2 * small) & 0xFFFFFu);
+    wr(c, kDstBresDec, static_cast<u32>(-2 * large) & 0xFFFFFu);
+    wr(c, kDstBresLnth, count);
+}
+
+// Every pixel of the top-left 12x10 that is not zero, as "x,y x,y ...".
+std::string lit(const R128Cell& c)
+{
+    std::string s;
+    for (u32 y = 0; y < 10; ++y)
+        for (u32 x = 0; x < 12; ++x)
+            if (pix(c, x, y))
+                s += std::to_string(x) + "," + std::to_string(y) + " ";
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("r128 2d: a line steps as Bresenham's does with the SDK's terms")
+{
+    const auto before = r128EngStats();
+    {
+        R128Cell c; // level
+        line(c, 2, 3, 7, 3, 6);
+        CHECK(lit(c) == "2,3 3,3 4,3 5,3 6,3 7,3 ");
+        CHECK(pix(c, 4, 3) == 0x00C0FFEEu);
+    }
+    {
+        R128Cell c; // at 45 degrees
+        line(c, 0, 0, 4, 4, 5);
+        CHECK(lit(c) == "0,0 1,1 2,2 3,3 4,4 ");
+    }
+    {
+        R128Cell c; // shallow: one down in three across
+        line(c, 0, 0, 6, 2, 7);
+        CHECK(lit(c) == "0,0 1,0 2,1 3,1 4,1 5,2 6,2 ");
+    }
+    {
+        R128Cell c; // steep, drawn upward and to the left
+        line(c, 5, 6, 3, 0, 7);
+        CHECK(lit(c) == "3,0 3,1 4,2 4,3 4,4 5,5 5,6 ");
+    }
+    CHECK(r128EngStats().lines2d - before.lines2d == 4);
+    CHECK(r128EngStats().linePixels - before.linePixels == 6 + 5 + 7 + 7);
+}
+
+TEST_CASE("r128 2d: BRES_SIGN decides which way a zero error term falls")
+{
+    // (0,0) to (2,1): after the first pixel the error term is exactly zero.
+    R128Cell positive;
+    line(positive, 0, 0, 2, 1, 3);
+    CHECK(lit(positive) == "0,0 1,1 2,1 "); // zero counts as positive: step
+    R128Cell negative;
+    wr(negative, kDpCntl, 0x100u); // BRES_SIGN
+    line(negative, 0, 0, 2, 1, 3);
+    CHECK(lit(negative) == "0,0 1,0 2,1 ");
+}
+
+TEST_CASE("r128 2d: a line leaves the pen at its end, and is clipped by the "
+          "scissor")
+{
+    R128Cell c;
+    line(c, 1, 1, 5, 1, 4); // four pixels: 1..4
+    CHECK(lit(c) == "1,1 2,1 3,1 4,1 ");
+    // The pen is at (5,1) and the terms stand: another length continues.
+    wr(c, kDstBresLnth, 3u);
+    CHECK(lit(c) == "1,1 2,1 3,1 4,1 5,1 6,1 7,1 ");
+    // The scissor's right edge at 3: the rest of a line is not drawn.
+    R128Cell d;
+    line(d, 0, 2, 9, 2, 10);
+    CHECK(lit(d) == "0,2 1,2 2,2 3,2 4,2 5,2 6,2 7,2 8,2 9,2 ");
+    R128Cell e;
+    wr(e, kGmc, gmc(0xF0u, 3u, 2u));
+    surface(e);
+    wr(e, kScBottomRight, 3u | (63u << 16));
+    wr(e, kBrushFrgd, 0x00C0FFEEu);
+    wr(e, kDpCntlLine, (1u << 31) | (1u << 15));
+    wr(e, kDstYX, 0u | (2u << 16));
+    wr(e, kDstBresErr, static_cast<u32>(-9) & 0xFFFFFu);
+    wr(e, kDstBresInc, 0u);
+    wr(e, kDstBresDec, static_cast<u32>(-18) & 0xFFFFFu);
+    wr(e, kDstBresLnth, 10u);
+    CHECK(lit(e) == "0,2 1,2 2,2 3,2 ");
+}
+
+TEST_CASE("r128 2d: a line that would read a source or an unknown pattern is "
+          "declined")
+{
+    R128Cell c;
+    const auto before = r128EngStats();
+    line(c, 0, 0, 5, 0, 6, 0xCCu); // SRCCOPY: a line has no source
+    CHECK(lit(c).empty());
+    CHECK(r128EngStats().lineDeclined - before.lineDeclined == 1);
+    // A dashed line's 32x1 pattern: no layout for it in any source.
+    wr(c, kGmc, 0x0Fu | (6u << 4) | (6u << 8) | (0xF0u << 16) | (2u << 24));
+    surface(c);
+    wr(c, kDstYX, 0);
+    wr(c, kDstBresLnth, 6u);
+    CHECK(lit(c).empty());
+    CHECK(r128EngStats().lineDeclined - before.lineDeclined == 2);
+    CHECK(r128EngStats().lines2d == before.lines2d);
 }

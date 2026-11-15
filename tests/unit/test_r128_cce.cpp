@@ -743,3 +743,31 @@ TEST_CASE("cce: SET_MODE_24BPP (0x1F) is taken, and the stream stays in step")
     CHECK(r128CceP3Skipped().count(0x1Fu) == 0);
     CHECK(r.c.peek(0x15E0u) == 0x24242424u);
 }
+
+TEST_CASE("cce: POLYLINE (0x95) draws through its corners, each corner once "
+          "and the last one not")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    // PATINVERT, so a pixel drawn twice would show as undrawn.
+    r.fifo(0xC0009500u | (7u << 16)); // 8-DWord body: settings (5) + 3 corners
+    r.fifo(2u | 8u | (13u << 4) | (6u << 8) | (0x5Au << 16));
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET
+    r.fifo(0x00000000u); // SC_TOP_LEFT
+    r.fifo(0x001F001Fu); // SC_BOT_RITE
+    r.fifo(0x00A1B2C3u); // FRGD
+    r.fifo(0x00020002u); // Y=2 X=2
+    r.fifo(0x00020006u); // Y=2 X=6
+    r.fifo(0x00050006u); // Y=5 X=6
+    const auto& e = r128EngStats();
+    CHECK(e.lines2d - before.lines2d == 2);
+    CHECK(e.linePixels - before.linePixels == 4 + 3);
+    for (u32 x = 2; x <= 5; ++x)
+        CHECK(pix32(r.c, x, 2) == 0x00A1B2C3u);
+    CHECK(pix32(r.c, 6, 2) == 0x00A1B2C3u); // the corner: once, by segment 2
+    CHECK(pix32(r.c, 6, 3) == 0x00A1B2C3u);
+    CHECK(pix32(r.c, 6, 4) == 0x00A1B2C3u);
+    CHECK(pix32(r.c, 6, 5) == 0u); // the last corner is left for the caller
+    CHECK(pix32(r.c, 7, 2) == 0u);
+    CHECK(r128CceP3Skipped().count(0x95u) == 0);
+}

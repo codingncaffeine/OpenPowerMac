@@ -209,6 +209,7 @@ private:
     // operations" (§2.1.5 of ATI's reference guide), so the trigger is a
     // write, not a command word.
     void engBlit();
+    void engLine(u32 length);
     // Absorb a write into the engine block: normalise aliases, apply the
     // side effects of a DP_GUI_MASTER_CNTL write, and initiate on a trigger.
     // Returns true when it has fully handled the write.
@@ -438,6 +439,9 @@ struct R128EngStats {
     u64 offVram = 0;     // a rectangle that would run off the end of VRAM
     u64 agpTarget = 0;   // an offset in the upper 32 MB: AGP, not VRAM
     u64 clippedOut = 0;  // entirely outside the scissor
+    u64 lines2d = 0;     // Bresenham lines drawn by the 2D engine
+    u64 linePixels = 0;  // ...and the pixels they wrote
+    u64 lineDeclined = 0; // a line asked for with a brush or ROP not drawn
     u64 hostData = 0;    // source is HOST_DATA (stage 3, not built yet)
     u64 colorCompare = 0; // a colour compare this engine did not apply
     u64 waitUntil = 0;   // WAIT_UNTIL events, all satisfiable at once here

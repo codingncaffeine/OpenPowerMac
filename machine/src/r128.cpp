@@ -480,10 +480,13 @@ bool r128RegDecodedBits(u32 off, u32& mask)
     // carries the brush origin, which the packet parser then loads. Not
     // read: 15 (colour temperature).
     case 0x146Cu: case 0x1C84u: mask = 0xFFFF7FFFu; return true;
-    // DP_CNTL: the two directions, and the raster stall (an operation here
-    // is complete before the store returns). Not read: the rectangle tiling
-    // bits (the value census has them), the line and trapezoid fields.
-    case 0x16C0u: mask = 0x00010003u; return true;
+    // DP_CNTL: the two directions, the major axis and the sign of a zero
+    // error term for lines, and the raster stall (an operation here is
+    // complete before the store returns). Not read: the rectangle tiling
+    // bits (the value census has them), the last-pel bit, the poly-line and
+    // trapezoid fields.
+    case 0x16C0u: mask = 0x00010107u; return true;
+    case 0x16D0u: mask = 0x80008004u; return true;
     // DP_DATATYPE: destination, brush and source types, the pixel order
     // within a pattern's byte. Not read: 29 (big-endian host data) and 31
     // (as bit 15 above).
@@ -1585,6 +1588,42 @@ static u32 cceScanline(R128Cell& c, const u32* body, u32 i, u32 n, u32 runs)
     return i;
 }
 
+// POLYLINE (0x95, SDK F.12): SETTINGS, then the corners [Y | X] of a line
+// drawn through them in order. Each segment gets the terms the SDK's own
+// line sample computes and goes through the engine's line registers. A
+// segment draws from its first corner up to, not onto, its second: the next
+// segment starts there, so a corner is drawn once, which is what an XOR
+// needs. The manual does not say whether the polyline's last corner is
+// drawn; it is left out, the convention of the Windows drivers this packet
+// family was made for (its HOSTDATA_BLT is their glyph call).
+static bool cceOpPolyline(R128Cell& c, const u32* body, u32 n)
+{
+    u32 i = cceSettings(c, body, n);
+    if (i > n || i + 2u > n)
+        return false;
+    for (; i + 1u < n; ++i) {
+        const int x0 = static_cast<int16_t>(body[i] & 0xFFFFu);
+        const int y0 = static_cast<int16_t>(body[i] >> 16);
+        const int x1 = static_cast<int16_t>(body[i + 1u] & 0xFFFFu);
+        const int y1 = static_cast<int16_t>(body[i + 1u] >> 16);
+        const int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+        const int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+        const int large = dx < dy ? dy : dx, small = dx < dy ? dx : dy;
+        if (!large)
+            continue;
+        cceRegWrite(c, 0x16D0u,
+                    (x0 < x1 ? 1u << 31 : 0u) | (y0 < y1 ? 1u << 15 : 0u) |
+                        (dx < dy ? 4u : 0u)); // DP_CNTL_XDIR_YDIR_YMAJOR
+        cceRegWrite(c, 0x1438u, (static_cast<u32>(y0 & 0x3FFF) << 16) |
+                                    static_cast<u32>(x0 & 0x3FFF)); // DST_Y_X
+        cceRegWrite(c, 0x1628u, static_cast<u32>(-large) & 0xFFFFFu);
+        cceRegWrite(c, 0x162Cu, static_cast<u32>(2 * small) & 0xFFFFFu);
+        cceRegWrite(c, 0x1630u, static_cast<u32>(-2 * large) & 0xFFFFFu);
+        cceRegWrite(c, 0x1634u, static_cast<u32>(large)); // DST_BRES_LNTH: draw
+    }
+    return true;
+}
+
 // POLYSCANLINES (0x98): SETTINGS, [SCAN_COUNT], then that many scanlines,
 // each led by its own [NUM_LINE], the number of runs.
 static bool cceOpPolyScanlines(R128Cell& c, const u32* body, u32 n)
@@ -1985,6 +2024,8 @@ static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
             done = cceOpNextChar(c, body, n);
         else if (op == 0x1Eu) // SET_SCISSORS — SDK F.22
             done = cceOpSetScissors(c, body, n);
+        else if (op == 0x95u) // POLYLINE — SDK F.12
+            done = cceOpPolyline(c, body, n);
         else if (op == 0x98u) // POLYSCANLINES — SDK F.15
             done = cceOpPolyScanlines(c, body, n);
         else if (op == 0x1Du) // PLY_NEXTSCAN — SDK F.20
@@ -2807,6 +2848,121 @@ void R128Cell::engBlit()
 
 // Absorb a write into the engine block. Returns true when the write has been
 // fully handled and must not also fall through to the plain register store.
+// ── Lines ────────────────────────────────────────────────────────────────
+//
+// The engine draws a line by Bresenham's algorithm from the terms a driver
+// computes: the pen starts at DST_X, DST_Y; DP_CNTL has the two directions
+// and which axis is the major one; DST_BRES_ERR, _INC and _DEC are the error
+// term and its two steps (20 bits, signed); and the store to DST_BRES_LNTH,
+// the number of pixels, draws.
+//
+// The guide names the registers and stops. The stepping rule is the one the
+// SDK's own sample (4.3.2, R128_DrawLine) and the XFree86 driver's lines
+// both program for: err = -major, inc = 2 * minor, dec = -2 * major, length
+// = the pixel count. Those terms draw the line they are meant to only if,
+// after each pixel, the engine adds INC and, when the result is not
+// negative, steps the minor axis and adds DEC. DP_CNTL's BRES_SIGN says
+// which way a zero falls ("0 = zero error term is positive").
+//
+// The pen is left where the line ended and the error term as it stood, so a
+// polyline continues from one segment into the next. The brush must be the
+// solid one: the line patterns (8x1, 32x1) have no layout in any source.
+// DST_LAST_PEL is not acted on: the XFree86 driver leaves it clear and gets
+// every pixel of its count, and nothing says what setting it changes.
+static constexpr u32 kDstBresErr = 0x1628, kDstBresInc = 0x162C;
+static constexpr u32 kDstBresDec = 0x1630, kDstBresLnth = 0x1634;
+static constexpr u32 kDpCntlXdirYdirYmajor = 0x16D0;
+
+void R128Cell::engLine(u32 length)
+{
+    const u32 dt = rd(kDpDatatype);
+    r128SettingUsed(R128Setting::Dst2d, dt & 0xFu);
+    u32 bypp = 0;
+    switch (dt & 0xFu) {
+    case 2: case 7: case 8: case 9: bypp = 1; break;
+    case 3: case 4: bypp = 2; break;
+    case 5: bypp = 3; break;
+    case 6: bypp = 4; break;
+    default: break;
+    }
+    if (!bypp) {
+        ++gEng.badBpp;
+        return;
+    }
+    const u32 rop = (rd(kDpMix) >> 16) & 0xFFu;
+    const u32 brush = (dt >> 8) & 0xFu;
+    if (ropUsesPat(rop))
+        r128SettingUsed(R128Setting::Brush2d, brush);
+    // A line has no source rectangle, and only the solid brush is known.
+    if (ropUsesSrc(rop) ||
+        (ropUsesPat(rop) && brush != 13u && brush != 15u)) {
+        ++gEng.lineDeclined;
+        return;
+    }
+    const u32 pitch = rd(kDstPitch) & 0x3FFu;
+    const u32 stride = bypp == 3u ? pitch * 8u : pitch * 8u * bypp;
+    const u32 dstOff = rd(kDstOffset) & kEngAddrMask;
+    if (!stride) {
+        ++gEng.zeroPitch;
+        return;
+    }
+    if (dstOff >= kVramSpan) {
+        ++gEng.agpTarget;
+        return;
+    }
+    const auto s20 = [](u32 v) {
+        return static_cast<int>(v & 0xFFFFFu) -
+               ((v & 0x80000u) ? 0x100000 : 0);
+    };
+    int err = s20(rd(kDstBresErr));
+    const int inc = s20(rd(kDstBresInc)), dec = s20(rd(kDstBresDec));
+    const u32 dpc = rd(kDpCntl);
+    const int stepX = (dpc & 1u) ? 1 : -1, stepY = (dpc & 2u) ? 1 : -1;
+    const bool yMajor = (dpc & 4u) != 0;
+    const bool zeroSteps = !(dpc & 0x100u); // BRES_SIGN clear: zero is positive
+    const int scl = sx14(rd(kScLeft)), scr = sx14(rd(kScRight));
+    const int sct = sx14(rd(kScTop)), scb = sx14(rd(kScBottom));
+    const u32 wmask = rd(kDpWriteMsk);
+    const u32 mask = wmask ? wmask : 0xFFFFFFFFu; // as engBlit: zero masks nothing
+    const u32 pat = rd(kDpBrushFrgdClr);
+    int x = sx14(rd(kDstX)), y = sx14(rd(kDstY));
+    for (u32 k = 0; k < length; ++k) {
+        const u64 at = static_cast<u64>(dstOff) +
+                       static_cast<u64>(y < 0 ? 0 : y) * stride +
+                       static_cast<u64>(x < 0 ? 0 : x) * bypp;
+        if (x >= scl && x <= scr && y >= sct && y <= scb && x >= 0 && y >= 0 &&
+            at + bypp <= vram.size()) {
+            u32 d = 0;
+            for (u32 b = 0; b < bypp; ++b)
+                d = (d << 8) | vram[at + b];
+            u32 v = rop3(rop, pat, 0, d);
+            if (mask != 0xFFFFFFFFu)
+                v = (d & ~mask) | (v & mask);
+            if (r128PixelWatched(at, bypp))
+                r128PixelWatchNote("2d line", "rop %02x at (%d,%d), wrote %x",
+                                   rop, x, y, v);
+            for (u32 b = 0; b < bypp; ++b)
+                vram[at + b] = static_cast<u8>(v >> (8u * (bypp - 1u - b)));
+            ++gEng.linePixels;
+            const u32 lo = static_cast<u32>(at);
+            if (lo < fbLo)
+                fbLo = lo;
+            if (lo + bypp - 1u > fbHi)
+                fbHi = lo + bypp - 1u;
+        }
+        err += inc;
+        if (err > 0 || (err == 0 && zeroSteps)) {
+            (yMajor ? x : y) += yMajor ? stepX : stepY;
+            err += dec;
+        }
+        (yMajor ? y : x) += yMajor ? stepY : stepX;
+    }
+    regs_[kDstX] = static_cast<u32>(x) & 0x3FFFu;
+    regs_[kDstY] = static_cast<u32>(y) & 0x3FFFu;
+    regs_[kDstBresErr] = static_cast<u32>(err) & 0xFFFFFu;
+    ++gEng.lines2d;
+}
+
 bool R128Cell::engWrite(u32 off, u32 v)
 {
     // The 3D unit's registers first: the fog-table pair and the write-gated
@@ -2953,6 +3109,18 @@ bool R128Cell::engWrite(u32 off, u32 v)
         // ...and then step down one scanline, which is what the INCY in the
         // name is for: it draws a run of single rows without reprogramming Y.
         regs_[kDstY] = (rd(kDstY) + 1u) & 0x3FFFu;
+        return true;
+
+    // --- lines ------------------------------------------------------------
+    case kDstBresLnth:
+        engLine(v & 0x3FFFu);
+        return true;
+    case kDpCntlXdirYdirYmajor:
+        // The three line bits of DP_CNTL under another address: X direction
+        // in bit 31, Y direction in bit 15, the major axis in bit 2.
+        regs_[kDpCntlXdirYdirYmajor] = v;
+        regs_[kDpCntl] = (rd(kDpCntl) & ~7u) | (v >> 31) |
+                         (((v >> 15) & 1u) << 1) | (v & 4u);
         return true;
 
     // --- the pixel cache -------------------------------------------------

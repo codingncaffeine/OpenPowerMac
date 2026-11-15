@@ -138,6 +138,10 @@ void hostStop();
 // Returns the number of samples written, 0 when there were none or the file
 // could not be opened.
 size_t hostDump(const char* path);
+// The samples themselves (host addresses, in the order taken), for a caller
+// that can say what lies at addresses no file on disk describes: valid after
+// hostStop. Returns how many.
+size_t hostSamples(const u64** addrs);
 
 } // namespace prof
 } // namespace opm

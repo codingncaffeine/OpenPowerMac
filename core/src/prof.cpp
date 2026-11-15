@@ -314,12 +314,23 @@ size_t hostDump(const char* path)
     return n;
 }
 
+size_t hostSamples(const u64** addrs)
+{
+    *addrs = gHostBuf.data();
+    return gHostN;
+}
+
 } // namespace prof
 } // namespace opm
 #else
 bool hostStart(unsigned, const u32*) { return false; }
 void hostStop() {}
 size_t hostDump(const char*) { return 0; }
+size_t hostSamples(const u64** addrs)
+{
+    *addrs = nullptr;
+    return 0;
+}
 
 } // namespace prof
 } // namespace opm

@@ -651,6 +651,15 @@ struct Compiler {
     i32 gpr(u32 r) const { return o.gpr0 + i32(r * 4u); }
     i32 fpr(u32 r) const { return o.fpr0 + i32(r * 8u); }
 
+    // What the bytes from here on are for (JitCache::map); nothing unless a
+    // profile asked.
+    u32 curRow = JitCache::kMapNoRow;
+    void mark(u32 part)
+    {
+        if (jc->mapOn)
+            jc->map.push_back({u32(e.at), curRow | (part << 10)});
+    }
+
     // -- shared fragments ----------------------------------------------------
 
     // charge(insnCycles + extraCycles) + ++stamp — the execFast tail, in its
@@ -753,9 +762,11 @@ struct Compiler {
     }
     void setCr0FromEax() // result still in eax; crInsert only clobbers it
     {                    // after the setcc trio captured the flags
+        mark(JitCache::kPartCr);
         zero3();
         e.bytes({0x85, 0xC0}); // test eax, eax
         crInsert(0, true);
+        mark(JitCache::kPartBody);
     }
     void caFromEdx() // XER[CA] <- edx (0/1); mirrors setCa
     {
@@ -991,6 +1002,7 @@ struct Compiler {
     // run of assumptions.
     void fallback(u32 insn, u32 row, u32 nextVa)
     {
+        mark(JitCache::kPartCall);
         flushPc(nextVa - 4); // execRow's contract: st.pc == CIA at entry
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
         e.movEdxI(insn);
@@ -1040,6 +1052,7 @@ struct Compiler {
     void fallbackDirectFull(u32 insn, u32 row, u32 nextVa, const void* fn,
                             bool fpGate, bool keepBatch)
     {
+        mark(JitCache::kPartCall);
         size_t coldJ = size_t(-1);
         if (fpGate) { // execRow's kPreFp arm, tested before anything is written
             e.loadR(RAX, o.msr);
@@ -1135,6 +1148,7 @@ struct Compiler {
         // FPRs, FPSCR, CR and, to trap, the pc, and nothing else) the batch
         // cannot have ended and no line can have been dropped: the pc is
         // the one thing left to ask.
+        mark(JitCache::kPartCall);
         size_t coldJ = size_t(-1);
         if (fpGate) { // FP unavailable is execRow's to raise: the cold arm
             e.loadR(RAX, o.msr);
@@ -1327,6 +1341,7 @@ struct Compiler {
     void load(u32 insn, u32 nextVa, u32 kind, bool xform, bool update,
               bool sext, bool brx)
     {
+        mark(JitCache::kPartProbe);
         if (xform)
             emitEaX(insn, update);
         else
@@ -1358,6 +1373,7 @@ struct Compiler {
             for (size_t j : slow)
                 e.patch32(j);
         }
+        mark(JitCache::kPartShim);
         flushPc(nextVa); // handlers see NIA; readV can observe all three
         e.storeI(o.curInsn, insn); // a faulting access builds DSISR from it
         e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
@@ -1391,6 +1407,7 @@ struct Compiler {
     void store(u32 insn, u32 nextVa, u32 kind, bool xform, bool update,
                bool brx)
     {
+        mark(JitCache::kPartProbe);
         if (xform)
             emitEaX(insn, update);
         else
@@ -1403,7 +1420,9 @@ struct Compiler {
             // Inside one 32-byte block: the block is what the fetch buffer
             // may hold a copy of, and one compare then covers the store.
             memProbe(true, 31u, 32u - len, slow);
+            mark(JitCache::kPartDrop);
             storeDropsFetched();
+            mark(JitCache::kPartProbe);
             // The bytes, in the guest's order: a plain store is reversed on
             // the way, a byte-reversed one is this host's own order.
             e.bytes({0x45, 0x8B, 0x9D});             // mov r11d, [r13+gpr rs]
@@ -1423,11 +1442,13 @@ struct Compiler {
             if (update)
                 e.bytes({0x45, 0x89, 0xA5}), e.i32le(u32(gpr(f_ra(insn))));
             bump();
+            mark(JitCache::kPartDrop);
             leaveIfOwnBlockDropped(nextVa);
             endJ = e.jmp32f();
             for (size_t j : slow)
                 e.patch32(j);
         }
+        mark(JitCache::kPartShim);
         flushPc(nextVa); // handlers see NIA; writeV can observe all three
         e.storeI(o.curInsn, insn);
         e.bytes({0x45, 0x8B, 0x85}); // mov r8d, [r13+gpr rs]
@@ -1471,6 +1492,7 @@ struct Compiler {
         e.b(0xA9); // test eax, imm32
         e.i32le(0x2000u); // msr::FP
         const size_t fbJ = e.j32(CC_Z);
+        mark(JitCache::kPartProbe);
         if (xform)
             emitEaX(insn, update);
         else
@@ -1518,7 +1540,9 @@ struct Compiler {
                     e.bytes({0x49, 0x0F, 0xCB});         // bswap r11
                 }
                 memProbe(true, 31u, 32u - len, slow);
+                mark(JitCache::kPartDrop);
                 storeDropsFetched();
+                mark(JitCache::kPartProbe);
                 e.bytes({0x4D, 0x8B, 0x40, u8(offsetof(Cpu::DpPage, host))}); // mov r8, [r8+host]
                 if (single)
                     e.bytes({0x45, 0x89, 0x1C, 0x08});   // mov [r8+rcx], r11d
@@ -1529,6 +1553,7 @@ struct Compiler {
                     e.i32le(u32(gpr(f_ra(insn))));
                 }
                 bump();
+                mark(JitCache::kPartDrop);
                 leaveIfOwnBlockDropped(nextVa);
             } else {
                 memProbe(false, 0xFFFu, 0x1000u - len, slow);
@@ -1581,6 +1606,7 @@ struct Compiler {
             for (size_t j : slow)
                 e.patch32(j);
         }
+        mark(JitCache::kPartShim);
         flushPc(nextVa); // the shim can fault: pc/stamp/cycles must be true
         e.bytes({0x41, 0xB8}); // mov r8d, insn (the shim decodes frt/DSISR)
         e.i32le(insn);
@@ -1674,6 +1700,8 @@ void Compiler::word(u32 k, u32 insn, u32 row)
 {
     const u32 cia = vaBase + 4u * k;
     const u32 nextVa = cia + 4u;
+    curRow = row < 1022u ? row : 1022u;
+    mark(JitCache::kPartBody);
 
     // Anything the line executor would hand to execRow's slow paths goes to
     // execRow here too: unknown words (kNoRow), gated rows (privileged, FP,
@@ -1801,6 +1829,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     // ---- compares (cmpS/cmpU; the register reads are direct, not gpr0) ----
     case Lo::Cmpi:
     case Lo::Cmpli: {
+        mark(JitCache::kPartCr);
         e.loadR(RAX, gpr(ra));
         zero3();
         e.cmpEaxI(lo == Lo::Cmpi ? u32(sext16(f_d(insn))) : f_d(insn));
@@ -1810,6 +1839,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
     }
     case Lo::Cmp:
     case Lo::Cmpl: {
+        mark(JitCache::kPartCr);
         e.loadR(RAX, gpr(ra));
         e.loadR(RDX, gpr(rb));
         zero3();
@@ -2027,6 +2057,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
             e.storeI(o.lr, nextVa);
         bump();
         if (target != nextVa) {
+            mark(JitCache::kPartHop);
             e.storeI(o.pc, target);
             flushNoPc();
             chainOrExit(target, k);
@@ -2043,6 +2074,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         const bool chained = chain && target != nextVa &&
                              (target >> 12) == (vaBase >> 12);
         const size_t nt = condJump(v, chained);
+        mark(JitCache::kPartHop);
         bump();
         e.storeI(o.pc, target);
         flushNoPc();
@@ -2057,6 +2089,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
                 e.patch32(nt);
             else
                 e.patch8(nt);
+            mark(JitCache::kPartBody);
             bump(); // not taken: fall through, pc deferred
         }
         return;
@@ -2070,12 +2103,14 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         if (f_lkbit(insn))
             e.storeI(o.lr, nextVa);
         const size_t nt = condJump(v);
+        mark(JitCache::kPartHop);
         bump();
         e.storeR(o.pc, RAX);
         flushNoPc();
         hopOrExit();
         if (nt != size_t(-1)) {
             e.patch8(nt);
+            mark(JitCache::kPartBody);
             bump();
         }
         return;
@@ -2276,6 +2311,20 @@ void JitCache::dropAll()
     std::memset(rr, 0, sizeof rr);
 }
 
+u32 JitCache::mapAt(u32 off) const
+{
+    // The last mark at or before the offset.
+    size_t lo = 0, hi = map.size();
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (map[mid].first <= off)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo ? map[lo - 1].second : ~0u;
+}
+
 void JitCache::sever(JitLine& jl)
 {
 #if OPM_JIT_HOST
@@ -2397,6 +2446,7 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
         dropAll();
         at_ = firstCode_;
         ++resets;
+        map.clear();
     }
     // The victim way: an invalid way if one exists, else round-robin. The
     // ways are what keep a fetch-slot conflict from being a compile storm —
@@ -2426,7 +2476,8 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
                 !c.jitChainOff,
                 !c.jitDirectOff,
                 this,
-                {}}; // fixes: named, because gcc requires every member here
+                {}, // fixes: named, because gcc requires every member here
+                JitCache::kMapNoRow};
     for (u32 k = 0; k < 8; ++k) {
         jl.off[k] = u32(cp.e.at);
         cp.word(k, w[k], rows[k]);
@@ -2435,6 +2486,8 @@ bool JitCache::compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
     // after the line) and the batched counters, then chain to the next line
     // — the other half of every dispatcher round trip — or leave. Every
     // other path out of the block flushed at its own exit.
+    cp.curRow = kMapNoRow;
+    cp.mark(kPartHop);
     cp.flushPc(vaBase + 32u);
     cp.chainOrExit(vaBase + 32u, 7u);
     // Forward intra-line chain targets, now that every segment has a home.
@@ -2463,6 +2516,7 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
         c.jit = std::make_unique<JitCache>();
         c.jit->bind(c);
         c.jit->tscOn = c.jitTscOn;
+        c.jit->mapOn = c.jitMapOn;
         if (!c.jit->ready()) {
             c.jitOn = false; // no executable memory: interpreter it is
             return false;

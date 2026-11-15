@@ -1144,6 +1144,9 @@ struct Cpu {
     // --jit-tsc, carried here because the cache is created on first use and
     // the harness sets its flags before the machine runs.
     bool jitTscOn = false;
+    // DIAGNOSTIC (g4run --profile-host): keep the list that says what each
+    // run of emitted bytes was compiled for (JitCache::map).
+    bool jitMapOn = false;
     // MSR as the dispatcher found it when it last entered compiled code,
     // which is the MSR its entry conditions were checked under. A hop from
     // block to block compares against it: see Compiler::chainChecks.

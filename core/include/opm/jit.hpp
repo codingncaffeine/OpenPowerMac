@@ -30,6 +30,8 @@
 #include "types.hpp"
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace opm {
 
@@ -130,6 +132,34 @@ class JitCache {
     // named lfs the single hottest row in the game. Counted apart so the
     // historical number stays comparable to the sessions that quoted it.
     u64 fpMemOps = 0;
+
+    // 🔬 WHAT THE EMITTED BYTES ARE FOR (g4run --profile-host). A host sample
+    // inside the arena says nothing by its address, and "translated code" is
+    // half of the processor's thread: this is the list that turns an arena
+    // offset back into the guest instruction it was compiled for and the
+    // part of that instruction's code it lies in. Appended to in emission
+    // order, so it is sorted by offset; kept only when asked for, emptied
+    // with the arena.
+    enum : u32 {
+        kPartBody,     // the instruction's own work, in line
+        kPartProbe,    // a load or store: the address and the page memo's probe
+        kPartShim,     // a load or store through the call
+        kPartCall,     // an instruction called out for, and its tests after
+        kPartHop,      // leaving for the next block: counts, gate, the jump
+        kPartCr,       // a condition register field built from a result
+        kPartDrop,     // a store: the fetched copy of its block, and this one
+        kPartFp,       // floating-point arithmetic in line
+        kPartN
+    };
+    static constexpr const char* kPartName[kPartN] = {
+        "in line", "address + page probe", "memory call", "handler call",
+        "hop to the next block", "condition field", "store's code check",
+        "floating point in line"};
+    static constexpr u32 kMapNoRow = 1023u; // not one instruction's (a line's end)
+    bool mapOn = false;
+    std::vector<std::pair<u32, u32>> map; // {arena offset, row | part << 10}
+    // The tag of the code at an arena offset, or ~0u.
+    u32 mapAt(u32 off) const;
 
     // r13-relative displacements into Cpu, measured off the live object at
     // bind() rather than via offsetof: Cpu holds std::map members, so it is

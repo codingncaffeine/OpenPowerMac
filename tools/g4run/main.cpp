@@ -1587,6 +1587,7 @@ int main(int argc, char** argv)
     cpu.jitFullGate = jitFullGate;
     cpu.jitHopOff = jitHopOff;
     cpu.jitTscOn = jitTsc; // JitCache is created lazily; carried on the Cpu
+    cpu.jitMapOn = hostProfHz != 0; // a host profile names the emitted code
     cpu.jitDirectOff = jitDirectOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);
     bus.ohci(1).setLivePortPower(ohciPortPower);
@@ -5801,6 +5802,63 @@ int main(int argc, char** argv)
         printf("-- host profile: %zu samples -> %s (tools/hostprof.py reads "
                "it)\n",
                n, hostProfPath);
+        // The samples that fell in translated code, by the guest instruction
+        // the bytes were compiled for and the part of its code they lie in.
+        if (cpu.jit && cpu.jit->arena_ && !cpu.jit->map.empty()) {
+            const JitCache& J = *cpu.jit;
+            const u64* addrs = nullptr;
+            const size_t ns = prof::hostSamples(&addrs);
+            const u64 lo = reinterpret_cast<u64>(J.arena_);
+            const u64 hi = lo + J.at_;
+            std::map<u32, u64> byTag;
+            u64 partHits[JitCache::kPartN] = {};
+            u64 inArena = 0, setup = 0;
+            for (size_t k = 0; k < ns; ++k) {
+                if (addrs[k] < lo || addrs[k] >= hi)
+                    continue;
+                ++inArena;
+                const u32 tag = J.mapAt(static_cast<u32>(addrs[k] - lo));
+                if (tag == ~0u) {
+                    ++setup; // the trampoline and the shared way out
+                    continue;
+                }
+                ++byTag[tag];
+                ++partHits[(tag >> 10) < JitCache::kPartN ? tag >> 10 : 0];
+            }
+            const double all = ns ? static_cast<double>(ns) : 1.0;
+            printf("--   translated code: %llu of %zu samples (%.1f%% of the "
+                   "thread)%s\n",
+                   static_cast<unsigned long long>(inArena), ns,
+                   100.0 * static_cast<double>(inArena) / all,
+                   J.resets ? "; the arena was reset during the run, so "
+                              "earlier samples are misnamed"
+                            : "");
+            for (u32 p = 0; p < JitCache::kPartN; ++p)
+                if (partHits[p])
+                    printf("--     %-24s %6.2f%%\n", JitCache::kPartName[p],
+                           100.0 * static_cast<double>(partHits[p]) / all);
+            if (setup)
+                printf("--     %-24s %6.2f%%\n", "entry and way out",
+                       100.0 * static_cast<double>(setup) / all);
+            std::vector<std::pair<u64, u32>> top;
+            for (const auto& [tag, hits] : byTag)
+                top.push_back({hits, tag});
+            std::sort(top.rbegin(), top.rend());
+            printf("--   translated code, by instruction and part (top 40 of "
+                   "%zu):\n",
+                   top.size());
+            for (size_t k = 0; k < top.size() && k < 40; ++k) {
+                const u32 row = top[k].second & 1023u;
+                const u32 part = top[k].second >> 10;
+                const char* mn = row == JitCache::kMapNoRow ? "(line end)"
+                                 : row < kIsaCount          ? kIsa[row].mnem
+                                                            : "(no row)";
+                printf("       %-10s %-24s %6.2f%%\n", mn,
+                       part < JitCache::kPartN ? JitCache::kPartName[part]
+                                               : "?",
+                       100.0 * static_cast<double>(top[k].first) / all);
+            }
+        }
         // The guest's code at the sampled pcs, read through the translation
         // as it stands now: every sampled 4 KB page and its two neighbors,
         // as "virtual page, 4096 bytes" records. An application's address is

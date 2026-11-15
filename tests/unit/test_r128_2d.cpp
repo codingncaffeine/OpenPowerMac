@@ -757,3 +757,171 @@ TEST_CASE("r128 2d: a line that would read a source or an unknown pattern is "
     CHECK(r128EngStats().lineDeclined - before.lineDeclined == 2);
     CHECK(r128EngStats().lines2d == before.lines2d);
 }
+
+// ── One-bit sources, and host data through the registers ──────────────────
+
+namespace {
+
+constexpr u32 kSrcFrgd = 0x15D8, kSrcBkgd = 0x15DC;
+constexpr u32 kHostData0 = 0x17C0, kHostData3 = 0x17CC, kHostDataLast = 0x17E0;
+constexpr u32 kFg = 0x00F1F2F3u, kBg = 0x00212223u;
+
+// A 1-bit bitmap at video memory 0x10000, eight bytes a row: row 0 is 0xA0
+// (its pixels 0 and 2, most significant bit first), row 1 is 0x01 (pixel 7).
+void monoBitmap(R128Cell& c)
+{
+    c.vram[0x10000] = 0xA0;
+    c.vram[0x10008] = 0x01;
+}
+// Expand it to (dx, dy), eight wide and two high, with the given source
+// type, pixel order and source x.
+void monoCopy(R128Cell& c, u32 srcType, u32 pixOrder, u32 dx, u32 dy,
+              u32 srcX = 0)
+{
+    wr(c, kGmc, gmc(0xCCu, srcType, 2u) | (pixOrder << 14));
+    surface(c);
+    wr(c, kSrcOffset, 0x10000u);
+    wr(c, kSrcPitch, 8u); // 8 x 8 pixels = 8 bytes a row
+    wr(c, kSrcFrgd, kFg);
+    wr(c, kSrcBkgd, kBg);
+    wr(c, kSrcYX, srcX);
+    wr(c, kDstYX, dx | (dy << 16));
+    wr(c, kDstHeightWidth, 8u | (2u << 16));
+}
+
+u32 bswap(u32 v) { return be(v); }
+
+} // namespace
+
+TEST_CASE("r128 2d: a one-bit source in video memory is expanded to the two "
+          "source colours")
+{
+    R128Cell c;
+    monoBitmap(c);
+    const auto before = r128EngStats();
+    monoCopy(c, 0u, 0u, 4, 2);
+    CHECK(r128EngStats().monoSrc == before.monoSrc);
+    CHECK(r128EngStats().copies == before.copies + 1);
+    CHECK(pix(c, 4, 2) == kFg);
+    CHECK(pix(c, 5, 2) == kBg);
+    CHECK(pix(c, 6, 2) == kFg);
+    CHECK(pix(c, 7, 2) == kBg);
+    CHECK(pix(c, 11, 2) == kBg);
+    CHECK(pix(c, 4, 3) == kBg);
+    CHECK(pix(c, 11, 3) == kFg); // row 1's last pixel
+    CHECK(pix(c, 12, 2) == 0u);  // eight wide and no more
+    CHECK(pix(c, 4, 4) == 0u);
+}
+
+TEST_CASE("r128 2d: a see-through one-bit source draws its set bits only, "
+          "and the pixel order and source position are honoured")
+{
+    R128Cell c;
+    monoBitmap(c);
+    surface(c);
+    for (u32 x = 0; x < 16; ++x)
+        setPix(c, x, 2, 0x00777777u);
+    monoCopy(c, 1u, 0u, 4, 2);
+    CHECK(pix(c, 4, 2) == kFg);
+    CHECK(pix(c, 5, 2) == 0x00777777u); // not the background colour
+    CHECK(pix(c, 6, 2) == kFg);
+    // Least significant bit first: 0xA0 is now pixels 5 and 7, 0x01 pixel 0.
+    R128Cell d;
+    monoBitmap(d);
+    monoCopy(d, 0u, 1u, 0, 0);
+    CHECK(pix(d, 5, 0) == kFg);
+    CHECK(pix(d, 7, 0) == kFg);
+    CHECK(pix(d, 0, 0) == kBg);
+    CHECK(pix(d, 0, 1) == kFg);
+    // From source x = 2: the bitmap's pixel 2 lands on the first pixel.
+    R128Cell e;
+    monoBitmap(e);
+    monoCopy(e, 0u, 0u, 0, 0, 2);
+    CHECK(pix(e, 0, 0) == kFg);
+    CHECK(pix(e, 1, 0) == kBg);
+    CHECK(pix(e, 5, 1) == kFg); // row 1's pixel 7, two to the left
+}
+
+TEST_CASE("r128 2d: colour pixels stored to HOST_DATA fill the rectangle "
+          "that was set up, in memory byte order")
+{
+    R128Cell c;
+    const auto before = r128EngStats();
+    wr(c, kGmc, gmc(0xCCu, 3u, 3u)); // colour source, loaded through host data
+    surface(c);
+    wr(c, kDstYX, 1u | (1u << 16));
+    wr(c, kDstHeightWidth, 2u | (2u << 16)); // sets the rectangle up: no draw
+    CHECK(r128EngStats().blits == before.blits);
+    CHECK(r128EngStats().hostData == before.hostData);
+    const u32 p[4] = {0x00102030u, 0x00405060u, 0x00708090u, 0x00A0B0C0u};
+    // A pixel's bytes x,R,G,B in memory are the DWORD's bytes low to high.
+    wr(c, kHostData0, bswap(p[0]));
+    wr(c, kHostData0 + 4, bswap(p[1]));
+    wr(c, kHostData3, bswap(p[2]));
+    CHECK(pix(c, 1, 1) == 0u); // nothing until the rectangle's worth is in
+    wr(c, kHostData0, bswap(p[3]));
+    CHECK(pix(c, 1, 1) == p[0]);
+    CHECK(pix(c, 2, 1) == p[1]);
+    CHECK(pix(c, 1, 2) == p[2]);
+    CHECK(pix(c, 2, 2) == p[3]);
+    CHECK(pix(c, 3, 1) == 0u);
+    CHECK(r128EngStats().blits == before.blits + 1);
+    // The operation is over: a further word draws nothing.
+    wr(c, kHostData0, 0xFFFFFFFFu);
+    CHECK(pix(c, 3, 1) == 0u);
+    CHECK(pix(c, 1, 3) == 0u);
+}
+
+TEST_CASE("r128 2d: HOST_DATA_LAST ends a stream that is short of its "
+          "rectangle")
+{
+    R128Cell c;
+    wr(c, kGmc, gmc(0xCCu, 3u, 3u));
+    surface(c);
+    wr(c, kDstYX, 0u);
+    wr(c, kDstHeightWidth, 4u | (4u << 16)); // sixteen pixels wanted
+    wr(c, kHostData0, bswap(0x00111111u));
+    wr(c, kHostDataLast, bswap(0x00222222u));
+    CHECK(pix(c, 0, 0) == 0x00111111u);
+    CHECK(pix(c, 1, 0) == 0x00222222u);
+    CHECK(pix(c, 2, 0) == 0u);
+    wr(c, kHostData0, bswap(0x00333333u)); // no rectangle is waiting
+    CHECK(pix(c, 2, 0) == 0u);
+}
+
+TEST_CASE("r128 2d: a one-bit source through HOST_DATA runs on from row to "
+          "row, or starts each row on a byte")
+{
+    // Ten wide, two high; row 0 has its first and last pixel, row 1 its
+    // second. See-through, over a surface of zeroes.
+    auto text = [](R128Cell& c, u32 srcSel, u32 dword) {
+        wr(c, kGmc, gmc(0xCCu, 1u, srcSel));
+        surface(c);
+        wr(c, kSrcFrgd, kFg);
+        wr(c, kDstYX, 3u | (1u << 16));
+        wr(c, kDstHeightWidth, 10u | (2u << 16));
+        wr(c, kHostDataLast, dword);
+    };
+    // Linear: 20 bits, from the DWORD's top bit down.
+    R128Cell linear;
+    text(linear, 3u, 0x80500000u);
+    CHECK(pix(linear, 3, 1) == kFg);
+    CHECK(pix(linear, 12, 1) == kFg);
+    CHECK(pix(linear, 4, 2) == kFg);
+    CHECK(pix(linear, 4, 1) == 0u);
+    CHECK(pix(linear, 3, 2) == 0u);
+    CHECK(pix(linear, 5, 2) == 0u);
+    // Byte-aligned: each row takes sixteen bits.
+    R128Cell aligned;
+    text(aligned, 4u, 0x80404000u);
+    CHECK(pix(aligned, 3, 1) == kFg);
+    CHECK(pix(aligned, 12, 1) == kFg);
+    CHECK(pix(aligned, 4, 2) == kFg);
+    CHECK(pix(aligned, 3, 2) == 0u);
+    CHECK(pix(aligned, 5, 2) == 0u);
+    // The same DWORD read the linear way puts row 1 elsewhere: the two
+    // trajectories are told apart.
+    R128Cell crossed;
+    text(crossed, 3u, 0x80404000u);
+    CHECK(pix(crossed, 4, 2) == 0u);
+}

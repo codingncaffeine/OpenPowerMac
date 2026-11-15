@@ -78,8 +78,9 @@ constexpr Setting kSettings[] = {
      "1x8 mono|1x8 mono, see-through|32x1 mono|32x1 mono, see-through|"
      "32x32 mono|32x32 mono, see-through|8x8 colour|8x1 colour|1x8 colour|"
      "solid||solid, from the packet parser"},
-    {"2D source format", bit(3), "mono|mono, see-through||colour"},
-    {"2D source, through the registers", bit(2),
+    {"2D source format", bit(0) | bit(1) | bit(3),
+     "mono|mono, see-through||colour"},
+    {"2D source, through the registers", bit(2) | bit(3) | bit(4),
      "||video memory|host data|host data, byte aligned"},
     {"2D rectangle tiling", bit(0), "off|across|down|across and down"},
     // DP_GUI_MASTER_CNTL bit 27, at the write. Zero is an ACTION: clear the

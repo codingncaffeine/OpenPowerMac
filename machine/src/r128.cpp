@@ -646,6 +646,7 @@ static constexpr u32 kDstHeightWidth = 0x143C;
 static constexpr u32 kDpGuiMasterCntl = 0x146C;
 static constexpr u32 kDpBrushFrgdClr = 0x147C;
 static constexpr u32 kDpBrushBkgdClr = 0x1478, kBrushYX = 0x1474;
+static constexpr u32 kDpSrcFrgdClr = 0x15D8, kDpSrcBkgdClr = 0x15DC;
 static constexpr u32 kBrushData0 = 0x1480, kBrushData1 = 0x1484;
 static constexpr u32 kDstWidthX = 0x1588;
 static constexpr u32 kSrcXY = 0x1590, kDstXY = 0x1594;
@@ -846,6 +847,18 @@ void asyncRelease(R128Cell& c, const CceMem& m);
 // parse loop performs it at the packet boundary.
 static std::vector<u32> gCcePendingInd;
 
+// A rectangle whose pixels are arriving through the HOST_DATA registers:
+// see "Host data through the registers", by engHostBegin.
+namespace {
+struct HostOp {
+    bool active = false, byteAligned = false, lsbFirst = false;
+    int x = 0, y = 0;
+    u32 w = 0, h = 0, srcType = 3, rop = 0xCC, bypp = 4;
+    u64 need = 0; // DWORDs the rectangle takes
+    std::vector<u32> words;
+} gHostOp;
+} // namespace
+
 // ── The command engine on its own thread (see opm/r128.hpp) ───────────────
 //
 // Three locks, always taken in this order when more than one is held:
@@ -966,6 +979,7 @@ void r128CceReset()
     gCceHead = 0;
     gCceDepth = 0;
     gCcePendingInd.clear();
+    gHostOp = HostOp{};
     r128Cce3dReset();
 }
 
@@ -983,6 +997,21 @@ void r128EngineStateSave(SnapWriter& w)
     for (u32 v : gCcePendingInd)
         w.u32v(v);
     r128Cce3dStateSave(w);
+    // A rectangle whose pixels are still arriving through HOST_DATA.
+    w.b(gHostOp.active);
+    w.b(gHostOp.byteAligned);
+    w.b(gHostOp.lsbFirst);
+    w.i32v(gHostOp.x);
+    w.i32v(gHostOp.y);
+    w.u32v(gHostOp.w);
+    w.u32v(gHostOp.h);
+    w.u32v(gHostOp.srcType);
+    w.u32v(gHostOp.rop);
+    w.u32v(gHostOp.bypp);
+    w.u64v(gHostOp.need);
+    w.u64v(gHostOp.words.size());
+    for (u32 v : gHostOp.words)
+        w.u32v(v);
 }
 void r128EngineStateLoad(SnapReader& r)
 {
@@ -996,6 +1025,25 @@ void r128EngineStateLoad(SnapReader& r)
     for (u64 k = 0; k < pending && r.ok; ++k)
         gCcePendingInd.push_back(r.u32v());
     r128Cce3dStateLoad(r);
+    // A recording made before host data went through the registers ends
+    // here.
+    gHostOp = HostOp{};
+    if (r.ok && r.p < r.end) {
+        gHostOp.active = r.b();
+        gHostOp.byteAligned = r.b();
+        gHostOp.lsbFirst = r.b();
+        gHostOp.x = r.i32v();
+        gHostOp.y = r.i32v();
+        gHostOp.w = r.u32v();
+        gHostOp.h = r.u32v();
+        gHostOp.srcType = r.u32v();
+        gHostOp.rop = r.u32v();
+        gHostOp.bypp = r.u32v();
+        gHostOp.need = r.u64v();
+        const u64 have = r.u64v();
+        for (u64 k = 0; k < have && r.ok; ++k)
+            gHostOp.words.push_back(r.u32v());
+    }
 }
 
 static void cceRegWrite(R128Cell& c, u32 off, u32 native)
@@ -2558,11 +2606,11 @@ void R128Cell::engBlit()
     const u32 srcSource = (mix >> 8) & 0x7u;
     r128SettingUsed(R128Setting::SrcFrom2d, srcSource);
     r128SettingUsed(R128Setting::Tile2d, (rd(kDpCntl) >> 3) & 3u);
-    // 3 and 4 are "loaded thru hostdata": the CPU feeds pixels through
-    // HOST_DATA0..7 after the trigger, which is a stream, not a rectangle
-    // copy. Stage 3 of the plan. Counted rather than half-drawn.
+    // 3 and 4 are "loaded thru hostdata": the rectangle's pixels come from
+    // the processor, through HOST_DATA0..7, after this trigger. See
+    // engHostBegin.
     if (srcSource == 3u || srcSource == 4u) {
-        ++gEng.hostData;
+        engHostBegin(rop, bypp, srcSource == 4u);
         return;
     }
     const bool usesSrc = ropUsesSrc(rop);
@@ -2615,15 +2663,23 @@ void R128Cell::engBlit()
         const u32 col = (static_cast<u32>(x) - patX) & 7u;
         return ((row >> (patLsbFirst ? col : 7u - col)) & 1u) != 0;
     };
-    // The source operand must be colour pixels from memory. A MONO source is
-    // a 1-bit mask expanded through DP_SRC_FRGD_CLR/BKGD_CLR, which is its
-    // own path and belongs with host-data blits.
+    // The source operand: colour pixels of the destination's own format
+    // (3), or a ONE-BIT bitmap (guide, GMC_SRC_DATATYPE: 0 "mono, expanded
+    // to frgd, bkgd", 1 "mono, expanded to frgd, leave alone"): a set bit is
+    // DP_SRC_FRGD_CLR, a clear one DP_SRC_BKGD_CLR or, for type 1, no pixel
+    // at all. A one-bit bitmap in video memory has a row every pitch bytes,
+    // the pitch being in units of eight pixels, and DP_BYTE_PIX_ORDER says
+    // which end of a byte is its left pixel. Type 2 is reserved.
+    const u32 srcType = (dt >> 16) & 0x3u;
     if (usesSrc)
-        r128SettingUsed(R128Setting::SrcFormat2d, (dt >> 16) & 0x3u);
-    if (usesSrc && ((dt >> 16) & 0x3u) != 3u) {
+        r128SettingUsed(R128Setting::SrcFormat2d, srcType);
+    if (usesSrc && srcType == 2u) {
         ++gEng.monoSrc;
         return;
     }
+    const bool srcMono = usesSrc && srcType != 3u;
+    const bool srcLsbFirst = (dt >> 30) & 1u;
+    const u32 srcFrgd = rd(kDpSrcFrgdClr), srcBkgd = rd(kDpSrcBkgdClr);
 
     // --- pitches, in bytes ---------------------------------------------
     // DST_PITCH/SRC_PITCH bits 9:0 are the pitch in units of EIGHT PIXELS,
@@ -2636,7 +2692,8 @@ void R128Cell::engBlit()
         return bpp == 24u ? p * 8u : p * bpp;
     };
     const u32 dstStride = strideOf(rd(kDstPitch));
-    const u32 srcStride = strideOf(rd(kSrcPitch));
+    const u32 srcStride = srcMono ? rd(kSrcPitch) & 0x3FFu
+                                  : strideOf(rd(kSrcPitch));
     if (!dstStride || (usesSrc && !srcStride)) {
         ++gEng.zeroPitch;
         return;
@@ -2699,8 +2756,17 @@ void R128Cell::engBlit()
                static_cast<u64>(py + static_cast<int>(rows) - 1) * stride +
                static_cast<u64>(px) * bypp + bypp;
     };
+    // The last byte a one-bit source reads is the one holding the bottom
+    // right pixel's bit.
+    const u64 srcEnd =
+        srcMono ? static_cast<u64>(srcOff) +
+                      static_cast<u64>(csy + static_cast<int>(ch) - 1) *
+                          srcStride +
+                      static_cast<u64>((csx + static_cast<int>(cw) - 1) >> 3) +
+                      1u
+                : lastByte(srcOff, srcStride, csx, csy, ch);
     if (lastByte(dstOff, dstStride, x0, y0, ch) > vram.size() ||
-        (usesSrc && lastByte(srcOff, srcStride, csx, csy, ch) > vram.size())) {
+        (usesSrc && srcEnd > vram.size())) {
         ++gEng.offVram;
         return;
     }
@@ -2710,7 +2776,11 @@ void R128Cell::engBlit()
     const u32 cmp = rd(kClrCmpCntl);
     ClrCmp key = clrCmpDecode(cmp, rd(0x15C4u), rd(0x15C8u), rd(kClrCmpMsk),
                               bypp);
-    if (!usesSrc && key.fnSrc) {
+    if ((!usesSrc || srcMono) && key.fnSrc) {
+        // What "the source colour" is for a compare against an expanded bit
+        // the guide does not say: such a compare is counted, not applied.
+        if (srcMono)
+            ++gEng.colorCompare;
         key.fnSrc = 0;
         key.any = key.fnDst == 1u || key.fnDst == 4u || key.fnDst == 5u;
     }
@@ -2781,7 +2851,7 @@ void R128Cell::engBlit()
             for (u32 c = 0; c < cw; ++c)
                 putPix(d + static_cast<size_t>(c) * bypp, fill);
         }
-    } else if (rop == 0xCCu && plain && !key.any) {
+    } else if (rop == 0xCCu && plain && !key.any && !srcMono) {
         // Straight SRCCOPY with no write mask: whole rows at a time.
         ++gEng.copies;
         for (u32 r = 0; r < ch; ++r) {
@@ -2812,8 +2882,21 @@ void R128Cell::engBlit()
             for (u32 c = 0; c < cw; ++c) {
                 const u32 cc = l2r ? c : cw - 1u - c;
                 const size_t dp = d + static_cast<size_t>(cc) * bypp;
-                const u32 S = usesSrc ? pixAt(s + static_cast<size_t>(cc) * bypp)
-                                      : 0u;
+                u32 S = 0;
+                if (srcMono) {
+                    const size_t sx = static_cast<size_t>(csx) + cc;
+                    const u8 bits = vram[srcOff +
+                                         (static_cast<size_t>(csy) + rr) *
+                                             srcStride +
+                                         (sx >> 3)];
+                    const bool on =
+                        (bits >> (srcLsbFirst ? sx & 7u : 7u - (sx & 7u))) & 1u;
+                    if (!on && srcType == 1u)
+                        continue; // "leave alone": no background pixel
+                    S = on ? srcFrgd : srcBkgd;
+                } else if (usesSrc) {
+                    S = pixAt(s + static_cast<size_t>(cc) * bypp);
+                }
                 const u32 D = (usesDst || key.fnDst) ? pixAt(dp) : 0u;
                 if (key.any && !key.draws(S, D))
                     continue; // keyed out: the destination keeps its pixel
@@ -2848,6 +2931,158 @@ void R128Cell::engBlit()
 
 // Absorb a write into the engine block. Returns true when the write has been
 // fully handled and must not also fall through to the plain register store.
+// ── Host data through the registers ──────────────────────────────────────
+//
+// With DP_SRC_SOURCE 3 or 4 a rectangle's pixels come from the processor:
+// the store that would have drawn (DST_HEIGHT_WIDTH and its kin) only sets
+// the rectangle up, and the pixels follow as DWORDs stored to HOST_DATA0-7,
+// the last of them to HOST_DATA_LAST (guide: "indicates the last host data
+// register write for operation"). The XFree86 driver's image writes and its
+// text (a one-bit source expanded through DP_SRC_FRGD_CLR / _BKGD_CLR) are
+// this protocol.
+//
+// The stream is read as the HOSTDATA_BLT packet's raster is, since that
+// packet is this protocol with the DWORDs in a buffer: colour pixels are
+// bytes taken from each DWORD low byte first, rows running on; a one-bit
+// source is bits taken across the DWORDs, from each DWORD's top bit or its
+// bottom one as DP_BYTE_PIX_ORDER says. Source 3 is the "linear trajectory":
+// a row begins where the last ended. Source 4 is "linear trajectory and
+// byte-aligned": each row of a one-bit source begins on a byte.
+//
+// The DWORDs are kept until the rectangle's worth has arrived (or
+// HOST_DATA_LAST says there are no more) and drawn then, so a guest that
+// reads video memory in the middle of a stream sees none of it rather than
+// part: the one thing here the chip does differently.
+void R128Cell::engHostBegin(u32 rop, u32 bypp, bool byteAligned)
+{
+    const u32 dt = rd(kDpDatatype);
+    const u32 srcType = (dt >> 16) & 3u;
+    r128SettingUsed(R128Setting::SrcFormat2d, srcType);
+    const u32 w = rd(kDstWidth) & 0x1FFFu, h = rd(kDstHeight) & 0x1FFFu;
+    gHostOp = HostOp{};
+    if (srcType == 2u || bypp == 3u) {
+        // A reserved source type; and 24 bpp, whose packing in the stream
+        // nothing describes.
+        ++gEng.hostData;
+        return;
+    }
+    if (!w || !h)
+        return;
+    const u32 dpc = rd(kDpCntl);
+    gHostOp.active = true;
+    gHostOp.byteAligned = byteAligned;
+    gHostOp.lsbFirst = (dt >> 30) & 1u;
+    // As for any rectangle, the programmed corner is the far one when the
+    // direction runs backward.
+    gHostOp.x = (dpc & 1u) ? sx14(rd(kDstX))
+                           : sx14(rd(kDstX)) + 1 - static_cast<int>(w);
+    gHostOp.y = (dpc & 2u) ? sx14(rd(kDstY))
+                           : sx14(rd(kDstY)) + 1 - static_cast<int>(h);
+    gHostOp.w = w;
+    gHostOp.h = h;
+    gHostOp.srcType = srcType;
+    gHostOp.rop = rop;
+    gHostOp.bypp = bypp;
+    const u64 bits = srcType == 3u
+                         ? static_cast<u64>(w) * h * bypp * 8u
+                         : byteAligned ? static_cast<u64>((w + 7u) & ~7u) * h
+                                       : static_cast<u64>(w) * h;
+    gHostOp.need = (bits + 31u) / 32u;
+}
+
+void R128Cell::engHostWord(u32 v, bool last)
+{
+    HostOp& op = gHostOp;
+    if (!op.active)
+        return; // a stray word, with no rectangle waiting for it
+    op.words.push_back(v);
+    if (!last && op.words.size() < op.need)
+        return;
+    op.active = false;
+    const u32 bypp = op.bypp;
+    const u32 pitch = rd(kDstPitch) & 0x3FFu;
+    const u32 stride = pitch * 8u * bypp;
+    const u32 dstOff = rd(kDstOffset) & kEngAddrMask;
+    if (!stride) {
+        ++gEng.zeroPitch;
+        return;
+    }
+    if (dstOff >= kVramSpan) {
+        ++gEng.agpTarget;
+        return;
+    }
+    const int scl = sx14(rd(kScLeft)), scr = sx14(rd(kScRight));
+    const int sct = sx14(rd(kScTop)), scb = sx14(rd(kScBottom));
+    const u32 wmask = rd(kDpWriteMsk);
+    const u32 mask = wmask ? wmask : 0xFFFFFFFFu;
+    const u32 pat = rd(kDpBrushFrgdClr);
+    const u32 fg = rd(kDpSrcFrgdClr), bk = rd(kDpSrcBkgdClr);
+    const bool mono = op.srcType != 3u;
+    ClrCmp key = clrCmpDecode(rd(kClrCmpCntl), rd(0x15C4u), rd(0x15C8u),
+                              rd(kClrCmpMsk), bypp);
+    if (key.unknown || (mono && key.fnSrc))
+        ++gEng.colorCompare;
+    if (mono) // as in engBlit: not applied across an expanded bit
+        key.fnSrc = 0;
+    const u64 haveBits = static_cast<u64>(op.words.size()) * 32u;
+    const u64 rowBits = mono ? (op.byteAligned ? (op.w + 7u) & ~7u : op.w)
+                             : static_cast<u64>(op.w) * bypp * 8u;
+    for (u32 yy = 0; yy < op.h; ++yy) {
+        for (u32 xx = 0; xx < op.w; ++xx) {
+            const u64 bit = yy * rowBits + (mono ? xx : xx * bypp * 8ull);
+            if (bit + (mono ? 1u : bypp * 8u) > haveBits)
+                break; // the stream ended short of the rectangle
+            u32 S = 0;
+            if (mono) {
+                const u32 word = op.words[bit >> 5];
+                const u32 b = static_cast<u32>(bit & 31u);
+                const bool on =
+                    ((word >> (op.lsbFirst ? b : 31u - b)) & 1u) != 0;
+                if (!on && op.srcType == 1u)
+                    continue;
+                S = on ? fg : bk;
+            } else {
+                for (u32 k = 0; k < bypp; ++k) {
+                    const u64 s = (bit >> 3) + k;
+                    S = (S << 8) |
+                        ((op.words[s >> 2] >> (8u * (s & 3u))) & 0xFFu);
+                }
+            }
+            const int px = op.x + static_cast<int>(xx);
+            const int py = op.y + static_cast<int>(yy);
+            if (px < scl || px > scr || py < sct || py > scb || px < 0 ||
+                py < 0)
+                continue;
+            const u64 at = static_cast<u64>(dstOff) +
+                           static_cast<u64>(py) * stride +
+                           static_cast<u64>(px) * bypp;
+            if (at + bypp > vram.size())
+                continue;
+            u32 D = 0;
+            for (u32 k = 0; k < bypp; ++k)
+                D = (D << 8) | vram[at + k];
+            if (key.any && !key.draws(S, D))
+                continue;
+            u32 out = rop3(op.rop, pat, S, D);
+            if (mask != 0xFFFFFFFFu)
+                out = (D & ~mask) | (out & mask);
+            if (r128PixelWatched(at, bypp))
+                r128PixelWatchNote(
+                    "2d host data",
+                    "%s pushed through the registers to (%d,%d %ux%u), rop "
+                    "%02x, wrote %x",
+                    mono ? "1-bit pixels" : "colour pixels", op.x, op.y, op.w,
+                    op.h, op.rop, out);
+            for (u32 k = 0; k < bypp; ++k)
+                vram[at + k] = static_cast<u8>(out >> (8u * (bypp - 1u - k)));
+            ++gEng.pixels;
+        }
+    }
+    ++gEng.blits;
+    ++gEng.copies;
+    op.words.clear();
+}
+
 // ── Lines ────────────────────────────────────────────────────────────────
 //
 // The engine draws a line by Bresenham's algorithm from the terms a driver
@@ -3109,6 +3344,15 @@ bool R128Cell::engWrite(u32 off, u32 v)
         // ...and then step down one scanline, which is what the INCY in the
         // name is for: it draws a run of single rows without reprogramming Y.
         regs_[kDstY] = (rd(kDstY) + 1u) & 0x3FFFu;
+        return true;
+
+    // --- host data --------------------------------------------------------
+    case 0x17C0u: case 0x17C4u: case 0x17C8u: case 0x17CCu:
+    case 0x17D0u: case 0x17D4u: case 0x17D8u: case 0x17DCu:
+        engHostWord(v, false);
+        return true;
+    case 0x17E0u: // HOST_DATA_LAST
+        engHostWord(v, true);
         return true;
 
     // --- lines ------------------------------------------------------------

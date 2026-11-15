@@ -210,6 +210,8 @@ private:
     // write, not a command word.
     void engBlit();
     void engLine(u32 length);
+    void engHostBegin(u32 rop, u32 bypp, bool byteAligned);
+    void engHostWord(u32 v, bool last);
     // Absorb a write into the engine block: normalise aliases, apply the
     // side effects of a DP_GUI_MASTER_CNTL write, and initiate on a trigger.
     // Returns true when it has fully handled the write.

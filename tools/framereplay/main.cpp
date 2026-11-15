@@ -286,7 +286,7 @@ int main(int argc, char** argv)
     if (a.size() >= 3 && a[0] == "--diff")
         return diff(a[1], a[2], a.size() > 3 ? a[3].c_str() : nullptr);
     std::string file, out = ".";
-    bool strict = false, census = false;
+    bool strict = false, census = false, hashes = false;
     unsigned bench = 0, profHz = 0;
     std::string profOut;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -302,6 +302,8 @@ int main(int argc, char** argv)
             strict = true;
         else if (a[i] == "--census")
             census = true;
+        else if (a[i] == "--hashes")
+            hashes = true;
         else if (file.empty() && a[i].rfind("--", 0) != 0)
             file = a[i];
         else
@@ -310,6 +312,7 @@ int main(int argc, char** argv)
     if (file.empty()) {
         std::fprintf(stderr,
                      "usage: framereplay FILE [--out DIR] [--strict] [--census]\n"
+                     "       framereplay FILE --hashes\n"
                      "       framereplay FILE --bench N [--profile-host HZ OUT]\n"
                      "       framereplay --diff A.png B.png [MAP.png]\n");
         return 2;
@@ -327,7 +330,9 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "framereplay: %s\n", err.c_str());
                 return 2;
             }
-            ns.push_back(rep.playNs);
+            // Drawing alone: the replay's own hashing of video memory at
+            // each frame edge is a third of a pass and none of the card's.
+            ns.push_back(rep.playNs - rep.hashNs);
         }
         if (profHz) {
             prof::hostStop();
@@ -344,6 +349,30 @@ int main(int argc, char** argv)
                     static_cast<unsigned long long>(es.tris / bench),
                     static_cast<unsigned long long>(es.triPixels / bench),
                     static_cast<unsigned long long>(r128VramHash(*cell)));
+        return 0;
+    }
+    if (hashes) {
+        // Video memory at every frame edge and at the end, as one number
+        // each: what two builds are compared by, with no picture written.
+        auto cell = std::make_unique<R128Cell>();
+        const R128EdgeFn none = [](u32, char, const R128Cell&) {};
+        R128ReplayReport rep;
+        std::string err;
+        if (!r128Replay(file, *cell, none, rep, err)) {
+            std::fprintf(stderr, "framereplay: %s\n", err.c_str());
+            return 2;
+        }
+        for (u32 k = 0; k < rep.edges; ++k)
+            std::printf("frame %u %c %016llx\n", k + 1, rep.heard[k].first,
+                        static_cast<unsigned long long>(rep.heard[k].second));
+        const R128EngStats& es = r128EngStats();
+        std::printf("end %016llx  %llu triangles %llu pixels %llu texture "
+                    "samples %llu 2D pixels\n",
+                    static_cast<unsigned long long>(rep.endHash),
+                    static_cast<unsigned long long>(es.tris),
+                    static_cast<unsigned long long>(es.triPixels),
+                    static_cast<unsigned long long>(es.texSamples),
+                    static_cast<unsigned long long>(es.pixels));
         return 0;
     }
     std::error_code ec;

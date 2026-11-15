@@ -112,9 +112,13 @@ struct R128ReplayReport {
     u32 edgesEqual = 0;   // ...whose kind and video memory matched, in order
     bool endRecorded = false, endEqual = false;
     u64 endHash = 0;
-    // Host time spent drawing: from the first recorded event to the last,
-    // the caller's edge function included. Loading the file is not in it.
+    // Host time from the first recorded event to the last, the caller's edge
+    // function included. Loading the file is not in it.
     u64 playNs = 0;
+    // ...and the part of it this replay spent hashing video memory at the
+    // frame edges and the end mark, which is not drawing: playNs - hashNs is
+    // what the card's engine itself took.
+    u64 hashNs = 0;
     // Each edge as (kind, video-memory hash): the replay's, the recording's.
     std::vector<std::pair<char, u64>> heard, wanted;
 };

@@ -309,15 +309,28 @@ namespace {
 struct ReplayCtx {
     const R128EdgeFn* onEdge = nullptr;
     std::vector<std::pair<char, u64>> heard;
+    u64 hashNs = 0;
 };
 ReplayCtx* gReplay = nullptr;
+
+// The hash of video memory, and how long taking it took.
+u64 timedHash(const R128Cell& c, u64& ns)
+{
+    const auto from = std::chrono::steady_clock::now();
+    const u64 h = r128VramHash(c);
+    ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - from)
+            .count());
+    return h;
+}
 
 void replayEdge(R128Cell& c, char kind)
 {
     if (!gReplay)
         return;
     const u32 index = static_cast<u32>(gReplay->heard.size());
-    gReplay->heard.emplace_back(kind, r128VramHash(c));
+    gReplay->heard.emplace_back(kind, timedHash(c, gReplay->hashNs));
     if (*gReplay->onEdge)
         (*gReplay->onEdge)(index, kind, c);
 }
@@ -464,7 +477,7 @@ bool r128Replay(const std::string& path, R128Cell& c, const R128EdgeFn& onEdge,
         }
         case 'Z':
             rep.endRecorded = true;
-            rep.endEqual = r.u64v() == r128VramHash(c);
+            rep.endEqual = r.u64v() == timedHash(c, ctx.hashNs);
             break;
         default:
             bad = true;
@@ -475,6 +488,7 @@ bool r128Replay(const std::string& path, R128Cell& c, const R128EdgeFn& onEdge,
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - playFrom)
             .count());
+    rep.hashNs = ctx.hashNs;
     gR128FrameEdge = nullptr;
     gReplay = nullptr;
     r128AsyncEnable(wasAsync, wasStrict);

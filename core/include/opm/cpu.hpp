@@ -749,20 +749,26 @@ struct Cpu {
         // profiler charged 22% of the machine to it. Filled with the block and
         // dropped with the block, so it can never outlive the bytes it
         // describes.
-        u16 row[8] = {kNoRow, kNoRow, kNoRow, kNoRow,
-                      kNoRow, kNoRow, kNoRow, kNoRow};
+        u16 row[8];
         // The eight instruction WORDS, already assembled. Held as bytes they
         // cost four loads, three shifts and three ors on every hit, and after
         // the caches above landed the fetch path was 42.7% of the machine and
         // the biggest item in it. The block is assembled once per fill and
         // read about eighteen times, so the work belongs in the fill.
-        u32 w[8] = {};
+        u32 w[8];
     };
     // The block each slot holds: its base, or 1 — which no 32-byte base can
     // be. Set by the constructor (fetchDrop).
     u32 fetchBase[kFetchLines];
+    // ⚠ ALLOCATED, NOT INITIALIZED, and the same for the handlers and gates
+    // below. A slot's words, rows, handlers and gate mean something only
+    // while its tag names a block, and the fill that sets the tag writes all
+    // of them first; nothing reads a slot whose tag does not match. Seven
+    // megabytes zeroed in every constructor was nothing to a machine that
+    // makes one processor, and minutes to a test tool that makes one per
+    // test vector.
     std::unique_ptr<FetchLine[]> fetchLine =
-        std::make_unique<FetchLine[]>(kFetchLines);
+        std::make_unique_for_overwrite<FetchLine[]>(kFetchLines);
     // ⭐ THE HANDLER OF EACH WORD, BOUND WHEN THE BLOCK IS FILLED. The line
     // executor used to get from a word to its handler in three loads and
     // three tests per instruction — the row, the gate byte for the row, the
@@ -777,8 +783,9 @@ struct Cpu {
     // by layout, and 264 KB of pointers do not belong in a Cpu that tests
     // put on the stack. Filled and dropped with the line, never on their own.
     std::unique_ptr<Handler[]> fetchFn =
-        std::make_unique<Handler[]>(size_t(kFetchLines) * 8u);
-    std::unique_ptr<u16[]> fetchGate = std::make_unique<u16[]>(kFetchLines);
+        std::make_unique_for_overwrite<Handler[]>(size_t(kFetchLines) * 8u);
+    std::unique_ptr<u16[]> fetchGate =
+        std::make_unique_for_overwrite<u16[]>(kFetchLines);
 
     // ---- instruction translation cache -----------------------------------
     //

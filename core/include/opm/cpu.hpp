@@ -1123,19 +1123,20 @@ struct Cpu {
     // snapshotted, dropped on reset, re-keyed by the refill hook.
     std::unique_ptr<JitCache> jit;
     //
-    // ⚠ ON BY DEFAULT ONLY WHERE IT HAS MEASURED FASTER. Built with MSVC the
-    // JIT took the in-game window from 68.8 to 85.6 MIPS. Built with GCC on
-    // Linux the same blocks run it at 86.4 against 89.0 for the line
-    // executor alone (two interleaved pairs, real time, 97.0% of instructions
-    // native, no bails): that compiler's interpreter is already where the
-    // blocks get to, and a block pays a call for every memory access. So it
-    // is compiled, tested and available there (g4run --jit) and off unless
-    // asked for.
-#if defined(_WIN32)
+    // ⚠ ON BY DEFAULT BECAUSE IT MEASURES FASTER, and the history says why
+    // that had to be measured twice. Built with MSVC the JIT took a game's
+    // level from 68.8 to 85.6 MIPS from the start. Built with GCC on Linux
+    // the same blocks ran it at 86.4 against 89.0 for the line executor
+    // alone: that compiler's interpreter was already where the blocks got
+    // to, because a block paid a call for every memory access. Once memory
+    // could be read directly (Cpu::dmDirect) the blocks make their loads
+    // and stores themselves (Compiler::memProbe in jit.cpp), and on the
+    // same host two games' levels run at 205 and 223 MIPS against the
+    // interpreter's 172 and 183. A host the JIT has no back end for, or
+    // one that refuses executable memory, switches this off at the first
+    // block and runs the line executor. g4run --no-jit and OPM_JIT=0 (the
+    // app's library) are the control.
     bool jitOn = true;
-#else
-    bool jitOn = false;
-#endif
     // DIAGNOSTIC (--no-jit-chain): compile blocks without chain sites, so
     // every block exit returns to the dispatcher as v1 did. The control for
     // Stage B, exactly as --no-jit is for the JIT itself.

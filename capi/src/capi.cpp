@@ -115,6 +115,10 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     m->fastTb = fastTb;
     if (const char* env = getenv("OPM_EXACT_CACHES"))
         m->cpu.exactCaches = env[0] == '1';
+    // OPM_JIT=0 keeps the processor on the line executor, for telling the
+    // translator's effect apart from outside (it is the same machine).
+    if (const char* env = getenv("OPM_JIT"))
+        m->cpu.jitOn = env[0] != '0';
     wireMachine(m);
     return m;
 }

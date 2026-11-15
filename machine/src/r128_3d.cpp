@@ -285,6 +285,9 @@ struct Pipe {
     // conversion rounds to the nearest step or cuts. See snapVertex.
     float subSteps = 4.0f;
     bool subNearest = false;
+    // SETUP_CNTL bit 9 clear (r128_reg.h TEXTURE_ST_MULT_W): the vertices'
+    // S and T are plain, and the chip multiplies them by W itself.
+    bool stTimesW = false;
     u32 planeMask = 0xFFFFFFFFu;
     // Z / stencil
     bool zEn = false, zWr = false, stEn = false;
@@ -432,6 +435,7 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     // 15 (FPU_ROUND_TRUNCATE / _NEAREST).
     P.subSteps = (P.fpu >> 7) & 1u ? 16.0f : 4.0f;
     P.subNearest = (P.fpu >> 15) & 1u;
+    P.stTimesW = !((c.peek(kSetupCntl) >> 9) & 1u);
     // WINDOW_XY_OFFSET (guide 3-248): X in 31:16 and Y in 15:0, signed, "in
     // S.12.2 format or S.11.4 format depending on SUB_PIX_AMNT", which is to
     // say in the vertices' own fixed point. (It was read as whole pixels
@@ -634,10 +638,14 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
             out.a = 255;
         return true;
     }
-    case 1u: { // CI4: two texels per byte, low nibble first
-        if (!b8(base + y * pitch / 2u + x / 2u, b0))
+    case 1u: { // CI4
+        // A texel is a BYTE whose low four bits are the index (SDK F-20,
+        // the source datatype table the texture formats share: "4 bpp
+        // pseudocolor. Upper 4 bits of the byte are unused"). It was read
+        // as two texels a byte, which no source says.
+        if (!b8(base + y * pitch + x, b0))
             return false;
-        const u32 idx = (x & 1u) ? (b0 >> 4) : (b0 & 0xFu);
+        const u32 idx = b0 & 0xFu;
         const u32 e = gPalette[((t.cntl >> 20) & 3u) == 2u ? 1 : 0][idx];
         out.a = 255;
         out.r = static_cast<float>((e >> 16) & 0xFFu);
@@ -743,7 +751,30 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         out.b = static_cast<float>((p & 0xFu) * 17u);
         return true;
     }
-    default: // VQ (0), CI16 (10), reserved (13): counted, borders drawn
+    // The two 16-bit formats with an alpha byte (SDK F-20: 10 is "16 bpp
+    // a:pseudocolor (8:8)", 13 is "16 bpp a:RGB8 greyscale (8:8)"): the
+    // 16-bit texel has alpha in its high byte, as the 1555 texel has its
+    // alpha bit on top, and a palette index or a grey level in its low one.
+    case 10u: {
+        const u32 at = base + (y * pitch + x) * 2u;
+        if (!b8(at, b0) || !b8(at + 1u, b1))
+            return false;
+        const u32 e = gPalette[((t.cntl >> 20) & 3u) == 2u ? 1 : 0][b1];
+        out.a = static_cast<float>(b0);
+        out.r = static_cast<float>((e >> 16) & 0xFFu);
+        out.g = static_cast<float>((e >> 8) & 0xFFu);
+        out.b = static_cast<float>(e & 0xFFu);
+        return true;
+    }
+    case 13u: {
+        const u32 at = base + (y * pitch + x) * 2u;
+        if (!b8(at, b0) || !b8(at + 1u, b1))
+            return false;
+        out.a = static_cast<float>(b0);
+        out.r = out.g = out.b = static_cast<float>(b1);
+        return true;
+    }
+    default: // VQ (0): "2 bpp", and no word anywhere on its code book
         ++eng().texUnimpl;
         return false;
     }
@@ -1827,6 +1858,18 @@ void snapVertex(const Pipe& P, Vtx& v)
     };
     v.x = snap(v.x);
     v.y = snap(v.y);
+    // Texture coordinates. The rasteriser works on S and T ALREADY
+    // multiplied by W (the numerators of the perspective divide), which is
+    // how the Mac driver sends them, with SETUP_CNTL's bit 9 set
+    // (TEXTURE_ST_DIRECT: use them as they are). With the bit clear
+    // (TEXTURE_ST_MULT_W, the setting the Mesa driver's context carries)
+    // the stream has them plain and the multiply is the chip's.
+    if (P.stTimesW) {
+        v.s1 *= v.rhw;
+        v.t1 *= v.rhw;
+        v.s2 *= v.rhw;
+        v.t2 *= v.rhw;
+    }
 }
 
 // Assemble and draw every primitive the packet describes. `idx` maps

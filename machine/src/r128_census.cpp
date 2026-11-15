@@ -117,7 +117,8 @@ constexpr Setting kSettings[] = {
     {"dither, error at the start of a line", upTo(1), "kept|reset"},
     {"vertex position precision", upTo(1),
      "quarter pixel|sixteenth of a pixel"},
-    {"texture coordinates", bit(1), "multiplied by W|as given"},
+    {"texture coordinates", upTo(1),
+     "plain, for the chip to multiply by W|already multiplied by W"},
     {"shading", upTo(3), "constant colour|flat|Gouraud|Gouraud"},
     {"back faces", upTo(3), kFace},
     {"front faces", upTo(3), kFace},
@@ -142,8 +143,7 @@ constexpr Setting kSettings[] = {
      "nearest|linear|nearest|linear|nearest|linear"},                         \
     {"texture " N " edge, across", upTo(3), kClamp},                          \
     {"texture " N " edge, down", upTo(3), kClamp},                            \
-    {"texture " N " format", upTo(15) & ~(bit(0) | bit(10) | bit(13)),        \
-     kTexFormat},                                                             \
+    {"texture " N " format", upTo(15) & ~bit(0), kTexFormat},                 \
     /* The palette is used as it was loaded, whatever this says. */           \
     {"texture " N " palette entries", 0, kPalEntries},                        \
     {"texture " N " colour combine", upTo(15), kCombine},                     \

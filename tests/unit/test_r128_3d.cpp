@@ -561,6 +561,7 @@ TEST_CASE("3d: perspective correction divides premultiplied S by rhw")
     r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11)); // 565 nearest clamp
     r.reg(0x1CB8u, (0u << 8) | (2u << 4) | 2u);          // pitch 4, w 4, h 1
     r.reg(0x1CC4u, 0x80000u); // slot 2: size-indexed (2^2 px wide)
+    r.reg(0x1BC4u, 1u << 9);  // SETUP_CNTL: TEXTURE_ST_DIRECT, the Mac's
     std::vector<u32> v;
     auto vtxW = [&](float x, float y, float u, float rhw) {
         v.push_back(f2u(x));
@@ -1249,4 +1250,146 @@ TEST_CASE("3d: the window offset is in the vertices' own fixed point")
     neg.prim(0x9u, 4u, 3u, v);
     CHECK(neg.pix32(2, 0) == 0u);
     CHECK(neg.pix32(3, 0) == 0xFF0000FFu);
+}
+
+// ── The remaining texture settings ────────────────────────────────────────
+
+namespace {
+
+// A 16x16 right triangle textured 0..1 from a 2x2 texture at 0x80000, with
+// the given format word for PRIM_TEX_CNTL_C.
+void texturedTriangle(Rig3d& r, u32 texCntl)
+{
+    r.reg(0x1C9Cu, 1u << 4);  // TEXMAP_ENABLE
+    r.reg(0x1CB0u, texCntl);  // format, nearest, wrap
+    r.reg(0x1CB8u, 0x111u);   // pitch 2, 2 wide, 2 high
+    r.reg(0x1CC0u, 0x80000u); // slot 1: size-indexed (2^1 px)
+    std::vector<u32> v;
+    auto vtxSt = [&](float x, float y, float s, float t) {
+        v.push_back(f2u(x));
+        v.push_back(f2u(y));
+        v.push_back(f2u(0.5f));
+        v.push_back(f2u(1.0f));
+        v.push_back(0xFFFFFFFFu);
+        v.push_back(f2u(s));
+        v.push_back(f2u(t));
+    };
+    vtxSt(0, 0, 0, 0);
+    vtxSt(32, 0, 2, 0);
+    vtxSt(0, 32, 0, 2);
+    r.prim(0x9u | 0x80u, 4u, 3u, v);
+}
+
+} // namespace
+
+TEST_CASE("3d: a CI4 texel is a byte, its index in the low four bits")
+{
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
+    // LOAD_PALETTE, 16 entries: entry 7 red, the rest blue.
+    r.fifo(0xC0002C00u | ((17u - 1u) << 16));
+    r.fifo(1u); // 4 bpp palette
+    for (u32 i = 0; i < 16u; ++i)
+        r.fifo(i == 7u ? 0x00FF0000u : 0x000000FFu);
+    // 2x2: indices 7,7 / 0,0, with junk in the unused high bits. Read two
+    // texels a byte, the second texel of row 0 would be 0xF: blue.
+    r.c.vram[0x80000u] = 0xF7;
+    r.c.vram[0x80001u] = 0xA7;
+    r.c.vram[0x80002u] = 0x30;
+    r.c.vram[0x80003u] = 0x00;
+    texturedTriangle(r, 1u << 16);
+    CHECK(r.pix32(3, 3) == 0xFFFF0000u);  // texel (0,0)
+    CHECK(r.pix32(12, 3) == 0xFFFF0000u); // texel (1,0)
+    CHECK(r.pix32(3, 12) == 0xFF0000FFu); // texel (0,1)
+}
+
+TEST_CASE("3d: the 16-bit alpha formats carry alpha above an index or a "
+          "grey level")
+{
+    {
+        Rig3d r; // 10: a:pseudocolour 8:8
+        r.dst32();
+        r.openGate();
+        r.fpuSolidBoth();
+        r.fifo(0xC0002C00u | ((257u - 1u) << 16));
+        r.fifo(2u);
+        for (u32 i = 0; i < 256u; ++i)
+            r.fifo(i == 7u ? 0x00FF0000u : 0x000000FFu);
+        const u8 tex[8] = {0x80, 7, 0xFF, 0, 0x10, 0, 0x20, 7};
+        for (u32 i = 0; i < 8; ++i)
+            r.c.vram[0x80000u + i] = tex[i];
+        const auto before = r128EngStats().texUnimpl;
+        texturedTriangle(r, 10u << 16);
+        CHECK(r128EngStats().texUnimpl == before);
+        CHECK(r.pix32(3, 3) == 0x80FF0000u);  // alpha 0x80, palette entry 7
+        CHECK(r.pix32(12, 3) == 0xFF0000FFu); // alpha 0xFF, entry 0
+        CHECK(r.pix32(3, 12) == 0x100000FFu);
+    }
+    {
+        Rig3d r; // 13: a:grey 8:8
+        r.dst32();
+        r.openGate();
+        r.fpuSolidBoth();
+        const u8 tex[8] = {0x40, 0xC8, 0xFF, 0x10, 0x00, 0xFF, 0x80, 0x80};
+        for (u32 i = 0; i < 8; ++i)
+            r.c.vram[0x80000u + i] = tex[i];
+        const auto before = r128EngStats().texUnimpl;
+        texturedTriangle(r, 13u << 16);
+        CHECK(r128EngStats().texUnimpl == before);
+        CHECK(r.pix32(3, 3) == 0x40C8C8C8u);
+        CHECK(r.pix32(12, 3) == 0xFF101010u);
+        CHECK(r.pix32(3, 12) == 0x00FFFFFFu);
+    }
+    {
+        Rig3d r; // 0: VQ has no code book in any manual, and is still declined
+        r.dst32();
+        r.openGate();
+        r.fpuSolidBoth();
+        const auto before = r128EngStats().texUnimpl;
+        texturedTriangle(r, 0u << 16);
+        CHECK(r128EngStats().texUnimpl > before);
+    }
+}
+
+TEST_CASE("3d: with TEXTURE_ST_MULT_W the chip multiplies plain S and T by W")
+{
+    // The perspective case again, the stream carrying plain u this time and
+    // SETUP_CNTL's bit 9 clear: the same pixel must come out. Left as they
+    // are, plain coordinates would be divided by rhw once too often: at
+    // pixel (12,0) u = 0.195 / 0.414 = 0.47 (texel 1, green) becomes
+    // 0.75 / 0.414, past the last texel (clamped: white).
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
+    auto t16 = [&](u32 i, u32 v) {
+        r.c.vram[0x80000u + i * 2u] = static_cast<u8>(v >> 8);
+        r.c.vram[0x80000u + i * 2u + 1u] = static_cast<u8>(v);
+    };
+    t16(0, 0xF800u);
+    t16(1, 0x07E0u);
+    t16(2, 0x001Fu);
+    t16(3, 0xFFFFu);
+    r.reg(0x1C9Cu, 1u << 4);
+    r.reg(0x1CB0u, (4u << 16) | (2u << 8) | (2u << 11));
+    r.reg(0x1CB8u, (0u << 8) | (2u << 4) | 2u);
+    r.reg(0x1CC4u, 0x80000u);
+    r.reg(0x1BC4u, 0u); // SETUP_CNTL: TEXTURE_ST_MULT_W
+    std::vector<u32> v;
+    auto vtxW = [&](float x, float y, float u, float rhw) {
+        v.push_back(f2u(x));
+        v.push_back(f2u(y));
+        v.push_back(f2u(0.5f));
+        v.push_back(f2u(rhw));
+        v.push_back(0xFFFFFFFFu);
+        v.push_back(f2u(u)); // plain
+        v.push_back(f2u(0.0f));
+    };
+    vtxW(0, 0, 0, 1.0f);
+    vtxW(16, 0, 1, 0.25f);
+    vtxW(0, 16, 0, 1.0f);
+    r.prim(0x9u | 0x80u, 4u, 3u, v);
+    CHECK(r.pix32(12, 0) == 0xFF00FF00u);
 }

@@ -28,7 +28,7 @@ rm -rf "$out/src"; mkdir -p "$out/src"
 "${NICE[@]}" "$runtime" run --rm --network=host -e JOBS="$JOBS" -v "$PWD/$out/src:/src:Z" -w /src \
     "docker.io/library/alpine:$tag" sh -euc '
     set -o pipefail
-    apk add --no-cache -q build-base cmake samurai dotnet10-sdk bash icu-libs fontconfig ttf-dejavu sdl3 \
+    apk add --no-cache -q build-base cmake samurai dotnet10-sdk bash icu-libs fontconfig ttf-dejavu harfbuzz sdl3 \
         libx11 libice libsm libxi libxfixes libxcursor libxrandr libxext xvfb dbus > /dev/null
     echo "── Alpine $(cat /etc/alpine-release), $(c++ --version | head -1), .NET SDK $(dotnet --version)"
     cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null

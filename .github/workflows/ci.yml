@@ -57,7 +57,7 @@ jobs:
       - name: Alpine packages
         run: >
           apk add --no-cache build-base cmake samurai dotnet10-sdk bash git icu-libs fontconfig
-          ttf-dejavu sdl3 libx11 libice libsm libxi libxfixes libxcursor libxrandr libxext xvfb dbus
+          ttf-dejavu harfbuzz sdl3 libx11 libice libsm libxi libxfixes libxcursor libxrandr libxext xvfb dbus
       - uses: actions/checkout@v4
       - name: Build the core and its tools
         run: |

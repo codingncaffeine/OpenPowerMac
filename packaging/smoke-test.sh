@@ -101,12 +101,28 @@ smoke_one() {
         before=$(for i in "${!real[@]}"; do find "${real[i]}" -type f -printf '%p %T@\n' 2>/dev/null; done | sort | md5sum)
     fi
 
-    local out=$tmp/launch.out rc start elapsed
+    # A font the font cache has never seen, in the user's font folder, as after
+    # installing one: fontconfig then reads it with FreeType inside the app, and
+    # FreeType 2.14 and later brings the system's HarfBuzz into the process at that
+    # moment. The app ships its own HarfBuzz and must come up beside the system's.
+    local font
+    font=$(find /usr/share/fonts -name '*.ttf' 2>/dev/null | head -1)
+    [[ -n $font ]] && mkdir -p "$xdg/data/fonts" && cp "$font" "$xdg/data/fonts/smoke-test-unseen.ttf"
+
+    local out=$tmp/launch.out rc start elapsed runner p app_pid="" system_hb=0
     start=$SECONDS
     ( cd "$payload" &&
       exec env XDG_CONFIG_HOME="$xdg/config" XDG_DATA_HOME="$xdg/data" \
                XDG_CACHE_HOME="$xdg/cache" XDG_STATE_HOME="$xdg/state" \
-               "${wall[@]}" timeout -k 5 "$LAUNCH_SECONDS" ./OpenPowerMac ) > "$out" 2>&1
+               "${wall[@]}" timeout -k 5 "$LAUNCH_SECONDS" ./OpenPowerMac ) > "$out" 2>&1 &
+    runner=$!
+    # Shortly before the launch is stopped: which libraries the running app has loaded.
+    sleep $((LAUNCH_SECONDS - 4))
+    for p in /proc/[0-9]*; do
+        [[ $(readlink "$p/exe" 2>/dev/null) == "$payload/OpenPowerMac" ]] && { app_pid=${p#/proc/}; break; }
+    done
+    [[ -n $app_pid ]] && grep -q 'libharfbuzz\.so' "/proc/$app_pid/maps" 2>/dev/null && system_hb=1
+    wait $runner
     rc=$?
     elapsed=$((SECONDS - start))
     # timeout exits 124 when it had to stop the app (137 if TERM was ignored; BusyBox's
@@ -128,6 +144,9 @@ smoke_one() {
     else fail "no log under the scratch profile (startup never got that far)"; return 1; fi
     line=$(grep -o 'app startup: .*' "$log" | head -1)
     [[ -n $line ]] && ok "$line" || fail "no version line in the log"
+    line=$(grep -o 'text shaper: .*' "$log" | head -1)
+    if [[ $line == "text shaper: own HarfBuzz opened first ($payload/libHarfBuzzSharp.so)" ]]; then ok "${line/"$payload"\//<payload>/}"
+    else fail "the app's own HarfBuzz was not opened first: ${line:-no text shaper line}"; fi
     line=$(grep -o 'core: .*' "$log" | head -1)
     if [[ $line == "core: loaded $payload/libopmcapi.so (machine import ok)" ]]; then ok "${line/"$payload"\//<payload>/}"
     else fail "the emulator core did not load from the package: ${line:-no core line}"; fi
@@ -139,6 +158,8 @@ smoke_one() {
     else
         ok "${line/"$payload"\//<payload>/}"
     fi
+    if (( system_hb )); then ok "the system's HarfBuzz is in the process, beside the app's own"
+    else ok "(the system's HarfBuzz was not loaded here: no such library, or a FreeType that does not open it)"; fi
     line=$(grep -o 'window: platform handle .*' "$log" | head -1)
     [[ -n $line ]] && ok "the main window came up ($line)" || fail "the main window never opened (no 'window: platform handle' line)"
     if grep -qE 'UNHANDLED|FATAL' "$log"; then

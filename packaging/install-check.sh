@@ -12,13 +12,17 @@ if command -v apt-get >/dev/null; then
         *.deb) what="$artifact" ;;
         *) what="libicu-dev libfontconfig1 libx11-6 libice6 libsm6 libxi6 libxfixes3 libxcursor1 libxrandr2 libxext6" ;;
     esac
+    # libharfbuzz0b and a font: what every desktop has, and what the smoke test's new-font step needs.
     # shellcheck disable=SC2086
-    if ! apt-get install -y -q $what xvfb dbus > /tmp/install.log 2>&1; then tail -25 /tmp/install.log; exit 1; fi
+    if ! apt-get install -y -q $what libharfbuzz0b fonts-dejavu-core xvfb dbus > /tmp/install.log 2>&1; then tail -25 /tmp/install.log; exit 1; fi
 elif command -v dnf >/dev/null; then
-    if ! dnf install -y -q libicu fontconfig freetype libX11 libICE libSM libXi libXfixes libXcursor libXrandr libXext libstdc++ \
-            xorg-x11-server-Xvfb dbus-daemon tar gzip findutils > /tmp/install.log 2>&1; then tail -25 /tmp/install.log; exit 1; fi
+    if ! dnf install -y -q libicu fontconfig freetype harfbuzz dejavu-sans-fonts libX11 libICE libSM libXi libXfixes libXcursor \
+            libXrandr libXext libstdc++ xorg-x11-server-Xvfb dbus-daemon tar gzip findutils > /tmp/install.log 2>&1; then tail -25 /tmp/install.log; exit 1; fi
+elif command -v pacman >/dev/null; then
+    if ! pacman -Syu --noconfirm --needed icu fontconfig freetype2 harfbuzz ttf-dejavu libx11 libice libsm libxi libxfixes \
+            libxcursor libxrandr libxext xorg-server-xvfb dbus > /tmp/install.log 2>&1; then tail -25 /tmp/install.log; exit 1; fi
 elif command -v apk >/dev/null; then
-    if ! apk add --no-cache -q bash coreutils findutils tar icu-libs libstdc++ libgcc fontconfig ttf-dejavu \
+    if ! apk add --no-cache -q bash coreutils findutils tar icu-libs libstdc++ libgcc fontconfig ttf-dejavu harfbuzz \
             libx11 libice libsm libxi libxfixes libxcursor libxrandr libxext xvfb dbus > /tmp/install.log 2>&1; then tail -25 /tmp/install.log; exit 1; fi
 fi
 command -v bash >/dev/null || { echo "FAIL no bash in this image"; exit 1; }

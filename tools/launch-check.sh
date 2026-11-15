@@ -20,19 +20,34 @@ fi
 
 out="$OPM_TEST_TMP/launch.out"
 log="$XDG_STATE_HOME/OpenPowerMac/gui.log"
-start=$SECONDS
-timeout -k 5 "$secs" "$app" > "$out" 2>&1; rc=$?
 failed=0
 ok()   { printf '  ok    %s\n' "$*"; }
 fail() { printf '  FAIL  %s\n' "$*"; failed=1; }
 
-# timeout exits 124 when it had to stop the app (137 if TERM was ignored; BusyBox's
-# timeout passes on the stopped app's own 143): the app was still up.
-if { [ $rc = 124 ] || [ $rc = 137 ] || [ $rc = 143 ]; } && [ $((SECONDS - start)) -ge "$secs" ]; then ok "still running after $secs s"
-else fail "exited after $((SECONDS - start)) s (code $rc)"; sed 's/^/           | /' "$out" | head -20; fi
+# A font the font cache has never seen, in the user's font folder, as after
+# installing one: fontconfig then reads it with FreeType inside the app, and
+# FreeType 2.14 and later brings the system's HarfBuzz into the process at that
+# moment. The app ships its own HarfBuzz and must come up beside the system's.
+font=$(find /usr/share/fonts -name '*.ttf' 2>/dev/null | head -1)
+if [ -n "$font" ]; then mkdir -p "$XDG_DATA_HOME/fonts" && cp "$font" "$XDG_DATA_HOME/fonts/launch-check-unseen.ttf"; fi
+
+"$app" > "$out" 2>&1 &
+pid=$!
+sleep "$secs"
+if kill -0 $pid 2>/dev/null; then
+  ok "still running after $secs s"
+  if grep -q 'libharfbuzz\.so' "/proc/$pid/maps" 2>/dev/null; then ok "the system's HarfBuzz is in the process, beside the app's own"
+  else ok "(the system's HarfBuzz was not loaded here: no such library, or a FreeType that does not open it)"; fi
+  kill $pid 2>/dev/null
+  wait $pid 2>/dev/null
+else
+  wait $pid 2>/dev/null; rc=$?
+  fail "exited within $secs s (code $rc)"; sed 's/^/           | /' "$out" | head -20
+fi
 [ -f "$log" ] || { fail "no log at $log (startup never got that far)"; exit 1; }
 line() { grep -o -- "$1" "$log" | head -1; }
 l=$(line 'app startup: .*');                                   [ -n "$l" ] && ok "$l" || fail "no version line in the log"
+l=$(line 'text shaper: own HarfBuzz opened first .*');           [ -n "$l" ] && ok "$l" || fail "the app's own HarfBuzz was not opened first: $(line 'text shaper: .*')"
 l=$(line 'core: loaded .* (machine import ok)');               [ -n "$l" ] && ok "$l" || fail "the emulator core did not load: $(line 'core: .*')"
 l=$(line 'SDL3: loaded .* (audio import ok)');                 [ -n "$l" ] && ok "$l" || fail "SDL3 did not load: $(line 'SDL3: .*')"
 l=$(line 'window: platform handle .*');                        [ -n "$l" ] && ok "$l" || fail "the main window never opened"

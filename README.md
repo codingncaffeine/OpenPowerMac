@@ -118,7 +118,7 @@ there and starts the app; CI does the same on every push.
 
 `packaging/build-release.sh` builds the release artifacts (the native libraries in
 containers, against glibc 2.28 and in Alpine), and `packaging/release-check.sh` installs
-and starts each one in clean Debian, Ubuntu, Fedora and Alpine containers.
+and starts each one in clean Debian, Ubuntu, Fedora, Arch and Alpine containers.
 
 ### Windows
 

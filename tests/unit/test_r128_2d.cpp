@@ -404,19 +404,138 @@ TEST_CASE("r128 2d: every raster op is a truth table, and all 256 are exact")
     CHECK(ropBlit(0x99u, S, D, P) == (~(D ^ S) & 0xFFFFFFFFu)); // ROP3_DSxn
 }
 
+// The 8x8 mono pattern brush (r128.cpp engBlit says where its layout comes
+// from). The pattern here is one no symmetry can hide a mistake in: row 0 is
+// 0x80 (its leftmost pixel only, most significant bit first), row 1 is 0x01
+// (its rightmost), rows 2 and 3 are full, rows 4 to 7 are empty except row 4
+// which is 0xF0.
+constexpr u32 kBrushData0 = 0x1480, kBrushData1 = 0x1484, kBrushYX = 0x1474;
+constexpr u32 kBrushBkgd = 0x1478;
+constexpr u32 kPatRows03 = 0xFFFF0180u, kPatRows47 = 0x000000F0u;
+
+void patternFill(R128Cell& c, u32 brush, u32 rop3, u32 pixOrder, u32 x, u32 y,
+                 u32 w, u32 h)
+{
+    wr(c, kGmc, 0x0Fu | (brush << 4) | (6u << 8) | (3u << 12) |
+                    (pixOrder << 14) | (rop3 << 16) | (2u << 24));
+    surface(c);
+    wr(c, kBrushFrgd, 0x00F0F0F0u);
+    wr(c, kBrushBkgd, 0x00101010u);
+    wr(c, kBrushData0, kPatRows03);
+    wr(c, kBrushData1, kPatRows47);
+    wr(c, kDstYX, x | (y << 16));
+    wr(c, kDstHeightWidth, w | (h << 16));
+}
+
+TEST_CASE("r128 2d: an 8x8 mono pattern paints foreground and background by "
+          "its bits, rows from the low byte, pixels from the high bit")
+{
+    R128Cell c;
+    const auto before = r128EngStats();
+    patternFill(c, 0u, 0xF0u, 0u, 0, 0, 16, 8);
+    CHECK(r128EngStats().blits == before.blits + 1);
+    CHECK(r128EngStats().brushUnimpl == before.brushUnimpl);
+    const u32 F = 0x00F0F0F0u, B = 0x00101010u;
+    // Row 0 = 0x80: the leftmost pixel of each tile.
+    CHECK(pix(c, 0, 0) == F);
+    CHECK(pix(c, 1, 0) == B);
+    CHECK(pix(c, 7, 0) == B);
+    CHECK(pix(c, 8, 0) == F); // the tile repeats across
+    // Row 1 = 0x01: the rightmost.
+    CHECK(pix(c, 0, 1) == B);
+    CHECK(pix(c, 7, 1) == F);
+    CHECK(pix(c, 15, 1) == F);
+    // Rows 2 and 3 full; row 4 = 0xF0: the left half; rows 5 to 7 empty.
+    CHECK(pix(c, 5, 2) == F);
+    CHECK(pix(c, 5, 3) == F);
+    CHECK(pix(c, 3, 4) == F);
+    CHECK(pix(c, 4, 4) == B);
+    CHECK(pix(c, 0, 5) == B);
+    CHECK(pix(c, 0, 7) == B);
+    // Outside the rectangle nothing is touched.
+    CHECK(pix(c, 16, 0) == 0u);
+    CHECK(pix(c, 0, 8) == 0u);
+}
+
+TEST_CASE("r128 2d: the pattern's pixel order follows DP_BYTE_PIX_ORDER")
+{
+    R128Cell c;
+    patternFill(c, 0u, 0xF0u, 1u, 0, 0, 8, 2); // least significant bit first
+    const u32 F = 0x00F0F0F0u, B = 0x00101010u;
+    CHECK(pix(c, 7, 0) == F); // row 0 = 0x80: now its rightmost pixel
+    CHECK(pix(c, 0, 0) == B);
+    CHECK(pix(c, 0, 1) == F); // row 1 = 0x01: now its leftmost
+    CHECK(pix(c, 7, 1) == B);
+}
+
+TEST_CASE("r128 2d: a pattern with the background left alone draws only its "
+          "foreground")
+{
+    R128Cell c;
+    surface(c);
+    for (u32 x = 0; x < 8; ++x)
+        setPix(c, x, 0, 0x00ABCDEFu);
+    patternFill(c, 1u, 0xF0u, 0u, 0, 0, 8, 1);
+    CHECK(pix(c, 0, 0) == 0x00F0F0F0u); // the one set bit of row 0
+    for (u32 x = 1; x < 8; ++x)
+        CHECK(pix(c, x, 0) == 0x00ABCDEFu); // not the background colour
+}
+
+TEST_CASE("r128 2d: the pattern is anchored to the surface, at BRUSH_Y_X")
+{
+    // Two rectangles that do not start on a tile boundary continue one
+    // pattern: a pixel's colour depends on where it is, not on where its
+    // rectangle began.
+    R128Cell c;
+    patternFill(c, 0u, 0xF0u, 0u, 3, 1, 10, 4);
+    const u32 F = 0x00F0F0F0u, B = 0x00101010u;
+    CHECK(pix(c, 7, 1) == F);  // row 1's rightmost pixel
+    CHECK(pix(c, 8, 1) == B);
+    CHECK(pix(c, 3, 2) == F);  // row 2 is full
+    CHECK(pix(c, 8, 4) == F);  // row 4's left half, second tile
+    CHECK(pix(c, 12, 4) == B);
+    // The origin moved to (2, 1): everything shifts with it.
+    R128Cell d;
+    wr(d, kBrushYX, 2u | (1u << 8));
+    patternFill(d, 0u, 0xF0u, 0u, 0, 0, 16, 8);
+    CHECK(pix(d, 2, 1) == F); // pattern (0,0)
+    CHECK(pix(d, 3, 1) == B);
+    CHECK(pix(d, 1, 2) == F); // pattern (7,1)
+    CHECK(pix(d, 2, 0) == B); // pattern (0,7)
+}
+
+TEST_CASE("r128 2d: a pattern under an XOR draws and undraws an outline")
+{
+    // What a desktop does to show something being dragged: the same
+    // patterned rectangle twice with PATINVERT restores every pixel.
+    R128Cell c;
+    surface(c);
+    for (u32 y = 0; y < 8; ++y)
+        for (u32 x = 0; x < 16; ++x)
+            setPix(c, x, y, 0x00010203u * (x + 1u) + y);
+    const u32 was = pix(c, 8, 2);
+    patternFill(c, 1u, 0x5Au, 0u, 0, 0, 16, 8); // PATINVERT, background left
+    CHECK(pix(c, 8, 2) == (was ^ 0x00F0F0F0u)); // a foreground pixel
+    CHECK(pix(c, 1, 0) == 0x00010203u * 2u);    // a background pixel: as it was
+    patternFill(c, 1u, 0x5Au, 0u, 0, 0, 16, 8);
+    for (u32 y = 0; y < 8; ++y)
+        for (u32 x = 0; x < 16; ++x)
+            CHECK(pix(c, x, y) == 0x00010203u * (x + 1u) + y);
+}
+
 TEST_CASE("r128 2d: an op that reads a pattern this engine has no data for is "
           "declined, not painted as a solid guess")
 {
-    // Brush datatype 13 is a solid colour and is modelled. The mono and
-    // colour brushes need the pattern registers, which are not — so an op
-    // that would actually READ the pattern must draw nothing rather than
-    // paint a flat colour where a chequer belongs. Never paint a guess.
+    // The solid brush and the 8x8 mono pattern are modelled. The other
+    // pattern brushes have no layout in anything on the shelf, so an op that
+    // would actually READ one must draw nothing rather than paint a flat
+    // colour where a chequer belongs. Never paint a guess.
     R128Cell c;
     surface(c);
     setPix(c, 0, 0, 0x12345678u);
     const auto before = r128EngStats();
-    // brush datatype 0 = 8x8 mono pattern, with PATCOPY, which reads it.
-    wr(c, kGmc, 0x0Fu | (0u << 4) | (6u << 8) | (0xF0u << 16) | (2u << 24));
+    // brush datatype 10 = 8x8 colour pattern, with PATCOPY, which reads it.
+    wr(c, kGmc, 0x0Fu | (10u << 4) | (6u << 8) | (0xF0u << 16) | (2u << 24));
     surface(c);
     wr(c, kDstYX, 0);
     wr(c, kDstHeightWidth, 4u | (4u << 16));

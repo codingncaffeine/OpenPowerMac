@@ -73,7 +73,7 @@ constexpr Setting kSettings[] = {
     {"2D destination format", upTo(9) & ~3u,
      "||8 bpp palette|15 bpp|16 bpp|24 bpp|32 bpp|8 bpp RGB332|Y8|RGB8||"
      "VYUY422|YVYU422||AYUV444|ARGB4444"},
-    {"2D brush", bit(13) | bit(15),
+    {"2D brush", bit(0) | bit(1) | bit(13) | bit(15),
      "8x8 mono|8x8 mono, see-through|8x1 mono|8x1 mono, see-through|"
      "1x8 mono|1x8 mono, see-through|32x1 mono|32x1 mono, see-through|"
      "32x32 mono|32x32 mono, see-through|8x8 colour|8x1 colour|1x8 colour|"

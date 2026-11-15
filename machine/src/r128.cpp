@@ -475,17 +475,19 @@ bool r128RegDecodedBits(u32 off, u32& mask)
     // "leave alone" controls, the brush, destination and source datatypes,
     // the ROP, the source select, and the three clear-on-write controls.
     // Bit 27 set means "leave the 3D function alone", which is what happens;
-    // its zero is an action not taken, and the value census has it. Not
-    // read: 14 (bit order of a mono source), 15 (colour temperature) and 31
-    // (load the brush origin).
-    case 0x146Cu: case 0x1C84u: mask = 0x7FFF3FFFu; return true;
+    // its zero is an action not taken, and the value census has it. Bit 14
+    // is the pixel order within a pattern's byte; bit 31 says a packet
+    // carries the brush origin, which the packet parser then loads. Not
+    // read: 15 (colour temperature).
+    case 0x146Cu: case 0x1C84u: mask = 0xFFFF7FFFu; return true;
     // DP_CNTL: the two directions, and the raster stall (an operation here
     // is complete before the store returns). Not read: the rectangle tiling
     // bits (the value census has them), the line and trapezoid fields.
     case 0x16C0u: mask = 0x00010003u; return true;
-    // DP_DATATYPE: destination, brush and source types. Not read: 29
-    // (big-endian host data), 30 and 31 (as bits 14 and 15 above).
-    case 0x16C4u: mask = 0x00030F0Fu; return true;
+    // DP_DATATYPE: destination, brush and source types, the pixel order
+    // within a pattern's byte. Not read: 29 (big-endian host data) and 31
+    // (as bit 15 above).
+    case 0x16C4u: mask = 0x40030F0Fu; return true;
     // DST_PITCH_OFFSET_C: offset and pitch. Bit 31 tiles the destination.
     case 0x1C80u: mask = 0x7FFFFFFFu; return true;
     case 0x1C88u: case 0x1C8Cu: mask = 0x3FFF3FFFu; return true;
@@ -640,6 +642,8 @@ static constexpr u32 kSrcYX = 0x1434, kDstYX = 0x1438;
 static constexpr u32 kDstHeightWidth = 0x143C;
 static constexpr u32 kDpGuiMasterCntl = 0x146C;
 static constexpr u32 kDpBrushFrgdClr = 0x147C;
+static constexpr u32 kDpBrushBkgdClr = 0x1478, kBrushYX = 0x1474;
+static constexpr u32 kBrushData0 = 0x1480, kBrushData1 = 0x1484;
 static constexpr u32 kDstWidthX = 0x1588;
 static constexpr u32 kSrcXY = 0x1590, kDstXY = 0x1594;
 static constexpr u32 kDstWidthHeight = 0x1598, kDstWidthXIncy = 0x159C;
@@ -1155,8 +1159,14 @@ static u32 cceSettings(R128Cell& c, const u32* body, u32 n)
     case 0: // [BKGD][FRGD][BMP1][BMP2]
         cceRegWrite(c, 0x1478u, body[i]);
         cceRegWrite(c, 0x147Cu, body[i + 1u]);
+        cceRegWrite(c, kBrushData0, body[i + 2u]);
+        cceRegWrite(c, kBrushData1, body[i + 3u]);
         break;
-    case 1:
+    case 1: // [FRGD][BMP1][BMP2]: the 8x8 pattern over what is there
+        cceRegWrite(c, 0x147Cu, body[i]);
+        cceRegWrite(c, kBrushData0, body[i + 1u]);
+        cceRegWrite(c, kBrushData1, body[i + 2u]);
+        break;
     case 3:
     case 5:
     case 7:
@@ -2406,20 +2416,51 @@ void R128Cell::engBlit()
     const bool usesDst = ropUsesDst(rop);
 
     // The pattern operand. Brush datatype 13 is a solid colour taken from
-    // DP_BRUSH_FRGD_CLR, and 15 the manual says to "treat as 13". The mono
-    // and colour brushes (0..12) need the pattern registers, which this
-    // engine does not model — so if the op would actually READ the pattern,
-    // decline rather than paint a solid guess where a chequer belongs.
-    u32 pat = 0;
+    // DP_BRUSH_FRGD_CLR, and 15 the manual says to "treat as 13".
+    //
+    // 0 and 1 are the 8x8 MONO PATTERN: 64 bits in BRUSH_DATA0 and 1, a set
+    // bit drawing the foreground colour and a clear one the background (0)
+    // or nothing at all (1, "leave alone"). The books give the registers no
+    // description; the layout is the XFree86 driver's use of them (its XAA
+    // 8x8 pattern fill, r128_accel.c): the first register holds rows 0 to 3
+    // and the second rows 4 to 7, a row a byte, the first row in the low
+    // byte; the pixel order within a byte is DP_BYTE_PIX_ORDER's (most
+    // significant bit leftmost, or least); and BRUSH_Y_X is where on the
+    // SURFACE the pattern's first pixel sits, so a pattern stays put under
+    // the rectangles drawn with it.
+    //
+    // The other pattern brushes (the 8x1, 1x8 and 32x1 mono ones, which are
+    // for lines, the 32x32, the colour ones) have no layout in anything on
+    // the shelf: an operation that would READ one is declined rather than
+    // painted with a solid guess where a chequer belongs.
+    u32 pat = 0, patBkgd = 0, patX = 0, patY = 0;
+    u64 patBits = 0;
+    bool patMono = false, patLeave = false, patLsbFirst = false;
     if (usesPat) {
         const u32 brush = (dt >> 8) & 0xFu;
         r128SettingUsed(R128Setting::Brush2d, brush);
-        if (brush != 13u && brush != 15u) {
+        if (brush == 0u || brush == 1u) {
+            patMono = true;
+            patLeave = brush == 1u;
+            patBits = rd(kBrushData0) |
+                      (static_cast<u64>(rd(kBrushData1)) << 32);
+            patBkgd = rd(kDpBrushBkgdClr);
+            patX = rd(kBrushYX) & 7u;
+            patY = (rd(kBrushYX) >> 8) & 7u;
+            patLsbFirst = (dt >> 30) & 1u;
+        } else if (brush != 13u && brush != 15u) {
             ++gEng.brushUnimpl;
             return;
         }
         pat = rd(kDpBrushFrgdClr);
     }
+    // Whether the pattern has its foreground at this pixel of the surface.
+    const auto patOn = [&](int x, int y) {
+        const u32 row = static_cast<u32>(
+            (patBits >> (8u * ((static_cast<u32>(y) - patY) & 7u))) & 0xFFu);
+        const u32 col = (static_cast<u32>(x) - patX) & 7u;
+        return ((row >> (patLsbFirst ? col : 7u - col)) & 1u) != 0;
+    };
     // The source operand must be colour pixels from memory. A MONO source is
     // a 1-bit mask expanded through DP_SRC_FRGD_CLR/BKGD_CLR, which is its
     // own path and belongs with host-data blits.
@@ -2573,7 +2614,7 @@ void R128Cell::engBlit()
     };
 
     const bool plain = mask == 0xFFFFFFFFu;
-    if (!usesSrc && !usesDst && !key.any) {
+    if (!usesSrc && !usesDst && !key.any && !patMono) {
         // The result does not depend on anything that varies across the
         // rectangle, so evaluate the op ONCE and fill. This is PATCOPY,
         // BLACKNESS and WHITENESS, and every other op that reduces to a
@@ -2622,7 +2663,15 @@ void R128Cell::engBlit()
                 const u32 D = (usesDst || key.fnDst) ? pixAt(dp) : 0u;
                 if (key.any && !key.draws(S, D))
                     continue; // keyed out: the destination keeps its pixel
-                putPix(dp, rop3(rop, pat, S, D));
+                u32 P = pat;
+                if (patMono &&
+                    !patOn(x0 + static_cast<int>(cc),
+                           y0 + static_cast<int>(rr))) {
+                    if (patLeave)
+                        continue; // "leave alone": no background is drawn
+                    P = patBkgd;
+                }
+                putPix(dp, rop3(rop, P, S, D));
             }
         }
     }

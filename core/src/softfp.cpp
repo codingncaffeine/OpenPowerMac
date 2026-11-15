@@ -376,7 +376,8 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
     if (rexp == 0xFFu)
         return false; // overflowed: the model owns OX and the defaults
     if (rexp == 0u && (rbits & 0x007FFFFFu))
-        return false; // denormal result: tininess is the model's business
+        return false; // denormal result: left to the model (measured: the
+                      // host is no faster than the model on these)
     // ⚠ ANY 2Sum RESIDUE BAILS. T != 0 means the addend reaches below the
     // 53-bit window of the sum — jam territory in the model's aligned-add,
     // where BOTH deliverables leave ideal arithmetic behind: the jam is an
@@ -398,6 +399,13 @@ bool hostSglFast(u64 fa, u64 fc, u64 fb, bool hasAddend, bool negResult,
         fl |= kXx;
         if ((resid < 0.0) != ((rbits >> 31) != 0))
             fl |= kFr; // rounded away from zero
+        // ⚠ TININESS IS DETECTED BEFORE ROUNDING (PEM 3.3.6.2), so a value
+        // just under 2^-126 that rounds UP to it is tiny and inexact, and
+        // raises UX, although what is delivered is a normal number and the
+        // denormal test above let it through. This path returned it without
+        // UX until a directed test asked: (1 - 2^-24) * 2^-126.
+        if (S < 0x1p-126 && S > -0x1p-126)
+            fl |= kUx;
     }
     u64 bits = std::bit_cast<u64>(static_cast<double>(r0));
     if (negResult)
@@ -780,8 +788,103 @@ R madd(u64 a, u64 c, u64 b, const Env& e, Tgt t, bool negAdd, bool negResult)
     return fmaCore(a, c, b, true, negAdd, negResult, e, t);
 }
 
+namespace {
+
+// ⭐ THE DIVIDE'S HOST FAST PATH. The model below is fifty-five trips round a
+// shift-and-subtract loop, about 170 host cycles, and a game's perspective
+// divides and normalizations make it one of the dearest rows left. For the
+// ordinary case the host's own divide is the same answer:
+//
+//   result   the model takes 56 quotient bits and a sticky and rounds once,
+//            to nearest: the correct rounding of the exact quotient, which is
+//            what an IEEE divide is. For a single target the operands must be
+//            single-valued, so that one float divide is one rounding of the
+//            exact quotient; a double quotient narrowed afterwards would be
+//            two roundings.
+//   flags    FI is "the quotient was not exact", FR is "its magnitude went
+//            up". Both come from the residue q*b - a, which is exact here:
+//            for singles the product of two 24-bit significands fits a double
+//            and the subtraction is of two values within 2^-24 of each other
+//            (Sterbenz); for doubles it is one fused multiply-add, whose
+//            result (at most half an ulp of q times b) is a normal double
+//            inside the operand band below. q*b has a's sign, so the
+//            magnitude went up exactly when the residue has a's sign too.
+//
+// Left to the model: zeros, infinities, NaNs and denormals; a rounding mode
+// other than nearest, enabled over/underflow, NI; operands that are not
+// single-valued going to a single; a single result that overflows or lands
+// in or next to the denormal range (the model detects tininess before
+// rounding); doubles outside the band where neither the quotient nor the
+// residue can leave the normal range; and a host without FMA3 for doubles.
+bool hostDivFast(u64 fa, u64 fb, Tgt t, R& out)
+{
+    if (t == Tgt::Sgl) {
+        const auto normalD = [](u64 x) {
+            const u32 e = static_cast<u32>(x >> 52) & 0x7FFu;
+            return e != 0u && e != 0x7FFu;
+        };
+        if (!normalD(fa) || !normalD(fb))
+            return false;
+        const double da = std::bit_cast<double>(fa);
+        const double db = std::bit_cast<double>(fb);
+        const float sa = static_cast<float>(da);
+        const float sb = static_cast<float>(db);
+        if (static_cast<double>(sa) != da || static_cast<double>(sb) != db)
+            return false; // not single-valued: the model's territory
+        const u32 ea = (std::bit_cast<u32>(sa) >> 23) & 0xFFu;
+        const u32 eb = (std::bit_cast<u32>(sb) >> 23) & 0xFFu;
+        if (ea == 0u || eb == 0u)
+            return false; // a denormal single
+        const float q = sa / sb;
+        const u32 qb = std::bit_cast<u32>(q);
+        const u32 qe = (qb >> 23) & 0xFFu;
+        if (qe >= 0xFEu || qe <= 1u)
+            return false; // at or past either end of the normal range
+        const double resid = static_cast<double>(q) * db - da; // exact
+        u32 fl = 0;
+        if (resid != 0.0) {
+            fl |= kXx;
+            if ((resid < 0.0) == ((fa >> 63) != 0))
+                fl |= kFr; // rounded away from zero
+        }
+        out = {std::bit_cast<u64>(static_cast<double>(q)), fl};
+        return true;
+    }
+#if OPM_SF_X64
+    if (!kHaveFma)
+        return false;
+#endif
+    const u32 ea = static_cast<u32>(fa >> 52) & 0x7FFu;
+    const u32 eb = static_cast<u32>(fb >> 52) & 0x7FFu;
+    if (ea - kDblELo > kDblEHi - kDblELo || eb - kDblELo > kDblEHi - kDblELo)
+        return false;
+    const double da = std::bit_cast<double>(fa);
+    const double db = std::bit_cast<double>(fb);
+    const double q = da / db;
+    const double resid = fmaExact(q, db, -da); // exact: see above
+    u32 fl = 0;
+    if (resid != 0.0) {
+        fl |= kXx;
+        if ((resid < 0.0) == ((fa >> 63) != 0))
+            fl |= kFr;
+    }
+    out = {std::bit_cast<u64>(q), fl};
+    return true;
+}
+
+} // namespace
+
 R div(u64 fa, u64 fb, const Env& env, Tgt t)
 {
+    if (env.rn == 0 && !env.oe && !env.ue && !env.ni &&
+        !(gHostFastOff & (t == Tgt::Sgl ? kFastOffSgl : kFastOffDbl))) {
+        R fast;
+        if (hostDivFast(fa, fb, t, fast)) {
+            ++(t == Tgt::Sgl ? gFastHits : gFastHitsD);
+            return fast;
+        }
+        ++(t == Tgt::Sgl ? gFastMiss : gFastMissD);
+    }
     const Un a = unpack(fa), b = unpack(fb);
     u32 fl = 0;
     if (a.c == cSNaN || b.c == cSNaN)
@@ -1021,6 +1124,20 @@ R rsqrte(u64 fb, const Env& env)
     }
     if (b.c == cInf)
         return {0, fl}; // +0
+
+    // ⭐ THE HOST DOES BOTH STEPS. What follows is the square root rounded to
+    // a double, to nearest, and then one over that rounded to a double, to
+    // nearest, with every flag of the two steps dropped: exactly what the
+    // host's own square root and divide return for a positive finite
+    // operand, denormal ones included (the root of any positive double is a
+    // normal double, and so is its reciprocal). The digit recurrence below
+    // costs 56 trips of 128-bit arithmetic and the divide 55 more, and a
+    // game normalizing its vectors asks for this thousands of times a frame.
+    if (!(gHostFastOff & kFastOffDbl)) {
+        ++gFastHitsD;
+        return {std::bit_cast<u64>(1.0 / std::sqrt(std::bit_cast<double>(fb))),
+                fl};
+    }
 
     // sqrt to double precision (RN), then reciprocal to double (RN) —
     // deterministic composition, well inside the 1/32 architectural bound.

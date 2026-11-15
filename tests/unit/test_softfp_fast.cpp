@@ -9,6 +9,7 @@
 #include "doctest.h"
 #include "../../core/src/softfp.hpp"
 
+#include <bit>
 #include <cstdio>
 
 using namespace opm;
@@ -357,4 +358,192 @@ TEST_CASE("softfp: fast path bails outside round-to-nearest and plain env")
             CHECK(fr.fl == mr.fl);
         }
     }
+}
+
+// The divide, the reciprocal estimate and the reciprocal square-root
+// estimate: the host's own divide and square root against the model's digit
+// loops, on the same inputs, demanding identical {bits, flags}. Quotients
+// that are exact, quotients that land on a rounding tie's neighbors,
+// operands at both ends of the exponent range, denormals, and everything the
+// path must refuse and hand to the model.
+TEST_CASE("softfp: host divide and square-root estimate == model on {bits, flags}")
+{
+    const Env env{0, false, false, false};
+    Rng r;
+    u32 bad = 0;
+    u64 sglTaken = 0, sglAsked = 0, dblTaken = 0, dblAsked = 0, rootTaken = 0, rootAsked = 0;
+    auto check = [&](const char* what, u64 a, u64 b, auto&& fn) {
+        R fast{}, model{};
+        gHostFastOff = 0;
+        fast = fn();
+        gHostFastOff = kFastOffSgl | kFastOffDbl;
+        model = fn();
+        gHostFastOff = 0;
+        if ((fast.bits != model.bits || fast.fl != model.fl) && ++bad <= 8) {
+            char why[192];
+            snprintf(why, sizeof why,
+                     "%s a=%016llx b=%016llx fast=%016llx/%x model=%016llx/%x",
+                     what, (unsigned long long)a, (unsigned long long)b,
+                     (unsigned long long)fast.bits, fast.fl,
+                     (unsigned long long)model.bits, model.fl);
+            MESSAGE(why);
+        }
+    };
+    for (u32 it = 0; it < 400000 && bad < 8; ++it) {
+        // Single target: mostly single-valued operands, some raw doubles.
+        u64 a = pickOperand(r), b = pickOperand(r);
+        if (it % 16u == 0u) {
+            // An exact quotient: b times a small integer over b.
+            const float fb = float(int(r.next() % 4096u) + 1) * 0.125f;
+            const float fa = fb * float(int(r.next() % 255u) + 1);
+            a = std::bit_cast<u64>(double(fa));
+            b = std::bit_cast<u64>(double(fb));
+        }
+        u64 h = gFastHits, m = gFastMiss;
+        check("fdivs", a, b, [&] { return div(a, b, env, Tgt::Sgl); });
+        // (check ran the fast arm once: one hit or one miss.)
+        sglTaken += gFastHits - h;
+        sglAsked += (gFastHits - h) + (gFastMiss - m);
+        check("fres", 0, b, [&] { return res(b, env); });
+
+        // Double target: the band the path admits, and beyond both ends.
+        const bool wide = it % 5u == 0u;
+        u64 da = pickDouble(r, wide ? 1 : 600, wide ? 2046 : 1500);
+        u64 db = pickDouble(r, wide ? 1 : 600, wide ? 2046 : 1500);
+        if (it % 16u == 1u) {
+            const double x = double(i64(r.next()) + 1) * 0x1p-20;
+            da = std::bit_cast<u64>(x * double(int(r.next() % 1023u) + 1));
+            db = std::bit_cast<u64>(x);
+        }
+        h = gFastHitsD;
+        m = gFastMissD;
+        check("fdiv", da, db, [&] { return div(da, db, env, Tgt::Dbl); });
+        dblTaken += gFastHitsD - h;
+        dblAsked += (gFastHitsD - h) + (gFastMissD - m);
+
+        // The estimate takes anything: signs, zeros, NaNs, denormals.
+        const u64 x = it % 3u ? (pickDouble(r, 1, 2046) & ~(1ull << 63)) : pickDouble(r, 1, 2046);
+        h = gFastHitsD;
+        check("frsqrte", 0, x, [&] { return rsqrte(x, env); });
+        rootTaken += gFastHitsD > h ? 1 : 0;
+        ++rootAsked;
+    }
+    CHECK(bad == 0);
+    // The positive control: both arms being the model would pass the above.
+    MESSAGE("taken: fdivs " << sglTaken << "/" << sglAsked << ", fdiv " << dblTaken << "/"
+            << dblAsked << ", frsqrte " << rootTaken << "/" << rootAsked);
+    // (The generators are mostly zeros, NaNs, denormals and band edges, which
+    // the path refuses: these floors are of that mix, not of a game's.)
+    CHECK(sglTaken * 10 > sglAsked);
+    CHECK(dblTaken * 5 > dblAsked);
+    CHECK(rootTaken * 2 > rootAsked);
+}
+
+TEST_CASE("softfp: the divide's fast path stands aside for every mode the model owns")
+{
+    // Directed rounding, enabled over/underflow and NI all change what a
+    // result or a flag is; with any of them on, both arms must be the model.
+    Rng r;
+    u32 bad = 0;
+    for (u32 it = 0; it < 60000; ++it) {
+        const u64 a = pickOperand(r), b = pickOperand(r);
+        const u64 da = pickDouble(r, 600, 1500), db = pickDouble(r, 600, 1500);
+        for (u32 mode = 1; mode < 7u; ++mode) {
+            const Env env{mode < 4u ? mode : 0u, mode == 4u, mode == 5u, mode == 6u};
+            for (int dbl = 0; dbl < 2; ++dbl) {
+                const u64 x = dbl ? da : a, y = dbl ? db : b;
+                const Tgt t = dbl ? Tgt::Dbl : Tgt::Sgl;
+                gHostFastOff = 0;
+                const R fast = div(x, y, env, t);
+                gHostFastOff = kFastOffSgl | kFastOffDbl;
+                const R model = div(x, y, env, t);
+                gHostFastOff = 0;
+                if (fast.bits != model.bits || fast.fl != model.fl)
+                    ++bad;
+            }
+        }
+    }
+    CHECK(bad == 0);
+}
+
+// Results in and around the denormal range of a single. A denormal result
+// is the model's on both arms; what the fast path must get right is the
+// neighbor: a value just under the smallest normal that rounds UP to it,
+// which is tiny before rounding and so raises UX although what is delivered
+// is a normal number. Operands are chosen so that products and sums land
+// between 2^-160 and 2^-120; the first triple is that value exactly.
+TEST_CASE("softfp: single-target tiny results == model on {bits, flags}")
+{
+    const Env env{0, false, false, false};
+    Rng r;
+    u32 bad = 0;
+    u64 tinyInexact = 0, tinyExact = 0, roundedUpToNormal = 0;
+    const u64 h0 = gFastHits, m0 = gFastMiss;
+    auto single = [&](u32 expLo, u32 expHi) {
+        const u32 e = expLo + r.next() % (expHi - expLo + 1u);
+        const u32 frac = (r.next() % 4u) ? (r.next() & 0x7FFFFFu)
+                                         : (0x7FFFFFu >> (r.next() % 23u)) << (r.next() % 8u) & 0x7FFFFFu;
+        return loadSingle((r.next() & 0x80000000u) | (e << 23) | frac);
+    };
+    for (u32 it = 0; it < 400000 && bad < 8; ++it) {
+        u64 a, c, b;
+        if (it == 0) {
+            a = loadSingle(0x3F7FFFFFu); // 1 - 2^-24
+            c = loadSingle(0x00800000u); // 2^-126, the smallest normal
+            b = 0;
+        } else {
+            // a * c lands near the denormal range; b is a denormal, a small
+            // normal, or zero.
+            a = single(1, 60);
+            c = single(67, 127);
+            switch (r.next() % 4u) {
+            case 0: b = 0; break;
+            case 1: b = loadSingle((r.next() & 0x80000000u) | (r.next() & 0x7FFFFFu)); break;
+            default: b = single(1, 12); break;
+            }
+        }
+        for (u32 op = 0; op < 7u; ++op) {
+            R fast{}, model{};
+            for (int pass = 0; pass < 2; ++pass) {
+                gHostFastOff = pass ? (kFastOffSgl | kFastOffDbl) : 0u;
+                R& out = pass ? model : fast;
+                switch (op) {
+                case 0: out = add(a, b, env, Tgt::Sgl); break;
+                case 1: out = sub(a, b, env, Tgt::Sgl); break;
+                case 2: out = mul(a, c, env, Tgt::Sgl); break;
+                case 3: out = madd(a, c, b, env, Tgt::Sgl, false, false); break;
+                case 4: out = madd(a, c, b, env, Tgt::Sgl, true, false); break;
+                case 5: out = madd(a, c, b, env, Tgt::Sgl, false, true); break;
+                default: out = madd(a, c, b, env, Tgt::Sgl, true, true); break;
+                }
+            }
+            gHostFastOff = 0;
+            const u64 mag = model.bits & 0x7FFFFFFFFFFFFFFFull;
+            if (mag != 0 && mag < 0x3810000000000000ull) // below 2^-126
+                ++((model.fl & kUx) ? tinyInexact : tinyExact);
+            if (mag == 0x3810000000000000ull && (model.fl & kUx))
+                ++roundedUpToNormal;
+            if ((fast.bits != model.bits || fast.fl != model.fl) && ++bad <= 8) {
+                char why[192];
+                snprintf(why, sizeof why,
+                         "op=%u a=%016llx c=%016llx b=%016llx "
+                         "fast=%016llx/%x model=%016llx/%x",
+                         op, (unsigned long long)a, (unsigned long long)c,
+                         (unsigned long long)b,
+                         (unsigned long long)fast.bits, fast.fl,
+                         (unsigned long long)model.bits, model.fl);
+                MESSAGE(why);
+            }
+        }
+    }
+    CHECK(bad == 0);
+    const u64 hits = gFastHits - h0, miss = gFastMiss - m0;
+    MESSAGE("denormal results: " << tinyInexact << " inexact (UX), " << tinyExact
+            << " exact; rounded up to the smallest normal with UX: " << roundedUpToNormal
+            << "; fast path taken " << hits << " of " << hits + miss);
+    // The inputs really are what the case is about, and the path really ran.
+    CHECK(tinyInexact > 100000);
+    CHECK(tinyExact > 1000);
+    CHECK(roundedUpToNormal >= 1);
+    CHECK(hits * 4 > hits + miss);
 }

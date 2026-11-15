@@ -1,4 +1,6 @@
 #include "opm/r128.hpp"
+#include "opm/r128rec.hpp" // the frame recorder's taps
+#include "opm/snapshot.hpp" // the engine's own state, for a recording
 
 #include <vector>
 #include <string>
@@ -699,6 +701,8 @@ void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
     // write direction of exactly this.
     if (snoop)
         snoop->snoopRead(pa, 8);
+    if (r128RecOn())
+        r128RecTouch(ram, ramSize, pa, 8, snoop);
     // Little-endian throughout: the guest builds this with stwbrx and reads
     // the registers back with lwbrx.
     auto le32 = [&](u32 at) {
@@ -722,6 +726,8 @@ void r128BusMasterFetch(R128Cell& c, const u8* ram, u32 ramSize,
     }
     if (snoop)
         snoop->snoopRead(src, 8);
+    if (r128RecOn())
+        r128RecTouch(ram, ramSize, src, 8, snoop);
     // ⚠ TWO WORDS, because two is all that has ever been observed: the
     // self-test compares exactly GUI_SCRATCH_REG0 and REG1 against the pair
     // it planted. Nothing establishes where a longer transfer would take its
@@ -938,6 +944,35 @@ void r128CceReset()
     r128Cce3dReset();
 }
 
+// The engine's state that lives outside the cell, for a frame recording
+// (opm/r128rec.hpp): the words of a packet still arriving, the indirect
+// dispatches waiting for a packet boundary, and the 3D unit's tables. Machine
+// snapshots do not carry these (see the note on the staging FIFO); a
+// recording starts wherever the guest happens to be, so it must.
+void r128EngineStateSave(SnapWriter& w)
+{
+    w.u64v(gCceFifo.size() - gCceHead);
+    for (size_t k = gCceHead; k < gCceFifo.size(); ++k)
+        w.u32v(gCceFifo[k]);
+    w.u64v(gCcePendingInd.size());
+    for (u32 v : gCcePendingInd)
+        w.u32v(v);
+    r128Cce3dStateSave(w);
+}
+void r128EngineStateLoad(SnapReader& r)
+{
+    gCceFifo.clear();
+    gCceHead = 0;
+    gCcePendingInd.clear();
+    const u64 staged = r.u64v();
+    for (u64 k = 0; k < staged && r.ok; ++k)
+        gCceFifo.push_back(r.u32v());
+    const u64 pending = r.u64v();
+    for (u64 k = 0; k < pending && r.ok; ++k)
+        gCcePendingInd.push_back(r.u32v());
+    r128Cce3dStateLoad(r);
+}
+
 static void cceRegWrite(R128Cell& c, u32 off, u32 native)
 {
     // Through the front door: the same path a guest MMIO store takes, so a
@@ -999,6 +1034,8 @@ static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
     if (base && ea + 4u <= ramSize) {
         if (snoop)
             snoop->snoopRead(static_cast<u32>(ea), 4);
+        if (r128RecOn())
+            r128RecTouch(ram, ramSize, static_cast<u32>(ea), 4, snoop);
         const u32 entry = le32(static_cast<u32>(ea));
         const u32 pa = (entry & 0xFFFFF000u) | (agp & 0xFFFu);
         if ((entry & 1u) && static_cast<u64>(pa) + 4u <= ramSize) {
@@ -1011,6 +1048,8 @@ static bool cceGartRead(const u8* ram, u32 ramSize, u32 gartBase,
             }
             if (snoop)
                 snoop->snoopRead(pa, 4);
+            if (r128RecOn())
+                r128RecTouch(ram, ramSize, pa, 4, snoop);
             out = le32(pa);
             return true;
         }
@@ -2459,6 +2498,21 @@ void R128Cell::engBlit()
     if (key.unknown)
         ++gEng.colorCompare;
 
+    // A recorder or a replayer is listening for frame edges (opm/r128rec.hpp).
+    // An operation on the surface being displayed that covers at least half
+    // of it is a frame being presented (a copy onto it, reported once it is
+    // drawn) or begun (a fill of it, reported before it wipes the last one).
+    bool frameEdge = false;
+    if (gR128FrameEdge) {
+        const R128Scan shown = r128ScanDecode(*this);
+        frameEdge = shown.enabled && shown.rowBytes == dstStride &&
+                    shown.offset == dstOff &&
+                    static_cast<u64>(cw) * ch * 2u >=
+                        static_cast<u64>(shown.w) * shown.h;
+        if (frameEdge && !usesSrc)
+            gR128FrameEdge(*this, 'C');
+    }
+
     // --- draw -----------------------------------------------------------
     //
     // ⚠ BYTE ORDER. This model's VRAM holds pixels exactly as the guest
@@ -2550,6 +2604,8 @@ void R128Cell::engBlit()
     }
     ++gEng.blits;
     gEng.pixels += static_cast<u64>(cw) * ch;
+    if (frameEdge && usesSrc)
+        gR128FrameEdge(*this, 'P');
     // Keep the painted span honest: the screen dump and the "did anything
     // reach the framebuffer" report both read it, and a desktop drawn
     // entirely by the engine would otherwise look like a machine that never

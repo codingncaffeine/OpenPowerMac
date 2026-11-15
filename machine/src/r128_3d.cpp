@@ -36,6 +36,8 @@
 
 #include "opm/bus.hpp"
 #include "opm/r128.hpp"
+#include "opm/r128rec.hpp"
+#include "opm/snapshot.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -1792,6 +1794,32 @@ void r128Cce3dReset()
     gTriSeq = 0;
     // gTriDump deliberately survives reset: the flag is armed before the
     // machine boots and the machine resets on the way up.
+}
+
+// The 3D unit's share of the engine state a frame recording carries.
+void r128Cce3dStateSave(SnapWriter& w)
+{
+    w.raw(gFog.t, sizeof gFog.t);
+    w.arr32(gPalette[0], 256);
+    w.arr32(gPalette[1], 256);
+    w.b(gWalk.valid);
+    w.u32v(gWalk.vloff);
+    w.u32v(gWalk.vsize);
+    w.u32v(gWalk.fmt);
+    w.u32v(gWalk.cntl);
+    w.i32v(gGate3d);
+}
+void r128Cce3dStateLoad(SnapReader& r)
+{
+    r.raw(gFog.t, sizeof gFog.t);
+    r.arr32(gPalette[0], 256);
+    r.arr32(gPalette[1], 256);
+    gWalk.valid = r.b();
+    gWalk.vloff = r.u32v();
+    gWalk.vsize = r.u32v();
+    gWalk.fmt = r.u32v();
+    gWalk.cntl = r.u32v();
+    gGate3d = r.i32v();
 }
 
 int r128Gate3dState() { return gGate3d; }

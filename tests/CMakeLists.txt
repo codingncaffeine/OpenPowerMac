@@ -12,6 +12,7 @@ add_executable(opm_unit
   unit/test_r128_cce.cpp
   unit/test_r128_3d.cpp
   unit/test_hfs.cpp
+  unit/test_r128_rec.cpp
   unit/test_macio.cpp
   unit/test_pmu.cpp
   unit/test_awacs.cpp

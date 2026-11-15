@@ -5,6 +5,7 @@
 #include "opm/bus.hpp"
 #include "opm/ohci.hpp"
 #include "opm/r128.hpp"
+#include "opm/r128rec.hpp"
 #include "opm/openpic.hpp"
 #include "opm/pmu.hpp"
 #include "opm/types.hpp"
@@ -373,6 +374,15 @@ public:
         if (r128AsyncBusy())
             r128AsyncDrain(ati_, atiMem());
     }
+    // Record the card's inputs over the next `frames` frames into a file
+    // (opm/r128rec.hpp). The engine is finished first: a recording begins
+    // between two stores, with nothing of an earlier one still to draw.
+    bool atiRecordStart(u32 frames, const std::string& path, std::string& err)
+    {
+        atiDrain();
+        return r128RecStart(ati_, atiMem(), frames, path, err);
+    }
+    void atiRecordStop() { r128RecStop(ati_, "stopped on request"); }
     // The registers whose value a queued packet may read or write — the PM4
     // block (status, the indirect dispatch pair, the vertex-format word), the
     // bus-master block, the surface ranges, and everything from the FIFO up:
@@ -1278,6 +1288,8 @@ private:
                 // half of the register.
                 const u32 lane = len == 4u ? 0u : (o - 4u);
                 atiBeforeRead(idx);
+                if (r128RecOn())
+                    r128RecRegRead(idx + lane, len);
                 R128RegLock atiLock;
                 return ioSwap(ati_.read(idx + lane, len), len);
             }
@@ -1289,6 +1301,8 @@ private:
         if (atiRegBar_ && pa - atiRegBar_ < 0x4000u) {
             const u32 regOff = (pa - atiRegBar_) & 0x1FFFu;
             atiBeforeRead(regOff);
+            if (r128RecOn())
+                r128RecRegRead(regOff, len);
             R128RegLock atiLock;
             return ati_.read(regOff, len);
         }
@@ -1518,8 +1532,15 @@ private:
                 // half of the register.
                 const u32 lane = len == 4u ? 0u : (o - 4u);
                 atiBefore(idx);
-                R128RegLock atiLock;
-                ati_.write(idx + lane, sv, len);
+                const bool rec = r128RecOn();
+                if (rec)
+                    r128RecRegWrite(ati_, 'w', idx + lane, sv, len, nullptr);
+                {
+                    R128RegLock atiLock;
+                    ati_.write(idx + lane, sv, len);
+                }
+                if (rec)
+                    r128RecRegWriteDone(ati_);
                 return;
             }
             return;
@@ -1532,47 +1553,13 @@ private:
                 (off & ~3u) == 0x1000u || (off & ~3u) == 0x1004u;
             if (!fifoWord)
                 atiBefore(off);
-            {
-                R128RegLock atiLock;
-                ati_.write(off, v, len);
-            }
-            // The card is a BUS MASTER, and this is the one place it acts as
-            // one: writing the transfer address starts a fetch out of system
-            // memory. The walk lives here rather than in the cell because the
-            // BUS owns RAM and the snoop responder — the cell is a leaf device
-            // with no route to either, and giving it one would add members and
-            // kill every snapshot.
-            if ((off & ~3u) == 0x0A50u)
-                r128BusMasterFetch(ati_, ram_.data(),
-                                   static_cast<u32>(ram_.size()), snoop);
-            // The CCE's PIO packet FIFO: each store hands the command
-            // engine one DWORD of packet stream, and executing the stream
-            // is what lands the ARM's GUI_SCRATCH fence. Routed from here
-            // for the same reason as the bus-master fetch above — packet
-            // execution can dispatch an INDIRECT buffer, which the card
-            // fetches out of system RAM through the Uni-N GART, and only
-            // the bus owns RAM, the snoop responder and the bridge's
-            // config space where the GART base lives.
-            else if ((off & ~3u) == 0x1000u || (off & ~3u) == 0x1004u)
-                r128CceFifoWord(ati_, v, len, ram_.data(),
-                                static_cast<u32>(ram_.size()), agpGartBase(),
-                                agpAperBase(), snoop);
-            // A guest that writes PM4_IW_INDSIZE directly (SDK §5.3.3's
-            // other flow) dispatches the same way a packet-written one does.
-            else if ((off & ~3u) == 0x073Cu)
-                r128CceIndirect(ati_, ati_.peek(0x073Cu), ram_.data(),
-                                static_cast<u32>(ram_.size()), agpGartBase(),
-                                agpAperBase(), snoop);
-            // The ring doorbell: advancing PM4_BUFFER_DL_WPTR — or starting
-            // the microengine with work already queued — hands the card a
-            // span of ring DWORDs to fetch out of AGP space and execute
-            // (SDK §5.3). Bus-level for the same reason as the rest: the
-            // fetch walks the GART and the read-pointer write-back lands in
-            // system RAM, snooped.
-            else if ((off & ~3u) == 0x0714u || (off & ~3u) == 0x07FCu)
-                r128CceRingKick(ati_, ram_.data(),
-                                static_cast<u32>(ram_.size()), agpGartBase(),
-                                agpAperBase(), snoop);
+            // The cell's write, and what the card does as a bus master
+            // because of it (a fetch, a FIFO word, an indirect dispatch, a
+            // ring doorbell): one function, which a replayed recording goes
+            // through as well. The memory is handed over from here because
+            // the BUS owns RAM, the snoop responder and the bridge's config
+            // space where the GART base lives; the cell is a leaf device.
+            r128GuestRegWrite(ati_, off, v, len, atiMem());
             return;
         }
         if (atiFbBar_ && pa - atiFbBar_ < (64u << 20)) {
@@ -1598,6 +1585,8 @@ private:
                     static_cast<int>(len * 2u),
                     static_cast<unsigned long long>(v),
                     pcRef ? *pcRef : 0u, lrRef ? *lrRef : 0u);
+            if (r128RecOn())
+                r128RecFbWrite((pa - atiFbBar_) & 0x01FFFFFFu, v, len);
             put(ati_.vram.data() + ((pa - atiFbBar_) & 0x01FFFFFFu), v, len);
             return;
         }

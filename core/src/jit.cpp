@@ -346,6 +346,65 @@ void opmJitChainResolve(Cpu* c, u32 siteOff, u32 tgtPaLine, u32 tgtVa)
     ++J.chainMisses;
 }
 
+// ⭐ THE HOP THE COMPILER COULD NOT LINK. A site is linked at compile time
+// only when its target is known and on the block's own page. Every other
+// transfer left compiled code: a branch to another page, and every blr and
+// bctr, which is every call and every return. Each then paid the epilogue,
+// a turn of the dispatcher's loop, one instruction through the interpreter's
+// fetch path when the page had changed, and the trampoline back in — once
+// every 37 instructions in a game, an eighth of the processor's thread.
+//
+// This is the dispatcher's own way from one line to the next, called from
+// the block with the pc already stored and the counts settled, and it
+// answers with the next block's entry or with null ("ask the dispatcher"):
+//
+//   the gate       as a linked hop has it (Compiler::chainChecks): the batch
+//                  has not ended, MSR is the one the dispatcher entered
+//                  under, a line's worth of budget remains;
+//   the page       unchanged: the one-page fetch translation must still
+//                  stand for it, by the same four compares fetchBlockFast
+//                  makes. Changed: the page memo, through fetchPageProbe,
+//                  which is what the line executor calls there — it replays
+//                  the ITLB set's LRU write and moves the fetch translation
+//                  exactly as the fetch path would have. A page the memo
+//                  does not hold is the fetch path's to walk: null;
+//   the line       resident under that address, or null (the fetch path
+//                  fills it);
+//   the block      compiled for that line and address, or null (the
+//                  dispatcher compiles it).
+//
+// Nothing here is new machine behavior: each step is one the interpreter
+// takes at the same point, or a refusal.
+const void* opmJitHop(Cpu* c, u64* stamp)
+{
+    if (c->batchBreak || c->st.msr != c->jitMsr || c->jitUntil - *stamp < 8u)
+        return nullptr;
+    const u32 pc = c->st.pc;
+    u32 paPage = c->xlPa;
+    if ((pc >> 12) == c->xlPage) {
+        if (c->xlGen != c->mmuGen ||
+            c->xlMsr != (c->st.msr & (msr::IR | msr::PR | msr::LE)) ||
+            c->xlSr != c->st.sr[pc >> 28])
+            return nullptr;
+    } else if (!c->fetchPageProbe(pc, paPage)) {
+        return nullptr;
+    }
+    const u32 pa = paPage | (pc & 0xFFFu);
+    const u32 base = pa & ~31u;
+    const u32 slot = Cpu::fetchSlot(pa);
+    if (c->fetchBase[slot] != base)
+        return nullptr;
+    JitCache& J = *c->jit;
+    const u32 va = pc & ~31u;
+    const JitLine* ways = &J.line[slot * JitCache::kWays];
+    for (u32 k = 0; k < JitCache::kWays; ++k)
+        if (ways[k].base == base && ways[k].va == va) {
+            ++c->jitChainHops;
+            return J.arena_ + ways[k].off[(pc >> 2) & 7u];
+        }
+    return nullptr;
+}
+
 // FP memory shims — transcriptions of exec_int.cpp's FLOAD/FSTORE bodies:
 // word-alignment fault first (UM 4.6.6, DSISR from the image), then readV/
 // writeV, then the FPR write with the PEM D.6/D.7 single<->double models.
@@ -880,7 +939,24 @@ struct Compiler {
         else if (chain && (target >> 12) == (vaBase >> 12))
             chainCross(target);
         else
+            hopOrExit();
+    }
+    // An exit whose successor this block cannot name: on another page, or
+    // read from LR or CTR. The pc is stored and the counts are settled, as
+    // at every exit. Ask opmJitHop for the next block and go there, or leave
+    // for the dispatcher as before.
+    void hopOrExit()
+    {
+        if (!chain || c.jitHopOff) {
             e.jmpTo(epi);
+            return;
+        }
+        e.bytes({0x4C, 0x89, 0xE9}); // mov rcx, r13
+        e.bytes({0x4C, 0x89, 0xF2}); // mov rdx, r14 (the instruction count)
+        e.callAbs(reinterpret_cast<const void*>(&opmJitHop));
+        e.bytes({0x48, 0x85, 0xC0}); // test rax, rax
+        e.jccTo(CC_Z, epi);
+        e.bytes({0xFF, 0xE0});       // jmp rax
     }
 
     // -- per-instruction tails ----------------------------------------------
@@ -1896,6 +1972,8 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         flushNoPc();
         if (chained)
             chainOrExit(target, k);
+        else if (target != nextVa)
+            hopOrExit();
         else
             e.jmpTo(epi);
         if (nt != size_t(-1)) {
@@ -1919,7 +1997,7 @@ void Compiler::word(u32 k, u32 insn, u32 row)
         bump();
         e.storeR(o.pc, RAX);
         flushNoPc();
-        e.jmpTo(epi);
+        hopOrExit();
         if (nt != size_t(-1)) {
             e.patch8(nt);
             bump();

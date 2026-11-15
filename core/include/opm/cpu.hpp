@@ -1148,6 +1148,11 @@ struct Cpu {
     // which is the MSR its entry conditions were checked under. A hop from
     // block to block compares against it: see Compiler::chainChecks.
     u32 jitMsr = 0;
+    // DIAGNOSTIC (--no-jit-hop): a branch to another page, a blr and a bctr
+    // leave compiled code for the dispatcher, as they did before blocks
+    // could find each other at run time (opmJitHop in jit.cpp). The control
+    // for that.
+    bool jitHopOff = false;
     // DIAGNOSTIC (--jit-full-gate): at every hop between blocks re-test each
     // of the dispatcher's entry conditions by name, as the hops did before
     // they compared the MSR instead. The control for that.

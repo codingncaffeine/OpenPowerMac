@@ -595,6 +595,7 @@ int main(int argc, char** argv)
     bool jitChainOff = false;
     bool jitInlineMemOff = false; // --no-jit-inline-mem
     bool jitFullGate = false; // --jit-full-gate
+    bool jitHopOff = false; // --no-jit-hop
     // --jit-tsc: rdtsc the shims and the block entries (opm/jit.hpp).
     bool jitTsc = false;
     // --no-jit-direct: fallbacks go through the execRow shim, as before the
@@ -812,6 +813,9 @@ int main(int argc, char** argv)
         // ...and on, which is the default on every host with a back end.
         if (!strcmp(a, "--jit")) { jitForce = true; continue; }
         if (!strcmp(a, "--no-jit-chain")) { jitChainOff = true; continue; }
+        // The control for hops found at run time (another page, blr, bctr):
+        // those exits go to the dispatcher.
+        if (!strcmp(a, "--no-jit-hop")) { jitHopOff = true; continue; }
         // The control for the hop gate that compares MSR: every condition
         // re-tested by name at every hop between blocks.
         if (!strcmp(a, "--jit-full-gate")) { jitFullGate = true; continue; }
@@ -1581,6 +1585,7 @@ int main(int argc, char** argv)
     cpu.jitChainOff = jitChainOff;
     cpu.jitInlineMemOff = jitInlineMemOff;
     cpu.jitFullGate = jitFullGate;
+    cpu.jitHopOff = jitHopOff;
     cpu.jitTscOn = jitTsc; // JitCache is created lazily; carried on the Cpu
     cpu.jitDirectOff = jitDirectOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);

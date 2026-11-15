@@ -54,6 +54,9 @@
 #endif
 #if defined(_MSC_VER)
 #define OPM_FORCE_INLINE __forceinline
+// "marked as __forceinline not inlined": the request is a hint about speed,
+// and a compiler that declines it has still built the right program.
+#pragma warning(disable : 4714)
 #else
 #define OPM_FORCE_INLINE inline __attribute__((always_inline))
 #endif
@@ -1163,7 +1166,7 @@ F4 sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
     }
     const float ax = fx - static_cast<float>(x0);
     const float ay = fy - static_cast<float>(y0);
-    F4 q00, q01, q10, q11;
+    F4 q00 = F4::splat(0.0f), q01 = q00, q10 = q00, q11 = q00;
     // ⭐ THE FOUR TEXELS READ IN PLACE, when all four are inside the map's
     // own rules (no border color) and plainly in memory (texSpan), in one of
     // the formats fetchTexel answers from a pointer. They are decoded
@@ -1181,7 +1184,8 @@ F4 sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
         const u32 base = t.offs[l] & 0x07FFFFFFu;
         const u32 n = t.fmt == 6u ? 4u : 2u;
         const auto at = [&](u32 x, u32 y) { return base + (y * pitch + x) * n; };
-        const u8 *p00, *p01, *p10, *p11;
+        const u8 *p00 = nullptr, *p01 = nullptr, *p10 = nullptr,
+                 *p11 = nullptr;
         switch (t.fmt) {
         case 3u: case 4u: case 6u: case 15u:
             direct = texSpan(P, at(xs[0], ys[0]), n, p00) &&
@@ -1617,8 +1621,10 @@ inline F4 blendFactor(u32 sel, F4 s, F4 d, bool isSrc)
 
 // ── Interpolated fragment attributes handed to the shader ─────────────────
 struct Frag {
-    float z = 0;
+    // The two colors first: they are held to a register's alignment, and
+    // eight floats after them leave no padding anywhere.
     F4 diffuse = F4::set(255, 0, 0, 0), spec = F4::set(255, 0, 0, 0);
+    float z = 0;
     float fog = 255;
     float s1 = 0, t1 = 0, s2 = 0, t2 = 0; // perspective-resolved
     float lod1 = 0, lod2 = 0;

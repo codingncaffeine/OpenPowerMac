@@ -362,7 +362,7 @@ struct Cpu {
     // window, the paced serial injection, the ATA traffic logs), and every
     // instrument in g4run quotes it. Adding a batch's worth at the end left
     // all of them reading a count that was up to a batch behind — a lying
-    // instrument first, and a real behaviour difference second. The state
+    // instrument first, and a real behavior difference second. The state
     // differential (tools/diffstate.sh) is what caught it.
     u64 runSteps(u64 n, u64& stamp);
 
@@ -550,7 +550,7 @@ struct Cpu {
                   "snapshot layoutDigest() hashes sizeof(DLine)");
     // alignas is the whole point — an entry that straddled two host cache
     // lines would cost the second line this change exists to stop touching.
-    // MSVC's C4324 just reports that it padded Cpu to honour it, which is
+    // MSVC's C4324 just reports that it padded Cpu to honor it, which is
     // what was asked for.
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -590,7 +590,7 @@ struct Cpu {
         // --trace-from — is keyed on instructions, and a watch that reports
         // only tb cannot be lined up against any of them without interpolating
         // a rate that is not even constant. Correlating a store against when
-        // the machine changed behaviour is the whole use of this log.
+        // the machine changed behavior is the whole use of this log.
         u64 at;
         // r24 is the 68K program counter inside the NanoKernel's emulator.
         // A store made by emulated 68K code reports a pc in 0x68xxxxxx --
@@ -611,10 +611,10 @@ struct Cpu {
     // silence is not an answer: the same question asked of the bus watch
     // reported zero hits for a word that provably changed. Watching the whole
     // RECORD and censusing it by address puts the control INSIDE the run —
-    // a neighbouring field known to change is the proof the watch was armed
+    // a neighboring field known to change is the proof the watch was armed
     // and looking, so the silence of the field under test means what it says.
-    // The log cannot do this job: it is capped, so a busy neighbour fills it
-    // and the quiet field's absence becomes an artefact of the cap.
+    // The log cannot do this job: it is capped, so a busy neighbor fills it
+    // and the quiet field's absence becomes an artifact of the cap.
     // The LENGTH belongs with the count: a dcbz writes 32 bytes from one
     // address, so a census that recorded only the address would report a
     // block-zero of the record as a store to its first field and every other

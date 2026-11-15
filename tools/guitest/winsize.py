@@ -99,7 +99,7 @@ def shot(name):
     return out
 BORDER = (0x3A, 0x3A, 0x40)
 def border_bands(w, png):
-    """Runs of the border colour down the middle of the window, top to bottom."""
+    """Runs of the border color down the middle of the window, top to bottom."""
     ox, oy = origin(w); ww, wh = size(w)
     im = Image.open(png).convert("RGB")
     x, bands, y = ox + ww // 2, [], oy
@@ -112,7 +112,7 @@ def border_bands(w, png):
             y += 1
     return bands
 def splitter(w, png):
-    """The splitter: the one thick band of the border colour (the rest are hairlines)."""
+    """The splitter: the one thick band of the border color (the rest are hairlines)."""
     thick = [b for b in border_bands(w, png) if b[1] - b[0] >= 4]
     return thick[-1] if thick else None
 def console_height(w, png):

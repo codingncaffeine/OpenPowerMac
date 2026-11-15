@@ -93,7 +93,7 @@ TEST_CASE("r128 2d: GUI_STAT reports an idle engine with a free FIFO")
 {
     // GUI_FIFOCNT is bits 11:0 and its reset default is 0x40 — 64 free
     // CMDFIFO entries. A driver that waits for FIFO room before writing
-    // spins for ever on a zero, which is one of the ways this card can wedge
+    // spins forever on a zero, which is one of the ways this card can wedge
     // a guest without ever drawing anything wrong.
     R128Cell c;
     const u32 st = be(c.read(kGuiStat, 4));
@@ -125,7 +125,7 @@ TEST_CASE("r128 2d: a solid fill lands in the right pixels, most significant "
     // ⚠ Byte order is the whole point of the check above: this model's VRAM
     // holds pixels as the guest wrote them through the big-endian aperture,
     // and the scanout reads byte1/byte2/byte3 as R/G/B. Storing the fill the
-    // other way round is the bug that once turned a grey desktop olive.
+    // other way round is the bug that once turned a gray desktop olive.
     CHECK(c.vram[static_cast<size_t>(1) * kStride + 2 * 4] == 0x11);
     CHECK(c.vram[static_cast<size_t>(1) * kStride + 2 * 4 + 3] == 0x44);
 }
@@ -141,7 +141,7 @@ TEST_CASE("r128 2d: GMC_AUX_CLIP_DIS clears the three auxiliary scissor "
     CHECK(c.peek(0x1660) == 0x2Au);
 }
 
-TEST_CASE("r128 2d: BLACKNESS and WHITENESS ignore the brush colour")
+TEST_CASE("r128 2d: BLACKNESS and WHITENESS ignore the brush color")
 {
     R128Cell c;
     surface(c);
@@ -170,7 +170,7 @@ TEST_CASE("r128 2d: SRCCOPY moves a rectangle")
         for (u32 x = 0; x < 4; ++x)
             setPix(c, x, y, 0xA0000000u | (y * 16u + x));
 
-    wr(c, kGmc, gmc(0xCCu, 3u, 2u)); // SRCCOPY, colour source from memory
+    wr(c, kGmc, gmc(0xCCu, 3u, 2u)); // SRCCOPY, color source from memory
     surface(c);
     wr(c, kSrcYX, 0);                        // from (0,0)
     wr(c, kDstYX, 10u | (5u << 16));         // to (10,5)
@@ -188,7 +188,7 @@ TEST_CASE("r128 2d: SRCCOPY moves a rectangle")
 // function 5 is "draw when not equal", 4 "draw when equal", 1 "never draw",
 // each against a key through a mask, on the source pixel (bits 25:24 = 1),
 // the destination pixel (0) or both (2).
-TEST_CASE("r128 2d: a source colour key leaves the destination where the "
+TEST_CASE("r128 2d: a source color key leaves the destination where the "
           "source is the key")
 {
     constexpr u32 kClrCmpCntl = 0x15C0, kKeySrc = 0x15C4, kKeyDst = 0x15C8,
@@ -196,7 +196,7 @@ TEST_CASE("r128 2d: a source colour key leaves the destination where the "
     for (const u32 fn : {5u, 4u, 1u, 0u}) {
         R128Cell c;
         surface(c);
-        // A 4x1 source: key, colour, key-but-for-the-top-byte, colour.
+        // A 4x1 source: key, color, key-but-for-the-top-byte, color.
         setPix(c, 0, 0, 0x00000000u);
         setPix(c, 1, 0, 0x00112233u);
         setPix(c, 2, 0, 0xFF000000u);
@@ -241,13 +241,13 @@ TEST_CASE("r128 2d: a source colour key leaves the destination where the "
     }
 }
 
-TEST_CASE("r128 2d: a destination colour key draws only over the key, fills "
+TEST_CASE("r128 2d: a destination color key draws only over the key, fills "
           "included")
 {
     constexpr u32 kClrCmpCntl = 0x15C0, kKeyDst = 0x15C8, kCmpMsk = 0x15CC;
     R128Cell c;
     surface(c);
-    setPix(c, 30, 4, 0x00FF00FFu); // the key colour
+    setPix(c, 30, 4, 0x00FF00FFu); // the key color
     setPix(c, 31, 4, 0x00123456u); // anything else
     setPix(c, 32, 4, 0x00FF00FFu);
     wr(c, kGmc, gmc(0xF0u, 0u, 0u)); // PATCOPY: a solid fill
@@ -480,13 +480,13 @@ TEST_CASE("r128 2d: a pattern with the background left alone draws only its "
     patternFill(c, 1u, 0xF0u, 0u, 0, 0, 8, 1);
     CHECK(pix(c, 0, 0) == 0x00F0F0F0u); // the one set bit of row 0
     for (u32 x = 1; x < 8; ++x)
-        CHECK(pix(c, x, 0) == 0x00ABCDEFu); // not the background colour
+        CHECK(pix(c, x, 0) == 0x00ABCDEFu); // not the background color
 }
 
 TEST_CASE("r128 2d: the pattern is anchored to the surface, at BRUSH_Y_X")
 {
     // Two rectangles that do not start on a tile boundary continue one
-    // pattern: a pixel's colour depends on where it is, not on where its
+    // pattern: a pixel's color depends on where it is, not on where its
     // rectangle began.
     R128Cell c;
     patternFill(c, 0u, 0xF0u, 0u, 3, 1, 10, 4);
@@ -528,15 +528,15 @@ TEST_CASE("r128 2d: a pattern under an XOR draws and undraws an outline")
 TEST_CASE("r128 2d: an op that reads a pattern this engine has no data for is "
           "declined, not painted as a solid guess")
 {
-    // The solid brush and the 8x8 mono pattern are modelled. The other
+    // The solid brush and the 8x8 mono pattern are modeled. The other
     // pattern brushes have no layout in anything on the shelf, so an op that
     // would actually READ one must draw nothing rather than paint a flat
-    // colour where a chequer belongs. Never paint a guess.
+    // color where a chequer belongs. Never paint a guess.
     R128Cell c;
     surface(c);
     setPix(c, 0, 0, 0x12345678u);
     const auto before = r128EngStats();
-    // brush datatype 10 = 8x8 colour pattern, with PATCOPY, which reads it.
+    // brush datatype 10 = 8x8 color pattern, with PATCOPY, which reads it.
     wr(c, kGmc, 0x0Fu | (10u << 4) | (6u << 8) | (0xF0u << 16) | (2u << 24));
     surface(c);
     wr(c, kDstYX, 0);
@@ -643,14 +643,14 @@ constexpr u32 kDpCntlLine = 0x16D0; // DP_CNTL_XDIR_YDIR_YMAJOR
 // A solid PATCOPY line from (x0, y0) toward (x1, y1), `count` pixels, with
 // the terms the SDK's sample computes.
 void line(R128Cell& c, int x0, int y0, int x1, int y1, u32 count,
-          u32 rop3 = 0xF0u, u32 colour = 0x00C0FFEEu)
+          u32 rop3 = 0xF0u, u32 color = 0x00C0FFEEu)
 {
     const int dx = x1 > x0 ? x1 - x0 : x0 - x1;
     const int dy = y1 > y0 ? y1 - y0 : y0 - y1;
     const int large = dx < dy ? dy : dx, small = dx < dy ? dx : dy;
     wr(c, kGmc, gmc(rop3, 3u, 2u));
     surface(c);
-    wr(c, kBrushFrgd, colour);
+    wr(c, kBrushFrgd, color);
     wr(c, kDpCntlLine, (x0 < x1 ? 1u << 31 : 0u) | (y0 < y1 ? 1u << 15 : 0u) |
                            (dx < dy ? 4u : 0u));
     wr(c, kDstYX, static_cast<u32>(x0) | (static_cast<u32>(y0) << 16));
@@ -794,7 +794,7 @@ u32 bswap(u32 v) { return be(v); }
 } // namespace
 
 TEST_CASE("r128 2d: a one-bit source in video memory is expanded to the two "
-          "source colours")
+          "source colors")
 {
     R128Cell c;
     monoBitmap(c);
@@ -814,7 +814,7 @@ TEST_CASE("r128 2d: a one-bit source in video memory is expanded to the two "
 }
 
 TEST_CASE("r128 2d: a see-through one-bit source draws its set bits only, "
-          "and the pixel order and source position are honoured")
+          "and the pixel order and source position are honored")
 {
     R128Cell c;
     monoBitmap(c);
@@ -823,7 +823,7 @@ TEST_CASE("r128 2d: a see-through one-bit source draws its set bits only, "
         setPix(c, x, 2, 0x00777777u);
     monoCopy(c, 1u, 0u, 4, 2);
     CHECK(pix(c, 4, 2) == kFg);
-    CHECK(pix(c, 5, 2) == 0x00777777u); // not the background colour
+    CHECK(pix(c, 5, 2) == 0x00777777u); // not the background color
     CHECK(pix(c, 6, 2) == kFg);
     // Least significant bit first: 0xA0 is now pixels 5 and 7, 0x01 pixel 0.
     R128Cell d;
@@ -842,12 +842,12 @@ TEST_CASE("r128 2d: a see-through one-bit source draws its set bits only, "
     CHECK(pix(e, 5, 1) == kFg); // row 1's pixel 7, two to the left
 }
 
-TEST_CASE("r128 2d: colour pixels stored to HOST_DATA fill the rectangle "
+TEST_CASE("r128 2d: color pixels stored to HOST_DATA fill the rectangle "
           "that was set up, in memory byte order")
 {
     R128Cell c;
     const auto before = r128EngStats();
-    wr(c, kGmc, gmc(0xCCu, 3u, 3u)); // colour source, loaded through host data
+    wr(c, kGmc, gmc(0xCCu, 3u, 3u)); // color source, loaded through host data
     surface(c);
     wr(c, kDstYX, 1u | (1u << 16));
     wr(c, kDstHeightWidth, 2u | (2u << 16)); // sets the rectangle up: no draw

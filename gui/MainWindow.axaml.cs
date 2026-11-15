@@ -14,7 +14,7 @@ using OpenPowerMac.Shell;
 
 namespace OpenPowerMac.Gui;
 
-/// <summary>The Linux window. Behaviour follows the Windows front end
+/// <summary>The Linux window. Behavior follows the Windows front end
 /// (shell/MainWindow.xaml.cs) menu for menu; the machine itself is driven by
 /// the shared <see cref="MachineSession"/>, which owns every capi call on its
 /// own thread. This class only queues input and draws what the session

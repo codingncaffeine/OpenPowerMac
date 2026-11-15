@@ -20,7 +20,7 @@
 #   tools/diffstate.sh --from $OPM_SCRATCH/desk28_ft4.snap \
 #                      --max 15200000000 --every 25000000
 #
-# Anything after the recognised options is passed to BOTH runs. Run B always
+# Anything after the recognized options is passed to BOTH runs. Run B always
 # adds the controls (--no-batch --no-line-exec), so what is being compared is
 # "the machine as it ships" against "the machine as it was before any of this".
 set -uo pipefail

@@ -230,7 +230,7 @@ TEST_CASE("an ATA disk addresses in CHS when the device register says so")
 // the CD — an ATAPI packet and its payload go through the task file here — and
 // silently destroyed every byte of a disk write once there was a disk. The
 // transfer reported success, the drive kept waiting for data that had already
-// been thrown away, and initialising a disk stopped there.
+// been thrown away, and initializing a disk stopped there.
 TEST_CASE("a DMA write reaches the image, and asserts no PIO handshake")
 {
     REQUIRE(makeSectorIso());

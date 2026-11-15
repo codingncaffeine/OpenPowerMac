@@ -146,7 +146,7 @@ TEST_CASE("3d: two triangles sharing an edge cover a quad exactly once")
     CHECK(r.pix32(0, 32) == 0u);  // bottom edge exclusive
 }
 
-TEST_CASE("3d: Gouraud interpolation lands the corner colours and the blend")
+TEST_CASE("3d: Gouraud interpolation lands the corner colors and the blend")
 {
     Rig3d r;
     r.dst32();
@@ -174,7 +174,7 @@ TEST_CASE("3d: Z-less rejects the farther triangle wherever they overlap")
     r.dst32();
     r.openGate();
     r.fpuSolidBoth();
-    // Z16 buffer at 128 KB, 64-px pitch, initialised to the far plane.
+    // Z16 buffer at 128 KB, 64-px pitch, initialized to the far plane.
     for (u32 i = 0; i < 64u * 64u * 2u; ++i)
         r.c.vram[0x20000u + i] = 0xFF;
     r.reg(0x1C90u, 0x20000u);
@@ -242,14 +242,14 @@ TEST_CASE("3d: alpha test rejects below the reference")
     CHECK(r.pix32(4, 4) == 0u);
 }
 
-TEST_CASE("3d: vertex fog carries the fragment to the fog colour")
+TEST_CASE("3d: vertex fog carries the fragment to the fog color")
 {
     Rig3d r;
     r.dst32();
     r.openGate();
     r.fpuSolidBoth();
     r.reg(0x1C9Cu, 1u << 7);        // FOG_ENABLE, vertex fog (misc bit14=0)
-    r.reg(0x1CACu, 0x0000FF00u);    // fog colour: green
+    r.reg(0x1CACu, 0x0000FF00u);    // fog color: green
     // Format RHW|DIFFUSE_ARGB|SPEC_FRGB: the FRGB dword's top byte is the
     // fog factor — zero means fully fogged.
     std::vector<u32> v;
@@ -278,7 +278,7 @@ TEST_CASE("3d: the fog table is written through the index/data pair and used")
     r.fpuSolidBoth();
     r.reg(0x1C9Cu, 1u << 7);
     r.reg(0x1CA0u, (2u << 8) | (1u << 14)); // FOG_TABLE_EN
-    r.reg(0x1CACu, 0x000000FFu);            // fog colour: blue
+    r.reg(0x1CACu, 0x000000FFu);            // fog color: blue
     // Table: everything fully fogged, through the auto-incrementing pair.
     r.reg(0x1A14u, 0);
     for (u32 i = 0; i < 256u; ++i)
@@ -291,7 +291,7 @@ TEST_CASE("3d: the fog table is written through the index/data pair and used")
     CHECK(r.pix32(4, 4) == 0xFF0000FFu);
 }
 
-TEST_CASE("3d: backface culling honours the winding and the front-face rule")
+TEST_CASE("3d: backface culling honors the winding and the front-face rule")
 {
     Rig3d r;
     r.dst32();
@@ -335,7 +335,7 @@ TEST_CASE("3d: a triangle strip alternates winding without alternating faces")
     CHECK(e.triPixels - before.triPixels == 1024);
 }
 
-TEST_CASE("3d: nearest-neighbour texturing maps the quadrants of a 2x2")
+TEST_CASE("3d: nearest-neighbor texturing maps the quadrants of a 2x2")
 {
     Rig3d r;
     r.dst32();
@@ -380,7 +380,7 @@ TEST_CASE("3d: nearest-neighbour texturing maps the quadrants of a 2x2")
 
 // TEX_CNTL_C bit 13: the texel's one alpha bit as a cutout. A driver sets it
 // with blending and the alpha test both off for textures that carry a shape,
-// and the texels outside the shape are not drawn at all — not their colour,
+// and the texels outside the shape are not drawn at all — not their color,
 // and not their depth, or whatever is drawn behind the quad afterwards would
 // be cut to its rectangle anyway.
 TEST_CASE("3d: the texel alpha mask draws nothing where the alpha bit is clear")
@@ -577,7 +577,7 @@ TEST_CASE("3d: perspective correction divides premultiplied S by rhw")
     // numerator 0.195, rhw 0.414 → perspective-correct u = 0.47 → texel 1
     // (green). Skipping the divide reads the numerator as u: 0.195 → texel
     // 0 (red). Re-multiplying by rhw (the old double-multiply defect):
-    // 0.049/0.414 → texel 0 as well. The colour names the one right path.
+    // 0.049/0.414 → texel 0 as well. The color names the one right path.
     vtxW(0, 0, 0, 1.0f);
     vtxW(16, 0, 1, 0.25f);
     vtxW(0, 16, 0, 1.0f);
@@ -903,7 +903,7 @@ TEST_CASE("3d: a zero function in one register does not close the gate the "
     CHECK(r128EngStats().gated3d - before.gated3d == 0);
 }
 
-TEST_CASE("3d: a 565 destination quantises and stores big-endian pixels")
+TEST_CASE("3d: a 565 destination quantizes and stores big-endian pixels")
 {
     Rig3d r;
     r.dst16();
@@ -983,7 +983,7 @@ TEST_CASE("3d: points and lines land with their attributes")
 
 namespace {
 
-// A flat 30x8 rectangle of one colour, as two triangles, into the 565
+// A flat 30x8 rectangle of one color, as two triangles, into the 565
 // destination. Returns the sums over its 240 pixels of each channel put
 // back on the 0..255 scale.
 struct Sums {
@@ -1015,18 +1015,18 @@ constexpr u32 kDitherEn = 1u << 8;
 
 } // namespace
 
-TEST_CASE("3d: error diffusion stores a flat colour's mean, where cutting the "
+TEST_CASE("3d: error diffusion stores a flat color's mean, where cutting the "
           "low bits stored it too dark")
 {
     // Red 100, green 101, blue 7 of 255: none of them a level the 565
     // destination has.
-    const u32 colour = 0xFF646507u;
+    const u32 color = 0xFF646507u;
     {
         Rig3d r;
         r.dst16();
         r.openGate();
         r.fpuSolidBoth();
-        const Sums cut = flatRect(r, colour); // dithering off: as before
+        const Sums cut = flatRect(r, color); // dithering off: as before
         CHECK(cut.r == 240u * 96u);
         CHECK(cut.g == 240u * 100u);
         CHECK(cut.b == 0u);
@@ -1037,7 +1037,7 @@ TEST_CASE("3d: error diffusion stores a flat colour's mean, where cutting the "
     r.openGate();
     r.fpuSolidBoth();
     r.reg(kTexCntlC, kDitherEn); // SCALE_3D_CNTL is zero: error diffusion
-    const Sums d = flatRect(r, colour);
+    const Sums d = flatRect(r, color);
     // What is stored plus what the register still holds is exactly what was
     // asked for, so the sums are short by less than one step.
     CHECK(d.r <= 240u * 100u);
@@ -1046,7 +1046,7 @@ TEST_CASE("3d: error diffusion stores a flat colour's mean, where cutting the "
     CHECK(d.g > 240u * 101u - 4u);
     CHECK(d.b <= 240u * 7u);
     CHECK(d.b > 240u * 7u - 8u);
-    // And it is a dither: both neighbouring levels are in the picture.
+    // And it is a dither: both neighboring levels are in the picture.
     bool low = false, high = false;
     for (u32 x = 0; x < 30; ++x) {
         const u32 r5 = (r.pix16(x, 0) >> 11) & 0x1Fu;
@@ -1093,14 +1093,14 @@ TEST_CASE("3d: DITHER_INIT resets the error where each scanline begins")
 TEST_CASE("3d: table dither and a 32 bpp destination are drawn as with "
           "dithering off")
 {
-    const u32 colour = 0xFF646507u;
+    const u32 color = 0xFF646507u;
     Rig3d table;
     table.dst16();
     table.openGate();
     table.fpuSolidBoth();
     table.reg(kScale3dCntl, 1u << 1); // SCALE_DITHER = 1: the table method
     table.reg(kTexCntlC, kDitherEn);
-    const Sums t = flatRect(table, colour);
+    const Sums t = flatRect(table, color);
     CHECK(t.r == 240u * 96u);
     CHECK(t.g == 240u * 100u);
     CHECK(t.b == 0u);
@@ -1111,12 +1111,12 @@ TEST_CASE("3d: table dither and a 32 bpp destination are drawn as with "
     deep.fpuSolidBoth();
     deep.reg(kTexCntlC, kDitherEn);
     std::vector<u32> v;
-    Rig3d::vtx(v, 0, 0, 0.5f, colour);
-    Rig3d::vtx(v, 30, 0, 0.5f, colour);
-    Rig3d::vtx(v, 0, 8, 0.5f, colour);
+    Rig3d::vtx(v, 0, 0, 0.5f, color);
+    Rig3d::vtx(v, 30, 0, 0.5f, color);
+    Rig3d::vtx(v, 0, 8, 0.5f, color);
     deep.prim(0x9u, 4u, 3u, v);
     for (u32 x = 0; x < 8; ++x)
-        CHECK(deep.pix32(x, 1) == colour);
+        CHECK(deep.pix32(x, 1) == color);
 }
 
 // ── Sub-pixel precision (r128_3d.cpp snapVertex) ──────────────────────────
@@ -1145,7 +1145,7 @@ void rectTo(Rig3d& r, float right)
 
 TEST_CASE("3d: a corner is placed on the sub-pixel grid the guest selects")
 {
-    // The edge is asked for at x = 10.7. Pixel 10's centre is 10.5: inside
+    // The edge is asked for at x = 10.7. Pixel 10's center is 10.5: inside
     // an edge at 10.7 or 10.6875 or 10.75, and ON an edge at 10.5, which a
     // right-hand edge does not take.
     {
@@ -1196,7 +1196,7 @@ TEST_CASE("3d: two triangles that share snapped corners still meet exactly")
     Rig3d::vtx(v, rt, b, 0.5f, 0xFF0000FFu);
     Rig3d::vtx(v, l, b, 0.5f, 0xFF0000FFu);
     r.prim(0x9u, 4u, 6u, v);
-    // Snapped: x from 1.25 to 21.75, y from 2.5 to 13.0. Centres taken:
+    // Snapped: x from 1.25 to 21.75, y from 2.5 to 13.0. Centers taken:
     // x 1..21 (1.5 .. 21.5), y 2..12 (2.5 on the top edge, which a top edge
     // takes, to 12.5).
     u32 drawn = 0;
@@ -1306,10 +1306,10 @@ TEST_CASE("3d: a CI4 texel is a byte, its index in the low four bits")
 }
 
 TEST_CASE("3d: the 16-bit alpha formats carry alpha above an index or a "
-          "grey level")
+          "gray level")
 {
     {
-        Rig3d r; // 10: a:pseudocolour 8:8
+        Rig3d r; // 10: a:pseudocolor 8:8
         r.dst32();
         r.openGate();
         r.fpuSolidBoth();
@@ -1328,7 +1328,7 @@ TEST_CASE("3d: the 16-bit alpha formats carry alpha above an index or a "
         CHECK(r.pix32(3, 12) == 0x100000FFu);
     }
     {
-        Rig3d r; // 13: a:grey 8:8
+        Rig3d r; // 13: a:gray 8:8
         r.dst32();
         r.openGate();
         r.fpuSolidBoth();

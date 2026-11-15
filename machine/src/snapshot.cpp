@@ -1,5 +1,5 @@
 // Machine snapshot / restore — every mutable field of the CPU and of every
-// modelled device, written by hand in one place.
+// modeled device, written by hand in one place.
 //
 // It is deliberately ONE file. The property that makes a snapshot usable as
 // evidence is completeness, and completeness is auditable only if the whole
@@ -1274,7 +1274,7 @@ void SawtoothBus::snapLoad(SnapReader& r)
     sndOut_.dmaBus = sndIn_.dmaBus = this;
     sndOut_.dev = sndIn_.dev = &snd_;
     // The device-service gate is a CACHE of "when could an interrupt line next
-    // change", and every device it summarises has just been replaced. Say
+    // change", and every device it summarizes has just been replaced. Say
     // "unknown" rather than carry a deadline computed for a different machine:
     // a stale one would withhold an interrupt until the guest happened to
     // touch a register. Nothing here needs to be in the stream — this restores

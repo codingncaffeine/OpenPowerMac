@@ -191,7 +191,7 @@ internal static class Native
     // applies its own acceleration or pins at a screen edge, and then aiming
     // the host pointer at the Apple menu leaves the guest's somewhere else.
     // The cure is to stop having two of them: hide the host pointer, warp it
-    // back to the centre after every move, and feed the guest the raw travel.
+    // back to the center after every move, and feed the guest the raw travel.
     // The guest's cursor becomes the only one on screen.
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

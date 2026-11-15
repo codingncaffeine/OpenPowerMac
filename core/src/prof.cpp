@@ -45,7 +45,7 @@ void sampler(unsigned hz)
         const auto now = clock::now();
         if (now < next) {
             // Sleep only when the wait is long enough that the OS scheduler
-            // can honour it; Windows' sleep granularity is milliseconds, so a
+            // can honor it; Windows' sleep granularity is milliseconds, so a
             // 250 us period has to be spun. One core out of many is a fair
             // price for not perturbing the thread under measurement.
             if (next - now > std::chrono::milliseconds(2))

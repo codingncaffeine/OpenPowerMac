@@ -20,16 +20,16 @@
 //
 // ⚠ CONVENTIONS THIS FILE MUST AGREE WITH, all inherited from the 2D engine:
 // a pixel in VRAM is stored MOST SIGNIFICANT BYTE FIRST (the big-endian
-// aperture the Mac paints through; getting this wrong once made a grey
+// aperture the Mac paints through; getting this wrong once made a gray
 // desktop olive), the Z buffer uses the same byte order because the guest
 // CLEARS Z with 2D PAINT ops through the same store path, and every counter
 // lives in a file-static so sizeof(R128Cell) — and with it every snapshot —
 // never moves.
 //
 // Known simplifications, each visible rather than silent: dithering rounds
-// instead of patterning (DITHER_ENABLE is honoured as "convert with
+// instead of patterning (DITHER_ENABLE is honored as "convert with
 // rounding"; the two documented dither algorithms are not reproduced),
-// error-diffusion state is not modelled, tiled textures and Z (bit flags
+// error-diffusion state is not modeled, tiled textures and Z (bit flags
 // observed) are counted and read as linear, and VQ/CI16 texel formats
 // decline. Lines use a DDA rather than the hardware's undocumented exact
 // rule; adjacency of LINES is not pixel-exact against real silicon.
@@ -82,7 +82,7 @@ constexpr u32 kPrimTexBorderColorC = 0x1D38;
 constexpr u32 kSecTexBorderColorC = 0x1D3C;
 constexpr u32 kStenRefMaskC = 0x1D40;    // ref 7:0, mask 23:16, wrmask 31:24
 constexpr u32 kPlane3dMaskC = 0x1D44;
-constexpr u32 kDpDatatype = 0x16C4;      // canonical, engWrite-normalised
+constexpr u32 kDpDatatype = 0x16C4;      // canonical, engWrite-normalized
 constexpr u32 kDstOffset = 0x1404, kDstPitch = 0x1408;
 constexpr u32 kScLeft = 0x1640, kScRight = 0x1644;
 constexpr u32 kScTop = 0x1648, kScBottom = 0x164C;
@@ -90,7 +90,7 @@ constexpr u32 kEngAddrMask = 0x03FFFFF0u;
 // The card's internal address split: offsets at or above 32 MB are the AGP
 // aperture — system memory through the GART. r128_reg.h pins the constant
 // (R128_AGP_TEX_OFFSET 0x02000000) and the 2D engine already refuses such
-// destinations; textures are where this model finally honours them.
+// destinations; textures are where this model finally honors them.
 constexpr u32 kAgpWindow = 0x02000000u;
 
 // ── File-static engine state (NEVER members: snapshot rule) ───────────────
@@ -100,7 +100,7 @@ constexpr u32 kAgpWindow = 0x02000000u;
 // as the parser's staging FIFO, and minted snapshots are quiescent.
 // f=255 is "no fog" in the blend equation, so an unwritten table must read
 // 255 from the very first machine of the process — g4run never calls the
-// reset, and a zero-initialised table would fog that machine solid.
+// reset, and a zero-initialized table would fog that machine solid.
 struct FogTable {
     u8 t[256];
     FogTable() { std::memset(t, 0xFF, sizeof t); }
@@ -112,7 +112,7 @@ u32 gPalette[2][256]; // LOAD_PALETTE targets; CI4 uses entries 0..15
 // the MISC word in the same Packet-0 — a strict power-on gate would drop
 // exactly the init sequence the shipping drivers use. 0 = a guest set the
 // function to something other than TEXMAP_SHADE: the block drops writes, the
-// documented behaviour a driver may rely on. 1 = open.
+// documented behavior a driver may rely on. 1 = open.
 int gGate3d = -1;
 // The vertex-walker continuation latch for NEXT_VERTEX_BUNDLE (F.27): the
 // bundle carries only indices, "rendered in the same manner as those of the
@@ -126,7 +126,7 @@ struct WalkLatch {
 // With TEX_CNTL_C:DITHER_EN set, a 15 or 16 bpp destination is dithered by
 // one of two methods, SCALE_3D_CNTL:SCALE_DITHER choosing: 0 = error
 // diffusion, 1 = a table lookup. The manual gives no table, so table dither
-// stays as it was (the colour rounded to 8 bits and cut to the channel's
+// stays as it was (the color rounded to 8 bits and cut to the channel's
 // width) and the census marks it. Error diffusion it describes by its
 // register: "the current contents of the error register" are used at the
 // start of a scanline, or the error is reset to zero there, as DITHER_INIT
@@ -138,12 +138,12 @@ struct WalkLatch {
 //     5-bit channel, two for the 6-bit green), which is what an adder that
 //     keeps its remainder holds;
 //   - what happens at full scale: the sum is held at 255;
-//   - the order pixels meet the register: this rasteriser's own, each
+//   - the order pixels meet the register: this rasterizer's own, each
 //     primitive's rows top to bottom and left to right, the register going
 //     from one primitive to the next, and only a pixel that is written
 //     moving it.
 // What it does guarantee is what dithering is for: along a span the mean of
-// what is stored equals the colour asked for, where cutting the low bits
+// what is stored equals the color asked for, where cutting the low bits
 // stored a level too dark by half a step on average.
 struct DitherError {
     u32 r = 0, g = 0, b = 0;
@@ -409,7 +409,7 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     case 3u: case 4u: P.bypp = 2; break; // aRGB1555 / RGB565
     case 6u: P.bypp = 4; break;          // aRGB8888 (X byte stored)
     default:
-        ++eng().badBpp; // 8-bpp and YUV destinations are not rasterised
+        ++eng().badBpp; // 8-bpp and YUV destinations are not rasterized
         return false;
     }
     P.dstType = dt;
@@ -420,7 +420,7 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
         return false;
     }
     if (P.dstOff >= (32u << 20)) {
-        ++eng().agpTarget; // rendering INTO system memory: not modelled
+        ++eng().agpTarget; // rendering INTO system memory: not modeled
         return false;
     }
     P.scL = sx14c(c.peek(kScLeft));
@@ -604,7 +604,7 @@ Rgba yuvToRgb(float y, float u, float v, float a)
 
 // Fetch and decode ONE texel at integer coordinates (already wrapped),
 // mip level l. False = unreadable (off VRAM / GART miss) — the border
-// colour stands in, which keeps a bad fetch visible without a crash.
+// color stands in, which keeps a bad fetch visible without a crash.
 bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
                 Rgba& out)
 {
@@ -706,7 +706,7 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         return true;
     }
     case 8u:  // Y8
-    case 9u: { // RGB8 grey
+    case 9u: { // RGB8 gray
         if (!b8(base + y * pitch + x, b0))
             return false;
         out.a = 255;
@@ -754,7 +754,7 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     // The two 16-bit formats with an alpha byte (SDK F-20: 10 is "16 bpp
     // a:pseudocolor (8:8)", 13 is "16 bpp a:RGB8 greyscale (8:8)"): the
     // 16-bit texel has alpha in its high byte, as the 1555 texel has its
-    // alpha bit on top, and a palette index or a grey level in its low one.
+    // alpha bit on top, and a palette index or a gray level in its low one.
     case 10u: {
         const u32 at = base + (y * pitch + x) * 2u;
         if (!b8(at, b0) || !b8(at + 1u, b1))
@@ -781,7 +781,7 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
 }
 
 // Wrap one coordinate per the unit's clamp mode. Returns false when border
-// colour applies instead of a fetch.
+// color applies instead of a fetch.
 bool wrapCoord(u32 mode, int i, u32 n, u32& out)
 {
     const int size = static_cast<int>(n);
@@ -796,7 +796,7 @@ bool wrapCoord(u32 mode, int i, u32 n, u32& out)
     case 2u: // clamp to edge
         out = static_cast<u32>(i < 0 ? 0 : i >= size ? size - 1 : i);
         return true;
-    case 3u: // border colour beyond the edge
+    case 3u: // border color beyond the edge
         if (i < 0 || i >= size)
             return false;
         out = static_cast<u32>(i);
@@ -830,14 +830,14 @@ Rgba sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
     const u32 h = t.hTex >> l ? t.hTex >> l : 1u;
     const u32 clampS = (t.cntl >> 8) & 3u;
     const u32 clampT = (t.cntl >> 11) & 3u;
-    // ⚠⚠ S/T ARE NORMALISED [0,1] PER TILE — and the ST CENSUS DOES NOT
+    // ⚠⚠ S/T ARE NORMALIZED [0,1] PER TILE — and the ST CENSUS DOES NOT
     // SETTLE IT. Reading texel-space out of the census extrema (s up to
     // 126.7 with a 128-texel texture bound) was wrong, and the user's eyes
     // rejected it: the picture went blacker and flatter, so this reverted.
     //
     // Why the census cannot decide: it reports GLOBAL extrema over every
     // vertex in the session, not the span of any one triangle, and the two
-    // readings are each self-consistent with it. Normalised coordinates
+    // readings are each self-consistent with it. Normalized coordinates
     // with tiling factors up to ~126 (a ground plane repeating its texture)
     // produce exactly the same extrema as texel coordinates over a
     // 128-texel map. The discriminator is the PER-TRIANGLE span against
@@ -937,7 +937,7 @@ Rgba sampleTex(const Pipe& P, const TexUnit& t, float s, float tt, float lod)
 //
 // factor selections resolve to RGBA operands; the combine function folds the
 // two into the unit's output. `tex` is this unit's sample, `interp` the
-// iterated vertex colour, `prev` the previous unit's output (secondary only).
+// iterated vertex color, `prev` the previous unit's output (secondary only).
 Rgba pickColorFactor(const Pipe& P, u32 sel, const Rgba& tex,
                      const Rgba& interp, const Rgba& prev)
 {
@@ -1034,7 +1034,7 @@ Rgba combineUnit(const Pipe& P, const TexUnit& t, const Rgba& tex,
 }
 
 // TEX_LIGHT_FN / ALPHA_LIGHT_FN (Tables 6-15/6-16): the post-multitexture
-// combine of the texture result with the iterated colour. The colour field
+// combine of the texture result with the iterated color. The color field
 // reads 4 bits wide (17:14) — the SDK's table runs to state 15 and the gap
 // to ALPHA_LIGHT at 18 is exactly four bits; r128_reg.h names only 0..7 and
 // both readings agree there.
@@ -1273,7 +1273,7 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
         // cut-away part in the texels' own black.
         //
         // So: the texture's alpha is one bit, and a sample whose bit is
-        // clear writes nothing — no colour, no depth. The sample's alpha is
+        // clear writes nothing — no color, no depth. The sample's alpha is
         // taken after filtering and rounded to that bit, which is what
         // leaves a bilinear sample on the shape's edge its darkened rim.
         // ⚠ That last choice is this model's: nothing here says whether the
@@ -1297,7 +1297,7 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
         color.b = clamp255(color.b + fr.spec.b);
     }
     if (P.fogEn) {
-        // f=255 is "all primitive colour". Vertex fog interpolates the
+        // f=255 is "all primitive color". Vertex fog interpolates the
         // specular alpha (SDK's own definition); table fog indexes the
         // 256-entry table by z.
         float f;
@@ -1400,7 +1400,7 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
 // ── Triangle rasterizer ───────────────────────────────────────────────────
 //
 // Screen-space edge functions, D3D top-left fill rule, pixel centers at
-// +0.5. Colours interpolate screen-linear (the era's hardware did not
+// +0.5. Colors interpolate screen-linear (the era's hardware did not
 // perspective-correct Gouraud); texture S,T arrive as premultiplied
 // numerators, interpolate screen-linearly alongside rhw, and divide per
 // pixel unless the unit disables perspective.
@@ -1435,7 +1435,7 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
         return;
     }
     // The per-triangle S/T span against the bound texture size — the
-    // measurement that tells normalised coordinates from texel ones. Taken
+    // measurement that tells normalized coordinates from texel ones. Taken
     // before any culling so the sample is of what the guest SENT.
     if (P.texAny && P.tex[0].wTex) {
         const float sMin = std::min(v0.s1, std::min(v1.s1, v2.s1));
@@ -1847,7 +1847,7 @@ struct VtxSource {
 // driven through its registers), and the register guide gives the formats
 // S.12.2 and S.11.4 for the window offset that is added to them. Corners
 // shared by two triangles land on the same step, so the pair still meets
-// without a gap; what changes against exact positions is which pixel centres
+// without a gap; what changes against exact positions is which pixel centers
 // an edge takes when it passes within a step of them.
 void snapVertex(const Pipe& P, Vtx& v)
 {
@@ -1858,7 +1858,7 @@ void snapVertex(const Pipe& P, Vtx& v)
     };
     v.x = snap(v.x);
     v.y = snap(v.y);
-    // Texture coordinates. The rasteriser works on S and T ALREADY
+    // Texture coordinates. The rasterizer works on S and T ALREADY
     // multiplied by W (the numerators of the perspective divide), which is
     // how the Mac driver sends them, with SETUP_CNTL's bit 9 set
     // (TEXTURE_ST_DIRECT: use them as they are). With the bit clear
@@ -2104,19 +2104,19 @@ bool r128Reg3dDecodedBits(u32 off, u32& mask)
     // PRIM/SEC_TEX_CNTL_C: the two filters, mip disable, the clamp modes,
     // perspective disable, the datatype, the palette select; the secondary
     // unit's coordinate select. Bits 25:24 are the palette entries' own
-    // datatype: a pseudo-colour texel is read through the palette at the
+    // datatype: a pseudo-color texel is read through the palette at the
     // width it was loaded with whatever they say (a simplification the
     // header lists), and no other format looks at a palette.
     case kPrimTexCntlC: mask = 0x033F5BFEu; return true;
     case kSecTexCntlC: mask = 0x033F5BFFu; return true;
-    // The combine registers: colour function and its two factors, alpha
+    // The combine registers: color function and its two factors, alpha
     // function and its two factors.
     case kPrimTexCombineCntlC:
     case kSecTexCombineCntlC: mask = 0x0E3FFCFFu; return true;
     // SCALE_3D_CNTL (r128_reg.h; the books give two of its fields): the 3D
     // function, which gates the block, and the texel cache's four settings,
     // which have nothing to act on here. The dither method (1) and the error
-    // reset (3) are in the value census, as is the colour key function the
+    // reset (3) are in the value census, as is the color key function the
     // Mac driver writes in the top two bits. Not read: 4 (24-bit rounding),
     // 8 (scaler pixel replication), 10 (a YUV mode), and 12 to 29, which
     // repeat MISC_3D_STATE_CNTL's fields: this model takes those from that
@@ -2200,7 +2200,7 @@ bool r128Eng3dWrite(R128Cell& c, u32 off, u32 v)
     if (off >= kZOffsetC && off <= kPlane3dMaskC && off != kMisc3dStateCntl) {
         if (gGate3d == 0) {
             ++eng().gated3d;
-            return true; // dropped, the documented behaviour
+            return true; // dropped, the documented behavior
         }
         c.setReg(off, v);
         return true;

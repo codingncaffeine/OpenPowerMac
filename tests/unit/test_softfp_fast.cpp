@@ -301,7 +301,7 @@ TEST_CASE("softfp: double fast path across the alignment window")
 
 TEST_CASE("softfp: double fast path on cancellation and exact sums")
 {
-    // Residues that carry the whole answer: near-cancelling pairs (where FR
+    // Residues that carry the whole answer: near-canceling pairs (where FR
     // and FI are decided by bits far below the result) and sums that are
     // exactly representable (where the fast path must report FI=0 and hand
     // back a bit-identical zero or sum).

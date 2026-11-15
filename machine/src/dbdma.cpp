@@ -111,7 +111,7 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
             // was the whole of it, while the comment claimed it "drops the
             // standing list state" — it left that state exactly where it was,
             // so a channel parked mid-descriptor stayed RUN|ACTIVE on the same
-            // descriptor for ever.
+            // descriptor forever.
             //
             // ⛔ That hung the Mac OS 9 boot during extension loading. A serial
             // driver programs SCC receive B (+0x8700) with an INPUT_MORE for
@@ -132,7 +132,7 @@ void DbdmaChannel::write(u32 off, u32 v, u32 len)
                 // touches a descriptor. This line went in without it and the
                 // omission cost a boot: the status word landed in RAM
                 // underneath a LIVE, STALE cache line, so the driver polling
-                // that descriptor read xferStatus=0000 for ever while memory
+                // that descriptor read xferStatus=0000 forever while memory
                 // held 8400 — a completion the guest could not see. The
                 // diagnostic read RAM and reported the descriptor complete,
                 // which is precisely the disagreement that named it.

@@ -17,7 +17,7 @@ public sealed class ShellSettings
     public string HdPath { get; set; } = "";
 
     // Disks used before, most-recent-first. Testing an OS install means
-    // keeping several around — a blank one to initialise, the half-installed
+    // keeping several around — a blank one to initialize, the half-installed
     // one from the last attempt, the good one — and switching between them by
     // hand through a file picker every time is how the wrong disk gets
     // overwritten. Capped when written; entries whose file has gone are
@@ -82,7 +82,7 @@ public sealed class ShellSettings
     // the 68K VBL chain, the Time Manager, CrsrTask. FastTb 60 leaves it
     // 416,666 x 4/61 = 27,300, less than the work costs, so the machine
     // services ticks back to back and the boot dies at 2.5 G instructions
-    // with a uniform grey screen. Measured on cold boots scored by distinct
+    // with a uniform gray screen. Measured on cold boots scored by distinct
     // scanlines: 60 fails; 30, 15, 8, 4 and 1 all reach the desktop with the
     // recorded baseline's 462 of 480, 292 disk commands and 1,261,505 bytes
     // painted.
@@ -102,14 +102,14 @@ public sealed class ShellSettings
     // sound is a broken Mac, and the very first thing this path carries is
     // the boot ROM's startup chime. Off leaves the codec running and simply
     // stops draining it to a speaker, so turning it off cannot change the
-    // machine's behaviour.
+    // machine's behavior.
     public bool Sound { get; set; } = true;
 
     public ulong ScriptAt { get; set; } = 240_000_000;
     public bool AutoBoot { get; set; } = true;
 
     // Empty by default. The machine auto-boots on its own now that mac-io
-    // +0x61 is modelled as an input, so Open Firmware honours NVRAM and never
+    // +0x61 is modeled as an input, so Open Firmware honors NVRAM and never
     // stops at the prompt — there is nothing to type at, and injecting the old
     // recipe into a booting machine only disturbs it.
     public string BootScript { get; set; } = "";
@@ -139,7 +139,7 @@ public sealed class ShellSettings
                 // ⚠ Every settings file written before 2026-07-30 carries
                 // FastTb 60, and 60 no longer reaches the OS: it leaves Mac OS
                 // less time per 60 Hz tick than its own tick work costs, so
-                // the machine services ticks back to back and stops at a grey
+                // the machine services ticks back to back and stops at a gray
                 // screen. Changing the default alone does not reach an
                 // install that already saved one — hence the clamp here.
                 if (s.FastTb > 30)

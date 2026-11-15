@@ -5,7 +5,7 @@ namespace OpenPowerMac.Gui;
 internal static class Program
 {
     // Nothing that touches Avalonia may run before BuildAvaloniaApp: the
-    // platform is not initialised yet.
+    // platform is not initialized yet.
     [STAThread]
     public static void Main(string[] args)
     {

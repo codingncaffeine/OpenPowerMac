@@ -119,9 +119,9 @@ static u64 gVblDropped = 0;
 // What it cannot say is whether this model ANSWERED any of them, and that is
 // the difference that matters: ⚠ a register this model does not implement is
 // NOT silent. The card claims its whole register aperture, so a read of an
-// unmodelled offset never reaches the unclaimed-access log — it falls through
+// unmodeled offset never reaches the unclaimed-access log — it falls through
 // to `default:` and reads back the last value written there, or zero. A guest
-// driver polling such a register for a change waits for ever, and the only
+// driver polling such a register for a change waits forever, and the only
 // trace it leaves is a machine that stopped making progress. Session 30 wrote
 // this down for mac-io as *claiming an address and implementing it are
 // different things*; it is the same trap on the other device, and it cost a
@@ -449,7 +449,7 @@ const char* r128RegName(u32 off)
 // The engine half of the card: CCE/PM4 at 0x07xx, video at 0x09xx, bus
 // mastering at 0x0Axx, the surface apertures at 0x0Bxx, the PM4 FIFO windows
 // at 0x1000/0x1004, and the whole GUI block from 0x1400 up. The display half
-// below 0x0700 is modelled and understood, and logging it would bury the
+// below 0x0700 is modeled and understood, and logging it would bury the
 // engine traffic under the driver's DDC bit-banging — which is exactly what
 // happened to the existing ring.
 static constexpr u32 kEngLo = 0x0700, kEngHi = 0x2000;
@@ -478,7 +478,7 @@ bool r128RegDecodedBits(u32 off, u32& mask)
     // its zero is an action not taken, and the value census has it. Bit 14
     // is the pixel order within a pattern's byte; bit 31 says a packet
     // carries the brush origin, which the packet parser then loads. Not
-    // read: 15 (colour temperature).
+    // read: 15 (color temperature).
     case 0x146Cu: case 0x1C84u: mask = 0xFFFF7FFFu; return true;
     // DP_CNTL: the two directions, the major axis and the sign of a zero
     // error term for lines, and the raster stall (an operation here is
@@ -630,8 +630,8 @@ const std::vector<R128EngEv>& r128EngineLog()
 //
 // Offsets, field positions and semantics are ATI's own, from the `RAGE 128
 // PRO Register Reference Guide` (RRG-G04500-C rev 1.01); QEMU's ati_2d.c is
-// the behavioural oracle for how the pieces combine into a blit. Names,
-// offsets, bit meanings and observed behaviour are facts; the code below is
+// the behavioral oracle for how the pieces combine into a blit. Names,
+// offsets, bit meanings and observed behavior are facts; the code below is
 // ours.
 //
 // ⚠ dingusppc's atirage.md is the MACH64 Rage Pro — a different register map
@@ -700,7 +700,7 @@ void r128SetEngine2d(bool on) { gEng2dOn = on; }
 // polls; 0x0A50 takes the physical address of the transfer. Neither is named
 // in either ATI register guide — the guides document exactly two registers of
 // this block, BM_QUEUE_FREE_STATUS 0x0A14 and BM_ABORT 0x0A88 — so these are
-// recorded as OBSERVED BEHAVIOUR and nothing more.
+// recorded as OBSERVED BEHAVIOR and nothing more.
 static constexpr u32 kBmChunk0 = 0x0A18;
 static constexpr u32 kBmStatus = 0x0A10;
 static constexpr u32 kBmAddr = 0x0A50;
@@ -842,7 +842,7 @@ void asyncRelease(R128Cell& c, const CceMem& m);
 // An INDSIZE write seen while a packet is still executing must not fetch on
 // the spot: the fetched body has to land BETWEEN this packet and the next
 // one, and a parse re-entered mid-packet would re-read the in-flight header
-// and desynchronise the whole stream — the unit test caught exactly that as
+// and desynchronize the whole stream — the unit test caught exactly that as
 // a garbage register spray. So execution only RECORDS the dispatch, and the
 // parse loop performs it at the packet boundary.
 static std::vector<u32> gCcePendingInd;
@@ -969,7 +969,7 @@ R128RegLock::~R128RegLock()
 
 // A machine is being created: no packet stream exists yet, whatever a
 // previous machine in this process left staged. See the header note — a
-// stale half-packet here desynchronises every subsequent submission, and
+// stale half-packet here desynchronizes every subsequent submission, and
 // it presented as "the desktop drew for a while after a Stop/Start and
 // then froze mid-redraw".
 void r128CceReset()
@@ -1066,7 +1066,7 @@ static void cceRegWrite(R128Cell& c, u32 off, u32 native)
 // PAGE-ALIGNED, always. Observed values: 0x03105D00 (64 MB machine) and
 // 0x00B77008 (1.5 GB). An earlier version probed the RAW base first and
 // let a valid bit decide; at 1.5 GB the off-by-8 read landed on the
-// NEIGHBOURING entries, whose valid bits are legitimately set, so every
+// NEIGHBORING entries, whose valid bits are legitimately set, so every
 // walk "succeeded" onto the wrong physical pages and fed 0xDDDDDD00 fill
 // garbage into the parser as packets — one absurd Type-3 header then
 // swallowed 3,895 real words and the desktop froze mid-redraw with zero
@@ -1161,7 +1161,7 @@ bool r128CceGartRead(const CceMem& m, u32 agp, u32& out)
 // {BRUSH_PACKET per bits 7:4} [BRUSH_Y_X b31].
 //
 // Consumes from `body` (bounded by the Type-3 COUNT, so a malformed body
-// can be declined without desynchronising the stream) and returns the index
+// can be declined without desynchronizing the stream) and returns the index
 // past SETTINGS, or n+1 to signal "decline".
 static u32 cceSettings(R128Cell& c, const u32* body, u32 n)
 {
@@ -1195,7 +1195,7 @@ static u32 cceSettings(R128Cell& c, const u32* body, u32 n)
                                          34, 33, 33, -1, -1, 1, -1, 0};
     int bn = kBrushDwords[brush];
     if (bn < 0) {
-        // 8x8 / 8x1 / 1x8 COLOUR patterns: 16*N / 2*N / 2*N DWORDs where N
+        // 8x8 / 8x1 / 1x8 COLOR patterns: 16*N / 2*N / 2*N DWORDs where N
         // is bytes-per-pixel from DST_TYPE (Table F-3).
         static const int kBpp[16] = {0, 0, 1, 2, 2, 3, 4, 1,
                                      0, 0, 0, 0, 0, 0, 0, 0};
@@ -1294,7 +1294,7 @@ static bool cceOpPaintMulti(R128Cell& c, const u32* body, u32 n)
     return true;
 }
 
-// ---- colour compare (CLR_CMP_CNTL, 0x15C0) ----------------------------------
+// ---- color compare (CLR_CMP_CNTL, 0x15C0) ----------------------------------
 //
 // The 2D engine's transparency: a pixel is drawn or left alone by comparing
 // the SOURCE pixel, the DESTINATION pixel or both against a key, through a
@@ -1370,7 +1370,7 @@ ClrCmp clrCmpDecode(u32 cntl, u32 keySrc, u32 keyDst, u32 mask, u32 bypp)
 // foreground/background — the large-glyph text path (SDK F.11, mirroring
 // the Windows LARGEBITGLYPH). The engine's register-path mono expansion is
 // not built (monoSrc is a decline counter), so the expansion happens here,
-// honouring the engine's CURRENT destination state: pitch/offset from the
+// honoring the engine's CURRENT destination state: pitch/offset from the
 // DST registers, the scissor, and the destination type from GUI_CONTROL.
 // FRGD/BKGD arrive as RGBQUAD and are converted to the destination format.
 static u32 ccePixelBytes(u32 dstType);
@@ -1382,7 +1382,7 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
     const u32 gc = body[0];
     const u32 dstType = (gc >> 8) & 0xFu;
     const u32 srcType = (gc >> 12) & 3u;   // 0 mono opaque, 1 transparent,
-                                           // 3 colour ("same as DST")
+                                           // 3 color ("same as DST")
     const bool lsbFirst = (gc >> 14) & 1u; // PIX_ORDER
     if (srcType == 2u) {
         ++gEng.hostData; // reserved encoding — decline loudly
@@ -1405,9 +1405,9 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
     const u32 fg = conv(body[i0]), bk = conv(body[i0 + 1u]);
     const u32 dstOff = c.peek(0x1404u);
     const u32 pitchBytes = c.peek(0x1408u) * 8u * bpp;
-    // Colour pixels go through the raster op and the colour compare, as any
+    // Color pixels go through the raster op and the color compare, as any
     // other source does: a sprite arrives this way with its surround keyed
-    // out. The 1-bit forms are expanded as before — what "the source colour"
+    // out. The 1-bit forms are expanded as before — what "the source color"
     // is for a compare against an expanded bit is not something the guide
     // says — and a compare left on across one is counted instead.
     const u32 rop = (gc >> 16) & 0xFFu;
@@ -1417,7 +1417,7 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
         ++gEng.colorCompare;
     const bool plainCopy = rop == 0xCCu && !key.any;
     const u32 brush = ropUsesPat(rop) ? c.peek(0x147Cu) : 0u;
-    // The engine normalises SC_TOP_LEFT/SC_BOTTOM_RIGHT into the split
+    // The engine normalizes SC_TOP_LEFT/SC_BOTTOM_RIGHT into the split
     // canonical cells — read those, not the alias offsets.
     const int scL = static_cast<int>(c.peek(0x1640u) & 0x3FFFu),
               scR = static_cast<int>(c.peek(0x1644u) & 0x3FFFu),
@@ -1437,7 +1437,7 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
         if (!wPx || !hPx || !m)
             continue;
         if (srcType == 3u) {
-            // COLOUR host data: the raster is packed destination-format
+            // COLOR host data: the raster is packed destination-format
             // pixels, rows continuous — an icon/pixmap push, copied
             // byte-for-byte. ⚠ THE COUNT IS NOT THE LAYOUT. For a width
             // whose row is not a whole number of DWORDs the Mac driver
@@ -1495,8 +1495,8 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
                         if (r128PixelWatched(at, bpp))
                             r128PixelWatchNote(
                                 "2d host data",
-                                "colour pixels pushed to (%d,%d %ux%u), rop "
-                                "%02x, colour compare %08x key %08x mask "
+                                "color pixels pushed to (%d,%d %ux%u), rop "
+                                "%02x, color compare %08x key %08x mask "
                                 "%08x, wrote %x",
                                 bx, by, wPx, hPx, rop, c.peek(0x15C0u),
                                 c.peek(0x15C4u), c.peek(0x15CCu), v);
@@ -1508,8 +1508,8 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
                     if (r128PixelWatched(at, bpp))
                         r128PixelWatchNote(
                             "2d host data",
-                            "colour pixels pushed to (%d,%d %ux%u), "
-                            "GUI_CONTROL %08x (rop %02x), no colour compare",
+                            "color pixels pushed to (%d,%d %ux%u), "
+                            "GUI_CONTROL %08x (rop %02x), no color compare",
                             bx, by, wPx, hPx, gc, (gc >> 16) & 0xFFu);
                     for (u32 k = 0; k < bpp; ++k) {
                         const u64 s = sb + k;
@@ -1592,7 +1592,7 @@ static bool cceOpBitbltMulti(R128Cell& c, const u32* body, u32 n)
         // overlap reads rows it has already overwritten. Measured: the
         // drag's own blit, src=(117,152) dst=(186,241) 417x239, repeated
         // the window image every dy=89 rows down the screen. The engine's
-        // register path honours DP_CNTL and treats a reversed origin as
+        // register path honors DP_CNTL and treats a reversed origin as
         // the far corner, so give it exactly what a safe driver would:
         // direction away from the overlap, far-corner coordinates when
         // reversed.
@@ -1615,7 +1615,7 @@ static bool cceOpBitbltMulti(R128Cell& c, const u32* body, u32 n)
 }
 
 // Destination state for the ops that write VRAM directly, gathered from the
-// engine's CANONICAL registers (the 0x16EC aliases are normalised away).
+// engine's CANONICAL registers (the 0x16EC aliases are normalized away).
 struct CceDst {
     u32 bpp = 0, dstOff = 0, pitchBytes = 0;
     int scL = 0, scR = 0, scT = 0, scB = 0;
@@ -1713,9 +1713,9 @@ static bool cceOpPlyNextScan(R128Cell& c, const u32* body, u32 n)
 
 static u32 cceConvColor(u32 rgbq, u32 dstType);
 
-// TRANS_BITBLT (0x9C, SDK F.19): a copy from video memory with a colour
+// TRANS_BITBLT (0x9C, SDK F.19): a copy from video memory with a color
 // compare. After SETTINGS: [CLR_CMP_CNTL], the source and destination
-// reference colours as RGBQUADs, then [SRC_Y | SRC_X], [DST_Y | DST_X] and
+// reference colors as RGBQUADs, then [SRC_Y | SRC_X], [DST_Y | DST_X] and
 // [DST_H | DST_W], each with its first-named half in the high word. The
 // compare word has CLR_CMP_CNTL's own layout (functions in 2:0 and 10:8,
 // which of them in 25:24), so the packet is the three compare registers and
@@ -1880,7 +1880,7 @@ static bool cceOpSmallText(R128Cell& c, const u32* body, u32 n)
 
 // NEXTCHAR (0x19): one glyph, no SETTINGS — the current GMC supplies the
 // destination type and pixel order, DP_SRC_FRGD_CLR (set by SMALL_TEXT)
-// the colour. Body: [DST_Y|DST_X] [DST_H|DST_W] [raster...], both words in
+// the color. Body: [DST_Y|DST_X] [DST_H|DST_W] [raster...], both words in
 // the ENGINE's own layout for once.
 static bool cceOpNextChar(R128Cell& c, const u32* body, u32 n)
 {
@@ -2060,7 +2060,7 @@ static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
         }
         // Type-3: an operation packet. COUNT = N-1 body DWORDs; the body is
         // consumed exactly by the HEADER count whatever the op does, so a
-        // half-understood operation can never desynchronise the stream.
+        // half-understood operation can never desynchronize the stream.
         const u32 op = (w >> 8) & 0xFFu;
         const bool op3d =
             op == 0x25u || op == 0x23u || op == 0x2Eu || op == 0x2Cu;
@@ -2422,7 +2422,7 @@ u32 R128Cell::regRead(u32 idx)
     // ⚠⚠ ZERO IS NOT IDLE HERE, IT IS THE WORST ANSWER AVAILABLE. Bits 11:0
     // are the count of FREE command-FIFO entries, and the reset default is
     // 0x40. Answering zero tells a driver the FIFO is completely full, so a
-    // driver that waits for room before writing waits for ever — and it never
+    // driver that waits for room before writing waits forever — and it never
     // appears in the unclaimed-access log, because the card claims its whole
     // aperture. Session 30 wrote this down for mac-io as *claiming an address
     // and implementing it are different things*; this is the same trap, on
@@ -2453,7 +2453,7 @@ u32 R128Cell::regRead(u32 idx)
         // and which the card's own FCode publishes in its `address`
         // property (BAR0 + 0x02000000 + the CRTC offset).
         //
-        // This register was not modelled and read back as zero. Measured
+        // This register was not modeled and read back as zero. Measured
         // consequence: the OS display driver stores it as its framebuffer
         // base (device record +0x8c), adds the CRTC offset it programmed
         // (+0x138 = 0x8000), and fills 640x480x32 from address 0x00008000 —
@@ -2556,8 +2556,8 @@ u32 R128Cell::regRead(u32 idx)
     default: {
         auto it = regs_.find(off);
         if (it == regs_.end()) {
-            // Never written, not modelled: this read is answering 0 and will
-            // keep answering 0 for ever. If a count here is large, the guest
+            // Never written, not modeled: this read is answering 0 and will
+            // keep answering 0 forever. If a count here is large, the guest
             // is waiting on something this card does not have.
             ++gRegReadsUnbacked[off];
             return 0;
@@ -2647,11 +2647,11 @@ void R128Cell::engBlit()
     const bool usesPat = ropUsesPat(rop);
     const bool usesDst = ropUsesDst(rop);
 
-    // The pattern operand. Brush datatype 13 is a solid colour taken from
+    // The pattern operand. Brush datatype 13 is a solid color taken from
     // DP_BRUSH_FRGD_CLR, and 15 the manual says to "treat as 13".
     //
     // 0 and 1 are the 8x8 MONO PATTERN: 64 bits in BRUSH_DATA0 and 1, a set
-    // bit drawing the foreground colour and a clear one the background (0)
+    // bit drawing the foreground color and a clear one the background (0)
     // or nothing at all (1, "leave alone"). The books give the registers no
     // description; the layout is the XFree86 driver's use of them (its XAA
     // 8x8 pattern fill, r128_accel.c): the first register holds rows 0 to 3
@@ -2662,7 +2662,7 @@ void R128Cell::engBlit()
     // the rectangles drawn with it.
     //
     // The other pattern brushes (the 8x1, 1x8 and 32x1 mono ones, which are
-    // for lines, the 32x32, the colour ones) have no layout in anything on
+    // for lines, the 32x32, the color ones) have no layout in anything on
     // the shelf: an operation that would READ one is declined rather than
     // painted with a solid guess where a chequer belongs.
     u32 pat = 0, patBkgd = 0, patX = 0, patY = 0;
@@ -2693,7 +2693,7 @@ void R128Cell::engBlit()
         const u32 col = (static_cast<u32>(x) - patX) & 7u;
         return ((row >> (patLsbFirst ? col : 7u - col)) & 1u) != 0;
     };
-    // The source operand: colour pixels of the destination's own format
+    // The source operand: color pixels of the destination's own format
     // (3), or a ONE-BIT bitmap (guide, GMC_SRC_DATATYPE: 0 "mono, expanded
     // to frgd, bkgd", 1 "mono, expanded to frgd, leave alone"): a set bit is
     // DP_SRC_FRGD_CLR, a clear one DP_SRC_BKGD_CLR or, for type 1, no pixel
@@ -2801,13 +2801,13 @@ void R128Cell::engBlit()
         return;
     }
 
-    // The colour compare: see ClrCmp. A source compare needs a source, so a
+    // The color compare: see ClrCmp. A source compare needs a source, so a
     // fill only ever takes the destination half.
     const u32 cmp = rd(kClrCmpCntl);
     ClrCmp key = clrCmpDecode(cmp, rd(0x15C4u), rd(0x15C8u), rd(kClrCmpMsk),
                               bypp);
     if ((!usesSrc || srcMono) && key.fnSrc) {
-        // What "the source colour" is for a compare against an expanded bit
+        // What "the source color" is for a compare against an expanded bit
         // the guide does not say: such a compare is counted, not applied.
         if (srcMono)
             ++gEng.colorCompare;
@@ -2837,11 +2837,11 @@ void R128Cell::engBlit()
     // ⚠ BYTE ORDER. This model's VRAM holds pixels exactly as the guest
     // wrote them through the big-endian aperture, and the scanout in
     // opm_screen reads a 32-bpp pixel as byte0=unused, byte1=R, byte2=G,
-    // byte3=B. A fill colour arriving in DP_BRUSH_FRGD_CLR is a plain 32-bit
+    // byte3=B. A fill color arriving in DP_BRUSH_FRGD_CLR is a plain 32-bit
     // number, so it has to be stored MOST SIGNIFICANT BYTE FIRST for the
     // three readers of this memory — the CPU, the scanout and this engine —
     // to agree. Storing it the other way round is exactly the bug that once
-    // made a grey desktop come out olive.
+    // made a gray desktop come out olive.
     const u32 wmask = rd(kDpWriteMsk);
     // A write mask of zero means "mask nothing" here rather than "write
     // nothing": the reset value is 0 and GMC_WR_MSK_DIS sets it to all ones,
@@ -2859,7 +2859,7 @@ void R128Cell::engBlit()
         if (r128PixelWatched(o, bypp))
             r128PixelWatchNote(
                 "2d blit",
-                "rop %02x %s to (%d,%d %dx%d), colour compare %08x key %08x, "
+                "rop %02x %s to (%d,%d %dx%d), color compare %08x key %08x, "
                 "wrote %x",
                 rop, usesSrc ? "from video memory" : "fill", dx0, dy0, w, h,
                 cmp, rd(0x15C4u), v);
@@ -2972,7 +2972,7 @@ void R128Cell::engBlit()
 // this protocol.
 //
 // The stream is read as the HOSTDATA_BLT packet's raster is, since that
-// packet is this protocol with the DWORDs in a buffer: colour pixels are
+// packet is this protocol with the DWORDs in a buffer: color pixels are
 // bytes taken from each DWORD low byte first, rows running on; a one-bit
 // source is bits taken across the DWORDs, from each DWORD's top bit or its
 // bottom one as DP_BYTE_PIX_ORDER says. Source 3 is the "linear trajectory":
@@ -3101,7 +3101,7 @@ void R128Cell::engHostWord(u32 v, bool last)
                     "2d host data",
                     "%s pushed through the registers to (%d,%d %ux%u), rop "
                     "%02x, wrote %x",
-                    mono ? "1-bit pixels" : "colour pixels", op.x, op.y, op.w,
+                    mono ? "1-bit pixels" : "color pixels", op.x, op.y, op.w,
                     op.h, op.rop, out);
             for (u32 k = 0; k < bypp; ++k)
                 vram[at + k] = static_cast<u8>(out >> (8u * (bypp - 1u - k)));
@@ -3235,7 +3235,7 @@ bool R128Cell::engWrite(u32 off, u32 v)
     if (off >= 0x1A00u && r128Eng3dWrite(*this, off, v))
         return true;
     switch (off) {
-    // --- composite registers: normalise into the canonical pair ---------
+    // --- composite registers: normalize into the canonical pair ---------
     //
     // Every one of these is marked [W] in the reference guide — they are
     // write-only aliases, so nothing is lost by decomposing them, and
@@ -3406,7 +3406,7 @@ bool R128Cell::engWrite(u32 off, u32 v)
         //
         // The accelerator writes 0x000000FF here — `R128_PC_FLUSH_ALL`, flush
         // and read-invalidate both the GUI and non-GUI sides — and then reads
-        // the register back. Storing the value and answering it back for ever
+        // the register back. Storing the value and answering it back forever
         // reports a cache flush that NEVER COMPLETES, and it does it silently,
         // because the offset is inside an aperture this card claims.
         //
@@ -3495,7 +3495,7 @@ void R128Cell::write(u32 off, u32 v, u32 len)
     note(off & ~3u, native, true);
     noteEngine(off & ~3u, native, pcRef ? *pcRef : 0, at, true);
     const u32 aligned = off & ~3u;
-    // The GUI block first: a write there may be an alias to normalise or the
+    // The GUI block first: a write there may be an alias to normalize or the
     // initiator of a draw, and in either case it must not also land in the
     // plain register store under its own offset.
     if (gEng2dOn && aligned >= 0x1400u && aligned < 0x2000u &&
@@ -3646,7 +3646,7 @@ void R128Cell::tick(u64 tb)
     // the previous one retires. Expiring an unanswered request turns that total
     // paralysis into a dropped frame, which is the right failure mode; when a
     // driver IS listening it acknowledges in ~6,100 instructions, four orders of
-    // magnitude inside this window, so serviced behaviour is unchanged.
+    // magnitude inside this window, so serviced behavior is unchanged.
     const u64 per = vblPeriod();
     auto st = regs_.find(kGenIntStatus);
     if (st != regs_.end() && (st->second & kCrtcVblankInt) &&
@@ -3703,7 +3703,7 @@ u8 R128Cell::edidByte(u8 at) const
     case 10: return 0x01; case 11: return 0x9D; // product
     case 16: return 0x0A; case 17: return 0x0B; // week 10, year 2001
     case 18: return 0x01; case 19: return 0x03; // EDID 1.3
-    case 20: return 0x0E;                       // analogue input
+    case 20: return 0x0E;                       // analog input
     case 21: return 0x22; case 22: return 0x1B; // 34 cm x 27 cm
     case 23: return 0x78;                       // gamma 2.2
     case 24: return 0x0D;                       // RGB, preferred timing
@@ -3925,14 +3925,14 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
             // ⭐ THE BYTE ORDER IS A LESSON ALREADY PAID FOR. A Mac 32-bpp
             // pixel is big-endian xRGB: byte 0 is the unused/alpha lane and
             // R, G, B follow. Reading bytes 0,1,2 as B,G,R put the unused
-            // lane in blue and shifted the other two, so a 50% grey desktop
+            // lane in blue and shifted the other two, so a 50% gray desktop
             // (00 80 80 80) came out as r=80 g=80 b=00 — olive. The whole
             // screen was yellow, which is what named the bug. The 15/16-bpp
             // pixel is therefore the BIG-ENDIAN halfword (vr[o] << 8) |
             // vr[o+1] before any field is extracted, and 24 bpp drops the
             // unused lane: R,G,B in bytes 0,1,2.
             //
-            // ⚠ If colours ever come out wrong in these modes, check
+            // ⚠ If colors ever come out wrong in these modes, check
             // SURFACE_CNTL / DAC swap state before inventing a new table —
             // the card has per-aperture byte swappers and the guest may
             // program them.
@@ -3975,7 +3975,7 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
 
 // 64x64 at two bits per pixel, 16 bytes per row: eight bytes of AND bits
 // then eight of XOR bits, each big-endian with the most significant bit
-// leftmost. AND=0 selects colour 0 or 1 from XOR; AND=1 with XOR=0 is
+// leftmost. AND=0 selects color 0 or 1 from XOR; AND=1 with XOR=0 is
 // transparent, and with XOR=1 complements what is underneath — which is
 // how the classic arrow keeps its black outline over any background.
 // CUR_HORZ_VERT_OFF is how many cursor rows/columns to skip, which is how

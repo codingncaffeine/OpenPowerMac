@@ -141,7 +141,7 @@ inline u64 napSkip(Cpu& cpu, const SawtoothBus& bus, u64 budget)
 // NOTHING TO DO — the core is asleep and no enabled interrupt is waiting — and
 // only up to the first moment something could happen. The guest cannot tell
 // the difference between this and a processor that was simply idle, which is
-// what it is modelling.
+// what it is modeling.
 //
 // Returns the nanoseconds waited (0 when the machine had work, or when the
 // deadline was too near to be worth a system call).
@@ -179,7 +179,7 @@ OPM_PACE_COLD inline u64 hostIdleWaitSlow(const Cpu& cpu,
         return 0; // work now, or already due: service it, do not wait on it
     // The guest's clock is BEHIND the host's (HostPacer repays a stall in
     // steps), and the host's is already at this deadline: the wait has
-    // happened out there. Waiting again would keep the guest late for ever.
+    // happened out there. Waiting again would keep the guest late forever.
     // Go round instead — one nanosecond is "waited, look again" to both
     // callers — and the next sync takes an asleep core straight to it.
     const u64 hostTb = pacer.targetTb();

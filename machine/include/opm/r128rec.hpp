@@ -15,7 +15,7 @@ struct SnapReader;
 // 🎞 The frame recorder: the card's inputs over a few frames, kept in a file,
 // and replayed into a card on its own.
 //
-// A change to the rasteriser is judged by drawing the SAME thing before and
+// A change to the rasterizer is judged by drawing the SAME thing before and
 // after, and a running guest cannot draw the same thing twice: under host
 // pacing no two runs take the same path, and some programs do not draw at
 // all when paced by the instruction count. A recording is the input itself.
@@ -46,7 +46,7 @@ struct SnapReader;
 // produced the last frame asked for; the hash at the very end is Z. A replay
 // hears the same edges from the same code, so its hashes can be compared with
 // the file's: equal means the replayed card drew exactly what the live one
-// did, and after a change to the rasteriser the two pictures at one edge are
+// did, and after a change to the rasterizer the two pictures at one edge are
 // the before and after of one input.
 //
 // While a recording runs, the engine's own thread is off (the caller drains it

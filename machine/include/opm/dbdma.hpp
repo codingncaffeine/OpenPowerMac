@@ -26,7 +26,7 @@ public:
     // finished, residual and all, and the channel moves on. A codec is a
     // STREAM draining at its sample rate: it took what the FIFO had room
     // for, and the rest of that same descriptor is still owed. False is the
-    // behaviour of every ATA transfer this machine has ever done.
+    // behavior of every ATA transfer this machine has ever done.
     virtual bool dmaStreams() const { return false; }
 };
 

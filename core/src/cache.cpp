@@ -534,7 +534,7 @@ void Cpu::dcbKill(u32 pa)
     l2Invalidate(pa & ~31u);
 }
 
-// Snoop response for a bus master. Unlike dcbf/dcbst this must NOT honour
+// Snoop response for a bus master. Unlike dcbf/dcbst this must NOT honor
 // L2CR[L2TS]: that idiom parks a pushed block in the L2 instead of memory,
 // and a DMA engine cannot see the L2 any more than it can see the L1. The
 // data has to reach RAM.

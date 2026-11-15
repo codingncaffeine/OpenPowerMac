@@ -88,7 +88,7 @@ public sealed class MachineSession
     // thread while that thread is inside opm_run is a data race, and the one
     // moment anybody wants this is the moment the machine looks stuck — which
     // is exactly when racing it would turn a diagnosable stall into a crash.
-    // The loop honours it between chunks and the text arrives on ConsoleQ.
+    // The loop honors it between chunks and the text arrives on ConsoleQ.
     private volatile bool _diagWanted;
     // Sample A, held while the machine runs one more chunk so B can be
     // compared against it. See the capture site for why one sample is not
@@ -100,7 +100,7 @@ public sealed class MachineSession
     public void RequestDiagnostics() => _diagWanted = true;
 
     // 📸 Save the machine, same request discipline and the same reason: the
-    // machine belongs to the run thread. Serialising it from the UI thread
+    // machine belongs to the run thread. Serializing it from the UI thread
     // mid-chunk would race every device in it.
     //
     // ⭐ What this is FOR: a rendering defect that only exists inside a
@@ -274,7 +274,7 @@ public sealed class MachineSession
 
     /// <summary>Whether a file can be a PCI card's expansion ROM. Every one
     /// begins with the signature 55 AA (PCI Local Bus specification, expansion
-    /// ROM header), which is how Open Firmware recognises the card's FCode in
+    /// ROM header), which is how Open Firmware recognizes the card's FCode in
     /// the first place; a file without it gives a card the firmware cannot
     /// read, so no display node is built and the machine boots with no
     /// picture. The usual way to get here is choosing the 1 MB boot ROM

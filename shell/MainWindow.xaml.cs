@@ -73,7 +73,7 @@ public partial class MainWindow : Window
         _captured = true;
         Mouse.Capture(imgScreen);
         imgScreen.Cursor = Cursors.None;
-        RecentrePointer();
+        RecenterPointer();
         UpdateCaptureHint();
     }
 
@@ -87,7 +87,7 @@ public partial class MainWindow : Window
         UpdateCaptureHint();
     }
 
-    private void RecentrePointer()
+    private void RecenterPointer()
     {
         if (imgScreen.ActualWidth <= 0 || imgScreen.ActualHeight <= 0)
             return;
@@ -121,7 +121,7 @@ public partial class MainWindow : Window
     }
 
     // Travel, not position. While captured the host pointer is pinned to the
-    // centre and every move is measured from there, so the guest gets
+    // center and every move is measured from there, so the guest gets
     // unbounded relative motion and the two cursors cannot drift apart.
     //
     // ⛔⛔ TRAVEL IS NOT METERED, AND THE METER THAT USED TO BE HERE IS WHY THE
@@ -199,7 +199,7 @@ public partial class MainWindow : Window
             if (dx == 0 && dy == 0)
                 return; // our own re-centring echo
             SendTravel(dx, dy, ButtonMask(e));
-            RecentrePointer();
+            RecenterPointer();
             return;
         }
 
@@ -676,7 +676,7 @@ public partial class MainWindow : Window
     // like the menu did nothing.
 
     // The history entries currently inserted into the submenu. Held so they
-    // can be removed before the next rebuild — the alternative is recognising
+    // can be removed before the next rebuild — the alternative is recognizing
     // them by their content, which breaks the first time a disk is called
     // "Detach".
     private readonly List<MenuItem> _hdRecentItems = new();
@@ -784,7 +784,7 @@ public partial class MainWindow : Window
             // mark: NTFS zero-fills everything before it, synchronously,
             // inside one emulated instruction. Drive Setup puts HFS+'s
             // alternate volume header at the very END of the disk, so the
-            // guest's first initialise stalls the whole machine for as long as
+            // guest's first initialize stalls the whole machine for as long as
             // it takes to zero the image. Measured here: 352 ms for a 2 GB
             // image on an NVMe, and seconds on a slower disk — long enough to
             // blow a driver timeout and reach the user as "the disk has
@@ -820,7 +820,7 @@ public partial class MainWindow : Window
                     this,
                     "This volume would not take a sparse file, so the image "
                     + "will use its full size on disk and the guest's first "
-                    + "initialise may pause while Windows zeroes it.",
+                    + "initialize may pause while Windows zeroes it.",
                     "New disk image", MessageBoxButton.OK,
                     MessageBoxImage.Warning);
             }

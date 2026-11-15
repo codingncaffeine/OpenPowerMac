@@ -240,7 +240,7 @@ void OhciCell::tick(u64 tb)
     // port read empty forever: OF found no keyboard, blocked in its console
     // read on stdin, and the machine never reached the desktop at all.
     // Frame GENERATION is what the operational state gates (HcFmNumber, SF,
-    // the ED lists); root-hub electrical behaviour is not.
+    // the ED lists); root-hub electrical behavior is not.
     for (u32 n = 0; n < 2; ++n) {
         if (!portPower_[n] || --portPower_[n]) continue;
         const u32 before = rhPort_[n];
@@ -292,7 +292,7 @@ void OhciCell::tick(u64 tb)
     // reclaim them. One report would be delivered and the endpoint then went
     // quiet.
     //
-    // The handoff is also once per acknowledgement, not once per frame: while
+    // The handoff is also once per acknowledgment, not once per frame: while
     // WritebackDoneHead is still set the driver has not read the list yet, so
     // the controller accumulates internally rather than overwriting it.
     if (doneHead_ && !(intStatus_ & 0x02u) && hcca_ && ram &&
@@ -472,7 +472,7 @@ bool OhciCell::doTd(u32 ed0, u32 td, u32& next)
         ++setupsSeen;
         buildDescriptor();
         moved = 8;
-        // The eight bytes that decide everything downstream. An unrecognised
+        // The eight bytes that decide everything downstream. An unrecognized
         // request leaves reply_ empty, and the IN that follows then moves
         // zero bytes -- which on the register bus looks exactly like a
         // controller that never ran.

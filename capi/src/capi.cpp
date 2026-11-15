@@ -129,7 +129,7 @@ OPM_API void opm_ati_at(OpmMachine* m, uint64_t insn)
 // Special > Restart and at the end of an installation. Whoever sent it then
 // parks in a loop and waits for the machine to go away, so a front end that
 // only records the request leaves the guest spinning behind a blank screen
-// for ever — which is what the app did. Nothing in a boot from power-on sends
+// forever — which is what the app did. Nothing in a boot from power-on sends
 // the command, so nothing showed it.
 //
 // The board is rebuilt at power-on values around its RAM, its flash and its
@@ -152,7 +152,7 @@ static void wireMachine(OpmMachine* m)
     // missing hd() and hdDma() — see SawtoothBus::setStamp. The app had no
     // working hard disk at all: the drive raised BSY on its first command and
     // never lowered it, which is exactly what Mac OS reports as a disk it
-    // cannot read and offers to initialise.
+    // cannot read and offers to initialize.
     m->bus->setPcRef(&m->cpu.st.pc);
     m->bus->setStamp(&m->executed);
 }
@@ -181,7 +181,7 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
     // The harness's clock advance rides along with the architectural one
     // inside step() instead of being a second call per instruction — see
     // Cpu::extraCycles. Set here rather than at create so that whatever
-    // changes fastTb is honoured on the next entry.
+    // changes fastTb is honored on the next entry.
     cpu.extraCycles = m->realtime ? 0u : m->fastTb;
     // ⏱⏱ AND THE ARCHITECTURAL CYCLE TOO. Real-time pacing means the HOST
     // CLOCK owns the timebase; leaving the per-instruction cycle in place left
@@ -370,7 +370,7 @@ OPM_API int32_t opm_halted(const OpmMachine* m) { return m->cpu.halted ? 1 : 0; 
 
 // ⏳ Time this machine spent OFF the host processor. HostWait counts it at the
 // one place it can be counted honestly — around the system call itself — so
-// this is measured, not modelled.
+// this is measured, not modeled.
 OPM_API uint64_t opm_idle_ns(const OpmMachine* m) { return m->idle.waitedNs; }
 
 // The guest's own clock. Divided by 25,000,000 it is the machine's uptime in
@@ -1007,7 +1007,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  sc.rowBytes, sc.offset, sc.enabled ? 1 : 0,
                  (gen & 0x00010000u) ? 1 : 0,
                  sc.tiled ? "  ⚠ TILED (scanned linearly: expect diagonal "
-                            "banding and scrambled colour)"
+                            "banding and scrambled color)"
                           : "",
                  (sc.enabled && sc.bypp && sc.w >= 64 && sc.w <= 2048 &&
                   sc.h >= 64 && sc.h <= 1536)
@@ -1020,13 +1020,13 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  m->bus->ati().peek(0x0260) & 0x07FFFFFFu);
         s += b;
     }
-    // 🎨🎨 THE REGISTERS THAT DECIDE COLOUR.
+    // 🎨🎨 THE REGISTERS THAT DECIDE COLOR.
     //
     // "The triangles all arrive, the textures all decode, and the picture is
     // still wrong" is a question about pipeline STATE, and not one byte of
     // it appeared in any capture — so the first real 3D session could say
     // what the engine DID and not what it was told to do. Every register
-    // the rasteriser reads is printed here, decoded where the field layout
+    // the rasterizer reads is printed here, decoded where the field layout
     // is known, because a wrong blend function and a wrong texture base
     // produce the same black screen.
     {
@@ -1055,7 +1055,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
             snprintf(b, sizeof b,
                      "--   blend: src=%u dst=%u alpha_comb=%u alpha_test=%u "
-                     "ref_alpha=%u fog_table=%u fog_colour=%06x\n",
+                     "ref_alpha=%u fog_table=%u fog_color=%06x\n",
                      (misc >> 16) & 0xFu, (misc >> 20) & 0xFu,
                      (misc >> 12) & 3u, (misc >> 24) & 7u, misc & 0xFFu,
                      (misc >> 14) & 1u, a.peek(0x1CAC) & 0xFFFFFFu);
@@ -1068,7 +1068,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
             snprintf(b, sizeof b,
                      "--   st census: s in [%.3f, %.3f]  t in [%.3f, %.3f]"
-                     "  (extrema near 0..1 = normalised, sampler correct; "
+                     "  (extrema near 0..1 = normalized, sampler correct; "
                      "tens+ = pre-scaled, sampler tiling into mush)\n",
                      e3.stMinS, e3.stMaxS, e3.stMinT, e3.stMaxT);
             s += b;
@@ -1088,7 +1088,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
             snprintf(b, sizeof b,
                      "--   sec tex:  cntl=%08x combine=%08x slot0=%08x "
-                     "border=%08x; const_colour=%08x plane_mask=%08x\n",
+                     "border=%08x; const_color=%08x plane_mask=%08x\n",
                      a.peek(0x1D00), a.peek(0x1D04), a.peek(0x1D08),
                      a.peek(0x1D3C), a.peek(0x1D34), a.peek(0x1D44));
             s += b;
@@ -1228,7 +1228,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // observation arrives as a percentage, and so a later capture can be
     // compared against this one without anyone opening an image. The 8x6
     // luminance grid is coarse on purpose — it says WHERE the picture is
-    // (a centred GUI, a black field with a bright band) in twelve numbers.
+    // (a centered GUI, a black field with a bright band) in twelve numbers.
     {
         R128Cell& a = m->bus->ati();
         const R128Scan sc = r128ScanDecode(a);
@@ -1238,7 +1238,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             uint64_t black = 0, total = 0, sumL = 0, cellL[6][8] = {};
             uint64_t cellN[6][8] = {};
             uint32_t mn = 255, mx = 0;
-            // Distinct colours, capped: a full histogram of a 32-bpp screen
+            // Distinct colors, capped: a full histogram of a 32-bpp screen
             // is a megabyte of set nodes and the question only needs "a few
             // or many".
             std::vector<uint8_t> seen(1u << 15, 0);
@@ -1265,7 +1265,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             }
             snprintf(b, sizeof b,
                      "-- screen content: %ux%u fmt %u; %.1f%% pure black, "
-                     "%u distinct colours (5-5-5 buckets), luminance "
+                     "%u distinct colors (5-5-5 buckets), luminance "
                      "min %u mean %u max %u\n",
                      sc.w, sc.h, sc.fmt,
                      total ? 100.0 * double(black) / double(total) : 0.0,
@@ -1290,7 +1290,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
     // 🎨 THE COMMAND ENGINE, because "the desktop froze mid-redraw" is a
     // question about the packet stream: a healthy stream has zero (or a
     // packet's worth of) staged words; a large backlog behind one absurd
-    // header IS a desynchronised stream, and the skipped-op map names any
+    // header IS a desynchronized stream, and the skipped-op map names any
     // operation the guest submitted that this model declined.
     {
         const auto& e = r128EngStats();
@@ -1331,7 +1331,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
         snprintf(b, sizeof b,
                  "--   2d not drawn: %llu pattern brush, %llu one-bit "
                  "source, %llu to system memory, %llu off video memory, "
-                 "%llu zero pitch; %llu colour compares not applied; %llu "
+                 "%llu zero pitch; %llu color compares not applied; %llu "
                  "clipped away; %llu host-data rasters with a word count of no "
                  "known layout\n",
                  (unsigned long long)e.brushUnimpl,
@@ -1756,7 +1756,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
         }
     }
-    // 🎚 THE DAC'S TABLE. In the direct-colour modes the palette RAM is the
+    // 🎚 THE DAC'S TABLE. In the direct-color modes the palette RAM is the
     // gamma ramp: every channel goes through it on the way out, which is how
     // Mac OS corrects for the monitor and how a game fades the screen. The
     // scan-out here applies it only in 8-bit mode, so what the guest has
@@ -1776,16 +1776,16 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  identity ? "an identity ramp" : "NOT an identity ramp",
                  a.pal(0), a.pal(64), a.pal(128), a.pal(192), a.pal(255));
         s += b;
-        // The table's shape, which is what says how a direct-colour mode is
+        // The table's shape, which is what says how a direct-color mode is
         // meant to index it: the red of every eighth entry, and whether the
         // entries come in runs of eight or four equal ones (a driver that
         // fills every index a 5- or 6-bit channel could reach).
         if (!identity) {
-            bool runs8 = true, runs4 = true, grey = true;
+            bool runs8 = true, runs4 = true, gray = true;
             for (u32 i = 0; i < 256; ++i) {
                 runs8 = runs8 && a.pal(i) == a.pal(i & ~7u);
                 runs4 = runs4 && a.pal(i) == a.pal(i & ~3u);
-                grey = grey && ((a.pal(i) >> 16) & 0xFFu) == (a.pal(i) & 0xFFu) &&
+                gray = gray && ((a.pal(i) >> 16) & 0xFFu) == (a.pal(i) & 0xFFu) &&
                        ((a.pal(i) >> 8) & 0xFFu) == (a.pal(i) & 0xFFu);
             }
             s += "--   red of entries 0, 8, .. 248, 255:";
@@ -1798,7 +1798,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                      runs8 ? "in runs of eight equal entries"
                      : runs4 ? "in runs of four equal entries"
                              : "every entry its own",
-                     grey ? "the three channels alike"
+                     gray ? "the three channels alike"
                           : "the channels differ");
             s += b;
         }

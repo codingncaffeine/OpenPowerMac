@@ -11,7 +11,7 @@ machine runs Apple's own Open Firmware out of a real Boot ROM image, brings up t
 Pro, and hands over to Mac OS — which drives the display through its own driver at
 640×480×32, enumerates USB keyboard and mouse, and plays sound through the AWACS codec.
 
-The whole storage path works end to end: create a blank disk in the app, initialise it with
+The whole storage path works end to end: create a blank disk in the app, initialize it with
 Drive Setup from the installation CD, run the installer, eject the CD, and boot from it.
 The guest's clock is paced from the host, so a guest second is a real second and the 60 Hz
 tick chain runs at 60 Hz regardless of how fast the emulator itself is.
@@ -26,13 +26,13 @@ The Boot ROM is the 1 MB image of a Power Mac G4 (AGP Graphics) — firmware 4.2
 3.2.4f1 are both known to boot. A ROM read out of a machine carries that machine's
 system-configuration block alongside the firmware; a ROM assembled from Apple's firmware
 updater carries a template block describing a different board instead, which sends the
-firmware off to wait on hardware this machine does not have. The emulator recognises that
+firmware off to wait on hardware this machine does not have. The emulator recognizes that
 case, configures the block as a Sawtooth's before power-on, and says so in the console.
 
 ## Where it is
 
 **Arc 1 — a complete MPC7400 (PowerPC G4) CPU core — is done.** Every instruction,
-register, exception, and MMU behaviour, implemented from the processor's own documentation
+register, exception, and MMU behavior, implemented from the processor's own documentation
 (the Motorola/NXP user's manuals, the PowerPC Programming Environments Manual, and the
 AltiVec Technology manuals) rather than from any other emulator. Integer, floating point on
 a from-scratch integer-only softfloat, all 162 AltiVec instructions, the hashed-page MMU
@@ -68,13 +68,13 @@ The CPU core is held to a standard the machine layer is still growing into:
 - **Known-answer tests** — 240 hand-derived vectors covering instruction semantics,
   exception entry state, and the MMU protection matrix.
 - **A differential oracle** — the same programs built by a PowerPC cross-compiler and run
-  against a host build, compared bit for bit at two optimisation levels.
+  against a host build, compared bit for bit at two optimization levels.
 - **Bare-metal proofs** — supervisor and demand-paging kernels whose output must match
   byte for byte.
 - **A determinism gate** — floating point is a from-scratch softfloat with no host FP and
   no `fenv`, so results are identical across compilers by construction.
 
-Every hardware behaviour the machine relies on is recorded in the wiki's
+Every hardware behavior the machine relies on is recorded in the wiki's
 [Receipts](https://github.com/codingncaffeine/OpenPowerMac/wiki/Clean-Room-Receipts)
 ledger with its source tier and how it was verified.
 

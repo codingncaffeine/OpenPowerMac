@@ -198,14 +198,14 @@ try:
 except subprocess.TimeoutExpired:
     app.kill(); rc = None; exited = False
 
-# The picture: distinct colours inside the screen area, ignoring the chrome.
-colours = int(subprocess.run(["magick", final, "-crop", "900x500+60+60", "-format", "%k", "info:"],
+# The picture: distinct colors inside the screen area, ignoring the chrome.
+colors = int(subprocess.run(["magick", final, "-crop", "900x500+60+60", "-format", "%k", "info:"],
                              capture_output=True, text=True).stdout.strip() or 0)
 log = open(log_path).read() if os.path.exists(log_path) else ""
 con_path = os.path.join(os.path.dirname(log_path), "console.log")
 console = open(con_path, errors="replace").read() if os.path.exists(con_path) else ""
 errors = [l for l in log.splitlines() if "UNHANDLED" in l or "FATAL" in l]
-print(f"boot test: exited by itself={exited} rc={rc} colours in screen area={colours} shots={shots}")
+print(f"boot test: exited by itself={exited} rc={rc} colors in screen area={colors} shots={shots}")
 for l in log.splitlines(): print("  log:", l)
 for l in console.splitlines()[-25:]: print("  console:", l)
 if a.cd_later:
@@ -247,7 +247,7 @@ if a.keys:
     keys_ok = injected >= 4 and delivered >= 4
     print(f"boot test: keyboard handed over {injected} event(s), the guest took {delivered} report(s): "
           + ("TAKEN" if keys_ok else "NOT TAKEN"))
-ok = (exited and colours > 40 and not errors and (moved is None or moved > 0) and keys_ok is not False
+ok = (exited and colors > 40 and not errors and (moved is None or moved > 0) and keys_ok is not False
       and cd_ok is not False and drop_ok is not False)
 print("boot test:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

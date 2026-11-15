@@ -9,7 +9,7 @@
 // to a black app window while the machine underneath was alive and
 // beeping. The conversion also has a paid-for byte-order lesson in it —
 // the Mac writes big-endian pixels, and reading the 32 bpp lanes as
-// little-endian rendered a grey desktop olive. These cases assert the
+// little-endian rendered a gray desktop olive. These cases assert the
 // exact BGRA bytes so neither lesson can regress silently.
 //
 // Every pixel reaches the screen through the DAC's table and then the
@@ -137,7 +137,7 @@ TEST_CASE("r128 scan: the monitor curve is a 2.6 tube shown in sRGB")
             CHECK(m[t] >= m[t - 1]);
     }
     // The look that was chosen: Mac OS's ramp holds 158 at 128, and a 50%
-    // grey is shown as 146.
+    // gray is shown as 146.
     CHECK(m[158] == 146);
 }
 
@@ -147,7 +147,7 @@ TEST_CASE("r128 scan: fmt 3 (ARGB1555) big-endian halfwords to BGRA")
     crtc8x1(c, 3);
     identity(c);
     // Big-endian halfwords in VRAM: pure red 0x7C00, green 0x03E0, blue
-    // 0x001F, mid grey 0x4210 (all three 5-bit fields 0x10).
+    // 0x001F, mid gray 0x4210 (all three 5-bit fields 0x10).
     const u8 fb[8] = {0x7C, 0x00, 0x03, 0xE0, 0x00, 0x1F, 0x42, 0x10};
     const Row r = scan(c, fb, 8);
     // A 5-bit channel is the table index with zeros below: full scale is
@@ -200,7 +200,7 @@ TEST_CASE("r128 scan: fmt 6 keeps the olive lesson — byte 0 is the x lane")
     R128Cell c;
     crtc8x1(c, 6);
     identity(c);
-    // The 50% grey that once rendered olive: 00 80 80 80 big-endian xRGB.
+    // The 50% gray that once rendered olive: 00 80 80 80 big-endian xRGB.
     // The second pixel's unused lane is full and must not reach a channel.
     const u8 fb[8] = {0x00, 0x80, 0x80, 0x80, 0xFF, 0x12, 0x34, 0x56};
     const Row r = scan(c, fb, 8);
@@ -245,7 +245,7 @@ TEST_CASE("r128 scan: a narrow channel indexes the table with zeros below it")
     CHECK(px(r.bgra, 1).g == mon(0x64));
 }
 
-TEST_CASE("r128 scan: the table is applied in the direct-colour modes, each "
+TEST_CASE("r128 scan: the table is applied in the direct-color modes, each "
           "channel through its own third")
 {
     // Before, a 15/16/32 bpp pixel went to the screen as stored, and a
@@ -273,7 +273,7 @@ TEST_CASE("r128 scan: the table is applied in the direct-colour modes, each "
     CHECK(p.r == mon(0xC8)); CHECK(p.g == mon(255u - 0x64u)); CHECK(p.b == 0);
 }
 
-TEST_CASE("r128 scan: Mac OS's ramp shows a 50% grey as 146")
+TEST_CASE("r128 scan: Mac OS's ramp shows a 50% gray as 146")
 {
     // The ramp Mac OS loads, as read from a running system (every eighth
     // entry; it is close to a 1/1.44 power). The entry a 0x80 channel
@@ -292,23 +292,23 @@ TEST_CASE("r128 scan: hardware cursor composites over the new formats")
     R128Cell c;
     crtc8x1(c, 4);
     identity(c);
-    // A visible 16-bpp row of mid grey.
+    // A visible 16-bpp row of mid gray.
     for (u32 i = 0; i < 16; i += 2) {
         c.vram[i] = 0x84;
         c.vram[i + 1] = 0x10;
     }
     // Cursor enabled, bitmap at 0x1000: row 0 has AND=0 for every column,
-    // XOR bit set for column 0 only → colour 1 at the hotspot column,
-    // colour 0 for the rest. Position the cursor at x=2.
+    // XOR bit set for column 0 only → color 1 at the hotspot column,
+    // color 0 for the rest. Position the cursor at x=2.
     c.setReg(0x0050, c.peek(0x0050) | 0x00010000u);
     c.setReg(0x0260, 0x1000);
     c.setReg(0x0264, 2u << 16); // CUR_HORZ_VERT_POSN: x=2, y=0
     c.setReg(0x0268, 0);
-    c.setReg(0x026C, 0x00112233u); // colour 0: R=11 G=22 B=33
-    c.setReg(0x0270, 0x00FF0000u); // colour 1: pure red
+    c.setReg(0x026C, 0x00112233u); // color 0: R=11 G=22 B=33
+    c.setReg(0x0270, 0x00FF0000u); // color 1: pure red
     for (u32 k = 0; k < 8; ++k)
-        c.vram[0x1000 + k] = 0x00; // AND: all select colours
-    c.vram[0x1008] = 0x80;         // XOR: col 0 → colour 1
+        c.vram[0x1000 + k] = 0x00; // AND: all select colors
+    c.vram[0x1008] = 0x80;         // XOR: col 0 → color 1
     for (u32 k = 1; k < 8; ++k)
         c.vram[0x1008 + k] = 0x00;
     auto shown = [&c] {
@@ -319,18 +319,18 @@ TEST_CASE("r128 scan: hardware cursor composites over the new formats")
         return r;
     };
     Row r = shown();
-    // x=0,1: untouched framebuffer grey.
+    // x=0,1: untouched framebuffer gray.
     Px p = px(r.bgra, 0);
     CHECK(p.r == mon(0x80)); CHECK(p.g == mon(0x80)); CHECK(p.b == mon(0x80));
-    // x=2: cursor colour 1 (stored 00RRGGBB).
+    // x=2: cursor color 1 (stored 00RRGGBB).
     p = px(r.bgra, 2);
     CHECK(p.r == 0xFF); CHECK(p.g == 0x00); CHECK(p.b == 0x00);
-    // x=3: cursor colour 0.
+    // x=3: cursor color 0.
     p = px(r.bgra, 3);
     CHECK(p.r == mon(0x11)); CHECK(p.g == mon(0x22)); CHECK(p.b == mon(0x33));
-    // The cursor's colours do not pass the table ("always 24 bpp,
+    // The cursor's colors do not pass the table ("always 24 bpp,
     // independent of graphics mode"): with the picture faded to black the
-    // pointer is still there, at its own colours.
+    // pointer is still there, at its own colors.
     loadTable(c, [](u32) { return 0u; });
     r = shown();
     CHECK(px(r.bgra, 0).r == 0);

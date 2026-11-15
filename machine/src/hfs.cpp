@@ -180,7 +180,7 @@ std::u32string decodeUtf8(const std::string& s)
     return out;
 }
 
-// RelString's ASCII behaviour: case-insensitive, otherwise byte order.
+// RelString's ASCII behavior: case-insensitive, otherwise byte order.
 u8 foldByte(u8 c) { return c >= 'a' && c <= 'z' ? c - 32 : c; }
 int nameCompare(const std::string& a, const std::string& b)
 {
@@ -213,7 +213,7 @@ std::string foldName(std::string s)
 // against the STARTUP disk's: the folder here whose ID equalled that one's
 // (19 on the disk it was met on) was taken for the desktop itself, which
 // holds every disk, and dragging it to any disk or folder was refused with
-// "cannot be copied into itself", while its neighbours copied. Measured both
+// "cannot be copied into itself", while its neighbors copied. Measured both
 // ways on one volume: without the folder the ID is refused, with it the same
 // ID copies. The Trash is carried on the reference disc's word alone.
 struct RootSystemFolder {
@@ -444,7 +444,7 @@ packLevel(const std::vector<std::vector<u8>>& recs)
 // size / 512): the B-tree header must describe exactly that many nodes, with
 // the unbuilt tail counted free, or Mac OS's mount-time consistency check
 // calls the volume unreadable — measured as the "Mac OS Standard 19.7 MB"
-// initialise dialog: partition found, size right, volume refused.
+// initialize dialog: partition found, size right, volume refused.
 BTree buildCatalogTree(std::vector<Rec>& recs, u32 fileNodes)
 {
     std::sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b) {
@@ -876,7 +876,7 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
     //
     // ⚠ The volume does NOT sit bare at sector 0. Mac OS 9's CD probe was
     // MEASURED refusing both a bare HFS+ and a bare classic-HFS volume with
-    // the "unreadable … ProDOS 0K" initialise dialog; what every pressed
+    // the "unreadable … ProDOS 0K" initialize dialog; what every pressed
     // Mac disc carries — and what the same probe then accepts — is a Driver
     // Descriptor Map at block 0 and an Apple Partition Map naming an
     // Apple_HFS partition. The wrapper written here mirrors a real one

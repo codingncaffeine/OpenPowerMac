@@ -18,7 +18,7 @@ namespace opm {
 //   raw      .bin/.img/.mdf and raw Toast — 2352 bytes per sector as the
 //            laser sees them: 12-byte sync mark, 4-byte header, then the
 //            2048 user bytes (at +16 for mode 1, +24 for mode 2 form 1)
-//            and error correction. Recognised by the sync mark itself, not
+//            and error correction. Recognized by the sync mark itself, not
 //            the file name, so a renamed image still opens.
 //   cue      a text sheet naming one or more BINARY files and the track
 //            table: per-track mode and sector size, pregaps, and where
@@ -120,7 +120,7 @@ private:
     };
     std::vector<UdifRun> runs_;
     bool udif_ = false;
-    // One materialised chunk: zlib runs decompress whole, so consecutive
+    // One materialized chunk: zlib runs decompress whole, so consecutive
     // reads out of the same chunk cost one inflate, not one per block.
     size_t cachedRun_ = ~size_t(0);
     std::vector<u8> cache_;

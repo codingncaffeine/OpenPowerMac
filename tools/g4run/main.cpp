@@ -680,7 +680,7 @@ int main(int argc, char** argv)
     bool klTimer = true;
     // --no-sound: take the AWACS codec and the two audio DBDMA channels back
     // out, so the mac-io window falls through to KeyLargo storage the way it
-    // did before 2026-07-31. It is the control for a machine-behaviour
+    // did before 2026-07-31. It is the control for a machine-behavior
     // change, not a preference: with the channels there the boot ROM waits
     // for its own startup chime to finish, because it spins on the output
     // channel's ACTIVE bit (fff868ec). See SawtoothBus::soundOn.
@@ -707,7 +707,7 @@ int main(int argc, char** argv)
     // `--no-cpu-cache-rom` restores a module that never answers.
     // `--cpu-cache-rom` is kept so old command lines still parse.
     bool cpuCacheRom = true;
-    // --l2-inert: DIAGNOSTIC. L2CR is honoured in full, the array holds
+    // --l2-inert: DIAGNOSTIC. L2CR is honored in full, the array holds
     // nothing. Attributes a change to "the L2 is on" vs "our L2 serves the
     // wrong bytes".
     bool l2Inert = false;
@@ -1253,7 +1253,7 @@ int main(int argc, char** argv)
     //   NVRAM-status: 2  at: 0
     //   NVRAM corrupted (init-nvram), cleaning it up...
     //
-    // and reinitialises it, so the edit does NOT stick. Established with a
+    // and reinitializes it, so the edit does NOT stick. Established with a
     // SAME-LENGTH replacement that shifted nothing and padded nothing
     // (`output-device=scca  ` for `output-device=screen`), which rules out
     // both the shift path and the sum-restoring bias — the earlier belief
@@ -1267,7 +1267,7 @@ int main(int argc, char** argv)
     if (!nvramSet.empty())
         printf("-- nvram-set: NOTE — measured on this ROM, any edit to the "
                "config partition is rejected by OF's validator and the "
-               "partition is reinitialised. See the comment above.\n");
+               "partition is reinitialized. See the comment above.\n");
     for (const std::string& kv : nvramSet) {
         const size_t eq = kv.find('=');
         if (eq == std::string::npos || eq == 0) {
@@ -1615,7 +1615,7 @@ int main(int argc, char** argv)
         bus.pmuHost().rtcSetTo(rtcSeconds, 0);
     cpu.l2Inert = l2Inert;
     if (l2Inert)
-        printf("-- DIAGNOSTIC --l2-inert: L2CR is honoured but the array holds "
+        printf("-- DIAGNOSTIC --l2-inert: L2CR is honored but the array holds "
                "nothing, so every access reaches memory\n");
     bus.cpuModuleRom = cpuCacheRom;
     if (cpuCacheRom)
@@ -2955,7 +2955,7 @@ int main(int argc, char** argv)
                 printf("   PA %08zx:", p);
                 // 48 bytes of context after the name: for a Name Registry
                 // property the value follows, and for an OF property the
-                // neighbouring names say which node this is.
+                // neighboring names say which node this is.
                 for (size_t k = 0; k < 48 && p + n + k < r.size(); ++k) {
                     const u8 b = r[p + n + k];
                     printf(" %02x", b);
@@ -5207,8 +5207,8 @@ int main(int argc, char** argv)
                              : "");
         // The census, which is what makes a range watch answer a question the
         // capped log cannot: WHICH bytes of the range were ever written. A
-        // field under test and a neighbour known to change go in the same
-        // watch, and the neighbour's row is the positive control for the
+        // field under test and a neighbor known to change go in the same
+        // watch, and the neighbor's row is the positive control for the
         // field's absence — in the same run, on the same armed instrument.
         if (!cpu.wpByPa.empty()) {
             printf("   written, by address (%zu distinct):\n",
@@ -5462,7 +5462,7 @@ int main(int argc, char** argv)
                      ticks, moved, host > 0 ? moved / host : 0.0);
         else
             snprintf(tickText, sizeof tickText,
-                     "guest Ticks n/a (68K lowmem not initialised yet)");
+                     "guest Ticks n/a (68K lowmem not initialized yet)");
         // Every rate is over what THIS run did, not over the whole history a
         // snapshot carries. 25.00 MHz is real time; the ratio to it is the
         // number the pacing work moves.
@@ -6496,7 +6496,7 @@ int main(int argc, char** argv)
         // Byte Swapping at +0x40 is the one sound register the ROM writes
         // with a plain store rather than a byte-reversed one, so reading a
         // sample order out of it would be a guess. Audio is smooth and noise
-        // is not: the mean absolute difference between neighbouring samples
+        // is not: the mean absolute difference between neighboring samples
         // is tiny for the right interpretation and near full scale for the
         // wrong one, and the two numbers are printed so the claim is
         // checkable rather than asserted.
@@ -6613,7 +6613,7 @@ int main(int argc, char** argv)
                gen, w, h, fmt, r128ScanFmtName(fmt), pitch8, scan.rowBytes,
                offset, bus.ati().peek(0x0228),
                scan.tiled ? "  <== TILED: scanned linearly, expect diagonal "
-                            "banding + scrambled colour"
+                            "banding + scrambled color"
                           : "");
         // The hardware cursor as the guest left it. Mac OS draws its pointer
         // with the cursor engine rather than into the framebuffer, so this is
@@ -6670,7 +6670,7 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(ac.fbWrites));
             // ⭐ THE REGISTERS THE GUEST READS THAT WE NEVER ANSWER. The card
             // claims its whole aperture, so these can never appear in the
-            // unclaimed-access log — they read back zero for ever. A big count
+            // unclaimed-access log — they read back zero forever. A big count
             // here is a driver spinning on hardware this model does not have,
             // which is precisely how the session-31 desktop hang looked from
             // the inside: `ARMQSTimeStampElapsed` in the ATI Graphics
@@ -6729,7 +6729,7 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(e.waitUntil));
             printf("--   declined: rop %llu, bpp %llu, pitch0 %llu, "
                    "off-vram %llu, agp %llu, clipped %llu, hostdata %llu; "
-                   "colour-key ignored %llu; bus-master fetches %llu (%llu bad "
+                   "color-key ignored %llu; bus-master fetches %llu (%llu bad "
                    "addr), cache flushes %llu\n",
                    static_cast<unsigned long long>(e.ropUnimpl),
                    static_cast<unsigned long long>(e.badBpp),
@@ -6824,7 +6824,7 @@ int main(int argc, char** argv)
                 }
             }
             // ⭐ The coordinate convention, per triangle. A triangle that
-            // shows one whole texture spans 1.0 in normalised coordinates
+            // shows one whole texture spans 1.0 in normalized coordinates
             // and `w` in texel ones — 128x apart, so the histogram's mass
             // names the convention outright.
             if (e.triSpanN) {
@@ -6895,7 +6895,7 @@ int main(int argc, char** argv)
         printf("-- ati vblank: %s period=%llutb GEN_INT_CNTL=%08x "
                "GEN_INT_STATUS=%08x "
                "blanks=%llu enabled=%llu acks=%llu expired=%llu line=%d\n",
-               bus.ati().vblEnabled ? "modelled" : "OFF (--no-ati-vbl)",
+               bus.ati().vblEnabled ? "modeled" : "OFF (--no-ati-vbl)",
                static_cast<unsigned long long>(R128Cell::vblPeriodEffective()),
                bus.ati().peek(0x0040), bus.ati().peek(0x0044),
                static_cast<unsigned long long>(bus.ati().vblanks),
@@ -6944,8 +6944,8 @@ int main(int argc, char** argv)
                bus.ati().fbWrites ? bus.ati().fbLo : 0u, bus.ati().fbHi);
         // What the guest ACTUALLY painted, measured rather than decoded.
         // A framebuffer's rows are strongly correlated with their
-        // neighbours whatever the picture is, so the true row stride is
-        // the one that minimises the mean absolute difference between
+        // neighbors whatever the picture is, so the true row stride is
+        // the one that minimizes the mean absolute difference between
         // row n and row n+1. Two candidates matter here — 8/16/32 bpp at
         // this width — and reading the CRTC's pixel-width field wrong is
         // indistinguishable by any other means from the guest painting
@@ -7016,7 +7016,7 @@ int main(int argc, char** argv)
                 // ⚠⚠ WHETHER THE SCREEN HAS ANYTHING ON IT, stated as a
                 // number. `ati paint` counts bytes ever written and SATURATES
                 // once one screenful has been painted: it reads 1,261,501 on
-                // a blank grey screen and 1,261,505 on the Finder desktop —
+                // a blank gray screen and 1,261,505 on the Finder desktop —
                 // four bytes apart — and a whole session was called healthy on
                 // the strength of it while the user was looking at nothing.
                 //

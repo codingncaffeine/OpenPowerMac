@@ -97,7 +97,7 @@ TEST_CASE("cce: the GART base register's low bits are flags, not address")
 {
     // Observed live: the driver programs 0x03105D00 (64 MB) and 0x00B77008
     // (1.5 GB) — the table itself is page-aligned. The old raw-base-first
-    // probe read entries offset by those low bits, landed on NEIGHBOURING
+    // probe read entries offset by those low bits, landed on NEIGHBORING
     // valid entries, walked the wrong physical pages with ZERO recorded
     // misses, and fed fill-pattern garbage into the parser — the 1.5 GB
     // desktop froze mid-redraw behind a 0xDDDDDD00 "header". This decoy
@@ -209,7 +209,7 @@ TEST_CASE("cce: ONE_REG_WR streams every word into the same register")
     r.fifo(0xBBBBBBBBu);
     r.fifo(0xCCCCCCCCu);
     CHECK(r.c.peek(0x15E0u) == 0xCCCCCCCCu); // last write wins
-    CHECK(r.c.peek(0x15E4u) != 0xBBBBBBBBu); // neighbour untouched
+    CHECK(r.c.peek(0x15E4u) != 0xBBBBBBBBu); // neighbor untouched
 }
 
 TEST_CASE("cce: Type-1 writes its two indexed registers")
@@ -271,7 +271,7 @@ TEST_CASE("cce: PAINT (0x91) fills its rectangles through SETTINGS")
     r.fifo(0x00800000u);  // DST_PITCH_OFFSET: pitch8=4 (32 px), offset 0
     r.fifo(0x00000000u);  // SC_TOP_LEFT
     r.fifo(0x001F001Fu);  // SC_BOT_RITE (31,31)
-    r.fifo(0x00AA5500u);  // FRGD colour (solid brush packet)
+    r.fifo(0x00AA5500u);  // FRGD color (solid brush packet)
     r.fifo(0x00010002u);  // TOP=1 LEFT=2
     r.fifo(0x00050006u);  // BOTM=5 RITE=6 -> 4x4 exclusive
     const auto& e = r128EngStats();
@@ -333,7 +333,7 @@ TEST_CASE("cce: HOSTDATA_BLT (0x94) expands a mono glyph MSB-first")
     CHECK(r.c.vram[stride * 1u + 5u * 4u + 1u] == 0x00); // (5,1) bk
 }
 
-TEST_CASE("cce: HOSTDATA_BLT colour keeps the guest's MEMORY byte order")
+TEST_CASE("cce: HOSTDATA_BLT color keeps the guest's MEMORY byte order")
 {
     CceRig r;
     const auto before = r128EngStats();
@@ -354,7 +354,7 @@ TEST_CASE("cce: HOSTDATA_BLT colour keeps the guest's MEMORY byte order")
         0x00800000u,               // DST_PITCH_OFFSET
         0x00000000u,               // SC_TOP_LEFT
         0x001F001Fu,               // SC_BOT_RITE
-        0x00000000u,               // FRGD (ineffective for colour)
+        0x00000000u,               // FRGD (ineffective for color)
         0x00000000u,               // BKGD (ineffective)
         0x00020003u,               // BaseY=2 | BaseX=3
         0x00020002u,               // HEIGHT=2 | WIDTH=2
@@ -382,12 +382,12 @@ TEST_CASE("cce: HOSTDATA_BLT colour keeps the guest's MEMORY byte order")
     CHECK(r.c.vram[stride * 3u + 4u * 4u + 0u] == 0x55);
 }
 
-// A sprite pushed from system memory with its surround keyed out: colour
+// A sprite pushed from system memory with its surround keyed out: color
 // host data with CLR_CMP_CNTL = 0x01000005 (compare the source, draw when
 // not equal) and a key of zero, which is what a driver programs for one.
 // GUI_CONTROL bit 28 clear leaves that setting alone; set, it switches the
 // compare off for the packet.
-TEST_CASE("cce: HOSTDATA_BLT colour honours the source colour key")
+TEST_CASE("cce: HOSTDATA_BLT color honors the source color key")
 {
     for (const bool keyed : {true, false}) {
         CceRig r;
@@ -611,7 +611,7 @@ TEST_CASE("cce: BITBLT (0x92) walks an overlapping copy away from itself")
 }
 
 TEST_CASE("cce: SMALL_TEXT (0x93) draws transparent glyphs and NEXTCHAR "
-          "(0x19) reuses its colour")
+          "(0x19) reuses its color")
 {
     CceRig r;
     const auto before = r128EngStats();
@@ -633,7 +633,7 @@ TEST_CASE("cce: SMALL_TEXT (0x93) draws transparent glyphs and NEXTCHAR "
     CHECK(r.c.vram[8 * stride + 5 * 4 + 1] == 0xFF);  // (5,8) red
     CHECK(r.c.vram[9 * stride + 5 * 4 + 1] == 0x00);  // (5,9) untouched
     CHECK(r.c.vram[9 * stride + 6 * 4 + 1] == 0xFF);  // (6,9) red
-    // NEXTCHAR: engine-layout words, colour remembered from SMALL_TEXT.
+    // NEXTCHAR: engine-layout words, color remembered from SMALL_TEXT.
     r.fifo(0xC0001900u | (2u << 16)); // 3-DWord body
     r.fifo(0x0014000Cu);              // DST_Y=20 | DST_X=12
     r.fifo(0x00010002u);              // DST_H=1 | DST_W=2
@@ -672,7 +672,7 @@ TEST_CASE("cce: an indirect body drives the 2D engine through PACKET0")
     const auto before = r128EngStats();
     // Body: a solid fill, the same programming test_r128_2d proves against
     // the blitter directly — DP_GUI_MASTER_CNTL for a PATCOPY fill, brush
-    // colour, then DST_Y_X / DST_HEIGHT_WIDTH which initiates the draw.
+    // color, then DST_Y_X / DST_HEIGHT_WIDTH which initiates the draw.
     // 32bpp dst (datatype 6), brush 13 (solid frgd), ROP3 0xF0 PATCOPY.
     const u32 gmc = 0x0Fu | (13u << 4) | (6u << 8) | (0xF0u << 16);
     r.body({
@@ -713,13 +713,13 @@ void setPix32(R128Cell& c, u32 x, u32 y, u32 v)
         c.vram[o + k] = static_cast<u8>(v >> (8u * (3u - k)));
 }
 // SETTINGS for a solid PATCOPY fill of that surface: five words.
-void solidSettings(CceRig& r, u32 colour)
+void solidSettings(CceRig& r, u32 color)
 {
     r.fifo(2u | 8u | (13u << 4) | (6u << 8) | (0xF0u << 16));
     r.fifo(0x00800000u); // DST_PITCH_OFFSET: pitch8 = 4, offset 0
     r.fifo(0x00000000u); // SC_TOP_LEFT
     r.fifo(0x001F001Fu); // SC_BOT_RITE (31,31)
-    r.fifo(colour);
+    r.fifo(color);
 }
 
 } // namespace
@@ -786,10 +786,10 @@ TEST_CASE("cce: PLY_NEXTSCAN (0x1D) paints one more scanline with the "
     CHECK(r128CceP3Skipped().count(0x1Du) == 0);
 }
 
-TEST_CASE("cce: TRANS_BITBLT (0x9C) copies all but the source's key colour")
+TEST_CASE("cce: TRANS_BITBLT (0x9C) copies all but the source's key color")
 {
     CceRig r;
-    // A 3x1 source at (2,1): a pixel, the key colour, a pixel. The
+    // A 3x1 source at (2,1): a pixel, the key color, a pixel. The
     // destination row at (10,5) already holds something.
     setPix32(r.c, 2, 1, 0x00112233u);
     setPix32(r.c, 3, 1, 0x00FF00FFu);
@@ -809,7 +809,7 @@ TEST_CASE("cce: TRANS_BITBLT (0x9C) copies all but the source's key colour")
     r.fifo(0x00000000u); // SC_TOP_LEFT
     r.fifo(0x001F001Fu); // SC_BOT_RITE
     r.fifo(0x01000005u); // CLR_CMP_CNTL: the source function, 5 = write the
-                         // pixels that are NOT the reference colour
+                         // pixels that are NOT the reference color
     r.fifo(0x00FF00FFu); // SRC_REF_CLR
     r.fifo(0x00000000u); // DST_REF_CLR
     r.fifo(0x00010002u); // SRC_Y=1 | SRC_X=2
@@ -821,7 +821,7 @@ TEST_CASE("cce: TRANS_BITBLT (0x9C) copies all but the source's key colour")
     CHECK(pix32(r.c, 11, 5) == 0x00ABABABu); // keyed out: what was there
     CHECK(pix32(r.c, 12, 5) == 0x00445566u);
     CHECK(r128CceP3Skipped().count(0x9Cu) == 0);
-    // The other source function, 4, writes ONLY the reference colour.
+    // The other source function, 4, writes ONLY the reference color.
     for (u32 x = 10; x < 13; ++x)
         setPix32(r.c, x, 6, 0x00ABABABu);
     r.fifo(0xC0009C00u | (10u << 16));

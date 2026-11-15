@@ -393,7 +393,7 @@ private:
             // driver was still walking its ports powering them up, before it
             // had queued the status-change transfer that the event is supposed
             // to complete. So it saw the port, and had nowhere to put it.
-            // Honouring POTPGT lands the connect after the driver is ready,
+            // Honoring POTPGT lands the connect after the driver is ready,
             // which is the whole reason the field exists.
             const u32 potpgt = ((rhDescA_ >> 24) & 0xFFu) * 2u;
             portPower_[n] =

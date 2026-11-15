@@ -11,7 +11,7 @@ namespace OpenPowerMac.Shell;
 /// that calls into the core. SDL pulls from the stream on its own thread;
 /// this side only queues and reads how much is still queued.
 ///
-/// The behaviour matches the Windows sink so the two front ends sound the
+/// The behavior matches the Windows sink so the two front ends sound the
 /// same and report the same counters:
 ///  - a 300 ms ceiling on what is queued (the latency bound), and the caller
 ///    drains the machine by <see cref="FreeBytes"/>, so the overflow waits in

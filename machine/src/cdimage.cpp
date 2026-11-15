@@ -340,7 +340,7 @@ bool base64Decode(const char* s, const char* end, std::vector<u8>& out)
 
 // ------------------------------------------------------------ cue sheet --
 
-// One whitespace-tokenised cue line, honouring "quoted names".
+// One whitespace-tokenized cue line, honoring "quoted names".
 std::vector<std::string> cueTokens(const std::string& line)
 {
     std::vector<std::string> t;
@@ -852,7 +852,7 @@ bool CdImage::udifRead512(u64 sector, u8* dst)
 // ---------------------------------------------------- the partition dress --
 
 // Mac OS 9's CD probe was MEASURED refusing a bare HFS+ and a bare
-// classic-HFS volume alike with the "unreadable … ProDOS 0K" initialise
+// classic-HFS volume alike with the "unreadable … ProDOS 0K" initialize
 // dialog; what every pressed Mac disc carries — and the same probe then
 // accepts — is a Driver Descriptor Map at block 0 and an Apple Partition
 // Map naming an Apple_HFS partition (hfsBuildImage writes this dress for

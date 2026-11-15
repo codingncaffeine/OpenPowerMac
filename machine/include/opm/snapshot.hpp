@@ -17,7 +17,7 @@ class SawtoothBus;
 // snapshot at all. Restore the CPU and RAM but leave a device's internal
 // state stale and the guest reads different bytes than it would have; the
 // run then diverges SILENTLY and manufactures evidence that looks real.
-// So every mutable field of every modelled device is written here by hand,
+// So every mutable field of every modeled device is written here by hand,
 // field by field, in a fixed order — never a memcpy of a struct, whose
 // padding and layout are a compiler's business rather than ours.
 //

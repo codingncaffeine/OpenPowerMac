@@ -348,7 +348,7 @@ void AtaCell::diskCommand(u8 cmd)
         // mac-io +0x8A00 actually serves. Ultra DMA stays unadvertised: the
         // engine moves the bytes either way, and claiming a transfer mode
         // whose timing the cell does not model is the kind of capability
-        // claim a driver acts on and we cannot honour.
+        // claim a driver acts on and we cannot honor.
         w16(49, 0x0300);                        // LBA + DMA supported
         w16(53, 0x0003);                        // words 54-58 and 64-70 valid
         // 54-56 are the CURRENT translation, not the default one words 1/3/6

@@ -93,7 +93,7 @@ TEST_CASE("sys block: the trailer is Adler-32 of the body")
     CHECK(SawtoothBus::sysBlockChecksum(rom.data() + kSys) == 0x3db43071u);
 }
 
-TEST_CASE("sys block: a real Sawtooth's block is recognised and left alone")
+TEST_CASE("sys block: a real Sawtooth's block is recognized and left alone")
 {
     std::vector<u8> rom = blankRom();
     putSawtoothBlock(rom);

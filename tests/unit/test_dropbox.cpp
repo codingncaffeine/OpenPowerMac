@@ -555,7 +555,7 @@ TEST_CASE("the drop drive travels in an optional snapshot section, both ways")
         // disc staged, so the guest remounts it cleanly on its next poll.
         CHECK(!m2.drop().mediaPresent());
         CHECK(m2.drop().swapPending());
-        CHECK(m2.drop().lockedByGuest()); // the guest's lock travelled
+        CHECK(m2.drop().lockedByGuest()); // the guest's lock traveled
         CHECK(m2.drop().readsSinceInsert() == 1u);
         // A guest that polls sees the absence, then the disc, then the
         // unit attention — the swap protocol from the top.

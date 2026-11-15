@@ -18,7 +18,7 @@ namespace OpenPowerMac.Gui.Platform;
 ///   Alt+Tab) go to the Mac instead. This is the X11 counterpart of the Windows
 ///   build's low-level keyboard hook. Under Xwayland the grab is forwarded to
 ///   the compositor; the window is first marked as allowed to grab, which is
-///   what GNOME asks of an X11 client before it honours one.
+///   what GNOME asks of an X11 client before it honors one.
 ///
 /// One thread owns a private X connection. The UI only posts Lock and Unlock and
 /// collects the accumulated motion; buttons and keys taken by the grab are handed
@@ -280,7 +280,7 @@ internal sealed class X11InputCapture : IDisposable
     {
         if (_grabbed || !_wantLocked) return;
 
-        // GNOME honours an X11 client's keyboard grab only for a window that has
+        // GNOME honors an X11 client's keyboard grab only for a window that has
         // announced it may grab; other desktops ignore the message.
         nuint mayGrab = XInternAtom(_dpy, "_XWAYLAND_MAY_GRAB_KEYBOARD", 0);
         IntPtr message = Marshal.AllocHGlobal(XEventSize);
@@ -329,7 +329,7 @@ internal sealed class X11InputCapture : IDisposable
             return;
         }
         _grabbed = true;
-        WarpToCentre();
+        WarpToCenter();
         XSync(_dpy, 0);
         _onState(State.Engaged);
     }
@@ -338,14 +338,14 @@ internal sealed class X11InputCapture : IDisposable
     {
         if (!_grabbed) return;
         _grabbed = false;
-        WarpToCentre();   // the pointer reappears in the middle of the Mac's screen
+        WarpToCenter();   // the pointer reappears in the middle of the Mac's screen
         XUngrabKeyboard(_dpy, 0);
         XUngrabPointer(_dpy, 0);
         XFixesShowCursor(_dpy, _root);
         XSync(_dpy, 0);
     }
 
-    private void WarpToCentre()
+    private void WarpToCenter()
     {
         if (XGetGeometry(_dpy, _window, out _, out _, out _, out uint w, out uint h, out _, out _) != 0 && w > 0 && h > 0)
             XWarpPointer(_dpy, 0, _window, 0, 0, 0, 0, (int)(w / 2), (int)(h / 2));

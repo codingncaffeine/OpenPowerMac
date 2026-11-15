@@ -153,7 +153,7 @@ public:
     // later, then waits). 200 µs is ~4000 instructions at --fast-tb 4 and
     // ~11,000 through the app's real-time loop, against an arming sequence of
     // about 700 — and a real drive takes milliseconds, so erring wide is
-    // erring towards the hardware.
+    // erring toward the hardware.
     bool tick(); // true when a deferred command ran: wake the DMA list
     // The timebase at which tick() could next do something, so the machine
     // loop need not ask on every instruction. ~0 when nothing is deferred.
@@ -196,7 +196,7 @@ public:
     // lost. A hard disk's OUTPUT descriptors ARE the write, and absorbing one
     // loses a sector the guest believes it wrote — the drive is left holding
     // a data phase for bytes that never arrive, and the driver waits on a
-    // transfer that can never finish. Initialising a disk stops there.
+    // transfer that can never finish. Initializing a disk stops there.
     u32 dmaGive(const u8* src, u32 n) override;
     // Whether this cell's OUTPUT descriptors carry real data. See dmaGive.
     bool dmaWriteSink() const override { return disk_; }

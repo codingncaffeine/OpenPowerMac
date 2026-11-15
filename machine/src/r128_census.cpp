@@ -33,31 +33,31 @@ constexpr const char* kCompare =
 constexpr const char* kStencilOp =
     "keep|zero|replace|increment|decrement|invert";
 constexpr const char* kBlend =
-    "zero|one|source colour|1 - source colour|source alpha|1 - source alpha|"
-    "destination alpha|1 - destination alpha|destination colour|"
-    "1 - destination colour|source alpha saturate|both source alpha|"
+    "zero|one|source color|1 - source color|source alpha|1 - source alpha|"
+    "destination alpha|1 - destination alpha|destination color|"
+    "1 - destination color|source alpha saturate|both source alpha|"
     "both 1 - source alpha";
 constexpr const char* kCombine =
     "off|copy|copy input|modulate|modulate x2|modulate x4|add|add signed|"
     "blend by vertex alpha|blend by texture alpha|blend by constant alpha|"
     "blend premultiplied|blend by previous|blend premultiplied, inverse|"
-    "add signed x2|blend by constant colour";
+    "add signed x2|blend by constant color";
 constexpr const char* kCombineAlpha =
     "off|copy|copy input|modulate|modulate x2|modulate x4|add|add signed|"
     "||||||add signed x2";
 constexpr const char* kMinFilter =
     "nearest|linear|nearest map, nearest|nearest map, linear|"
     "two maps, nearest|trilinear";
-constexpr const char* kClamp = "wrap|mirror|clamp|border colour";
+constexpr const char* kClamp = "wrap|mirror|clamp|border color";
 constexpr const char* kTexFormat =
     "VQ|CI4|CI8|ARGB1555|RGB565|RGB888|ARGB8888|RGB332|Y8|RGB8|aCI88|"
-    "YVYU422|VYUY422|alpha and grey 8:8|AYUV444|ARGB4444";
+    "YVYU422|VYUY422|alpha and gray 8:8|AYUV444|ARGB4444";
 constexpr const char* kColorFactor =
-    "constant colour|1 - constant colour|||texture colour|"
-    "1 - texture colour|texture alpha|1 - texture alpha|previous colour";
+    "constant color|1 - constant color|||texture color|"
+    "1 - texture color|texture alpha|1 - texture alpha|previous color";
 constexpr const char* kInputFactor =
-    "||constant colour|constant alpha|vertex colour|vertex alpha|||"
-    "previous colour|previous alpha";
+    "||constant color|constant alpha|vertex color|vertex alpha|||"
+    "previous color|previous alpha";
 constexpr const char* kAlphaFactor = "||||||texture alpha|1 - texture alpha";
 constexpr const char* kInputFactorA =
     "|constant alpha|vertex alpha||previous alpha";
@@ -76,10 +76,10 @@ constexpr Setting kSettings[] = {
     {"2D brush", bit(0) | bit(1) | bit(13) | bit(15),
      "8x8 mono|8x8 mono, see-through|8x1 mono|8x1 mono, see-through|"
      "1x8 mono|1x8 mono, see-through|32x1 mono|32x1 mono, see-through|"
-     "32x32 mono|32x32 mono, see-through|8x8 colour|8x1 colour|1x8 colour|"
+     "32x32 mono|32x32 mono, see-through|8x8 color|8x1 color|1x8 color|"
      "solid||solid, from the packet parser"},
     {"2D source format", bit(0) | bit(1) | bit(3),
-     "mono|mono, see-through||colour"},
+     "mono|mono, see-through||color"},
     {"2D source, through the registers", bit(2) | bit(3) | bit(4),
      "||video memory|host data|host data, byte aligned"},
     {"2D rectangle tiling", bit(0), "off|across|down|across and down"},
@@ -93,7 +93,7 @@ constexpr Setting kSettings[] = {
     // driver's own 3D register writes per three frames, because each burst
     // carries the depth and texture registers ahead of the function. A
     // driver that ships cannot be losing those on the chip, so the gate as
-    // modelled is stricter than the chip toward this sequence, and the
+    // modeled is stricter than the chip toward this sequence, and the
     // action stays out until something says what the chip does there.
     {"2D master control, on the 3D function", bit(0) | bit(1),
      "clear it|leave it"},
@@ -119,21 +119,21 @@ constexpr Setting kSettings[] = {
      "quarter pixel|sixteenth of a pixel"},
     {"texture coordinates", upTo(1),
      "plain, for the chip to multiply by W|already multiplied by W"},
-    {"shading", upTo(3), "constant colour|flat|Gouraud|Gouraud"},
+    {"shading", upTo(3), "constant color|flat|Gouraud|Gouraud"},
     {"back faces", upTo(3), kFace},
     {"front faces", upTo(3), kFace},
     // TEX_CNTL_C bit 21. Nothing says what the card does with it, so "on"
     // is not drawn; no draw of either game studied has it on.
     {"texture anti-alias bit", bit(0), "off|on"},
     // CLR_CMP_FCN_3D (guide, MISC_3D_STATE_CNTL_REG 31:30): the texel that
-    // equals the key colour is not drawn, whatever this says.
-    {"texture colour key", bit(3),
+    // equals the key color is not drawn, whatever this says.
+    {"texture color key", bit(3),
      "never|always|where the texel differs from the key|"
      "where the texel equals the key"},
     {"edge anti-aliasing", bit(0), "off|on"},
     {"supersampling", bit(0), "off|on"},
     // Table 6-15 has no state 11 or 13.
-    {"lighting, colour", upTo(15) & ~(bit(11) | bit(13)), kCombine},
+    {"lighting, color", upTo(15) & ~(bit(11) | bit(13)), kCombine},
     {"lighting, alpha", upTo(7), kCombineAlpha},
     // ── the two texture units ────────────────────────────────────────────
 #define OPM_UNIT(N)                                                           \
@@ -146,11 +146,11 @@ constexpr Setting kSettings[] = {
     {"texture " N " format", upTo(15) & ~bit(0), kTexFormat},                 \
     /* The palette is used as it was loaded, whatever this says. */           \
     {"texture " N " palette entries", 0, kPalEntries},                        \
-    {"texture " N " colour combine", upTo(15), kCombine},                     \
-    /* r128_reg.h's "1 - constant colour" is drawn as the texture colour. */  \
-    {"texture " N " colour factor",                                           \
+    {"texture " N " color combine", upTo(15), kCombine},                     \
+    /* r128_reg.h's "1 - constant color" is drawn as the texture color. */  \
+    {"texture " N " color factor",                                           \
      bit(0) | bit(4) | bit(5) | bit(6) | bit(7) | bit(8), kColorFactor},      \
-    {"texture " N " colour input",                                            \
+    {"texture " N " color input",                                            \
      bit(2) | bit(3) | bit(4) | bit(5) | bit(8) | bit(9), kInputFactor},      \
     {"texture " N " alpha combine", upTo(7) | bit(14), kCombineAlpha},        \
     {"texture " N " alpha factor", bit(6) | bit(7), kAlphaFactor},            \

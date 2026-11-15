@@ -24,9 +24,9 @@ struct SnapReader;
 
 // --no-agp-caps: build the machine with the PRE-2026-08-01 config space —
 // no AGP capability chains on the Uni-N AGP host function or the card.
-// A diagnostic A/B control in the --no-ati-2d mould, kept because the caps
+// A diagnostic A/B control in the --no-ati-2d mold, kept because the caps
 // are now load-bearing (they are what makes `.AGP` install, the ARM
-// initialise, and the accelerator draw) and "with/without the machine
+// initialize, and the accelerator draw) and "with/without the machine
 // change" should stay a one-flag question. ⚠ It exists because of a
 // GOOSE CHASE worth remembering: a question-mark boot was blamed on these
 // seeds through a whole bisect — with the flag, without the flag, the
@@ -169,7 +169,7 @@ private:
         // "7,MAC-IO,8,USB0,9,USB1,10,FireWire,11,Ethernet".
         // Apple id 0x0019, class 0x0C0310 (serial bus / USB / OHCI), INT
         // pin A; BAR0 is a 4 KB memory window with real sizing-mask
-        // behaviour (cfgAccess below). The Boot ROM carries ohci+usb-hid
+        // behavior (cfgAccess below). The Boot ROM carries ohci+usb-hid
         // FCode; the USB Expert seeds the boot-keyboard shim chain per
         // controller it registers — no controllers is the path Apple never
         // booted, and is what put the sad Mac on the screen.
@@ -751,7 +751,7 @@ public:
     // One edge, then the line goes back down and the channel's condition is
     // consumed. ⚠ The ATA channels deliberately do NOT go through here: their
     // interrupt reaches the driver through the cell's +0x300 latch, source 11
-    // has never raised once in a whole boot, and their behaviour is the one
+    // has never raised once in a whole boot, and their behavior is the one
     // every recorded baseline was measured against.
     void pulse(u32 src, DbdmaChannel& ch)
     {
@@ -964,7 +964,7 @@ public:
     // the same map gives: 0x8800 audio out, 0x8900 audio in.
     //
     // ⚠⚠ CONSTRUCTOR DEFAULT, WHICH IS WHAT THE CAPI AND THEREFORE THE APP
-    // GET. Turning this on is a MACHINE-BEHAVIOUR change, not an addition:
+    // GET. Turning this on is a MACHINE-BEHAVIOR change, not an addition:
     // the boot ROM arms the output channel for the startup chime and then
     // SPINS ON ITS ACTIVE BIT (fff868ec..fff868fc). With nothing behind the
     // window the status register read zero, the spin fell straight through
@@ -1629,7 +1629,7 @@ private:
             const u8 cmd = static_cast<u8>(v);
             if (flashMode_ == kFlashProgram) {
                 // Flash programming can only clear bits; the erase is what
-                // sets them. Modelling it as a plain store would let a
+                // sets them. Modeling it as a plain store would let a
                 // driver "write" ones into an unerased block and hide its
                 // own bug.
                 for (u32 k = 0; k < len && off + k < rom_.size(); ++k)

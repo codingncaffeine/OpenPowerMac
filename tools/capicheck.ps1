@@ -13,7 +13,7 @@
 #   tools/capicheck.ps1 -FastTb 4 -Realtime:$false
 #
 # It reports the same two numbers the boot gate uses — DISTINCT SCANLINES of
-# the framebuffer, which separates a desktop from a grey screen, and the
+# the framebuffer, which separates a desktop from a gray screen, and the
 # timebase rate against real time, which says whether pacing works.
 param(
     [int]$Seconds = 45,

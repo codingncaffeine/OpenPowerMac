@@ -35,7 +35,7 @@ namespace prof {
 // restores the enclosing region, so Exec means "the handler MINUS the memory
 // it touched" and Fetch means "instruction fetch MINUS the translation".
 enum class Ph : unsigned char {
-    Other = 0, // unmarked: loop overhead, reporting, anything uncategorised
+    Other = 0, // unmarked: loop overhead, reporting, anything uncategorized
     Fetch,     // fetch32 after translation: L1/L2 peek, bus read
     Xlate,     // Cpu::translate — BATs, TLBs, hardware page-table search
     Decode,    // decode() + facility/privilege guards + handlerFor()
@@ -51,12 +51,12 @@ enum class Ph : unsigned char {
     // of exception delivery — and at the desktop that is a decrementer every
     // few thousand instructions — was being billed to whatever phase the
     // machine loop had left set. Unattributed time is not a small bucket you
-    // can ignore; it is the bucket the next optimisation should have gone to.
+    // can ignore; it is the bucket the next optimization should have gone to.
     Exc,       // Cpu::raiseExc: vectoring, MSR/SRR transition, handler entry
     // ⚠ ADDED 2026-07-30, SAME REASON AS Exc AND ONE SESSION LATER. With the
     // clock batched and whole blocks executed in one go, "other" read 29.6% at
     // the desktop and was the second largest bucket in the machine. It is not
-    // "uncategorised": it is the RUN LOOP — sizing each batch, asking whether
+    // "uncategorized": it is the RUN LOOP — sizing each batch, asking whether
     // the core is asleep, and the exit tests every instruction of a line has
     // to pass. Naming it is the difference between "the interpreter is slow"
     // and "the loop around it is".

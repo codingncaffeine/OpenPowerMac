@@ -173,7 +173,7 @@ u16 crc16x(const u8* p, size_t n)
 TEST_CASE("hfs: a folder becomes a volume whose catalog and forks read back")
 {
     const fs::path d = scratchDir();
-    // A file whose bytes are recognisable, a nested folder with another,
+    // A file whose bytes are recognizable, a nested folder with another,
     // and a MacBinary file carrying both forks and its Mac identity.
     std::vector<u8> readme;
     for (int i = 0; i < 5000; ++i)

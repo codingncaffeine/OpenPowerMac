@@ -43,7 +43,7 @@ constexpr u32 kJunctionTempC = 45;
 
 // Recompute both thresholds' status. The comparison settles immediately rather
 // than after THRM3[SITV] -- deliberate: the only consumer polls TIV in a tight
-// loop until it is set, so arriving early is invisible to it, and modelling the
+// loop until it is set, so arriving early is invisible to it, and modeling the
 // interval would need a counter in the snapshotted CPU state.
 void Cpu::thrmUpdate()
 {

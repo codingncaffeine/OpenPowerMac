@@ -157,8 +157,8 @@ void findCallers(const std::vector<u8>& buf, u64 paBase, u64 vaBase, u32 target)
 // not understood yet -- and the symbol table then does not fit in the bytes
 // that remain. Until that is resolved the guards below drop every candidate
 // and the tool reports "0 export(s)", which is a false negative and safe. It
-// must not become a false name: an address labelled with the wrong routine is
-// worse than an address labelled with nothing.
+// must not become a false name: an address labeled with the wrong routine is
+// worse than an address labeled with nothing.
 constexpr u32 kPefTag1 = 0x4A6F7921u; // 'Joy!'
 constexpr u32 kPefTag2 = 0x70656666u; // 'peff'
 

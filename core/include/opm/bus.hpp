@@ -38,7 +38,7 @@ struct SnoopSink {
     // what was published rather than what was there before the store. Code
     // that relies on a store being thrown away is relying on the opposite
     // of what a cache is for; the machine that never publishes (a run with
-    // no device thread) keeps the exact behaviour.
+    // no device thread) keeps the exact behavior.
     virtual void publish(u8* /*ram*/, u32 /*ramSize*/) {}
 };
 
@@ -107,7 +107,7 @@ public:
     // and in this machine an unmapped fetch would file eight entries in the
     // unclaimed-access log instead of one, quietly corrupting an instrument.
     // The default is "no", so a bus that has not thought about the question
-    // keeps the exact single-word behaviour.
+    // keeps the exact single-word behavior.
     virtual bool memoryAt(u32 /*pa*/, u32 /*len*/) const { return false; }
 
     // Burst (cache-line) transactions, the 60x TBST-asserted class. Chipset

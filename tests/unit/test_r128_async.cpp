@@ -82,7 +82,7 @@ struct Rig {
     void drain() { r128AsyncDrain(c, mem()); }
 };
 
-// A stream of `n` Gouraud triangles in changing colours and places, with a
+// A stream of `n` Gouraud triangles in changing colors and places, with a
 // fence in GUI_SCRATCH_REG0 written after every eighth, and the fence value
 // `mark` at its very end. ~18 words a triangle.
 std::vector<u32> stream(u32 n, u32 mark)

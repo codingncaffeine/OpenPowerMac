@@ -324,7 +324,7 @@ struct HostPacer {
         }
         // A debt the guest cannot repay is forgiven down to the cap: the
         // origin moves, and the guest is never told about that time. With the
-        // control off this is the old behaviour exactly: one step of the cap.
+        // control off this is the old behavior exactly: one step of the cap.
         if (!smooth && delta > kCatchupTb)
             delta = kCatchupTb;
         if (debt - delta > (smooth ? kCatchupTb : 0)) {

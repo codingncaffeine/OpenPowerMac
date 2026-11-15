@@ -196,9 +196,9 @@ private:
     // change sizeof(R128Cell) and therefore sizeof(SawtoothBus), which the
     // layout digest hashes — every existing snapshot would die and
     // kSnapVersion would have to move. Instead the aliases and the composite
-    // registers are NORMALISED into their canonical offsets as they are
+    // registers are NORMALIZED into their canonical offsets as they are
     // written, and a blit reads its parameters back out of the same map. The
-    // engine adds no state of its own at all; it only adds behaviour.
+    // engine adds no state of its own at all; it only adds behavior.
     u32 rd(u32 off) const
     {
         auto it = regs_.find(off);
@@ -212,7 +212,7 @@ private:
     void engLine(u32 length);
     void engHostBegin(u32 rop, u32 bypp, bool byteAligned);
     void engHostWord(u32 v, bool last);
-    // Absorb a write into the engine block: normalise aliases, apply the
+    // Absorb a write into the engine block: normalize aliases, apply the
     // side effects of a DP_GUI_MASTER_CNTL write, and initiate on a trigger.
     // Returns true when it has fully handled the write.
     bool engWrite(u32 off, u32 v);
@@ -254,7 +254,7 @@ const std::map<u32, u64>& r128RegReadsUnbacked();
 //
 // THE DAC'S TABLE, AND THE MONITOR BEHIND IT. Every pixel goes to the DAC
 // through the 256-entry table (PALETTE_INDEX / PALETTE_DATA), in every mode:
-// in 8 bpp the pixel is the index, and in the direct-colour modes each
+// in 8 bpp the pixel is the index, and in the direct-color modes each
 // channel indexes its own third of the entry. That is where Mac OS keeps its
 // gamma ramp (entry 128 holds 158), and where a game fades the screen, by
 // loading the ramp scaled down a step at a time.
@@ -264,14 +264,14 @@ const std::map<u32, u64>& r128RegReadsUnbacked();
 // machines ran, writes exactly one entry for each value of a 5-bit channel,
 // at value * 8, and one for each value of the 6-bit green, at value * 4. So
 // the index is the channel's bits with zeros below them, and white in
-// thousands of colours is entry 248, not 255.
+// thousands of colors is entry 248, not 255.
 //
 // What leaves the DAC drives a monitor, and the ramp was computed for one:
 // it is close to a 1/1.44 power, which on a tube of gamma 2.6 gives the Mac's
 // 1.8. A host screen is not that tube, so the last stage is the monitor: the
 // light a 2.6 tube makes of the value, expressed in the host's sRGB
-// (r128MonitorCurve). Net: the Mac's own tone, mid-grey 128 shown as 146.
-// The hardware cursor's two colours are "always 24 bpp, independent of
+// (r128MonitorCurve). Net: the Mac's own tone, mid-gray 128 shown as 146.
+// The hardware cursor's two colors are "always 24 bpp, independent of
 // graphics mode" (guide, CUR_CLR0): they reach the DAC without the table,
 // and the monitor like everything else.
 struct R128Scan {
@@ -288,7 +288,7 @@ struct R128Scan {
     u8 lut[3][256] = {};
     // CRTC_OFFSET_CNTL bit 15 (CRTC_TILE_EN): the scan-out is reading a
     // TILED surface. This model walks VRAM linearly, so a tiled framebuffer
-    // comes out sheared into diagonal bands with scrambled colour — a
+    // comes out sheared into diagonal bands with scrambled color — a
     // symptom that is otherwise indistinguishable from a stride bug.
     // Reported rather than silently mis-rendered.
     bool tiled = false;
@@ -366,11 +366,11 @@ std::string r128SettingsReport();
 // A wrong pixel has three possible authors — the processor storing through
 // the frame buffer aperture, the 2D engine, the 3D rasterizer — and from the
 // picture they are indistinguishable: a sprite with a black box behind it
-// looks the same whether the game's own blitter, a colour-keyed engine blit
+// looks the same whether the game's own blitter, a color-keyed engine blit
 // or a textured quad drew the box. This names the author. Every store path
 // into video memory asks r128PixelWatched() and, for the watched bytes, logs
 // who it is and what it was doing: the storing pc, the blit's operation and
-// colour-compare setting, the triangle's state.
+// color-compare setting, the triangle's state.
 //
 // Off, it is one load and one branch per store. The first `budget` writes
 // are kept in order and the rest are counted per author. File-statics, like
@@ -446,7 +446,7 @@ struct R128EngStats {
     u64 lineDeclined = 0; // a line asked for with a brush or ROP not drawn
     u64 hostData = 0;    // source is HOST_DATA (stage 3, not built yet)
     u64 hostShape = 0;   // color host data with a word count of no known layout
-    u64 colorCompare = 0; // a colour compare this engine did not apply
+    u64 colorCompare = 0; // a color compare this engine did not apply
     u64 waitUntil = 0;   // WAIT_UNTIL events, all satisfiable at once here
     u64 cacheFlushes = 0; // PC_GUI_CTLSTAT flush/invalidate pulses answered
     u64 bmFetches = 0;    // bus-master fetches into the GUI scratch registers
@@ -474,7 +474,7 @@ struct R128EngStats {
     u64 cceRingWords = 0; // DWORDs fetched out of the ring
     u64 cceRingStall = 0; // a ring fetch that missed the GART — kick abandoned
     // The 3D pipeline (SDK ch 6 / App F.24-F.27).
-    u64 tris = 0;         // triangles rasterised
+    u64 tris = 0;         // triangles rasterized
     u64 lines3d = 0;      // 3D lines drawn
     u64 points3d = 0;     // 3D points drawn
     u64 triPixels = 0;    // pixels the 3D pipe wrote
@@ -487,7 +487,7 @@ struct R128EngStats {
     u64 texSamples = 0;   // texel fetches, both units
     u64 texUnimpl = 0;    // texture datatype this engine cannot decode
     u64 texGartMiss = 0;  // an AGP texture fetch that missed the GART
-    u64 zTile = 0;        // Z_PITCH_C had Z_TILE set — layout not modelled
+    u64 zTile = 0;        // Z_PITCH_C had Z_TILE set — layout not modeled
     // The S/T range the guest actually sends, accumulated at vertex decode.
     // ⭐ SETTLED (--tri-dump, 2026-08-02): stream S,T are u·rhw / v·rhw —
     // premultiplied numerators, RAVE's own uOverW contract — which is why
@@ -499,11 +499,11 @@ struct R128EngStats {
     // ⭐ THE COORDINATE CONVENTION, SETTLED PER TRIANGLE.
     //
     // The extrema above CANNOT decide it: global maxima of ~127 fit
-    // normalised-with-tiling and texel-space over a 128-map equally well,
+    // normalized-with-tiling and texel-space over a 128-map equally well,
     // and reading one story out of that ambiguity shipped a regression.
     // What discriminates is the span of ONE triangle against the size of
     // the texture bound to it — a triangle showing a whole texture spans
-    // 1.0 normalised or `w` in texel space, and those differ by 128x.
+    // 1.0 normalized or `w` in texel space, and those differ by 128x.
     // Bucketed by log2 so no assumption about the answer is baked in.
     u64 triSpanBucket[12] = {}; // span < 2^-4, 2^-3 ... >= 2^6
     u64 triSpanTexW = 0;        // sum of bound widths over counted triangles
@@ -517,7 +517,7 @@ struct SnoopSink; // opm/bus.hpp — only a pointer is needed here
 //
 // Writing a physical address to 0x0A50 makes the card bus-master EIGHT BYTES
 // from there into GUI_SCRATCH_REG0/REG1 (little-endian: +0 into REG0, +4 into
-// REG1). ⚠ This is DERIVED FROM OBSERVED BEHAVIOUR, not from a datasheet:
+// REG1). ⚠ This is DERIVED FROM OBSERVED BEHAVIOR, not from a datasheet:
 // neither ATI register guide documents the 0x0A00 block beyond two names, and
 // no open-source driver touches 0x0A50 at all. What pins it down is Mac OS's
 // ATI Graphics Accelerator, which uses exactly this as its bus-master
@@ -554,7 +554,7 @@ void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
                      u32 gartBase, u32 aperBase, SnoopSink* snoop);
 // Diagnostics: how many packet-stream words sit STAGED (accepted but not
 // yet consumed by a complete packet), and the word at the parse head —
-// a large backlog behind one absurd header is what a desynchronised
+// a large backlog behind one absurd header is what a desynchronized
 // stream looks like from outside.
 size_t r128CceStaged(u32& headWord);
 // Type-3 opcodes that arrived and were skipped, by opcode byte — the same
@@ -567,7 +567,7 @@ const std::map<u32, u64>& r128CceP3Skipped();
 // Stop/Start of the SAME process. A previous machine that died mid-stream
 // leaves a half-consumed packet staged; the new machine's first FIFO words
 // are then parsed as that stale header's body and the whole stream is
-// desynchronised — fences land only where the misparse happens to hit the
+// desynchronized — fences land only where the misparse happens to hit the
 // scratch registers, which presents as "the desktop drew for a while and
 // then froze mid-redraw". Found from a user diag capture after a
 // Stop/Start.
@@ -596,7 +596,7 @@ bool r128CceGartRead(const CceMem& m, u32 agp, u32& out);
 // 0x23 3D_RNDR_GEN_INDX_PRIM (vertex walker over an AGP-space buffer),
 // 0x2E NEXT_VERTEX_BUNDLE (continuation of the last 0x23), 0x2C
 // LOAD_PALETTE. Returns false — a counted decline — on a body it cannot
-// honour; the stream is bounded by the Type-3 header either way.
+// honor; the stream is bounded by the Type-3 header either way.
 bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n,
                  const CceMem& m);
 // Register writes the 3D unit owns: the fog table pair at 0x1A14/0x1A18 and

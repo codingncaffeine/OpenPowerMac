@@ -176,7 +176,7 @@ TEST_CASE("plain 2048 image: identity mapping, exact snap size")
     remove(p);
 }
 
-TEST_CASE("raw 2352 image: recognised by sync mark whatever the name")
+TEST_CASE("raw 2352 image: recognized by sync mark whatever the name")
 {
     std::vector<u8> img;
     for (u64 n = 0; n < 6; ++n)

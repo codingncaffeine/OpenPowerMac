@@ -95,16 +95,16 @@ TEST_CASE("r128 census: a setting's value is named when a draw uses it, and "
     CHECK(has(notDrawn(r), "none"));
     CHECK(!has(r, "NOT DRAWN"));
 
-    // An 8x8 colour pattern brush: the engine declines the fill, and the
+    // An 8x8 color pattern brush: the engine declines the fill, and the
     // report says what was asked for.
     const u64 declined = r128EngStats().brushUnimpl;
     fill(c, 10u, 1u << 27);
     CHECK(r128EngStats().brushUnimpl == declined + 1);
     r = r128SettingsReport();
     CHECK(has(notDrawn(r), "2D brush"));
-    CHECK(has(notDrawn(r), "8x8 colour (10)"));
+    CHECK(has(notDrawn(r), "8x8 color (10)"));
     CHECK(!has(notDrawn(r), "solid (13)")); // drawn: not in the short list
-    CHECK(has(r, "8x8 colour (10) NOT DRAWN"));
+    CHECK(has(r, "8x8 color (10) NOT DRAWN"));
 
     // A value of ZERO is a value like any other: the master control's bit
     // 27 was written as one so far, and only that is listed.

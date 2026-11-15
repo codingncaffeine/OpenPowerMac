@@ -32,7 +32,7 @@ constexpr u32 kScTopLeft = 0x16EC, kScBottomRight = 0x16F0;
 constexpr u32 kBmAddr = 0x0A50, kGuiScratch0 = 0x15E0;
 constexpr u32 kW = 64, kH = 8, kPitch8 = kW / 8, kStride = kPitch8 * 32u;
 
-// A card showing a 64x8 picture in millions of colours from the start of
+// A card showing a 64x8 picture in millions of colors from the start of
 // video memory, and a megabyte of system memory beside it.
 struct Rig {
     R128Cell c;
@@ -64,7 +64,7 @@ struct Rig {
         for (u32 k = 0; k < 4; ++k)
             ram[at + k] = static_cast<u8>(v >> (8u * k));
     }
-    void fillScreen(u32 colour)
+    void fillScreen(u32 color)
     {
         reg(kGmc, 0x0Fu | (13u << 4) | (6u << 8) | (0xF0u << 16) | (2u << 24));
         reg(kDstOffset, 0);
@@ -72,13 +72,13 @@ struct Rig {
         reg(kScTopLeft, 0);
         reg(kScBottomRight, (kW - 1u) | ((kH - 1u) << 16));
         reg(kDpWriteMsk, 0xFFFFFFFFu);
-        reg(kBrushFrgd, colour);
+        reg(kBrushFrgd, color);
         reg(kDstYX, 0);
         reg(kDstHeightWidth, kW | (kH << 16)); // the store that draws
     }
     // What a program does in one frame here: read two words out of system
     // memory by bus mastering, paint a pixel itself, then wipe the screen.
-    void frame(u32 word0, u32 colour)
+    void frame(u32 word0, u32 color)
     {
         le32(0x1000, kGuiScratch0);
         le32(0x1004, 0x2000);
@@ -86,7 +86,7 @@ struct Rig {
         le32(0x2004, ~word0);
         reg(kBmAddr, 0x1000);
         fb(5 * kStride + 12, word0 ^ 0x00FF00FFu);
-        fillScreen(colour);
+        fillScreen(color);
     }
 };
 
@@ -151,8 +151,8 @@ TEST_CASE("r128 rec: a replayed recording leaves the card as the live one stood"
     CHECK(again.peek(kGuiScratch0 + 4) == ~0x01020304u);
     CHECK(again.peek(kGuiScratch0) == live.c.peek(kGuiScratch0));
 
-    // CONTROL: one colour changed in the file. The first edge stands before
-    // that colour is drawn and still matches; the second shows it and must
+    // CONTROL: one color changed in the file. The first edge stands before
+    // that color is drawn and still matches; the second shows it and must
     // not.
     std::vector<u8> bytes = slurp(file);
     const u8 pat[9] = {'W', 0x7C, 0x14, 0, 0, 0x00, 0x40, 0x50, 0x60};

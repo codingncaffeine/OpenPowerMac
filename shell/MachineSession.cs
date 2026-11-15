@@ -197,6 +197,42 @@ public sealed class MachineSession
         return true;
     }
 
+    /// <summary>Pack a folder into a drop volume off the caller's thread and
+    /// leave it for the run loop to hand to the drive (see _dropWanted).
+    /// False if a pack is already under way; the caller tries again.</summary>
+    private bool PackDropFolder(string folder, string said)
+    {
+        if (Interlocked.CompareExchange(ref _dropBusy, 1, 0) != 0)
+            return false;
+        Task.Run(() =>
+        {
+            try
+            {
+                if (!FolderHasContent(folder))
+                {
+                    ConsoleQ.Enqueue($"[drop box] {folder} is empty — drop files "
+                                     + "on the display, or put some in it\n");
+                    return;
+                }
+                var img = BuildDropImage(folder, out var note);
+                if (img == null)
+                {
+                    ConsoleQ.Enqueue($"[drop box] volume NOT built: {note}\n");
+                    return;
+                }
+                if (note.Length > 0)
+                    ConsoleQ.Enqueue($"[drop box] {note}\n");
+                ConsoleQ.Enqueue($"[drop box] {said}\n");
+                _dropWanted = img;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _dropBusy, 0);
+            }
+        });
+        return true;
+    }
+
     private static void CopyTree(string src, string dst)
     {
         Directory.CreateDirectory(dst);
@@ -496,6 +532,7 @@ public sealed class MachineSession
             ulong executed = 0;
             int dropState = Native.opm_drop_state(m);
             ulong restarts = 0;
+            bool dropRepack = false; // pack the drop folder again at the next look
             // 💿 The CD the user has chosen, as last handed to the machine.
             // The settings object is the window's own and changes under this
             // thread when a disc is chosen or ejected from the menu; the
@@ -538,6 +575,14 @@ public sealed class MachineSession
                     restarts = restartsNow;
                     ConsoleQ.Enqueue($"\n[shell] the guest restarted the machine @{executed:N0} — "
                                      + "same disks, same memory, booting again\n");
+                    // 📥 A restarted guest finds the Drop Box as a machine that
+                    // was just started does: the folder's volume in the drive.
+                    // The core keeps a disc that was in, or waiting to go in;
+                    // a tray the guest had emptied (the volume put away before
+                    // the restart) would otherwise stay empty until the next
+                    // drop. Packed where a change of folder is, below.
+                    if (Native.opm_drop_state(m) == 1 && FolderHasContent(_dropFolder))
+                        dropRepack = true;
                 }
 
                 // Aim each chunk at ~15 ms so serial input and stop stay snappy.
@@ -747,6 +792,21 @@ public sealed class MachineSession
                     // mount — each a thing they can act on or stop waiting
                     // for. Retired images go once the core has let go of
                     // them (the open one cannot be deleted; try again).
+                    // 📥 The Drop Box folder follows the setting too. Choosing
+                    // another folder from the menu packs it and hands it to
+                    // the drive now; it used to wait for the next Start, and
+                    // the message that said so read as if restarting the
+                    // guest were enough, which it was not.
+                    string dropFolderWanted = DropBoxFolder(s);
+                    bool dropFolderChanged = dropFolderWanted != _dropFolder;
+                    if ((dropFolderChanged || dropRepack)
+                        && PackDropFolder(dropFolderWanted, dropFolderChanged
+                               ? $"folder is now {dropFolderWanted}; volume packed"
+                               : "volume packed for the restarted guest"))
+                    {
+                        _dropFolder = dropFolderWanted;
+                        dropRepack = false;
+                    }
                     string cdWanted = s.CdPath ?? "";
                     if (cdWanted != cdApplied)
                     {

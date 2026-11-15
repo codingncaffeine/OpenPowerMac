@@ -607,15 +607,16 @@ public partial class MainWindow : Window
         NoteDropFolderChange();
     }
 
-    // The drive is seated at Start with whatever the folder holds, and a
-    // running session keeps packing the folder it started with.
+    // The running machine is given the folder now (MachineSession follows
+    // the setting); the one thing the user may have to do is in the guest.
     private void NoteDropFolderChange()
     {
         if (_session is { Running: true })
             MessageBox.Show(this,
-                "Drop box folder set.\n\nThe running machine keeps using the "
-                + "folder it started with; the new one is used from the next "
-                + "start.",
+                "Drop box folder set. The running machine gets it now.\n\n"
+                + "If a Drop Box is already on the Mac's desktop, put it away "
+                + "there (drag it to the Trash) and the new one takes its "
+                + "place.",
                 "Drop Box", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 

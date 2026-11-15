@@ -131,13 +131,23 @@ static u32 lineVictim(Cpu& c, u32 pa)
 {
     const u32 set = setOf(pa);
     Cpu::DIdx& x = c.l1x[set];
-    u32 best = 0;
-    for (u32 w = 0; w < 8; ++w) {
-        if (!(x.tv[w] & 1u))
-            return w;
-        if (x.age[w] < x.age[best])
-            best = w;
-    }
+    // ⭐ WITHOUT A BRANCH PER WAY. Which way is oldest is as good as random
+    // to a branch predictor, and this runs on every miss: the walk it
+    // replaces was eight data-dependent branches and showed as 3% of the
+    // processor's thread in a game. The first invalid way is the lowest clear
+    // valid bit; the oldest is the least of eight (age, way) pairs, the way in
+    // the low bits so that equal ages still go to the lowest way, as the
+    // walk's strict "<" did.
+    u32 valid = 0;
+    for (u32 w = 0; w < 8; ++w)
+        valid |= (x.tv[w] & 1u) << w;
+    if (valid != 0xFFu)
+        return static_cast<u32>(std::countr_one(valid));
+    auto key = [&x](u32 w) { return (static_cast<u64>(x.age[w]) << 3) | w; };
+    auto least = [](u64 a, u64 b) { return a < b ? a : b; };
+    const u64 k = least(least(least(key(0), key(1)), least(key(2), key(3))),
+                        least(least(key(4), key(5)), least(key(6), key(7))));
+    const u32 best = static_cast<u32>(k & 7u);
     if (c.l1d[set][best].d)
         lineCastout(c, c.l1d[set][best], set, x.tv[best] >> 1);
     x.tv[best] = 0;

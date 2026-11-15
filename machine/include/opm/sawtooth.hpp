@@ -508,6 +508,32 @@ public:
         return (static_cast<u64>(read(pa, 4)) << 32) | read(pa + 4, 4);
     }
 
+    // ⭐ A WHOLE BLOCK OF PLAIN MEMORY IN ONE COPY. The processor's cache
+    // model reads a 32-byte block on every miss and writes one on every
+    // castout, and the default did each as eight word accesses: eight
+    // virtual calls, eight range tests, each word assembled from its bytes
+    // and taken apart again. Memory holds the guest's bytes in the guest's
+    // order, so for RAM the block is the 32 bytes as they lie. A device, the
+    // ROM, or a block that ends past the installed memory keeps the word
+    // path, and so does every store while one of write()'s instruments is
+    // armed: they are told about each word.
+    void readLine32(u32 pa, u8* out) override
+    {
+        if (ramFast(pa, 32)) {
+            std::memcpy(out, ram_.data() + pa, 32);
+            return;
+        }
+        Bus::readLine32(pa, out);
+    }
+    void writeLine32(u32 pa, const u8* b) override
+    {
+        if (!wmapTo && !watchPa && ramFast(pa, 32)) {
+            std::memcpy(ram_.data() + pa, b, 32);
+            return;
+        }
+        Bus::writeLine32(pa, b);
+    }
+
     void write8(u32 pa, u8 v) override { write(pa, v, 1); }
     void write16(u32 pa, u16 v) override { write(pa, v, 2); }
     void write32(u32 pa, u32 v) override { write(pa, v, 4); }

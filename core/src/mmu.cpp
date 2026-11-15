@@ -180,6 +180,7 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                 // walk below re-reads the PTE (and faults if it is gone).
                 e.v = false;
                 ++dtlbStamp[set * 2u + way]; // only a data access is a store
+                dpSlotMoved(set * 2u + way);
                 break;
             }
             pa = e.rpn | (ea & 0xFFFu);
@@ -255,6 +256,8 @@ bool Cpu::translate(u32 ea, bool write, bool fetch, u32& pa, u32* wimg)
                 // The entry that was here is gone, and whatever a memo
                 // remembered through it goes with it.
                 ++(fetch ? itlbStamp : dtlbStamp)[set * 2u + way];
+                if (!fetch)
+                    dpSlotMoved(set * 2u + way);
                 (fetch ? imSlot : dmSlot) = static_cast<u8>(set * 2u + way);
             }
             return true;
@@ -281,6 +284,7 @@ void Cpu::tlbInvalidateClass(u32 ea)
         dtlb[set][way].v = false;
         ++itlbStamp[set * 2u + way];
         ++dtlbStamp[set * 2u + way];
+        dpSlotMoved(set * 2u + way);
     }
 }
 
@@ -294,6 +298,7 @@ void Cpu::tlbFlushAll()
             dtlb[s][w] = TlbEntry{};
             ++itlbStamp[s * 2u + w];
             ++dtlbStamp[s * 2u + w];
+            dpSlotMoved(s * 2u + w);
         }
         itlbLru[s] = dtlbLru[s] = 0;
     }
@@ -447,6 +452,32 @@ bool Cpu::readVSlow(u32 ea, u32 len, u64& out)
 
 bool Cpu::writeVSlow(u32 ea, u32 len, u64 v)
 {
+    // The page memo's entry, good for stores but for the fetched code its
+    // page holds (or held when it was last looked at): the hit writeV does
+    // not take. The store may land on a fetched block, which is dropped; and
+    // once the page holds none the entry is good for writeV again.
+    {
+        DpPage& m = dpPage[(ea >> 12) & (kDpPages - 1u)];
+        if (m.store && m.rtag == dpTag((ea + len - 1u) >> 12)) {
+            OPM_MARK(Write);
+            OPM_COUNT(dpHits);
+            dtlbLru[m.lruIdx] = m.lruVal;
+            const u32 pa = static_cast<u32>(m.bias + ea -
+                                            reinterpret_cast<uintptr_t>(dmRam));
+            fetchDropRange(pa, len);
+            lineStoreBE(reinterpret_cast<u8*>(m.bias + ea), len, v);
+            const u32 pp = pa >> 12;
+            if (!dpCode[pp]) {
+                const u32 at = static_cast<u32>(&m - dpPage.get());
+                const u32 was = dpOfPhys[pp];
+                if (was && was - 1u != at)
+                    dpPage[was - 1u].wtag = ~0ull;
+                dpOfPhys[pp] = static_cast<u16>(at + 1u);
+                m.wtag = m.rtag;
+            }
+            return true;
+        }
+    }
     { // the line memo, as in readVSlow
         const u32 line = ea >> 5;
         const DmLine& m = dmLine[line & (kDmLines - 1u)];
@@ -616,7 +647,7 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         filled = true;
     }
     if (filled) {
-        fetchBase[slot] = base;
+        fetchTag(slot, base);
         // Assemble and decode the whole block while it is here. Eighteen
         // instructions are executed per fill on average, so the seven words
         // that were not asked for are paid off many times over — and decode
@@ -658,7 +689,7 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         row = fl.row[word];
         return true;
     }
-    fetchBase[slot] = 1; // a partial fill must not be left looking valid
+    fetchTag(slot, 1u); // a partial fill must not be left looking valid
     // Not memory: a device window, or nothing at all. Read exactly the word
     // that was asked for and cache nothing — see Bus::memoryAt.
     OPM_COUNT(fetchUncached);

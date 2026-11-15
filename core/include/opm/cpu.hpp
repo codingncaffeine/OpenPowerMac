@@ -972,23 +972,88 @@ struct Cpu {
     // readV/writeV. It holds what the line memo above holds, less the L1's
     // part: where the page translated to, as a host address, and the TLB
     // entry that answer came from. A hit replays the TLB set's LRU write and
-    // moves the bytes. Covered exactly as the line memo's inputs are (the
-    // key, the epoch, dtlbStamp, a store rides only an entry a store made);
-    // the mode itself is in the epoch, so no entry outlives a switch. Made
-    // only for a page that lies wholly in main memory, never in
-    // little-endian mode or with DABR armed, and live only inside runSteps.
+    // moves the bytes. Made only for a page that lies wholly in main memory,
+    // never in little-endian mode or with DABR armed, and live only inside
+    // runSteps.
+    //
+    // ⭐ A HIT IS ONE COMPARE. This is what every load and store of a running
+    // guest goes through, and in translated code its tests were half of all
+    // the time spent there: the page, the key, the bounds, the TLB entry's
+    // stamp, and for a store the fetched copy of the block and of the block
+    // under the code doing the storing. So each of those is now either in
+    // the one tag that is compared, or is kept true by whoever changes it:
+    //
+    //   the page, and the access   the tag holds the page number, and it is
+    //   fitting in it              compared with the page of the access's
+    //                              LAST byte while the entry is found by its
+    //                              first: an access that runs over the end
+    //                              of its page matches nothing;
+    //   MSR[DR], [PR], [LE] and    the upper half of the tag (the key the
+    //   the epoch                  line memo compares, dmLive with the MSR
+    //                              bits), so they are the same compare;
+    //   the TLB entry used         an entry is retired the moment its TLB
+    //                              entry is rewritten or invalidated
+    //                              (dpSlotMoved, called wherever dtlbStamp
+    //                              moves; dpOfSlot finds it). One memo entry
+    //                              per TLB entry at a time;
+    //   a store, and fetched       an entry is good for stores (wtag) only
+    //   code                       while no block of its page of memory is
+    //                              in the fetch buffer (dpCode counts them,
+    //                              fetchTag keeps the count): such a store
+    //                              cannot land on fetched code, so it has
+    //                              nothing to drop. A store to a page that
+    //                              does hold code misses here and is made in
+    //                              writeVSlow, which drops as before. One
+    //                              entry good for stores per page of memory
+    //                              at a time (dpOfPhys finds it);
+    //   write permission, C bit    as before: good for stores only if a store
+    //                              made it (`store`).
+    //
+    // dpConsistent() says whether all of that holds, for the tests.
     static constexpr u32 kDpPages = 4096;
     struct DpPage {
-        u32 page = ~0u; // ea >> 12, or ~0
-        u32 rkey = kDmNever, wkey = kDmNever;
-        u32 stamp = 0;      // what dtlbStamp[slot] must still read
-        u8* host = nullptr; // the page's first byte
-        u32 paPage = 0;     // pa & ~0xFFF: a store drops fetched code there
-        u8 slot = 128, lruIdx = 64, lruVal = 0, rsv = 0;
+        u64 rtag = ~0ull;   // (ea >> 12) | key << 32: good for a load, or ~0
+        u64 wtag = ~0ull;   // the same while it is good for a store, or ~0
+        uintptr_t bias = 0; // the byte at effective address ea is at bias + ea
+        u32 stamp = 0;      // what dtlbStamp[slot] read when it was made
+        u8 slot = 128, lruIdx = 64, lruVal = 0;
+        u8 store = 0;       // a store made it: C is set, protection proved
     };
     std::unique_ptr<DpPage[]> dpPage = std::make_unique<DpPage[]>(kDpPages);
+    u16 dpOfSlot[128] = {}; // dtlb entry -> its memo entry + 1, or 0
+    // Per page of main memory, while memory is read directly: how many of
+    // its blocks the fetch buffer holds, and the memo entry good for stores
+    // to it (+ 1, or 0). Sized to the memory the bus offers.
+    std::unique_ptr<u8[]> dpCode;
+    std::unique_ptr<u16[]> dpOfPhys;
+    u32 dpPhysPages = 0;
     u64 dpHits = 0, dpMisses = 0; // census, profiling build only
+    u64 dpMade = 0;               // entries made or re-made, always counted
+    u64 dpTag(u32 page) const
+    {
+        return page | (static_cast<u64>(dmLive | (st.msr & kDmMsr)) << 32);
+    }
+    // The page of memory an entry maps (valid entries only).
+    u32 dpPhysPage(const DpPage& m) const
+    {
+        return static_cast<u32>(
+            (m.bias + (static_cast<uintptr_t>(static_cast<u32>(m.rtag)) << 12) -
+             reinterpret_cast<uintptr_t>(dmRam)) >> 12);
+    }
+    void dpDrop(DpPage& m) { m.rtag = m.wtag = ~0ull; }
+    // A dtlb entry was rewritten or invalidated: what the memo remembered
+    // through it goes with it.
+    void dpSlotMoved(u32 slot)
+    {
+        const u32 k = dpOfSlot[slot];
+        if (k && dpPage[k - 1u].slot == slot)
+            dpDrop(dpPage[k - 1u]);
+        dpOfSlot[slot] = 0;
+    }
     void dpNotePage(u32 ea, u32 pa, bool write);
+    void dpCodeReset();           // recount from the fetch buffer as it stands
+    void dpCodeArrived(u32 page); // a page of memory got its first fetched block
+    const char* dpConsistent() const; // nullptr, or what does not hold
 
     // ---- …and the instruction side's ------------------------------------
     //
@@ -1151,6 +1216,9 @@ struct Cpu {
     // which is the MSR its entry conditions were checked under. A hop from
     // block to block compares against it: see Compiler::chainChecks.
     u32 jitMsr = 0;
+    // The page memo's key (dmLive with MSR's DR, PR, LE) at the same enter,
+    // in the upper half as DpPage's tags hold it.
+    u64 jitDpKey = 0;
     // DIAGNOSTIC (--no-jit-hop): a branch to another page, a blr and a bctr
     // leave compiled code for the dispatcher, as they did before blocks
     // could find each other at run time (opmJitHop in jit.cpp). The control
@@ -1186,16 +1254,32 @@ struct Cpu {
     bool jitCountHops = false;
     static_assert(JitCache::kLines == kFetchLines,
                   "the JIT cache is slot-parallel to the fetch lines");
+    // Every write of a fetch slot's tag: `base` is the block now held, or 1.
+    // Keeps dpCode, the count of fetched blocks per page of memory, which is
+    // what lets a store through the page memo skip looking for one.
+    void fetchTag(u32 slot, u32 base)
+    {
+        u32& b = fetchBase[slot];
+        if (dpPhysPages) {
+            if ((b >> 12) < dpPhysPages && b != 1u)
+                --dpCode[b >> 12];
+            if ((base >> 12) < dpPhysPages && base != 1u && !dpCode[base >> 12]++)
+                dpCodeArrived(base >> 12);
+        }
+        b = base;
+    }
     void fetchDrop()
     {
         for (u32& b : fetchBase)
             b = 1;
+        if (dpPhysPages)
+            std::memset(dpCode.get(), 0, dpPhysPages);
     }
     void fetchDropAt(u32 pa)
     {
-        u32& b = fetchBase[fetchSlot(pa)];
-        if (b == (pa & ~31u))
-            b = 1;
+        const u32 slot = fetchSlot(pa);
+        if (fetchBase[slot] == (pa & ~31u))
+            fetchTag(slot, 1u);
     }
     // icbi: every block that could be the one at this EFFECTIVE address. A
     // line is kept by physical address and icbi is not translated here, but
@@ -1204,7 +1288,7 @@ struct Cpu {
     void fetchDropInPage(u32 ea)
     {
         for (u32 s = (ea >> 5) & 127u; s < kFetchLines; s += 128u)
-            fetchBase[s] = 1;
+            fetchTag(s, 1u);
     }
     void fetchDropRange(u32 pa, u32 len)
     {
@@ -1313,30 +1397,25 @@ struct Cpu {
     // which is also the only path there is outside runSteps.
     bool readV(u32 ea, u32 len, u64& out)
     {
-        const u32 page = ea >> 12;
-        const DpPage& m = dpPage[page & (kDpPages - 1u)];
-        if (m.page == page && m.rkey == (dmLive | (st.msr & kDmMsr)) &&
-            (ea & 0xFFFu) + len <= 0x1000u && dtlbStamp[m.slot] == m.stamp) {
+        const DpPage& m = dpPage[(ea >> 12) & (kDpPages - 1u)];
+        if (m.rtag == dpTag((ea + len - 1u) >> 12)) {
             OPM_MARK(Read);
             OPM_COUNT(dpHits);
             dtlbLru[m.lruIdx] = m.lruVal;
-            out = lineLoadBE(m.host + (ea & 0xFFFu), len);
+            out = lineLoadBE(reinterpret_cast<const u8*>(m.bias + ea), len);
             return true;
         }
         return readVSlow(ea, len, out);
     }
     bool writeV(u32 ea, u32 len, u64 v)
     {
-        const u32 page = ea >> 12;
-        const DpPage& m = dpPage[page & (kDpPages - 1u)];
-        if (m.page == page && m.wkey == (dmLive | (st.msr & kDmMsr)) &&
-            (ea & 0xFFFu) + len <= 0x1000u && dtlbStamp[m.slot] == m.stamp) {
+        const DpPage& m = dpPage[(ea >> 12) & (kDpPages - 1u)];
+        if (m.wtag == dpTag((ea + len - 1u) >> 12)) {
             OPM_MARK(Write);
             OPM_COUNT(dpHits);
             dtlbLru[m.lruIdx] = m.lruVal;
-            // the store may land on fetched code
-            fetchDropRange(m.paPage | (ea & 0xFFFu), len);
-            lineStoreBE(m.host + (ea & 0xFFFu), len, v);
+            // No block of this page is in the fetch buffer: nothing to drop.
+            lineStoreBE(reinterpret_cast<u8*>(m.bias + ea), len, v);
             return true;
         }
         return writeVSlow(ea, len, v);

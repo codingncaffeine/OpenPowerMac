@@ -666,6 +666,9 @@ void Cpu::dmDropAll()
         imPage[k] = ImPage{};
     for (u32 k = 0; k < kDpPages; ++k)
         dpPage[k] = DpPage{};
+    std::memset(dpOfSlot, 0, sizeof dpOfSlot);
+    if (dpPhysPages)
+        std::memset(dpOfPhys.get(), 0, dpPhysPages * sizeof(u16));
     dmEpoch = kDmEpochStep;
 }
 
@@ -736,6 +739,15 @@ void Cpu::cacheModeUpdate()
         dmDirect = true;
         dmRam = base;
         dmRamSize = size;
+        // What the page memo keeps per page of this memory, counted from
+        // the fetch buffer as it stands. (Every entry is retired below, so
+        // none is left good for stores to a page that holds code.)
+        if (dpPhysPages != (size >> 12)) {
+            dpPhysPages = size >> 12;
+            dpCode = std::make_unique<u8[]>(dpPhysPages);
+            dpOfPhys = std::make_unique<u16[]>(dpPhysPages);
+        }
+        dpCodeReset();
     }
     // Every memo entry was made under the other mode's rules.
     dmEpoch += kDmEpochStep;
@@ -743,6 +755,36 @@ void Cpu::cacheModeUpdate()
         dmDropAll();
     if (dmLive != kDmOff)
         dmLive = dmEpoch;
+}
+
+// The fetched blocks per page of memory, counted afresh, and no entry
+// remembered as good for stores (the caller retires them all, or none is).
+void Cpu::dpCodeReset()
+{
+    if (!dpPhysPages)
+        return;
+    std::memset(dpCode.get(), 0, dpPhysPages);
+    std::memset(dpOfPhys.get(), 0, dpPhysPages * sizeof(u16));
+    for (u32 slot = 0; slot < kFetchLines; ++slot) {
+        const u32 b = fetchBase[slot];
+        if (b != 1u && (b >> 12) < dpPhysPages)
+            ++dpCode[b >> 12];
+    }
+    for (u32 k = 0; k < kDpPages; ++k)
+        dpPage[k].wtag = ~0ull;
+}
+
+// A page of memory just got its first block in the fetch buffer: the entry
+// good for stores to it, if there is one, is good for loads only from here.
+void Cpu::dpCodeArrived(u32 page)
+{
+    const u32 k = dpOfPhys[page];
+    if (!k)
+        return;
+    DpPage& m = dpPage[k - 1u];
+    if (m.wtag != ~0ull && dpPhysPage(m) == page)
+        m.wtag = ~0ull;
+    dpOfPhys[page] = 0;
 }
 
 // Remember where this page's access ended up, after the full path has taken
@@ -754,25 +796,86 @@ void Cpu::dpNotePage(u32 ea, u32 pa, bool write)
         (st.msr & msr::LE) || (st.dabr & 3u))
         return;
     OPM_COUNT(dpMisses);
+    ++dpMade;
     const u32 page = ea >> 12;
-    const u32 key = dmLive | (st.msr & kDmMsr);
+    const u64 tag = dpTag(page);
     const u8 slot = dmSlot;
-    const u32 stamp = dtlbStamp[slot];
-    DpPage& m = dpPage[page & (kDpPages - 1u)];
+    const u32 at = page & (kDpPages - 1u);
+    DpPage& m = dpPage[at];
     // A load re-making an entry a store had made good for stores: nothing
-    // that store proved has moved (same epoch and mode, same untouched TLB
-    // entry).
-    const bool keepW = m.page == page && m.wkey == key && m.slot == slot &&
-                       m.stamp == stamp;
-    m.page = page;
-    m.rkey = key;
-    m.wkey = (write || keepW) ? key : kDmNever;
-    m.stamp = stamp;
-    m.host = dmRam + (pa & ~0xFFFu);
-    m.paPage = pa & ~0xFFFu;
+    // that store proved has moved (the entry is still valid, so its TLB
+    // entry is untouched, and the tag is the same page, mode and epoch).
+    const bool keepW = m.rtag == tag && m.store && m.slot == slot;
+    // One entry per TLB entry: the one made through this TLB entry before,
+    // if it is another, is retired, so that dpSlotMoved has one to find.
+    if (slot < 128u) {
+        const u32 was = dpOfSlot[slot];
+        if (was && was - 1u != at && dpPage[was - 1u].slot == slot)
+            dpDrop(dpPage[was - 1u]);
+        dpOfSlot[slot] = static_cast<u16>(at + 1u);
+    }
+    m.rtag = tag;
+    m.store = (write || keepW) ? 1 : 0;
+    m.stamp = dtlbStamp[slot];
+    m.bias = reinterpret_cast<uintptr_t>(dmRam) + (pa & ~0xFFFu) -
+             (static_cast<uintptr_t>(page) << 12);
     m.slot = slot;
     m.lruIdx = static_cast<u8>(slot < 128u ? slot >> 1 : 64u);
     m.lruVal = static_cast<u8>((slot & 1u) ^ 1u);
+    // Good for stores without a look at the fetch buffer only while this
+    // page of memory holds no fetched block; and one such entry per page of
+    // memory, so that dpCodeArrived has one to find.
+    m.wtag = ~0ull;
+    const u32 pp = pa >> 12;
+    if (m.store && !dpCode[pp]) {
+        const u32 was = dpOfPhys[pp];
+        if (was && was - 1u != at)
+            dpPage[was - 1u].wtag = ~0ull;
+        dpOfPhys[pp] = static_cast<u16>(at + 1u);
+        m.wtag = tag;
+    }
+}
+
+// What the page memo's one compare takes for granted (see Cpu::DpPage),
+// checked entry by entry: the tests' instrument.
+const char* Cpu::dpConsistent() const
+{
+    for (u32 k = 0; k < kDpPages; ++k) {
+        const DpPage& m = dpPage[k];
+        if (m.rtag == ~0ull) {
+            if (m.wtag != ~0ull)
+                return "an entry good for stores and not for loads";
+            continue;
+        }
+        if ((static_cast<u32>(m.rtag) & (kDpPages - 1u)) != k)
+            return "an entry in another page's place";
+        if (dtlbStamp[m.slot] != m.stamp)
+            return "an entry whose TLB entry has moved";
+        if (m.slot < 128u && dpOfSlot[m.slot] != k + 1u)
+            return "an entry its TLB entry does not lead back to";
+        const u32 pp = dpPhysPage(m);
+        if (pp >= dpPhysPages)
+            return "an entry outside memory";
+        if (m.wtag == ~0ull)
+            continue;
+        if (m.wtag != m.rtag || !m.store)
+            return "an entry good for stores that no store made";
+        if (dpCode[pp])
+            return "an entry good for stores to a page that holds fetched code";
+        if (dpOfPhys[pp] != k + 1u)
+            return "an entry good for stores its page does not lead back to";
+    }
+    // The count itself, against the fetch buffer.
+    std::vector<u8> n(dpPhysPages, 0);
+    for (u32 slot = 0; slot < kFetchLines; ++slot) {
+        const u32 b = fetchBase[slot];
+        if (b != 1u && (b >> 12) < dpPhysPages)
+            ++n[b >> 12];
+    }
+    for (u32 pp = 0; pp < dpPhysPages; ++pp)
+        if (n[pp] != dpCode[pp])
+            return "a page's count of fetched blocks";
+    return nullptr;
 }
 
 std::string Cpu::directReport() const

@@ -452,6 +452,10 @@ const char* runTwins(Machine& a, Machine& b, u64 target, Rng& r, bool pokes,
         a.run(n);
         b.run(n);
         ++calls;
+        if (const char* bad = a.cpu.dpConsistent())
+            return bad;
+        if (const char* bad = b.cpu.dpConsistent())
+            return bad;
         if (a.stamp != b.stamp)
             return "the instruction count";
         if (std::memcmp(a.cpu.st.gpr, b.cpu.st.gpr, sizeof a.cpu.st.gpr) != 0)
@@ -524,7 +528,7 @@ u32 livePages(const Cpu& c)
 {
     u32 n = 0;
     for (u32 k = 0; k < Cpu::kDpPages; ++k)
-        if (c.dpPage[k].page != ~0u)
+        if (c.dpPage[k].rtag != ~0ull)
             ++n;
     return n;
 }
@@ -888,10 +892,13 @@ TEST_CASE("direct memory: the same guest-visible machine as the full model")
         // place, through page entries, and the other kept it in the caches.
         CHECK(direct.cpu.dmDirect);
         CHECK(direct.cpu.directEnters == 1u);
-        CHECK(livePages(direct.cpu) > 8u);
+        // (Entries made, not entries standing: one is retired with its
+        // TLB entry, and the program's sixteen pages share one TLB set.)
+        CHECK(direct.cpu.dpMade > 100u);
         CHECK(cachedBlocks(direct.cpu, kRam) == 0u);
         CHECK(!model.cpu.dmDirect);
         CHECK(model.cpu.directEnters == 0u);
+        CHECK(model.cpu.dpMade == 0u);
         CHECK(livePages(model.cpu) == 0u);
     }
 }
@@ -957,9 +964,10 @@ TEST_CASE("direct memory: a repeated access is answered from the page entry")
     Cpu::DpPage& a = m.cpu.dpPage[(kVirt >> 12) & (Cpu::kDpPages - 1u)];
     const Cpu::DpPage& b =
         m.cpu.dpPage[((kVirt + 0x40040u) >> 12) & (Cpu::kDpPages - 1u)];
-    REQUIRE(a.page == kVirt >> 12);
-    REQUIRE(b.page == (kVirt + 0x40040u) >> 12);
-    a.host = b.host;
+    REQUIRE(u32(a.rtag) == kVirt >> 12);
+    REQUIRE(u32(b.rtag) == (kVirt + 0x40040u) >> 12);
+    // The bytes of b's page under a's addresses.
+    a.bias = b.bias + 0x40000u;
     m.run(30);
     const u32 redirected = m.cpu.st.gpr[7];
     CHECK(redirected != first);
@@ -987,8 +995,13 @@ TEST_CASE("direct memory: a store through a page entry still drops the fetched c
         want += (trip * 3u) & 0x7FFFu;
     CHECK(m.cpu.st.gpr[11] == want);
     const Cpu::DpPage& e = m.cpu.dpPage[(kAlias >> 12) & (Cpu::kDpPages - 1u)];
-    CHECK(e.page == kAlias >> 12); // the stores did go through an entry
-    CHECK(e.wkey != Cpu::kDmNever);
+    CHECK(u32(e.rtag) == kAlias >> 12); // the stores did go through an entry
+    CHECK(e.store == 1);
+    // …one that is not good for a store without a look at the fetch buffer:
+    // its page of memory is the one the loop runs from.
+    CHECK(e.wtag == ~0ull);
+    CHECK(m.cpu.dpCode[kCode >> 12] != 0);
+    CHECK(m.cpu.dpConsistent() == nullptr);
     // …and they are in memory already, with no cache to write back.
     CHECK(m.bus.read32(kCode) == (0x396B0000u | ((100u * 3u) & 0x7FFFu)));
 }

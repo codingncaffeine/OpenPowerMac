@@ -31,7 +31,8 @@
 //   (Emit::callAbs), the trampoline reads its own arguments from the System
 //   V registers, and the arena comes from mmap. See OPM_JIT_SYSV below. Pinned callee-saved registers:
 //   r13 = Cpu*, rbx = instructions run and not yet settled, rbp = the
-//   batch's budget less what is settled (Compiler::settle). r12 stages the
+//   batch's budget less what is settled (Compiler::settle), r15 = the page
+//   memo's table and r14 = its key (Compiler::memProbe). r12 stages the
 //   effective address across the one shim call of an update-form access.
 //   Blocks never touch XMM.
 
@@ -1241,99 +1242,117 @@ struct Compiler {
     // Cpu::readV and writeV open with a probe of the direct mode's page memo
     // (Cpu::DpPage) and, on a hit, do two things: the TLB set's LRU write
     // and the bytes. This is that probe and that hit, transcribed, with the
-    // effective address in edx: the entry is found by page number, then the
-    // page, the key (the memo's live epoch with MSR's DR, PR and LE), the
-    // bounds and the TLB entry's stamp are compared exactly as written
-    // there. Any difference leaves edx alone and goes to `slow`, which is
-    // the shim, which is readV or writeV in full. Outside a batch, under an
-    // instrument or with the full cache model the live key matches nothing
-    // and every access is the shim, as before.
+    // effective address in edx. The entry is found by the page of the
+    // access's first byte and its tag compared with the page of the last
+    // one under the memo's key, as written there: one compare, which a
+    // page that is not remembered, another mode or epoch, an access over
+    // the end of its page and (for a store) a page holding fetched code all
+    // fail. Any failure leaves edx alone and goes to `slow`, which is the
+    // shim, which is readV or writeV in full. Outside a batch, under an
+    // instrument or with the full cache model the key matches nothing and
+    // every access is the shim.
     //
-    // A hit observes nothing: no pc, no cycle count, no device, no fault.
-    // So the caller counts the instruction in rbx like a register-only one
-    // and settles nothing. On return r8 = the entry, ecx = the offset in
-    // the page; eax and r9 are spent.
+    // The key is MSR's DR, PR and LE with the memo's live epoch, and it
+    // rides in r14 from the dispatcher (Cpu::jitDpKey): MSR does not change
+    // in a running block (chainChecks says why), and the epoch moves only
+    // in C++ that ends the batch, which a block tests after every call that
+    // could. --jit-full-gate works it out at every access instead.
     //
-    // `maxOff` is the last offset at which the access still fits: a load
-    // may lie anywhere in its page, a store must lie in one 32-byte block
-    // (the caller passes the mask that makes it so), because a store also
-    // drops what the fetch buffer holds for that block.
-    void memProbe(bool write, u32 offMask, u32 maxOff,
-                  std::vector<size_t>& slow)
+    // A hit observes nothing: no pc, no cycle count, no device, no fault,
+    // and a store's hit cannot land on fetched code (Cpu::DpPage). So the
+    // caller counts the instruction in rbx like a register-only one and
+    // settles nothing. On return r9 = the address of effective address 0
+    // (the byte at ea is [r9+rdx]); eax and ecx are spent, and r10 too
+    // under --jit-full-gate.
+    void memProbe(bool write, u32 len, std::vector<size_t>& slow)
     {
         using P = Cpu::DpPage;
-        e.bytes({0x89, 0xD0});             // mov eax, edx
-        e.bytes({0xC1, 0xE8, 0x0C});       // shr eax, 12        (the page)
-        e.bytes({0x89, 0xC1});             // mov ecx, eax
-        e.bytes({0x81, 0xE1});             // and ecx, kDpPages - 1
-        e.i32le(Cpu::kDpPages - 1u);
-        e.bytes({0xC1, 0xE1, 0x05});       // shl ecx, 5         (* 32)
-        e.bytes({0x49, 0xB8});             // mov r8, imm64 table
-        e.i64le(o.dpTable);
-        e.bytes({0x49, 0x01, 0xC8});       // add r8, rcx        (the entry)
-        e.bytes({0x41, 0x39, 0x40, u8(offsetof(P, page))}); // cmp [r8+page], eax
-        slow.push_back(e.j32(CC_NE));
-        e.loadR(RCX, o.msr);               // mov ecx, [r13+msr]
-        e.bytes({0x81, 0xE1});             // and ecx, DR|PR|LE
-        e.i32le(Cpu::kDmMsr);
-        e.mem13(0x0B, RCX, o.dmLive);      // or ecx, [r13+dmLive]
-        e.bytes({0x41, 0x39, 0x48,         // cmp [r8+key], ecx
-                 u8(write ? offsetof(P, wkey) : offsetof(P, rkey))});
-        slow.push_back(e.j32(CC_NE));
-        e.bytes({0x89, 0xD1});             // mov ecx, edx
-        e.bytes({0x81, 0xE1});             // and ecx, offMask
-        e.i32le(offMask);
-        e.bytes({0x81, 0xF9});             // cmp ecx, maxOff
-        e.i32le(maxOff);
-        slow.push_back(e.j32(7));          // ja: it does not fit
-        e.bytes({0x41, 0x0F, 0xB6, 0x40, u8(offsetof(P, slot))}); // movzx eax, byte [r8+slot]
-        e.bytes({0x41, 0x8B, 0x84, 0x85}); // mov eax, [r13+rax*4+dtlbStamp]
-        e.i32le(u32(o.dtlbStamp0));
-        e.bytes({0x41, 0x3B, 0x40, u8(offsetof(P, stamp))}); // cmp eax, [r8+stamp]
+        static_assert(sizeof(P) == 32, "the probe scales an entry by 32");
+        if (len > 1u)
+            e.bytes({0x8D, 0x42, u8(len - 1u)}); // lea eax, [rdx+len-1]
+        else
+            e.bytes({0x89, 0xD0});               // mov eax, edx
+        e.bytes({0xC1, 0xE8, 0x0C});             // shr eax, 12 (the last byte's page)
+        e.bytes({0x89, 0xD1});                   // mov ecx, edx
+        e.bytes({0xC1, 0xE9, 0x07});             // shr ecx, 7
+        e.bytes({0x81, 0xE1});                   // and ecx, (kDpPages - 1) * 32
+        e.i32le((Cpu::kDpPages - 1u) << 5);      // (the first byte's entry)
+        if (c.jitFullGate) {
+            e.bytes({0x45, 0x8B, 0x95});         // mov r10d, [r13+msr]
+            e.i32le(u32(o.msr));
+            e.bytes({0x41, 0x81, 0xE2});         // and r10d, DR|PR|LE
+            e.i32le(Cpu::kDmMsr);
+            e.bytes({0x45, 0x0B, 0x95});         // or r10d, [r13+dmLive]
+            e.i32le(u32(o.dmLive));
+            e.bytes({0x49, 0xC1, 0xE2, 0x20});   // shl r10, 32
+            e.bytes({0x4C, 0x09, 0xD0});         // or rax, r10
+        } else {
+            e.bytes({0x4C, 0x09, 0xF0});         // or rax, r14 (the key)
+        }
+        e.bytes({0x49, 0x3B, 0x44, 0x0F,         // cmp rax, [r15+rcx+tag]
+                 u8(write ? offsetof(P, wtag) : offsetof(P, rtag))});
         slow.push_back(e.j32(CC_NE));
         // The hit. The TLB set's LRU write first, as readV has it.
-        e.bytes({0x41, 0x0F, 0xB6, 0x40, u8(offsetof(P, lruIdx))}); // movzx eax, byte [r8+lruIdx]
-        e.bytes({0x45, 0x0F, 0xB6, 0x48, u8(offsetof(P, lruVal))}); // movzx r9d, byte [r8+lruVal]
-        e.bytes({0x45, 0x88, 0x8C, 0x05}); // mov [r13+rax+dtlbLru], r9b
+        e.bytes({0x41, 0x0F, 0xB6, 0x44, 0x0F, u8(offsetof(P, lruIdx))}); // movzx eax, byte [r15+rcx+lruIdx]
+        e.bytes({0x45, 0x0F, 0xB6, 0x4C, 0x0F, u8(offsetof(P, lruVal))}); // movzx r9d, byte [r15+rcx+lruVal]
+        e.bytes({0x45, 0x88, 0x8C, 0x05});       // mov [r13+rax+dtlbLru], r9b
         e.i32le(u32(o.dtlbLru0));
-        if (offMask != 0xFFFu) {           // the offset in the PAGE, for the bytes
-            e.bytes({0x89, 0xD1});         // mov ecx, edx
-            e.bytes({0x81, 0xE1});         // and ecx, 0xFFF
-            e.i32le(0xFFFu);
-        }
+        e.bytes({0x4D, 0x8B, 0x4C, 0x0F, u8(offsetof(P, bias))}); // mov r9, [r15+rcx+bias]
     }
     bool inlineMem() const { return !c.jitInlineMemOff && o.dpTable != 0; }
-    // What writeV's hit does before the bytes: drop the fetched copy of the
-    // block the store lands in (Cpu::fetchDropAt). r8 = the entry, ecx = the
-    // offset in the page; eax and r9 are spent.
-    void storeDropsFetched()
+    // The bytes at [r9+rdx], in the guest's order (most significant first)
+    // unless `raw`: one instruction where the host has movbe.
+    void loadAt(u32 len, bool raw) // -> eax / rax, zero-extended
     {
-        e.bytes({0x41, 0x8B, 0x40, u8(offsetof(Cpu::DpPage, paPage))}); // mov eax, [r8+paPage]
-        e.bytes({0x09, 0xC8});                   // or eax, ecx      (pa)
-        e.bytes({0x41, 0x89, 0xC1});             // mov r9d, eax
-        e.bytes({0x41, 0xC1, 0xE9, 0x05});       // shr r9d, 5
-        e.bytes({0x41, 0x81, 0xE1});             // and r9d, kFetchLines-1
-        e.i32le(Cpu::kFetchLines - 1u);
-        e.bytes({0x83, 0xE0, 0xE0});             // and eax, ~31     (its base)
-        e.bytes({0x43, 0x39, 0x84, 0x8D});       // cmp [r13+r9*4+fetchBase], eax
-        e.i32le(u32(o.fetchLine0));
-        const size_t keepJ = e.j8(CC_NE);
-        e.bytes({0x43, 0xC7, 0x84, 0x8D});       // mov dword [r13+r9*4+fetchBase], 1
-        e.i32le(u32(o.fetchLine0));
-        e.i32le(1u);
-        e.patch8(keepJ);
+        if (len == 1u) {
+            e.bytes({0x41, 0x0F, 0xB6, 0x04, 0x11});     // movzx eax, byte [r9+rdx]
+        } else if (len == 2u) {
+            e.bytes({0x41, 0x0F, 0xB7, 0x04, 0x11});     // movzx eax, word [r9+rdx]
+            if (!raw)
+                e.bytes({0x66, 0xC1, 0xC8, 0x08});       // ror ax, 8
+        } else if (len == 4u) {
+            if (!raw && jc->movbe) {
+                e.bytes({0x41, 0x0F, 0x38, 0xF0, 0x04, 0x11}); // movbe eax, [r9+rdx]
+            } else {
+                e.bytes({0x41, 0x8B, 0x04, 0x11});       // mov eax, [r9+rdx]
+                if (!raw)
+                    e.bytes({0x0F, 0xC8});               // bswap eax
+            }
+        } else {
+            if (!raw && jc->movbe) {
+                e.bytes({0x49, 0x0F, 0x38, 0xF0, 0x04, 0x11}); // movbe rax, [r9+rdx]
+            } else {
+                e.bytes({0x49, 0x8B, 0x04, 0x11});       // mov rax, [r9+rdx]
+                if (!raw)
+                    e.bytes({0x48, 0x0F, 0xC8});         // bswap rax
+            }
+        }
     }
-    // After an inline store, already counted in rbx: it may have landed on
-    // this very block. Then leave, as the line executor does, with the pc
-    // and the counts settled first.
-    void leaveIfOwnBlockDropped(u32 nextVa)
+    void storeAt(u32 len, bool raw) // r11b / r11w / r11d / r11 -> memory (r11 is spent)
     {
-        e.mem13(0x81, 7, flBase);                // cmp dword [fl], paBase
-        e.i32le(paBase);
-        const size_t oursJ = e.j8(CC_E);
-        e.storeI(o.pc, nextVa);
-        e.jmpTo(epi);
-        e.patch8(oursJ);
+        if (len == 1u) {
+            e.bytes({0x45, 0x88, 0x1C, 0x11});           // mov [r9+rdx], r11b
+        } else if (len == 2u) {
+            if (!raw)
+                e.bytes({0x66, 0x41, 0xC1, 0xCB, 0x08}); // ror r11w, 8
+            e.bytes({0x66, 0x45, 0x89, 0x1C, 0x11});     // mov [r9+rdx], r11w
+        } else if (len == 4u) {
+            if (!raw && jc->movbe) {
+                e.bytes({0x45, 0x0F, 0x38, 0xF1, 0x1C, 0x11}); // movbe [r9+rdx], r11d
+            } else {
+                if (!raw)
+                    e.bytes({0x41, 0x0F, 0xCB});         // bswap r11d
+                e.bytes({0x45, 0x89, 0x1C, 0x11});       // mov [r9+rdx], r11d
+            }
+        } else {
+            if (!raw && jc->movbe) {
+                e.bytes({0x4D, 0x0F, 0x38, 0xF1, 0x1C, 0x11}); // movbe [r9+rdx], r11
+            } else {
+                if (!raw)
+                    e.bytes({0x49, 0x0F, 0xCB});         // bswap r11
+                e.bytes({0x4D, 0x89, 0x1C, 0x11});       // mov [r9+rdx], r11
+            }
+        }
     }
 
     void load(u32 insn, u32 nextVa, u32 kind, bool xform, bool update,
@@ -1348,21 +1367,10 @@ struct Compiler {
         size_t endJ = size_t(-1);
         if (inlineMem()) {
             const u32 len = kind == 0 ? 1u : kind == 1 ? 2u : 4u;
-            memProbe(false, 0xFFFu, 0x1000u - len, slow);
-            e.bytes({0x4D, 0x8B, 0x40, u8(offsetof(Cpu::DpPage, host))}); // mov r8, [r8+host]
-            if (kind == 2) {
-                e.bytes({0x41, 0x8B, 0x04, 0x08});       // mov eax, [r8+rcx]
-                if (!brx)
-                    e.bytes({0x0F, 0xC8});               // bswap eax
-            } else if (kind == 1) {
-                e.bytes({0x41, 0x0F, 0xB7, 0x04, 0x08}); // movzx eax, word [r8+rcx]
-                if (!brx)
-                    e.bytes({0x66, 0xC1, 0xC8, 0x08});   // ror ax, 8
-                if (sext)
-                    e.b(0x98);                           // cwde (lha)
-            } else {
-                e.bytes({0x41, 0x0F, 0xB6, 0x04, 0x08}); // movzx eax, byte [r8+rcx]
-            }
+            memProbe(false, len, slow);
+            loadAt(len, brx);
+            if (sext)
+                e.b(0x98);                               // cwde (lha)
             e.storeR(gpr(f_rt(insn)), RAX);
             if (update)
                 e.bytes({0x45, 0x89, 0xA5}), e.i32le(u32(gpr(f_ra(insn))));
@@ -1413,35 +1421,16 @@ struct Compiler {
         std::vector<size_t> slow;
         size_t endJ = size_t(-1);
         if (inlineMem()) {
-            using P = Cpu::DpPage;
             const u32 len = kind == 0 ? 1u : kind == 1 ? 2u : 4u;
-            // Inside one 32-byte block: the block is what the fetch buffer
-            // may hold a copy of, and one compare then covers the store.
-            memProbe(true, 31u, 32u - len, slow);
-            mark(JitCache::kPartDrop);
-            storeDropsFetched();
-            mark(JitCache::kPartProbe);
+            memProbe(true, len, slow);
             // The bytes, in the guest's order: a plain store is reversed on
             // the way, a byte-reversed one is this host's own order.
             e.bytes({0x45, 0x8B, 0x9D});             // mov r11d, [r13+gpr rs]
             e.i32le(u32(gpr(f_rt(insn))));
-            e.bytes({0x4D, 0x8B, 0x40, u8(offsetof(P, host))}); // mov r8, [r8+host]
-            if (kind == 2) {
-                if (!brx)
-                    e.bytes({0x41, 0x0F, 0xCB});         // bswap r11d
-                e.bytes({0x45, 0x89, 0x1C, 0x08});       // mov [r8+rcx], r11d
-            } else if (kind == 1) {
-                if (!brx)
-                    e.bytes({0x66, 0x41, 0xC1, 0xCB, 0x08}); // ror r11w, 8
-                e.bytes({0x66, 0x45, 0x89, 0x1C, 0x08}); // mov [r8+rcx], r11w
-            } else {
-                e.bytes({0x45, 0x88, 0x1C, 0x08});       // mov [r8+rcx], r11b
-            }
+            storeAt(len, brx);
             if (update)
                 e.bytes({0x45, 0x89, 0xA5}), e.i32le(u32(gpr(f_ra(insn))));
-            bump();
-            mark(JitCache::kPartDrop);
-            leaveIfOwnBlockDropped(nextVa);
+            bump(); // …and it cannot have landed on this block: see memProbe
             endJ = e.jmp32f();
             for (size_t j : slow)
                 e.patch32(j);
@@ -1532,33 +1521,20 @@ struct Compiler {
                     e.b(0x25);                           // and eax, 0x3FFFFFFF
                     e.i32le(0x3FFFFFFFu);
                     e.bytes({0x41, 0x09, 0xC3});         // or r11d, eax
-                    e.bytes({0x41, 0x0F, 0xCB});         // bswap r11d
                 } else {
                     e.bytes({0x49, 0x89, 0xC3});         // mov r11, rax
-                    e.bytes({0x49, 0x0F, 0xCB});         // bswap r11
                 }
-                memProbe(true, 31u, 32u - len, slow);
-                mark(JitCache::kPartDrop);
-                storeDropsFetched();
-                mark(JitCache::kPartProbe);
-                e.bytes({0x4D, 0x8B, 0x40, u8(offsetof(Cpu::DpPage, host))}); // mov r8, [r8+host]
-                if (single)
-                    e.bytes({0x45, 0x89, 0x1C, 0x08});   // mov [r8+rcx], r11d
-                else
-                    e.bytes({0x4D, 0x89, 0x1C, 0x08});   // mov [r8+rcx], r11
+                memProbe(true, len, slow);
+                storeAt(len, false);
                 if (update) {
                     e.bytes({0x45, 0x89, 0xA5});         // mov [gpr ra], r12d
                     e.i32le(u32(gpr(f_ra(insn))));
                 }
                 bump();
-                mark(JitCache::kPartDrop);
-                leaveIfOwnBlockDropped(nextVa);
             } else {
-                memProbe(false, 0xFFFu, 0x1000u - len, slow);
-                e.bytes({0x4D, 0x8B, 0x40, u8(offsetof(Cpu::DpPage, host))}); // mov r8, [r8+host]
+                memProbe(false, len, slow);
+                loadAt(len, false);                      // the word / the double
                 if (single) {
-                    e.bytes({0x41, 0x8B, 0x04, 0x08});   // mov eax, [r8+rcx]
-                    e.bytes({0x0F, 0xC8});               // bswap eax   (the word)
                     e.bytes({0x41, 0x89, 0xC1});         // mov r9d, eax
                     e.bytes({0x41, 0xC1, 0xE9, 0x17});   // shr r9d, 23
                     e.bytes({0x41, 0x81, 0xE1});         // and r9d, 0xFF (exponent)
@@ -1590,8 +1566,6 @@ struct Compiler {
                     e.mem13W(0x89, RAX, fr);             // mov [r13+fpr], rax
                     e.patch8(wroteJ);
                 } else {
-                    e.bytes({0x49, 0x8B, 0x04, 0x08});   // mov rax, [r8+rcx]
-                    e.bytes({0x48, 0x0F, 0xC8});         // bswap rax
                     e.mem13W(0x89, RAX, fr);             // mov [r13+fpr], rax
                 }
                 if (update) {
@@ -2385,9 +2359,18 @@ void JitCache::bind(Cpu& c)
     offs.chainHops = d32(&c.jitChainHops);
     offs.jitMsr = d32(&c.jitMsr);
     offs.dmLive = d32(&c.dmLive);
-    offs.dtlbStamp0 = d32(&c.dtlbStamp[0]);
+    offs.dpKey = d32(&c.jitDpKey);
     offs.dtlbLru0 = d32(&c.dtlbLru[0]);
     offs.dpTable = reinterpret_cast<u64>(c.dpPage.get());
+#if defined(_MSC_VER)
+    {
+        int info[4] = {};
+        __cpuid(info, 1);
+        movbe = (info[2] & (1 << 22)) != 0;
+    }
+#else
+    movbe = __builtin_cpu_supports("movbe");
+#endif
 
     // The trampoline and the shared epilogue, emitted like everything else.
     // enter(entry=rcx, cpu=rdx). Eight callee-saved pushes plus the 40-byte
@@ -2408,6 +2391,9 @@ void JitCache::bind(Cpu& c)
 #else
     e.bytes({0x49, 0x89, 0xD5});                           // mov r13, rdx
 #endif
+    e.bytes({0x49, 0xBF});                                 // mov r15, the page memo's table
+    e.i64le(offs.dpTable);
+    e.mem13W(0x8B, 14, offs.dpKey);                        // mov r14, [r13+jitDpKey]
     e.mem13W(0x8B, 5, offs.until);                         // mov rbp, [r13+until]
     e.mem13W(0x8B, RAX, offs.stampPtr);                    // mov rax, [r13+stampPtr]
     e.bytes({0x48, 0x2B, 0x28});                           // sub rbp, [rax]
@@ -2573,6 +2559,8 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
     c.jitStampPtr = &stamp;
     c.jitCyc = u64(c.insnCycles) + c.extraCycles; // constant for a batch
     c.jitMsr = c.st.msr; // what runSteps just checked its entry conditions under
+    // The page memo's key for this enter, where a block's compare wants it.
+    c.jitDpKey = u64(c.dmLive | (c.st.msr & Cpu::kDmMsr)) << 32;
     const u64 before = stamp;
     if (J.tscOn) {
         // The split the report's "cycles per …" lines are built from:

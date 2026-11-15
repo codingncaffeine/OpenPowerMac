@@ -147,13 +147,12 @@ class JitCache {
         kPartCall,     // an instruction called out for, and its tests after
         kPartHop,      // leaving for the next block: counts, gate, the jump
         kPartCr,       // a condition register field built from a result
-        kPartDrop,     // a store: the fetched copy of its block, and this one
         kPartFp,       // floating-point arithmetic in line
         kPartN
     };
     static constexpr const char* kPartName[kPartN] = {
         "in line", "address + page probe", "memory call", "handler call",
-        "hop to the next block", "condition field", "store's code check",
+        "hop to the next block", "condition field",
         "floating point in line"};
     static constexpr u32 kMapNoRow = 1023u; // not one instruction's (a line's end)
     bool mapOn = false;
@@ -182,12 +181,12 @@ class JitCache {
         i32 stampPtr = 0, cyc = 0; // Cpu::jitStampPtr, Cpu::jitCyc
         bool pend4Ok = false;
         // Memory read directly (Cpu::DpPage), for the loads and stores a
-        // block makes without a call: the memo's live key, the TLB stamps
-        // and LRU bytes a hit compares and writes, and where the memo's
-        // table is (it is the processor's for life, so its address is a
-        // constant of the compiled code).
+        // block makes without a call: the memo's key as the dispatcher
+        // left it, the LRU bytes a hit writes, and where the memo's table
+        // is (it is the processor's for life, so its address is a constant
+        // of the compiled code).
         i32 jitMsr = 0; // Cpu::jitMsr, for the hop gate
-        i32 dmLive = 0, dtlbStamp0 = 0, dtlbLru0 = 0;
+        i32 dmLive = 0, dpKey = 0, dtlbLru0 = 0;
         u64 dpTable = 0;
     } offs;
 
@@ -205,6 +204,7 @@ class JitCache {
     bool compileLine(Cpu& c, u32 slot, u32 paBase, const u32* w,
                      const u16* rows, u32 vaBase);
 
+    bool movbe = false; // the host loads and stores byte-reversed in one step
     u8* arena_ = nullptr;
     size_t cap_ = 0, at_ = 0;
     size_t firstCode_ = 0; // end of trampoline+epilogue; resets rewind here

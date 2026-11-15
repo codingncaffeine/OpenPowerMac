@@ -89,6 +89,7 @@ class JitCache {
     // Counters, always on: they are how the report says what the JIT did.
     u64 compiles = 0, enters = 0, insns = 0, resets = 0, refillKeeps = 0,
         refillDrops = 0, bails = 0;
+
     // Chain lifecycle (Stage B). Hops themselves are counted by emitted code
     // into Cpu::jitChainHops (r13-addressable); everything here is C++-side.
     u64 chainLinks = 0, chainSevers = 0, chainResolves = 0, chainMisses = 0,
@@ -140,6 +141,13 @@ class JitCache {
         i32 pend4 = 0, extIrq = 0, smi = 0, decP = 0, pmP = 0;
         i32 until = 0, chainHops = 0;
         bool pend4Ok = false;
+        // Memory read directly (Cpu::DpPage), for the loads and stores a
+        // block makes without a call: the memo's live key, the TLB stamps
+        // and LRU bytes a hit compares and writes, and where the memo's
+        // table is (it is the processor's for life, so its address is a
+        // constant of the compiled code).
+        i32 dmLive = 0, dtlbStamp0 = 0, dtlbLru0 = 0;
+        u64 dpTable = 0;
     } offs;
 
     using EnterFn = void (*)(const void* entry, Cpu*, u64* stamp, u64 cyc);

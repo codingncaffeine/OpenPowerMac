@@ -1143,6 +1143,10 @@ struct Cpu {
     // --jit-tsc, carried here because the cache is created on first use and
     // the harness sets its flags before the machine runs.
     bool jitTscOn = false;
+    // DIAGNOSTIC (--no-jit-inline-mem): compile every load and store as a
+    // call to its shim, as before memory could be read directly. The control
+    // for the inline form (Compiler::memProbe in jit.cpp).
+    bool jitInlineMemOff = false;
     // DIAGNOSTIC (--no-jit-direct): compile fallbacks as the execRow shim
     // call instead of a direct call to the bound handler. The control for the
     // direct-call lowering, which is the only way its speed claim can be

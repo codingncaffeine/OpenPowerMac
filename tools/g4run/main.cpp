@@ -593,6 +593,7 @@ int main(int argc, char** argv)
     // --no-jit-chain: compile blocks without chain sites, so every exit
     // returns to the dispatcher as v1 did. The control for Stage B.
     bool jitChainOff = false;
+    bool jitInlineMemOff = false; // --no-jit-inline-mem
     // --jit-tsc: rdtsc the shims and the block entries (opm/jit.hpp).
     bool jitTsc = false;
     // --no-jit-direct: fallbacks go through the execRow shim, as before the
@@ -807,9 +808,11 @@ int main(int argc, char** argv)
         // The control for the JIT (opm/jit.hpp), same rule as every cache
         // and gate here: the claim ships with the switch that turns it off.
         if (!strcmp(a, "--no-jit")) { jitOff = true; continue; }
-        // ...and on, where it is not the default (Cpu::jitOn says where).
+        // ...and on, which is the default on every host with a back end.
         if (!strcmp(a, "--jit")) { jitForce = true; continue; }
         if (!strcmp(a, "--no-jit-chain")) { jitChainOff = true; continue; }
+        // The control for loads and stores emitted inline: all through shims.
+        if (!strcmp(a, "--no-jit-inline-mem")) { jitInlineMemOff = true; continue; }
         // 🔬 The host-cycle split inside compiled blocks. Perturbs the run
         // (an rdtsc pair per shim call), so read it for SHARES and per-call
         // costs — never quote its MIPS.
@@ -1572,6 +1575,7 @@ int main(int argc, char** argv)
     else if (jitForce)
         cpu.jitOn = true;
     cpu.jitChainOff = jitChainOff;
+    cpu.jitInlineMemOff = jitInlineMemOff;
     cpu.jitTscOn = jitTsc; // JitCache is created lazily; carried on the Cpu
     cpu.jitDirectOff = jitDirectOff;
     bus.ohci(0).setLivePortPower(ohciPortPower);

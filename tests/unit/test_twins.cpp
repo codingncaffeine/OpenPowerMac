@@ -1129,3 +1129,83 @@ TEST_CASE("fetch buffer: icbi drops the blocks at its address's offset, and no o
     m.run(8);
     CHECK(m.cpu.fetchBase[first] == kCode);
 }
+
+// ---- the translator's loads and stores without a call -----------------------------
+
+TEST_CASE("translator: inline loads and stores are the interpreter's, value by value")
+{
+    // With memory read directly a compiled block makes its loads and stores
+    // itself (Compiler::memProbe in jit.cpp), and for the floating-point
+    // forms also the single/double rearrangement of a normal number or a
+    // zero. Every other value is handed to the shim. So the table below is
+    // what matters: plain numbers, both zeros, the smallest and largest
+    // normal singles, denormals, infinities, quiet and signaling NaNs, and
+    // doubles outside a single's range, each loaded and stored every way.
+    const u32 singles[12] = {0x3FC00000u, 0x00000000u, 0x80000000u, 0x00000001u,
+                             0x007FFFFFu, 0x00800000u, 0x7F7FFFFFu, 0x7F800000u,
+                             0xFF800000u, 0x7FC12345u, 0x7F812345u, 0xC2F6E979u};
+    const u64 doubles[12] = {0x3FF8000000000000ull, 0x0000000000000000ull,
+                             0x8000000000000000ull, 0x0000000000000001ull,
+                             0x36A0000000000000ull, 0x3810000000000000ull,
+                             0x47EFFFFFE0000000ull, 0x7FF0000000000000ull,
+                             0x7FF8000000012345ull, 0x7FF4000000012345ull,
+                             0x47F0000000000000ull, 0x380FFFFFFFFFFFFFull};
+    std::vector<u32> prog;
+    for (u32 k = 0; k < 12; ++k) {
+        prog.push_back(dform(48, 1, 5, 4 * k));           // lfs  f1, single k
+        prog.push_back(dform(52, 1, 5, 0x100 + 4 * k));   // stfs f1
+        prog.push_back(dform(54, 1, 5, 0x600 + 8 * k));   // stfd f1 (as loaded)
+        prog.push_back(dform(50, 2, 5, 0x200 + 8 * k));   // lfd  f2, double k
+        prog.push_back(dform(54, 2, 5, 0x300 + 8 * k));   // stfd f2
+        prog.push_back(dform(52, 2, 5, 0x400 + 4 * k));   // stfs f2 (D.7)
+        prog.push_back(dform(48, 3, 5, 0x400 + 4 * k));   // lfs  f3, what that stored
+        prog.push_back(dform(54, 3, 5, 0x500 + 8 * k));   // stfd f3
+        prog.push_back(dform(32, 7, 5, 0x100 + 4 * k));   // lwz  r7, the single stored
+        prog.push_back(x31(8, 8, 7, 266));                // add  r8, r8, r7
+        prog.push_back(dform(36, 8, 5, 0x700 + 4 * k));   // stw  r8
+        prog.push_back(dform(40, 7, 5, 0x702 + 4 * k));   // lhz  r7, its low half
+        prog.push_back(dform(44, 7, 5, 0x780 + 2 * k));   // sth  r7
+        prog.push_back(dform(34, 7, 5, 0x703 + 4 * k));   // lbz  r7
+        prog.push_back(dform(38, 7, 5, 0x7C0 + k));       // stb  r7
+    }
+    prog.push_back(dform(14, 11, 11, 1));                 // addi r11, r11, 1
+    const i32 back = -static_cast<i32>(prog.size()) * 4;
+    prog.push_back(18u << 26 | (u32(back) & 0x03FFFFFCu)); // b top
+    Machine jit(true, true, true), interp(true, true, false);
+    for (Machine* m : {&jit, &interp}) {
+        REQUIRE(m->setUp(prog));
+        m->normalCaches(true);
+        m->cpu.st.gpr[5] = kVirt; // page 0 of the data pages
+        for (u32 k = 0; k < 12; ++k) {
+            m->bus.write32(kPhys + 4 * k, singles[k]);
+            m->bus.write64(kPhys + 0x200 + 8 * k, doubles[k]);
+        }
+    }
+    Rng r{0xF10A7ull};
+    const char* diff = runTwins(jit, interp, 40000, r, false, firstGuestDifference);
+    const std::string what = diff ? diff : "nothing";
+    CAPTURE(what);
+    CHECK(diff == nullptr);
+    CHECK(jit.cpu.excRingAt == 0u);
+    CHECK(jit.cpu.st.gpr[11] > 150u); // round the loop a couple of hundred times
+    // The values the model defines, spot-checked: a normal number, a zero,
+    // an infinity and a signaling NaN survive the round trip to a double
+    // and back; the double too large for a single stores what D.7 says.
+    CHECK(jit.bus.read32(kPhys + 0x100) == 0x3FC00000u);
+    CHECK(jit.bus.read64(kPhys + 0x600) == 0x3FF8000000000000ull);
+    CHECK(jit.bus.read32(kPhys + 0x100 + 4 * 2) == 0x80000000u);
+    CHECK(jit.bus.read32(kPhys + 0x100 + 4 * 7) == 0x7F800000u);
+    CHECK(jit.bus.read32(kPhys + 0x100 + 4 * 10) == 0x7F812345u);
+    CHECK(jit.bus.read32(kPhys + 0x100 + 4 * 3) == 0x00000001u); // a denormal
+    CHECK(jit.bus.read64(kPhys + 0x300 + 8 * 6) == 0x47EFFFFFE0000000ull);
+    CHECK(jit.bus.read32(kPhys + 0x400 + 4 * 6) == 0x7F7FFFFFu);
+    // The comparison was between the two things it names: one machine ran
+    // compiled blocks whose accesses were nearly all made in line (only the
+    // denormals, infinities and NaNs went to a shim), the other ran none.
+    REQUIRE(jit.cpu.jit != nullptr);
+    CHECK(jit.cpu.jit->insns > 30000u);
+    CHECK(jit.cpu.jit->memOps < 200u);
+    CHECK(jit.cpu.jit->fpMemOps > 500u);
+    CHECK(jit.cpu.jit->fpMemOps < jit.cpu.jit->insns / 8u);
+    CHECK(interp.cpu.jit == nullptr);
+}

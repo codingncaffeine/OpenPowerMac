@@ -1736,6 +1736,32 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  identity ? "an identity ramp" : "NOT an identity ramp",
                  a.pal(0), a.pal(64), a.pal(128), a.pal(192), a.pal(255));
         s += b;
+        // The table's shape, which is what says how a direct-colour mode is
+        // meant to index it: the red of every eighth entry, and whether the
+        // entries come in runs of eight or four equal ones (a driver that
+        // fills every index a 5- or 6-bit channel could reach).
+        if (!identity) {
+            bool runs8 = true, runs4 = true, grey = true;
+            for (u32 i = 0; i < 256; ++i) {
+                runs8 = runs8 && a.pal(i) == a.pal(i & ~7u);
+                runs4 = runs4 && a.pal(i) == a.pal(i & ~3u);
+                grey = grey && ((a.pal(i) >> 16) & 0xFFu) == (a.pal(i) & 0xFFu) &&
+                       ((a.pal(i) >> 8) & 0xFFu) == (a.pal(i) & 0xFFu);
+            }
+            s += "--   red of entries 0, 8, .. 248, 255:";
+            for (u32 i = 0; i <= 256; i += 8) {
+                snprintf(b, sizeof b, " %02x",
+                         (a.pal(i < 256 ? i : 255) >> 16) & 0xFFu);
+                s += b;
+            }
+            snprintf(b, sizeof b, "\n--   %s; %s\n",
+                     runs8 ? "in runs of eight equal entries"
+                     : runs4 ? "in runs of four equal entries"
+                             : "every entry its own",
+                     grey ? "the three channels alike"
+                          : "the channels differ");
+            s += b;
+        }
     }
     // 🖱 IS THE GUEST LISTENING TO ITS KEYBOARD AND MOUSE? "The pointer does
     // not move" has three causes that look the same from the window: the

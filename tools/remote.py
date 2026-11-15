@@ -40,6 +40,10 @@ Commands (one per argument; times are GUEST seconds unless they say host):
                     MIPS, the guest's clock against real time, idle share,
                     and the sound the guest produced against what a speaker
                     consumes in that second
+  bright S          S HOST seconds in the app's loop, sampling the picture's
+                    mean level every 50 ms: the series, and how many table
+                    entries the guest loaded into the DAC meanwhile (a fade
+                    is the gamma ramp loaded again and again)
   wav NAME | wav off   keep the sound the guest produces in OUT/NAME.wav
   record N NAME     record what reaches the graphics card over the next N
                     frames into OUT/NAME.frec (replay: tools/framereplay);
@@ -243,6 +247,38 @@ def perf(secs):
     state["chunk"] = chunk
     return "\n".join(out)
 
+def dac_entries():
+    hit = re.search(r"dac table: (\d+) entries written", diag_text())
+    return int(hit.group(1)) if hit else 0
+
+def bright(secs):
+    """The app's loop, with the picture's mean level sampled every 50 ms."""
+    from PIL import Image, ImageStat
+    series, chunk, before = [], state["chunk"], dac_entries()
+    t0 = time.monotonic()
+    next_sample = 0.0
+    while True:
+        now = time.monotonic() - t0
+        if now >= secs or opm_halted(m):
+            break
+        c0 = time.monotonic()
+        moved = step(chunk)
+        dt = (time.monotonic() - c0) * 1000
+        if dt < 8 and moved: chunk = min(chunk * 2, 40_000_000)
+        elif dt > 30: chunk = max(chunk // 2, 100_000)
+        now = time.monotonic() - t0
+        if now >= next_sample:
+            next_sample += 0.05
+            rc = opm_screen(m, shotbuf, len(shotbuf), ctypes.byref(w), ctypes.byref(h))
+            if rc > 0 and w.value:
+                W, H = w.value, h.value
+                im = Image.frombuffer("RGBA", (W, H), shotbuf.raw[:W * H * 4], "raw", "BGRA", 0, 1).convert("L")
+                series.append(round(ImageStat.Stat(im).mean[0]))
+    state["chunk"] = chunk
+    loaded = dac_entries() - before
+    return (f"{len(series)} samples, {len(set(series))} distinct levels, {loaded} table entries loaded "
+            f"({loaded / 256:.1f} whole tables)\n  " + " ".join(str(v) for v in series))
+
 def do(line):
     parts = line.split(None, 1)
     if not parts:
@@ -298,6 +334,7 @@ def do(line):
         opm_set_realtime(m, 1 if state["rt"] else 0)
         return "clock paced from the host" if state["rt"] else f"clock paced from the instruction count (fast-tb {a.fast_tb})"
     if cmd == "perf": return perf(float(arg or 10))
+    if cmd == "bright": return bright(float(arg or 5))
     if cmd == "record":
         said = ""
         if arg.strip() == "stop":

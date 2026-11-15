@@ -17,7 +17,11 @@ public partial class App : Application
                  + $"({System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier}, "
                  + $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription})");
         // Loading a library is file work; keep it off the UI thread.
-        Task.Run(() => Log.Line(Platform.NativeLibs.DescribeSdl3()));
+        Task.Run(() =>
+        {
+            Log.Line(Platform.NativeLibs.DescribeCore());
+            Log.Line(Platform.NativeLibs.DescribeSdl3());
+        });
 
         Dispatcher.UIThread.UnhandledException += OnDispatcherUnhandled;
         AppDomain.CurrentDomain.UnhandledException += (_, ev) =>

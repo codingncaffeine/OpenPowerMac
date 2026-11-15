@@ -16,7 +16,7 @@
     <RootNamespace>OpenPowerMac.Gui</RootNamespace>
     <Product>OpenPowerMac</Product>
     <AssemblyTitle>OpenPowerMac</AssemblyTitle>
-    <Version>0.1.0</Version>
+    <Version>0.0.3</Version>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>

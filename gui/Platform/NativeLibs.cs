@@ -54,6 +54,19 @@ internal static class NativeLibs
         }
     }
 
+    /// <summary>Loads the emulator core the way its imports will and says what
+    /// happened, for the log: a package whose core cannot load on this system
+    /// otherwise shows nothing until a Mac is started.</summary>
+    public static string DescribeCore()
+    {
+        if (!NativeLibrary.TryLoad("opmcapi", typeof(NativeLibs).Assembly, null, out IntPtr handle))
+            return "core: libopmcapi.so did not load, no Mac can be started";
+        string beside = Path.Combine(AppContext.BaseDirectory, "libopmcapi.so");
+        return NativeLibrary.TryGetExport(handle, "opm_create", out _)
+            ? $"core: loaded {(File.Exists(beside) ? beside : "libopmcapi.so")} (machine import ok)"
+            : "core: libopmcapi.so loaded, but opm_create is not in it";
+    }
+
     public static string AppVersion =>
         typeof(NativeLibs).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
             ?.InformationalVersion.Split('+')[0] ?? "0.0.0";

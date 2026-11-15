@@ -96,7 +96,7 @@ internal sealed class WaveOutSink : IDisposable
         {
             if (!_sdlInit)
             {
-                SDL_SetAppMetadata("OpenPowerMac", "0.1.0", "io.github.codingncaffeine.OpenPowerMac");
+                SDL_SetAppMetadata("OpenPowerMac", OpenPowerMac.Gui.Platform.NativeLibs.AppVersion, "io.github.codingncaffeine.OpenPowerMac");
                 _sdlInit = SDL_InitSubSystem(SDL_INIT_AUDIO);
                 if (!_sdlInit)
                     return false;

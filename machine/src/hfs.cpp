@@ -196,6 +196,37 @@ int nameCompare(const std::string& a, const std::string& b)
     return 0;
 }
 
+std::string foldName(std::string s)
+{
+    for (char& c : s)
+        c = static_cast<char>(foldByte(static_cast<u8>(c)));
+    return s;
+}
+
+// The two hidden folders a volume made by a Mac carries in its root, as
+// Apple's own pressed discs do: both empty, both invisible (DInfo.frFlags
+// 0x4000), the Desktop Folder with the first ID a volume hands out. The
+// Finder asks every volume for them, and a volume that cannot be written
+// cannot be given them later.
+//
+// Without a Desktop Folder of the volume's own, Finder 9.1 measures a folder
+// against the STARTUP disk's: the folder here whose ID equalled that one's
+// (19 on the disk it was met on) was taken for the desktop itself, which
+// holds every disk, and dragging it to any disk or folder was refused with
+// "cannot be copied into itself", while its neighbours copied. Measured both
+// ways on one volume: without the folder the ID is refused, with it the same
+// ID copies. The Trash is carried on the reference disc's word alone.
+struct RootSystemFolder {
+    const char* name;
+    u32 cnid;
+};
+constexpr RootSystemFolder kRootSystemFolders[] = {
+    {"Desktop Folder", 16},
+    {"Trash", 17},
+};
+constexpr u32 kFirstFreeCnid = 18;
+constexpr u16 kFinderInvisible = 0x4000;
+
 struct OSType {
     char c[4] = {'?', '?', '?', '?'};
 };
@@ -218,7 +249,7 @@ struct Item {
     u64 dataLen = 0, rsrcLen = 0;
     bool adsRsrc = false; // resource fork from the :rsrc alternate stream
     OSType type, creator;
-    u16 fdFlags = 0;
+    u16 fdFlags = 0; // Finder flags: a file's fdFlags, a folder's frFlags
     u32 crDate = 0, mdDate = 0;
     u16 valence = 0; // dirs
     // layout results
@@ -550,7 +581,7 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
     }
     // ── Scan ─────────────────────────────────────────────────────────────
     std::vector<Item> items;
-    u32 nextCnid = 16;
+    u32 nextCnid = kFirstFreeCnid;
     const u32 now = hfsNow();
     struct Pending {
         fs::path dir;
@@ -567,6 +598,9 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
         // one key. A clash is refused with both names so the user renames
         // one, rather than one file silently shadowing another.
         std::map<std::string, std::string> seen;
+        if (cur.cnid == 2u)
+            for (const auto& sf : kRootSystemFolders)
+                seen[foldName(sf.name)] = ""; // the volume's own: see above
         for (fs::directory_iterator it(cur.dir, ec), end; it != end;
              it.increment(ec)) {
             if (ec) {
@@ -641,10 +675,14 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
             }
             if (item.mac.empty())
                 item.mac = "_";
-            std::string folded = item.mac;
-            for (char& c : folded)
-                c = static_cast<char>(foldByte(static_cast<u8>(c)));
+            const std::string folded = foldName(item.mac);
             auto clash = seen.find(folded);
+            if (clash != seen.end() && clash->second.empty()) {
+                err = "'" + host8 + "' at the top level has the name of a "
+                      "hidden folder every Mac volume keeps there, and would "
+                      "not be shown: rename it";
+                return false;
+            }
             if (clash != seen.end()) {
                 err = "name clash after Mac conversion: '" + clash->second +
                       "' and '" + host8 + "' are one name on a Mac volume ('" +
@@ -659,6 +697,16 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
         err = warn && !warn->empty() ? "nothing was shareable: " + *warn
                                      : "the folder is empty — nothing to share";
         return false;
+    }
+    for (const auto& sf : kRootSystemFolders) {
+        Item item;
+        item.isDir = true;
+        item.cnid = sf.cnid;
+        item.parent = 2u;
+        item.mac = sf.name;
+        item.fdFlags = kFinderInvisible;
+        item.crDate = item.mdDate = now;
+        items.push_back(std::move(item));
     }
     // ── Volume geometry ──────────────────────────────────────────────────
     // Allocation blocks are 16-bit, so the block size scales with content.
@@ -732,6 +780,7 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
         put32(r.payload, 6, it.cnid);
         put32(r.payload, 10, it.crDate);
         put32(r.payload, 14, it.mdDate);
+        put16(r.payload, 30, it.fdFlags); // DInfo at 22: frRect, then frFlags
         recs.push_back(r);
         Rec th;
         th.parent = it.cnid;

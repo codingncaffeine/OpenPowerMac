@@ -31,6 +31,11 @@ namespace opm {
 //   PowerPC app still double-clicks.
 // - folders nest; dot-prefixed entries and Windows litter (desktop.ini,
 //   Thumbs.db) are skipped.
+// - the root also gets the two hidden, empty folders every Mac-made volume
+//   has, "Desktop Folder" and "Trash": the Finder looks for them on every
+//   volume and misjudges folders on one that lacks them (hfs.cpp says how).
+//   A host item with either name at the top level is refused, since the
+//   guest would hide it.
 //
 // The recommended transfer form for anything fork-critical remains a .sit
 // archive expanded in the guest — StuffIt carries the forks internally and

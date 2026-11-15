@@ -219,7 +219,7 @@ TEST_CASE("hfs: a folder becomes a volume whose catalog and forks read back")
     const auto mdb = v.sector(2);
     CHECK(g16(mdb, 10) == 0x0100); // cleanly unmounted
     CHECK(g32(mdb, 84) == 3);      // three files (litter skipped)
-    CHECK(g32(mdb, 88) == 1);      // one folder
+    CHECK(g32(mdb, 88) == 3);      // one folder, and the volume's own two
     // The alternate MDB sits at the PARTITION's second-to-last sector (the
     // free tail comes after it); find it by signature in the image's last
     // few raw sectors and require it to match the main one byte for byte.
@@ -241,8 +241,9 @@ TEST_CASE("hfs: a folder becomes a volume whose catalog and forks read back")
     for (size_t i = 1; i < recs.size(); ++i)
         CHECK(keyLess(recs[i - 1], recs[i]));
     // Records: root dir under parent 1, its thread, three files + one dir
-    // in root, the dir's thread, one file in the dir = 7.
-    CHECK(recs.size() == 7);
+    // in root, the dir's thread, one file in the dir = 7; the Desktop Folder
+    // and the Trash with their threads = 11.
+    CHECK(recs.size() == 11);
     std::map<std::string, const CRec*> byName;
     for (const auto& r : recs)
         byName[std::string(std::to_string(r.parent) + "/" + r.name)] = &r;
@@ -303,6 +304,79 @@ TEST_CASE("hfs: a name clash after Mac conversion is refused with both names")
     std::string err;
     CHECK(!hfsBuildImage(d.string(), img.string(), "Shared", err));
     CHECK(!err.empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("hfs: the root carries a Mac volume's own Desktop Folder and Trash")
+{
+    // As on a disc pressed from a Mac's volume: both in the root, empty,
+    // invisible, each with its thread; counted in the root's valence and in
+    // the volume's folder counts; and no item of the share takes their IDs.
+    const fs::path d = scratchDir();
+    fs::create_directories(d / "share" / "One");
+    fs::create_directories(d / "share" / "Two" / "Trash"); // fine below the root
+    writeFile(d / "share" / "One" / "a.txt", {1});
+    writeFile(d / "share" / "Two" / "Trash" / "b.txt", {2});
+    const fs::path img = d / "out.img";
+    std::string err;
+    REQUIRE(hfsBuildImage((d / "share").string(), img.string(), "Shared", err));
+    const Vol v = load(img);
+    const auto mdb = v.sector(2);
+    CHECK(g16(mdb, 82) == 4); // folders in the root: two shared, two of its own
+    CHECK(g32(mdb, 88) == 5); // folders on the volume
+    const auto recs = walkCatalog(v);
+    for (size_t i = 1; i < recs.size(); ++i)
+        CHECK(keyLess(recs[i - 1], recs[i]));
+    std::map<u32, int> idUses;
+    u32 desktopId = 0, trashId = 0, rootValence = 0, sharedRootDirs = 0;
+    for (const auto& r : recs) {
+        if (r.payload[0] == 1)
+            ++idUses[g32(r.payload, 6)];
+        if (r.payload[0] == 2)
+            ++idUses[g32(r.payload, 20)];
+        if (r.parent == 1 && r.payload[0] == 1)
+            rootValence = g16(r.payload, 4);
+        if (r.parent != 2 || r.payload[0] != 1)
+            continue;
+        const bool own = r.name == "Desktop Folder" || r.name == "Trash";
+        if (!own) {
+            ++sharedRootDirs;
+            CHECK(g16(r.payload, 30) == 0); // a shared folder is visible
+            continue;
+        }
+        CHECK(g16(r.payload, 4) == 0);       // empty
+        CHECK(g16(r.payload, 30) == 0x4000); // DInfo.frFlags: invisible
+        (r.name == "Trash" ? trashId : desktopId) = g32(r.payload, 6);
+    }
+    CHECK(desktopId == 16); // the first ID a volume hands out, as on the disc
+    CHECK(trashId != 0);
+    CHECK(sharedRootDirs == 2);
+    CHECK(rootValence == 4);
+    for (const auto& [id, uses] : idUses)
+        CHECK_MESSAGE(uses == 1, "catalog ID " << id << " is used twice");
+    // Each has the thread a lookup by ID goes through.
+    int threads = 0;
+    for (const auto& r : recs)
+        if (r.payload[0] == 3 && r.name.empty() &&
+            (r.parent == desktopId || r.parent == trashId)) {
+            CHECK(g32(r.payload, 10) == 2); // their parent is the root
+            ++threads;
+        }
+    CHECK(threads == 2);
+    fs::remove_all(d);
+}
+
+TEST_CASE("hfs: a shared item named like the volume's own folders is refused")
+{
+    // The guest would take it for the volume's Trash and never show it.
+    const fs::path d = scratchDir();
+    fs::create_directories(d / "share" / "trash"); // any case: one name on HFS
+    writeFile(d / "share" / "trash" / "kept.txt", {1});
+    const fs::path img = d / "out.img";
+    std::string err;
+    CHECK(!hfsBuildImage((d / "share").string(), img.string(), "Shared", err));
+    CHECK(err.find("'trash'") != std::string::npos);
+    CHECK(err.find("rename") != std::string::npos);
     fs::remove_all(d);
 }
 

@@ -14,6 +14,7 @@
 #include "opm/r128.hpp"
 
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1580,4 +1581,183 @@ TEST_CASE("3d: texels read in place are the texels read byte by byte")
                     ++cases;
                 }
     CHECK(cases == 64u);
+}
+
+namespace {
+// What a draw changed in the engine's counts.
+struct DrawCounts {
+    u64 pixels, samples, offVram, unimpl, crewTris, crewPixels;
+    static DrawCounts now()
+    {
+        const R128EngStats& e = r128EngStats();
+        return {e.triPixels, e.texSamples, e.offVram, e.texUnimpl, e.crewTris,
+                e.crewPixels};
+    }
+    DrawCounts since(const DrawCounts& b) const
+    {
+        return {pixels - b.pixels,     samples - b.samples,
+                offVram - b.offVram,   unimpl - b.unimpl,
+                crewTris - b.crewTris, crewPixels - b.crewPixels};
+    }
+};
+} // namespace
+
+TEST_CASE("3d: a triangle's rows drawn by several threads are the rows drawn "
+          "by one")
+{
+    // The same scene of large overlapping triangles on two cards, one drawing
+    // every row on the calling thread and one handing the rows of a large
+    // triangle to four. Video memory must end the same byte for byte, depth
+    // and stencil cells included, and so must every count the pixel path
+    // keeps. The scene is drawn with each kind of state a pixel can depend
+    // on; the last cases are the ones where rows are NOT independent, and
+    // there the four threads must not have been used at all.
+    constexpr u32 kW = 512, kH = 256;
+    constexpr u32 kZAt = 0x00100000u, kTex1 = 0x00200000u;
+    constexpr u32 kAll = 0x00400000u; // everything a case can touch, compared
+    struct Case {
+        const char* what;
+        u32 texCntl;  // TEX_CNTL_C
+        u32 misc;     // MISC_3D_STATE_CNTL above the gate's field
+        u32 zSten;    // Z_STEN_CNTL_C
+        u32 prim, sec; // the two units' control registers
+        u32 zOff;
+        u32 tex1At;
+        bool dst16;
+        bool crew;    // may the rows go to several threads?
+    };
+    const u32 kTri = 5u << 1, kBil = (1u << 1) | (1u << 4);
+    const u32 k1555 = 3u << 16, k8888 = 6u << 16;
+    const u32 kBlend = (4u << 16) | (5u << 20);
+    const Case cases[] = {
+        {"shaded only", 0, 0, 0, 0, 0, kZAt, kTex1, false, true},
+        {"depth, 16 bits", 0x3u, 0, 1u << 4, 0, 0, kZAt, kTex1, false, true},
+        {"blended", 1u << 9, kBlend, 0, 0, 0, kZAt, kTex1, false, true},
+        {"one texture with smaller maps, stencil, blended",
+         0x3u | (1u << 3) | (1u << 4) | (1u << 9), kBlend,
+         (1u << 1) | (1u << 4) | (7u << 12) | (3u << 20), k1555 | kTri | (1u << 4),
+         0, kZAt, kTex1, false, true},
+        {"two textures, specular, fog, alpha test",
+         0x3u | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 10) | (1u << 11),
+         (4u << 24) | 0x20u, 1u << 4, k1555 | kTri | (1u << 4),
+         k8888 | kBil | 1u | (2u << 8) | (2u << 11), kZAt, kTex1, false, true},
+        {"two textures, a level bias, nearest map",
+         0x3u | (1u << 4) | (1u << 5) | (0x18u << 24), 0, 1u << 4,
+         k1555 | (2u << 1), k8888 | 1u, kZAt, kTex1, false, true},
+        {"depth cells partly beyond video memory", 0x3u, 0, 1u << 4, 0, 0,
+         (32u << 20) - 0x18000u, kTex1, false, true},
+        // Rows that are not independent.
+        {"depth buffer lying in the destination", 0x3u, 0, 1u << 4, 0, 0,
+         kW * 4u * 64u, kTex1, false, false},
+        {"a texture lying in the destination", 0x3u | (1u << 4), 0, 1u << 4,
+         k1555 | kBil, 0, kZAt, kW * 4u * 100u, false, false},
+        {"error diffusion", 1u << 8, 0, 0, 0, 0, kZAt, kTex1, true, false},
+    };
+    // The scene: twelve triangles, corners anywhere in and a little around
+    // the target, every attribute its own number.
+    u32 seed = 0x2545F491u;
+    auto rnd = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    auto frac = [&]() { return static_cast<float>(rnd() & 0xFFFFu) / 65535.0f; };
+    std::vector<u32> scene;
+    for (u32 k = 0; k < 12u * 3u; ++k) {
+        const float rhw = 0.3f + 1.7f * frac();
+        scene.push_back(f2u(-40.0f + 600.0f * frac())); // x
+        scene.push_back(f2u(-30.0f + 320.0f * frac())); // y
+        scene.push_back(f2u(frac()));                   // z
+        scene.push_back(f2u(rhw));
+        scene.push_back(rnd() << 8 | (rnd() & 0xFFu)); // diffuse
+        scene.push_back(rnd() << 8 | (rnd() & 0xFFu)); // fog and specular
+        scene.push_back(f2u((-1.0f + 4.0f * frac()) * rhw)); // s, t: times
+        scene.push_back(f2u((-1.0f + 4.0f * frac()) * rhw)); // rhw, as sent
+        scene.push_back(f2u((-0.5f + 2.0f * frac()) * rhw));
+        scene.push_back(f2u((-0.5f + 2.0f * frac()) * rhw));
+    }
+    Rig3d one, many;
+    u32 ran = 0;
+    for (const Case& k : cases) {
+        DrawCounts got[2] = {};
+        int which = 0;
+        for (Rig3d* r : {&one, &many}) {
+            r128SetRasterThreads(r == &one ? 1 : 4);
+            // The engine's own state is one for the process (the dither's
+            // error register among it): each card starts from none.
+            r128CceReset();
+            // Memory as a case finds it: every byte its own, so that a cell
+            // read in the wrong order is a different number.
+            u32 fill = 0x9E3779B9u;
+            for (u32 i = 0; i < kAll; ++i) {
+                fill = fill * 1664525u + 1013904223u;
+                r->c.vram[i] = static_cast<u8>(fill >> 24);
+            }
+            for (u32 i = (32u << 20) - 0x20000u; i < (32u << 20); ++i)
+                r->c.vram[i] = static_cast<u8>(i * 7u);
+            r->mapPage(0x00300000u, 0x00200000u);
+            r->mapPage(0x00301000u, 0x00500000u);
+            for (u32 i = 0; i < 0x1000u; ++i) {
+                r->ram[0x00200000u + i] = static_cast<u8>(i * 13u + 5u);
+                r->ram[0x00500000u + i] = static_cast<u8>(i * 29u + 3u);
+            }
+            // A 512-wide target at 0, 32 bits or 16.
+            r->reg(0x146Cu, (1u << 30) | (1u << 28) | 0x0Fu |
+                                ((k.dst16 ? 4u : 6u) << 8));
+            r->reg(0x142Cu, (kW / 8u) << 21);
+            r->reg(0x16ECu, 0);
+            r->reg(0x16F0u, ((kH - 1u) << 16) | (kW - 1u));
+            r->reg(0x1CA0u, (2u << 8) | k.misc);
+            r->fpuSolidBoth();
+            r->reg(0x1C90u, k.zOff);
+            r->reg(0x1C94u, kW / 8u);
+            r->reg(0x1C98u, k.zSten);
+            r->reg(0x1D40u, 0xFFu << 16 | 0xFFu << 24);
+            r->reg(0x1C9Cu, k.texCntl);
+            r->reg(0x1CACu, 0x00406080u); // the fog color
+            // Unit 1: 64x64 with every smaller map, in video memory. Unit 2:
+            // 32x32, one map, in AGP space across two pages.
+            r->reg(0x1CB0u, k.prim);
+            r->reg(0x1CB4u, 0);
+            r->reg(0x1D00u, k.sec);
+            r->reg(0x1D04u, 1u);
+            r->reg(0x1CB8u, 0x0666u | (0x5555u << 16));
+            for (u32 l = 0; l <= 6u; ++l)
+                r->reg(0x1CBCu + 4u * (6u - l), k.tex1At + l * 0x4000u);
+            r->reg(0x1D08u + 4u * 5u, 0x02000000u + 0x00300F80u);
+            const DrawCounts before = DrawCounts::now();
+            r->prim(0x1u | 0x8u | 0x40u | 0x80u | 0x100u, 4u, 36u, scene);
+            got[which++] = DrawCounts::now().since(before);
+        }
+        const std::string what = k.what;
+        CAPTURE(what);
+        CHECK(std::memcmp(one.c.vram.data(), many.c.vram.data(), kAll) == 0);
+        CHECK(std::memcmp(one.c.vram.data() + (32u << 20) - 0x20000u,
+                          many.c.vram.data() + (32u << 20) - 0x20000u,
+                          0x20000u) == 0);
+        CHECK(got[0].pixels == got[1].pixels);
+        CHECK(got[0].samples == got[1].samples);
+        CHECK(got[0].offVram == got[1].offVram);
+        CHECK(got[0].unimpl == got[1].unimpl);
+        // The scene was drawn, and by whom: one thread never hands a row
+        // over, four take most of the pixels wherever rows are independent
+        // and next to none of them where they are not.
+        const bool cellsBeyond = k.zOff > (16u << 20);
+        CHECK(got[0].pixels > (cellsBeyond ? 5000u : 20000u));
+        CHECK((got[0].offVram > 0u) == cellsBeyond);
+        CHECK(got[0].crewTris == 0u);
+        if (k.crew) {
+            CHECK(got[1].crewTris >= 6u);
+            CHECK(got[1].crewPixels * 2u > got[1].pixels);
+        } else if (k.dst16) {
+            CHECK(got[1].crewTris == 0u); // no row of a dithered triangle
+        } else {
+            // Only a triangle that lies wholly clear of the other buffer:
+            // one small one in this scene, twelve if nothing were checked.
+            CHECK(got[1].crewTris <= 2u);
+            CHECK(got[1].crewPixels * 10u < got[1].pixels);
+        }
+        ++ran;
+    }
+    r128SetRasterThreads(0);
+    CHECK(ran == 10u);
 }

@@ -6893,6 +6893,12 @@ int main(int argc, char** argv)
                        static_cast<unsigned long long>(e.prim3dDecline),
                        static_cast<unsigned long long>(e.gated3d),
                        static_cast<unsigned long long>(e.zTile));
+            if (e.tris)
+                printf("-- ati 3D rows: %llu tris and %llu pixels drawn on "
+                       "%d threads\n",
+                       static_cast<unsigned long long>(e.crewTris),
+                       static_cast<unsigned long long>(e.crewPixels),
+                       opm::r128RasterThreads());
             // 🧪 THE BOUND TEXTURE'S BYTES, for offline layout analysis.
             //
             // Every texture offset this guest programs carries tiling bits

@@ -1426,6 +1426,12 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                      (unsigned long long)e.prim3dDecline,
                      (unsigned long long)e.gated3d);
             s += b;
+            snprintf(b, sizeof b,
+                     "--   3d rows: %llu tris and %llu px drawn on %d "
+                     "threads\n",
+                     (unsigned long long)e.crewTris,
+                     (unsigned long long)e.crewPixels, r128RasterThreads());
+            s += b;
         }
         for (const auto& [op, n] : r128CceP3Skipped()) {
             snprintf(b, sizeof b, "--   pkt3 opcode 0x%02x SKIPPED x%llu\n",

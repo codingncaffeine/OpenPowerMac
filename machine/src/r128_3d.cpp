@@ -39,8 +39,11 @@
 #include "opm/r128rec.hpp"
 #include "opm/snapshot.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 // The fragment path works on a pixel's four channels at once (F4, below):
 // with SSE2 where the target has it, which every x86-64 does, and as plain
 // loops elsewhere. Lane by lane the two are the same IEEE operations in the
@@ -60,8 +63,18 @@
 #else
 #define OPM_FORCE_INLINE inline __attribute__((always_inline))
 #endif
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+#define OPM_ROWS_X86 1
+#include <xmmintrin.h>
+#else
+#define OPM_ROWS_X86 0
+#endif
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 namespace opm {
 
@@ -340,6 +353,17 @@ struct Pipe {
     const u8* vram = nullptr;
     u32 vramEnd = 0;
     bool fastMem = false;
+    // What the pixel path counts, kept here and added to the engine's
+    // statistics when the packet is drawn (flushTally): a thread drawing
+    // rows of a triangle has its own copy of this record (drawTriangleRows),
+    // and with it its own counts and its own page cache below.
+    struct Tally {
+        u64 triPixels = 0, offVram = 0, texSamples = 0, texUnimpl = 0;
+    };
+    mutable Tally tally;
+    // Set in the copies several threads draw from at once: the rare paths
+    // that touch state all threads share take a lock then (texByte).
+    bool crowd = false;
     static constexpr u32 kAgpPages = 64;
     struct AgpPage {
         u32 page = ~0u;
@@ -629,6 +653,13 @@ bool texByte(const Pipe& P, u32 addr, u8& out)
         out = vram[addr];
         return true;
     }
+    // The walk counts its misses and logs its first few in state every
+    // thread shares; rows drawn by several threads at once come through
+    // here only for a texel across two pages or on an unmapped one.
+    static std::mutex shared;
+    std::unique_lock<std::mutex> lock(shared, std::defer_lock);
+    if (P.crowd)
+        lock.lock();
     u32 w = 0;
     if (!r128CceGartRead(P.m, (addr - kAgpWindow) & ~3u, w)) {
         ++eng().texGartMiss;
@@ -786,10 +817,9 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     // such sample as unimplemented would bury the real signal under tens of
     // millions of false positives per capture. The live-surface decision is
     // made once per packet in gatherPipe; here it is one flag.
-    auto& es = eng();
     if (t.tileCount[l])
-        ++es.texUnimpl;
-    ++es.texSamples;
+        ++P.tally.texUnimpl;
+    ++P.tally.texSamples;
     auto b8 = [&](u32 at, u8& v) { return texByte(P, at, v); };
     u8 b0, b1, b2, b3;
     switch (t.fmt) {
@@ -944,7 +974,7 @@ bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         return true;
     }
     default: // VQ (0): "2 bpp", and no word anywhere on its code book
-        ++eng().texUnimpl;
+        ++P.tally.texUnimpl;
         return false;
     }
 }
@@ -1075,13 +1105,11 @@ inline bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
         break;
     }
     return fetchTexelBytes(P, t, l, x, y, out);
-counted: {
-    auto& es = eng(); // what fetchTexelBytes counts before it reads
+counted: // what fetchTexelBytes counts before it reads
     if (t.tileCount[l])
-        ++es.texUnimpl;
-    ++es.texSamples;
+        ++P.tally.texUnimpl;
+    ++P.tally.texSamples;
     return true;
-}
 }
 
 // floor() of a float as an int, without the library call: the truncation,
@@ -1241,10 +1269,9 @@ F4 sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
                 break;
             }
             }
-            auto& es = eng(); // four fetches' worth, as fetchTexel counts
-            if (t.tileCount[l])
-                es.texUnimpl += 4;
-            es.texSamples += 4;
+            if (t.tileCount[l]) // four fetches' worth, as fetchTexel counts
+                P.tally.texUnimpl += 4;
+            P.tally.texSamples += 4;
         }
     }
     if (!direct) {
@@ -1713,7 +1740,7 @@ OPM_FORCE_INLINE bool shadeFragmentIn(const Pipe& P, int px, int py,
     const bool wantZ = P.zEn || (P.stEn && P.zw == 24u);
     if (wantZ) {
         if (!zAddr(P, px, py, za)) {
-            ++eng().offVram;
+            ++P.tally.offVram;
             return false;
         }
         const u32 cell = zRead(P, za);
@@ -1755,7 +1782,7 @@ OPM_FORCE_INLINE bool shadeFragmentIn(const Pipe& P, int px, int py,
                    static_cast<u64>(py) * P.dstStride +
                    static_cast<u64>(px) * P.bypp;
     if (at + P.bypp > P.c->vram.size()) {
-        ++eng().offVram;
+        ++P.tally.offVram;
         return false;
     }
     if (P.blendEn) {
@@ -1774,7 +1801,7 @@ OPM_FORCE_INLINE bool shadeFragmentIn(const Pipe& P, int px, int py,
         color = v;
     }
     dstWrite(P, at, dstEncode(P, color));
-    ++eng().triPixels;
+    ++P.tally.triPixels;
     return true;
 }
 
@@ -1809,185 +1836,46 @@ Plane planeOf(double x0, double y0, double x1, double y1, double x2,
     return p;
 }
 
-void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
-{
-    // Facing. In y-down screen space a clockwise triangle has positive
-    // doubled area; PM4_VC_FPU_SETUP bit 0 names which winding is front,
-    // bits 2:1 / 4:3 what to do with back / front faces (Table 6-22).
-    double area2 = (static_cast<double>(v1.x) - v0.x) * (v2.y - v0.y) -
-                   (static_cast<double>(v2.x) - v0.x) * (v1.y - v0.y);
-    if (area2 == 0.0) {
-        ++eng().triDegen;
-        return;
-    }
-    // The per-triangle S/T span against the bound texture size — the
-    // measurement that tells normalized coordinates from texel ones. Taken
-    // before any culling so the sample is of what the guest SENT.
-    if (P.texAny && P.tex[0].wTex) {
-        const float sMin = std::min(v0.s1, std::min(v1.s1, v2.s1));
-        const float sMax = std::max(v0.s1, std::max(v1.s1, v2.s1));
-        const float tMin = std::min(v0.t1, std::min(v1.t1, v2.t1));
-        const float tMax = std::max(v0.t1, std::max(v1.t1, v2.t1));
-        const float span = std::max(sMax - sMin, tMax - tMin);
-        if (span >= 0.0f && span < 1e6f) {
-            auto& e = eng();
-            int b = 0;
-            if (span > 0.0f) {
-                const float l2 = std::log2(span);
-                b = static_cast<int>(std::floor(l2)) + 5; // 2^-5 -> 0
-                if (b < 0) b = 0;
-                if (b > 11) b = 11;
-            }
-            ++e.triSpanBucket[b];
-            e.triSpanTexW += P.tex[0].wTex;
-            ++e.triSpanN;
-        }
-    }
-    ++gTriSeq;
-    if (gTriDump > 0 && P.texAny) {
-        --gTriDump;
-        const TexUnit& t0 = P.tex[0];
-        printf("-- tri3d %llu fmt=%03x prim=%u t0 %ux%u p%u f=%u cn=%08x "
-               "of=%08x tc=%08x fpu=%08x misc=%08x\n",
-               static_cast<unsigned long long>(gTriSeq), gDumpFmt, gDumpPrim,
-               t0.wTex, t0.hTex, t0.pitchTex, t0.fmt, t0.cntl, t0.offs[0],
-               P.texCntl, P.fpu, P.misc);
-        for (const Vtx* v : {&v0, &v1, &v2})
-            printf("-- tv %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
-                   v->x, v->y, v->z, v->rhw, v->s1, v->t1, v->s2, v->t2);
-    }
-    const bool ccwFront = (P.fpu & 1u) != 0;
-    bool front = (area2 > 0.0) != ccwFront; // area>0 = screen-CW
-    if (flipFacing)
-        front = !front; // strips alternate winding; facing does not
-    // An FPU_SETUP of exactly zero would cull every face; no driver means
-    // that, and an unprogrammed register reads zero here. Draw solid.
-    const u32 fn =
-        P.fpu == 0u ? 3u : front ? (P.fpu >> 3) & 3u : (P.fpu >> 1) & 3u;
-    if (fn == 0u) {
-        ++eng().triCulled;
-        return;
-    }
-    if (fn == 1u) { // degrade to its three vertices (Table 6-22)
-        rasterPoint(P, v0);
-        rasterPoint(P, v1);
-        rasterPoint(P, v2);
-        return;
-    }
-    if (fn == 2u) { // degrade to its three edges
-        rasterLine(P, v0, v1);
-        rasterLine(P, v1, v2);
-        rasterLine(P, v2, v0);
-        return;
-    }
-    if (area2 < 0.0) {
-        Vtx t = v1;
-        v1 = v2;
-        v2 = t;
-        area2 = -area2;
-    }
-    const double x0 = v0.x + P.winX, y0 = v0.y + P.winY;
-    const double x1 = v1.x + P.winX, y1 = v1.y + P.winY;
-    const double x2 = v2.x + P.winX, y2 = v2.y + P.winY;
-    int minX = static_cast<int>(std::floor(std::fmin(x0, std::fmin(x1, x2))));
-    int maxX = static_cast<int>(std::ceil(std::fmax(x0, std::fmax(x1, x2))));
-    int minY = static_cast<int>(std::floor(std::fmin(y0, std::fmin(y1, y2))));
-    int maxY = static_cast<int>(std::ceil(std::fmax(y0, std::fmax(y1, y2))));
-    if (minX < P.scL) minX = P.scL;
-    if (maxX > P.scR) maxX = P.scR;
-    if (minY < P.scT) minY = P.scT;
-    if (maxY > P.scB) maxY = P.scB;
-    if (minX < 0) minX = 0;
-    if (minY < 0) minY = 0;
-    if (minX > maxX || minY > maxY) {
-        ++eng().triDegen;
-        return;
-    }
-    struct Edge {
-        double a, b, c; // e = a*x + b*y + c, interior > 0 for CW/y-down
-        bool topLeft;
-    } e[3];
-    auto mkEdge = [](double ax, double ay, double bx, double by) {
-        // e = (bx-ax)(y-ay) - (by-ay)(x-ax), expanded to a*x + b*y + c.
-        Edge ed;
-        ed.a = ay - by;
-        ed.b = bx - ax;
-        ed.c = -(ed.a * ax + ed.b * ay);
-        // D3D top-left rule in y-down CW terms: a top edge runs rightward
-        // horizontally, a left edge runs upward.
-        const double dx = bx - ax, dy = by - ay;
-        ed.topLeft = (dy == 0.0 && dx > 0.0) || dy < 0.0;
-        return ed;
-    };
-    e[0] = mkEdge(x0, y0, x1, y1);
-    e[1] = mkEdge(x1, y1, x2, y2);
-    e[2] = mkEdge(x2, y2, x0, y0);
-    const double inv2a = 1.0 / area2;
-    // Attribute planes (screen-affine). The stream's S,T already ARE the
-    // s·rhw / t·rhw numerators (receipt below); rhw gets its own plane and
-    // the per-pixel divide resolves u,v unless the unit disables
-    // perspective.
-    const Plane pz = planeOf(x0, y0, x1, y1, x2, y2, v0.z, v1.z, v2.z, inv2a);
-    const Plane pa = planeOf(x0, y0, x1, y1, x2, y2, v0.ca, v1.ca, v2.ca, inv2a);
-    const Plane pr = planeOf(x0, y0, x1, y1, x2, y2, v0.cr, v1.cr, v2.cr, inv2a);
-    const Plane pg = planeOf(x0, y0, x1, y1, x2, y2, v0.cg, v1.cg, v2.cg, inv2a);
-    const Plane pb = planeOf(x0, y0, x1, y1, x2, y2, v0.cb, v1.cb, v2.cb, inv2a);
-    const Plane psr = planeOf(x0, y0, x1, y1, x2, y2, v0.sr, v1.sr, v2.sr, inv2a);
-    const Plane psg = planeOf(x0, y0, x1, y1, x2, y2, v0.sg, v1.sg, v2.sg, inv2a);
-    const Plane psb = planeOf(x0, y0, x1, y1, x2, y2, v0.sb, v1.sb, v2.sb, inv2a);
-    const Plane pfog = planeOf(x0, y0, x1, y1, x2, y2, v0.fog, v1.fog, v2.fog, inv2a);
-    const Plane pw = planeOf(x0, y0, x1, y1, x2, y2, v0.rhw, v1.rhw, v2.rhw, inv2a);
-    const bool persp0 = P.tex[0].on && !((P.tex[0].cntl >> 14) & 1u);
-    const bool persp1 = P.tex[1].on && !((P.tex[1].cntl >> 14) & 1u);
-    // ⭐⭐ THE VERTEX'S S,T ARE ALREADY PREMULTIPLIED BY RHW — they are the
-    // screen-linear NUMERATORS (u·rhw, v·rhw), not plain u,v, so the setup
-    // stage must NOT multiply by rhw again. Measured from a shipping RAVE
-    // title's live stream (--tri-dump, 900 triangles off a snapshot): raw
-    // s against the content's 0.2 UV lattice is random (mean distance
-    // 0.246 vs 0.25 chance) while s/rhw lands EXACTLY on it (0, 0.4, 0.6,
-    // 1.0; 41% of interior vertices within 1e-3, the rest being model UVs
-    // and screen-edge vertices the guest's own clipper interpolated) — and
-    // the stream's global max of s equals the global max of rhw to three
-    // decimals (126.7), which is what s = u·rhw with u ≤ ~1 looks like.
-    // This is RAVE's own vertex contract (uOverW/vOverW) passed through by
-    // the Mac driver. The SDK's F-45 calls the field "the u-coordinate"
-    // and documents no premultiply anywhere — the stream outranks the
-    // prose. A double multiply divided every coordinate by w once more,
-    // which under the title's clamp-to-edge modes smeared edge texels over
-    // the whole world: texture BYTES provably right, picture wrong
-    // everywhere.
-    //
-    // Iteration is therefore the same for both states of the perspective
-    // bit — the plane interpolates the stream value as given — and
-    // TEX_PERSPECTIVE_DISABLE only controls the per-pixel divide below.
-    const Plane ps1 = planeOf(x0, y0, x1, y1, x2, y2,
-                              v0.s1, v1.s1, v2.s1, inv2a);
-    const Plane pt1 = planeOf(x0, y0, x1, y1, x2, y2,
-                              v0.t1, v1.t1, v2.t1, inv2a);
-    const Plane ps2 = planeOf(x0, y0, x1, y1, x2, y2,
-                              v0.s2, v1.s2, v2.s2, inv2a);
-    const Plane pt2 = planeOf(x0, y0, x1, y1, x2, y2,
-                              v0.t2, v1.t2, v2.t2, inv2a);
-    ++eng().tris;
-    // What this triangle's fragments actually consume, decided once. spec
-    // and fog planes feed nothing when their stage is off; the second set
-    // feeds nothing without a second unit; and the LOD derivative block —
-    // which carries a log2 per pixel — steers the sampler ONLY when mips
-    // are live or the min/mag filters disagree on bilinearity (sampleTex's
-    // no-mip path reads nothing else out of it). A shipping title runs
-    // mips-off with both filters bilinear, so the whole block is dead
-    // weight there.
-    const bool wantSpec = P.specEn;
-    const bool wantFog = P.fogEn && !P.fogTable;
-    const bool lodLive =
-        P.tex[0].on &&
-        ((!((P.tex[0].cntl >> 7) & 1u) && P.tex[0].maxLevel > 0) ||
-         (((P.tex[0].cntl >> 1) & 1u) != ((P.tex[0].cntl >> 4) & 1u)));
+// One edge of a triangle as a function of the pixel center, and everything
+// else about a triangle its rows are drawn from: found once (rasterTriangle),
+// read by every row.
+struct TriEdge {
+    double a, b, c; // e = a*x + b*y + c, interior > 0 for CW/y-down
+    bool topLeft;
+};
+
+struct TriSetup {
+    TriEdge e[3];
+    Plane pz, pa, pr, pg, pb, psr, psg, psb, pfog, pw, ps1, pt1, ps2, pt2;
     // The four colors' planes side by side, and the specular three, for
     // F4::affine: one step along the row for all of them.
-    const double colA[4] = {pa.a, pr.a, pg.a, pb.a};
-    const double specA[4] = {0.0, psr.a, psg.a, psb.a};
-    for (int py = minY; py <= maxY; ++py) {
+    double colA[4], specA[4];
+    bool persp0, persp1, wantSpec, wantFog, lodLive;
+    bool lodSignOnly, lodNoBias; // see where the level is computed
+    int minX, maxX;
+};
+
+// Rows yFrom..yTo of a triangle. Nothing a row draws depends on another row
+// of the same triangle except through what both may touch in memory and the
+// dither's error register; rowsApart says when neither can happen, and then
+// the rows may be drawn in any order, or at once (RowCrew).
+void drawRows(const Pipe& P, const TriSetup& T, int yFrom, int yTo)
+{
+    // Copies, on purpose: pixels are stored through byte pointers, which a
+    // compiler has to assume might be T itself, and it would read every
+    // plane again after every pixel.
+    const TriEdge e[3] = {T.e[0], T.e[1], T.e[2]};
+    const Plane pz = T.pz, pa = T.pa, pr = T.pr, pg = T.pg, pb = T.pb;
+    const Plane psr = T.psr, psg = T.psg, psb = T.psb, pfog = T.pfog;
+    const Plane pw = T.pw, ps1 = T.ps1, pt1 = T.pt1, ps2 = T.ps2, pt2 = T.pt2;
+    const double colA[4] = {T.colA[0], T.colA[1], T.colA[2], T.colA[3]};
+    const double specA[4] = {T.specA[0], T.specA[1], T.specA[2], T.specA[3]};
+    const bool persp0 = T.persp0, persp1 = T.persp1;
+    const bool wantSpec = T.wantSpec, wantFog = T.wantFog;
+    const bool lodLive = T.lodLive;
+    const bool lodSignOnly = T.lodSignOnly, lodNoBias = T.lodNoBias;
+    const int minX = T.minX, maxX = T.maxX;
+    for (int py = yFrom; py <= yTo; ++py) {
         const double cy = py + 0.5;
         ditherLineStart(P);
         // Per-row bases: value at (cx,cy) = plane.a * cx + rowBase. One
@@ -2103,15 +1991,511 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
                 const double rx = dsx * sw * dsx * sw + dtx * sh * dtx * sh;
                 const double ry = dsy * sw * dsy * sw + dty * sh * dty * sh;
                 const double rho2 = rx > ry ? rx : ry;
-                fr.lod1 = rho2 > 0.0
-                              ? static_cast<float>(0.5 * std::log2(rho2))
-                              : 0.0f;
+                // The level is half the logarithm, and the logarithm is the
+                // dearest thing in this block. sampleTex asks two questions
+                // of it: is it above zero (which filter, and whether a
+                // smaller map is used at all), and, only then and only with
+                // smaller maps to choose from, what it is. Above zero is
+                // rho2 above one, exactly: a logarithm rounds to zero for no
+                // other number. So wherever the answer to the first settles
+                // it, a level of the same sign stands in. Not with a bias,
+                // which moves the question off zero.
+                if (!(rho2 > 0.0))
+                    fr.lod1 = 0.0f;
+                else if (lodSignOnly)
+                    fr.lod1 = rho2 > 1.0 ? 1.0f : 0.0f;
+                else if (lodNoBias && rho2 <= 1.0)
+                    fr.lod1 = 0.0f;
+                else
+                    fr.lod1 = static_cast<float>(0.5 * std::log2(rho2));
                 if (P.tex[1].on)
                     fr.lod2 = fr.lod1; // second set: same footprint model
             }
             shadeFragmentIn(P, px, py, fr);
         }
     }
+}
+
+// ── A triangle's rows on several threads ──────────────────────────────────
+//
+// A large triangle is nearly all of a frame's work at a high resolution, and
+// one thread drew it while the processor's waited. Its rows share nothing
+// (rowsApart), so a few threads draw them at once: the same pixels, written
+// with the same values, and only the order in time between rows differs,
+// which nothing can see.
+//
+// Each thread draws from its own copy of the pipe: its own counts, added up
+// afterwards, and its own cache of texture pages. The threads are started
+// once and kept; between triangles they spin briefly, because large
+// triangles come in runs, and then sleep.
+
+// Whether rows minY..maxY of a triangle, columns minX..maxX, can be drawn in
+// any order: what one row writes, no other row reads or writes.
+bool rowsApart(const Pipe& P, int minX, int maxX, int minY, int maxY)
+{
+    // The error a dithered pixel leaves for the next crosses rows, and the
+    // pixel watch reports in the order pixels are drawn.
+    if (P.ditherDiffuse || gR128PwHi != 0u || !P.fastMem)
+        return false;
+    const u64 cols = static_cast<u64>(maxX) + 1u;
+    // The destination's rows, and the depth buffer's, each within its own
+    // stride; and the two buffers apart from each other.
+    if (cols * P.bypp > P.dstStride)
+        return false;
+    const u64 dLo = static_cast<u64>(P.dstOff) +
+                    static_cast<u64>(minY) * P.dstStride +
+                    static_cast<u64>(minX) * P.bypp;
+    const u64 dHi = static_cast<u64>(P.dstOff) +
+                    static_cast<u64>(maxY) * P.dstStride + cols * P.bypp;
+    u64 zLo = 0, zHi = 0; // empty unless depth or stencil is in use
+    if (P.zEn || (P.stEn && P.zw == 24u)) {
+        const u64 zb = P.zw == 16u ? 2u : 4u;
+        if (cols * zb > P.zStride)
+            return false;
+        zLo = static_cast<u64>(P.zOff) + static_cast<u64>(minY) * P.zStride +
+              static_cast<u64>(minX) * zb;
+        zHi = static_cast<u64>(P.zOff) + static_cast<u64>(maxY) * P.zStride +
+              cols * zb;
+        if (zLo < dHi && dLo < zHi)
+            return false;
+    }
+    // No texture of this triangle lies where it draws. A level's extent is
+    // taken generously: its rows at their pitch, four bytes a texel.
+    if (P.texAny)
+        for (const TexUnit& t : P.tex) {
+            if (!t.on)
+                continue;
+            for (u32 l = 0; l <= t.maxLevel && l < 11u; ++l) {
+                const u64 base = t.offs[l] & 0x07FFFFFFu;
+                if (base >= kAgpWindow)
+                    continue; // system memory: never the frame buffer
+                const u64 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
+                const u64 h = t.hTex >> l ? t.hTex >> l : 1u;
+                const u64 end = base + (pitch * h + 4u) * 4u;
+                if ((base < dHi && dLo < end) || (base < zHi && zLo < end))
+                    return false;
+            }
+        }
+    return true;
+}
+
+inline void rowsRelax()
+{
+#if OPM_ROWS_X86
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+// How many threads draw a large triangle, the caller among them. 0 = not
+// set: OPM_RASTER_THREADS, or a number from the host's processors.
+std::atomic<int> gRowThreads{0};
+
+int rowThreadsDefault()
+{
+    if (const char* v = std::getenv("OPM_RASTER_THREADS")) {
+        const int n = std::atoi(v);
+        if (n >= 1)
+            return n;
+    }
+    // The processor's thread and this one are busy already; a small host
+    // keeps to that.
+    const unsigned hw = std::thread::hardware_concurrency();
+    return hw >= 12u ? 6 : hw >= 8u ? 4 : hw >= 4u ? 2 : 1;
+}
+
+class RowCrew {
+  public:
+    static constexpr int kMax = 16;
+    // Never destroyed: its threads live as long as the process, and one that
+    // is asleep when the process leaves must not find its lock gone.
+    static RowCrew& get()
+    {
+        static RowCrew* const crew = new RowCrew;
+        return *crew;
+    }
+    static int threads()
+    {
+        static const int byDefault = rowThreadsDefault();
+        const int set = gRowThreads.load(std::memory_order_relaxed);
+        const int n = set > 0 ? set : byDefault;
+        return n > kMax ? kMax : n;
+    }
+
+    // Whether a thread of the crew is awake and waiting for rows: a small
+    // triangle is worth sharing with it, and not worth waking it for.
+    bool hot() const { return spinners_.load(std::memory_order_relaxed) > 0; }
+
+    // Rows minY..maxY on `n` threads, this one among them; returns when
+    // every row is drawn. `rouse`: wake the threads that are asleep (and
+    // start them, the first time); without it only those already waiting
+    // take part. One caller at a time: the engine draws one triangle at a
+    // time.
+    void draw(const Pipe& P, const TriSetup& T, int minY, int maxY, int n,
+              bool rouse)
+    {
+        const int rows = maxY - minY + 1;
+        int chunk = rows / (n * 8);
+        chunk = chunk < 1 ? 1 : chunk > 32 ? 32 : chunk;
+        bool wake;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            while (rouse && static_cast<int>(crew_.size()) < n - 1) {
+                const int me = static_cast<int>(crew_.size()) + 1;
+                crew_.emplace_back([this, me] { work(me); });
+                crew_.back().detach();
+            }
+            job_.P = &P;
+            job_.T = &T;
+            job_.yEnd = maxY + 1;
+            job_.chunk = chunk;
+            job_.threads = n;
+#if OPM_ROWS_X86
+            job_.csr = _mm_getcsr();
+#endif
+            next_.store(minY, std::memory_order_relaxed);
+            joined_ = 0;
+            open_ = true;
+            ++gen_;
+            genSeen_.store(gen_, std::memory_order_release);
+            wake = rouse && sleepers_ > 0;
+        }
+        if (wake)
+            wake_.notify_all();
+        drain(0);
+        u32 joined;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            open_ = false; // nobody joins from here on
+            joined = joined_;
+        }
+        // Those who joined finish the rows they hold.
+        for (int spins = 0; active_.load() != 0; ++spins) {
+            if (spins < 4096)
+                rowsRelax();
+            else
+                std::this_thread::yield();
+        }
+        for (int k = 0; k < kMax; ++k)
+            if (k == 0 || (joined >> k) & 1u) {
+                P.tally.triPixels += tally_[k].triPixels;
+                P.tally.offVram += tally_[k].offVram;
+                P.tally.texSamples += tally_[k].texSamples;
+                P.tally.texUnimpl += tally_[k].texUnimpl;
+            }
+    }
+
+  private:
+    struct Job {
+        const Pipe* P = nullptr;
+        const TriSetup* T = nullptr;
+        int yEnd = 0, chunk = 1, threads = 1;
+        unsigned csr = 0;
+    };
+
+    void drain(int me)
+    {
+        const Job j = job_;
+        Pipe mine = *j.P;
+        mine.crowd = true;
+        mine.tally = Pipe::Tally{};
+        for (;;) {
+            const int y = next_.fetch_add(j.chunk);
+            if (y >= j.yEnd)
+                break;
+            const int to = y + j.chunk < j.yEnd ? y + j.chunk : j.yEnd;
+            drawRows(mine, *j.T, y, to - 1);
+        }
+        tally_[me] = mine.tally;
+    }
+
+    void work(int me)
+    {
+        u64 seen = 0;
+        for (;;) {
+            // Awake for a moment after a job: triangles come in runs.
+            spinners_.fetch_add(1, std::memory_order_relaxed);
+            const auto until = std::chrono::steady_clock::now() + kAwake;
+            while (genSeen_.load(std::memory_order_acquire) == seen) {
+                for (int i = 0; i < 32; ++i)
+                    rowsRelax();
+                if (std::chrono::steady_clock::now() >= until)
+                    break;
+            }
+            spinners_.fetch_sub(1, std::memory_order_relaxed);
+            bool mine = false;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                ++sleepers_;
+                wake_.wait(lk, [&] { return gen_ != seen; });
+                --sleepers_;
+                seen = gen_;
+                if (open_ && me < job_.threads) {
+                    active_.fetch_add(1);
+                    joined_ |= 1u << me;
+                    mine = true;
+                }
+            }
+            if (!mine)
+                continue;
+#if OPM_ROWS_X86
+            // The caller's rounding and exception masks, whatever they are:
+            // the same arithmetic on every thread.
+            _mm_setcsr(job_.csr);
+#endif
+            drain(me);
+            active_.fetch_sub(1);
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable wake_;
+    std::vector<std::thread> crew_;
+    // Under mu_: the job and who may still join it.
+    Job job_;
+    u64 gen_ = 0;
+    u32 joined_ = 0;
+    int sleepers_ = 0;
+    bool open_ = false;
+    // The job's number again, for a thread that is spinning; the next row
+    // nobody has taken; and how many threads besides the caller are drawing.
+    std::atomic<u64> genSeen_{0};
+    std::atomic<int> next_{0};
+    std::atomic<int> active_{0};
+    std::atomic<int> spinners_{0};
+    static constexpr std::chrono::microseconds kAwake{200};
+    Pipe::Tally tally_[kMax];
+};
+
+// The pixel path's counts, into the engine's statistics: once a packet.
+void flushTally(const Pipe& P)
+{
+    auto& es = eng();
+    es.triPixels += P.tally.triPixels;
+    es.offVram += P.tally.offVram;
+    es.texSamples += P.tally.texSamples;
+    es.texUnimpl += P.tally.texUnimpl;
+    P.tally = Pipe::Tally{};
+}
+
+// The size of a triangle, in pixels, from which the crew's sleeping threads
+// are woken for it, and from which it is shared with those already awake.
+// Measured on a game's frames at 1024x768 with two textures: three frames in
+// 218 ms on one thread, 114 ms on six when only triangles of 4096 pixels were
+// shared, 55 ms with these two numbers. Waking costs the caller several
+// microseconds, which a smaller triangle does not repay.
+constexpr double kCrewPixels = 2048.0;
+constexpr double kCrewHotPixels = 64.0;
+
+void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
+{
+    // Facing. In y-down screen space a clockwise triangle has positive
+    // doubled area; PM4_VC_FPU_SETUP bit 0 names which winding is front,
+    // bits 2:1 / 4:3 what to do with back / front faces (Table 6-22).
+    double area2 = (static_cast<double>(v1.x) - v0.x) * (v2.y - v0.y) -
+                   (static_cast<double>(v2.x) - v0.x) * (v1.y - v0.y);
+    if (area2 == 0.0) {
+        ++eng().triDegen;
+        return;
+    }
+    // The per-triangle S/T span against the bound texture size — the
+    // measurement that tells normalized coordinates from texel ones. Taken
+    // before any culling so the sample is of what the guest SENT.
+    if (P.texAny && P.tex[0].wTex) {
+        const float sMin = std::min(v0.s1, std::min(v1.s1, v2.s1));
+        const float sMax = std::max(v0.s1, std::max(v1.s1, v2.s1));
+        const float tMin = std::min(v0.t1, std::min(v1.t1, v2.t1));
+        const float tMax = std::max(v0.t1, std::max(v1.t1, v2.t1));
+        const float span = std::max(sMax - sMin, tMax - tMin);
+        if (span >= 0.0f && span < 1e6f) {
+            auto& e = eng();
+            int b = 0;
+            if (span > 0.0f) {
+                const float l2 = std::log2(span);
+                b = static_cast<int>(std::floor(l2)) + 5; // 2^-5 -> 0
+                if (b < 0) b = 0;
+                if (b > 11) b = 11;
+            }
+            ++e.triSpanBucket[b];
+            e.triSpanTexW += P.tex[0].wTex;
+            ++e.triSpanN;
+        }
+    }
+    ++gTriSeq;
+    if (gTriDump > 0 && P.texAny) {
+        --gTriDump;
+        const TexUnit& t0 = P.tex[0];
+        printf("-- tri3d %llu fmt=%03x prim=%u t0 %ux%u p%u f=%u cn=%08x "
+               "of=%08x tc=%08x fpu=%08x misc=%08x\n",
+               static_cast<unsigned long long>(gTriSeq), gDumpFmt, gDumpPrim,
+               t0.wTex, t0.hTex, t0.pitchTex, t0.fmt, t0.cntl, t0.offs[0],
+               P.texCntl, P.fpu, P.misc);
+        for (const Vtx* v : {&v0, &v1, &v2})
+            printf("-- tv %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                   v->x, v->y, v->z, v->rhw, v->s1, v->t1, v->s2, v->t2);
+    }
+    const bool ccwFront = (P.fpu & 1u) != 0;
+    bool front = (area2 > 0.0) != ccwFront; // area>0 = screen-CW
+    if (flipFacing)
+        front = !front; // strips alternate winding; facing does not
+    // An FPU_SETUP of exactly zero would cull every face; no driver means
+    // that, and an unprogrammed register reads zero here. Draw solid.
+    const u32 fn =
+        P.fpu == 0u ? 3u : front ? (P.fpu >> 3) & 3u : (P.fpu >> 1) & 3u;
+    if (fn == 0u) {
+        ++eng().triCulled;
+        return;
+    }
+    if (fn == 1u) { // degrade to its three vertices (Table 6-22)
+        rasterPoint(P, v0);
+        rasterPoint(P, v1);
+        rasterPoint(P, v2);
+        return;
+    }
+    if (fn == 2u) { // degrade to its three edges
+        rasterLine(P, v0, v1);
+        rasterLine(P, v1, v2);
+        rasterLine(P, v2, v0);
+        return;
+    }
+    if (area2 < 0.0) {
+        Vtx t = v1;
+        v1 = v2;
+        v2 = t;
+        area2 = -area2;
+    }
+    const double x0 = v0.x + P.winX, y0 = v0.y + P.winY;
+    const double x1 = v1.x + P.winX, y1 = v1.y + P.winY;
+    const double x2 = v2.x + P.winX, y2 = v2.y + P.winY;
+    int minX = static_cast<int>(std::floor(std::fmin(x0, std::fmin(x1, x2))));
+    int maxX = static_cast<int>(std::ceil(std::fmax(x0, std::fmax(x1, x2))));
+    int minY = static_cast<int>(std::floor(std::fmin(y0, std::fmin(y1, y2))));
+    int maxY = static_cast<int>(std::ceil(std::fmax(y0, std::fmax(y1, y2))));
+    if (minX < P.scL) minX = P.scL;
+    if (maxX > P.scR) maxX = P.scR;
+    if (minY < P.scT) minY = P.scT;
+    if (maxY > P.scB) maxY = P.scB;
+    if (minX < 0) minX = 0;
+    if (minY < 0) minY = 0;
+    if (minX > maxX || minY > maxY) {
+        ++eng().triDegen;
+        return;
+    }
+    TriSetup T;
+    auto mkEdge = [](double ax, double ay, double bx, double by) {
+        // e = (bx-ax)(y-ay) - (by-ay)(x-ax), expanded to a*x + b*y + c.
+        TriEdge ed;
+        ed.a = ay - by;
+        ed.b = bx - ax;
+        ed.c = -(ed.a * ax + ed.b * ay);
+        // D3D top-left rule in y-down CW terms: a top edge runs rightward
+        // horizontally, a left edge runs upward.
+        const double dx = bx - ax, dy = by - ay;
+        ed.topLeft = (dy == 0.0 && dx > 0.0) || dy < 0.0;
+        return ed;
+    };
+    T.e[0] = mkEdge(x0, y0, x1, y1);
+    T.e[1] = mkEdge(x1, y1, x2, y2);
+    T.e[2] = mkEdge(x2, y2, x0, y0);
+    const double inv2a = 1.0 / area2;
+    // Attribute planes (screen-affine). The stream's S,T already ARE the
+    // s·rhw / t·rhw numerators (receipt below); rhw gets its own plane and
+    // the per-pixel divide resolves u,v unless the unit disables
+    // perspective.
+    T.pz = planeOf(x0, y0, x1, y1, x2, y2, v0.z, v1.z, v2.z, inv2a);
+    T.pa = planeOf(x0, y0, x1, y1, x2, y2, v0.ca, v1.ca, v2.ca, inv2a);
+    T.pr = planeOf(x0, y0, x1, y1, x2, y2, v0.cr, v1.cr, v2.cr, inv2a);
+    T.pg = planeOf(x0, y0, x1, y1, x2, y2, v0.cg, v1.cg, v2.cg, inv2a);
+    T.pb = planeOf(x0, y0, x1, y1, x2, y2, v0.cb, v1.cb, v2.cb, inv2a);
+    T.psr = planeOf(x0, y0, x1, y1, x2, y2, v0.sr, v1.sr, v2.sr, inv2a);
+    T.psg = planeOf(x0, y0, x1, y1, x2, y2, v0.sg, v1.sg, v2.sg, inv2a);
+    T.psb = planeOf(x0, y0, x1, y1, x2, y2, v0.sb, v1.sb, v2.sb, inv2a);
+    T.pfog = planeOf(x0, y0, x1, y1, x2, y2, v0.fog, v1.fog, v2.fog, inv2a);
+    T.pw = planeOf(x0, y0, x1, y1, x2, y2, v0.rhw, v1.rhw, v2.rhw, inv2a);
+    T.persp0 = P.tex[0].on && !((P.tex[0].cntl >> 14) & 1u);
+    T.persp1 = P.tex[1].on && !((P.tex[1].cntl >> 14) & 1u);
+    // ⭐⭐ THE VERTEX'S S,T ARE ALREADY PREMULTIPLIED BY RHW — they are the
+    // screen-linear NUMERATORS (u·rhw, v·rhw), not plain u,v, so the setup
+    // stage must NOT multiply by rhw again. Measured from a shipping RAVE
+    // title's live stream (--tri-dump, 900 triangles off a snapshot): raw
+    // s against the content's 0.2 UV lattice is random (mean distance
+    // 0.246 vs 0.25 chance) while s/rhw lands EXACTLY on it (0, 0.4, 0.6,
+    // 1.0; 41% of interior vertices within 1e-3, the rest being model UVs
+    // and screen-edge vertices the guest's own clipper interpolated) — and
+    // the stream's global max of s equals the global max of rhw to three
+    // decimals (126.7), which is what s = u·rhw with u ≤ ~1 looks like.
+    // This is RAVE's own vertex contract (uOverW/vOverW) passed through by
+    // the Mac driver. The SDK's F-45 calls the field "the u-coordinate"
+    // and documents no premultiply anywhere — the stream outranks the
+    // prose. A double multiply divided every coordinate by w once more,
+    // which under the title's clamp-to-edge modes smeared edge texels over
+    // the whole world: texture BYTES provably right, picture wrong
+    // everywhere.
+    //
+    // Iteration is therefore the same for both states of the perspective
+    // bit — the plane interpolates the stream value as given — and
+    // TEX_PERSPECTIVE_DISABLE only controls the per-pixel divide below.
+    T.ps1 = planeOf(x0, y0, x1, y1, x2, y2,
+                     v0.s1, v1.s1, v2.s1, inv2a);
+    T.pt1 = planeOf(x0, y0, x1, y1, x2, y2,
+                     v0.t1, v1.t1, v2.t1, inv2a);
+    T.ps2 = planeOf(x0, y0, x1, y1, x2, y2,
+                     v0.s2, v1.s2, v2.s2, inv2a);
+    T.pt2 = planeOf(x0, y0, x1, y1, x2, y2,
+                     v0.t2, v1.t2, v2.t2, inv2a);
+    ++eng().tris;
+    // What this triangle's fragments actually consume, decided once. spec
+    // and fog planes feed nothing when their stage is off; the second set
+    // feeds nothing without a second unit; and the LOD derivative block —
+    // which carries a log2 per pixel — steers the sampler ONLY when mips
+    // are live or the min/mag filters disagree on bilinearity (sampleTex's
+    // no-mip path reads nothing else out of it). A shipping title runs
+    // mips-off with both filters bilinear, so the whole block is dead
+    // weight there.
+    T.wantSpec = P.specEn;
+    T.wantFog = P.fogEn && !P.fogTable;
+    T.lodLive =
+        P.tex[0].on &&
+        ((!((P.tex[0].cntl >> 7) & 1u) && P.tex[0].maxLevel > 0) ||
+         (((P.tex[0].cntl >> 1) & 1u) != ((P.tex[0].cntl >> 4) & 1u)));
+    // What sampleTex needs of the level (drawRows): with no bias, only
+    // whether it is above zero wherever no unit has smaller maps to choose
+    // from.
+    const auto mips = [](const TexUnit& t) {
+        return t.on && !((t.cntl >> 7) & 1u) && t.maxLevel > 0;
+    };
+    T.lodNoBias = ((P.texCntl >> 24) & 0xFFu) == 0u;
+    T.lodSignOnly = T.lodNoBias && !mips(P.tex[0]) && !mips(P.tex[1]);
+    const double colA[4] = {T.pa.a, T.pr.a, T.pg.a, T.pb.a};
+    const double specA[4] = {0.0, T.psr.a, T.psg.a, T.psb.a};
+    for (int k = 0; k < 4; ++k) {
+        T.colA[k] = colA[k];
+        T.specA[k] = specA[k];
+    }
+    T.minX = minX;
+    T.maxX = maxX;
+    // Several threads for a triangle large enough to repay waking them, or
+    // one much smaller while some are awake anyway (they stay so for a
+    // moment after a job, and a scene's triangles come in runs); and only
+    // where its rows share nothing.
+    const int crew = RowCrew::threads();
+    if (crew > 1 && maxY - minY >= 7) {
+        const double box = (static_cast<double>(maxX) - minX + 1.0) *
+                           (static_cast<double>(maxY) - minY + 1.0);
+        const double est = area2 * 0.5 < box ? area2 * 0.5 : box;
+        const bool rouse = est >= kCrewPixels;
+        if ((rouse || (est >= kCrewHotPixels && RowCrew::get().hot())) &&
+            rowsApart(P, minX, maxX, minY, maxY)) {
+            const u64 before = P.tally.triPixels;
+            RowCrew::get().draw(P, T, minY, maxY, crew, rouse);
+            auto& es = eng();
+            ++es.crewTris;
+            es.crewPixels += P.tally.triPixels - before;
+            return;
+        }
+    }
+    drawRows(P, T, minY, maxY);
 }
 
 // ── Lines and points ──────────────────────────────────────────────────────
@@ -2490,6 +2874,12 @@ int r128Gate3dState() { return gGate3d; }
 
 void r128Set3dTriDump(int n) { gTriDump = n; }
 
+void r128SetRasterThreads(int n)
+{
+    gRowThreads.store(n < 0 ? 0 : n, std::memory_order_relaxed);
+}
+int r128RasterThreads() { return RowCrew::threads(); }
+
 // Which bits of each 3D state register this file reads — the second statement
 // of gatherPipe and the samplers that r128RegDecodedBits is built from. A bit
 // a guest sets outside its register's mask is a feature it asked for and did
@@ -2683,6 +3073,7 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
         src.stride = stride;
         RegLend lend(m.worker);
         assemble(P, src, cntl & 0xFu, count, nullptr, false);
+        flushTally(P);
         return true;
     }
     if (op == 0x23u || op == 0x2Eu) { // INDX_PRIM / NEXT_VERTEX_BUNDLE
@@ -2756,6 +3147,7 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
         }
         RegLend lend(m.worker);
         assemble(P, src, cntl & 0xFu, count, idxWords, walk == 1u);
+        flushTally(P);
         return true;
     }
     return false;

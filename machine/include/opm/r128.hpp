@@ -480,6 +480,9 @@ struct R128EngStats {
     u64 triPixels = 0;    // pixels the 3D pipe wrote
     u64 triCulled = 0;    // triangles removed by the winding cull
     u64 triDegen = 0;     // zero-area or fully-clipped triangles
+    // Triangles whose rows several threads drew at once, and their pixels
+    // (r128SetRasterThreads): how much of the drawing that reached.
+    u64 crewTris = 0, crewPixels = 0;
     u64 vtxFetched = 0;   // vertices decoded, all walk modes
     u64 vtxGartMiss = 0;  // vertex-walker fetches that missed the GART
     u64 prim3dDecline = 0; // a 3D primitive packet refused whole
@@ -619,6 +622,12 @@ int r128Gate3dState();
 // convention questions are settled from the stream itself, offline, rather
 // than from a picture. File-static budget; snapshots unaffected.
 void r128Set3dTriDump(int n);
+// How many threads draw the rows of a large triangle, the calling one among
+// them: 1 = that one alone, 0 = the default (the environment's
+// OPM_RASTER_THREADS, or a number from the host's processors). The picture is
+// the same for every value; this is a speed setting and a test's control.
+void r128SetRasterThreads(int n);
+int r128RasterThreads();
 // The CCE ring: a PM4_BUFFER_DL_WPTR or PM4_MICRO_CNTL write may hand the
 // engine a span of ring DWORDs to fetch through the GART and execute
 // (SDK §5.3). Runs only in the bus-mastered-packet modes with the

@@ -304,6 +304,8 @@ int main(int argc, char** argv)
             census = true;
         else if (a[i] == "--hashes")
             hashes = true;
+        else if (a[i] == "--threads" && i + 1 < a.size())
+            r128SetRasterThreads(std::atoi(a[++i].c_str()));
         else if (file.empty() && a[i].rfind("--", 0) != 0)
             file = a[i];
         else
@@ -312,6 +314,8 @@ int main(int argc, char** argv)
     if (file.empty()) {
         std::fprintf(stderr,
                      "usage: framereplay FILE [--out DIR] [--strict] [--census]\n"
+                     "       (any of these with --threads N: the threads that "
+                     "draw a large triangle)\n"
                      "       framereplay FILE --hashes\n"
                      "       framereplay FILE --bench N [--profile-host HZ OUT]\n"
                      "       framereplay --diff A.png B.png [MAP.png]\n");
@@ -342,12 +346,16 @@ int main(int argc, char** argv)
         std::sort(ns.begin(), ns.end());
         const R128EngStats& es = r128EngStats();
         std::printf("%s: %u frames drawn %u times: best %.2f ms, median %.2f ms "
-                    "a pass; %llu triangles and %llu pixels a pass; video "
-                    "memory ends as %016llx\n",
+                    "a pass; %llu triangles and %llu pixels a pass (%llu and "
+                    "%llu of them on %d threads); video memory ends as "
+                    "%016llx\n",
                     file.c_str(), rep.edges, bench, ns.front() / 1e6,
                     ns[ns.size() / 2] / 1e6,
                     static_cast<unsigned long long>(es.tris / bench),
                     static_cast<unsigned long long>(es.triPixels / bench),
+                    static_cast<unsigned long long>(es.crewTris / bench),
+                    static_cast<unsigned long long>(es.crewPixels / bench),
+                    r128RasterThreads(),
                     static_cast<unsigned long long>(r128VramHash(*cell)));
         return 0;
     }

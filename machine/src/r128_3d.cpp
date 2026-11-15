@@ -1380,10 +1380,23 @@ F4 sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
                  *p11 = nullptr;
         switch (t.fmt) {
         case 3u: case 4u: case 6u: case 15u:
-            direct = texSpan(P, at(xs[0], ys[0]), n, p00) &&
-                     texSpan(P, at(xs[1], ys[0]), n, p01) &&
-                     texSpan(P, at(xs[0], ys[1]), n, p10) &&
-                     texSpan(P, at(xs[1], ys[1]), n, p11);
+            // The four are nearly always neighbors, a row apart, with no
+            // edge of the map between them: then one stretch of memory
+            // holds them all and is found once. Where it is not plainly
+            // there as a whole (the end of video memory, two pages of AGP
+            // space), each is found for itself, as before.
+            if (xs[1] == xs[0] + 1u && ys[1] == ys[0] + 1u &&
+                texSpan(P, at(xs[0], ys[0]), (pitch + 2u) * n, p00)) {
+                p01 = p00 + n;
+                p10 = p00 + pitch * n;
+                p11 = p10 + n;
+                direct = true;
+            } else {
+                direct = texSpan(P, at(xs[0], ys[0]), n, p00) &&
+                         texSpan(P, at(xs[1], ys[0]), n, p01) &&
+                         texSpan(P, at(xs[0], ys[1]), n, p10) &&
+                         texSpan(P, at(xs[1], ys[1]), n, p11);
+            }
             break;
         default:
             break;

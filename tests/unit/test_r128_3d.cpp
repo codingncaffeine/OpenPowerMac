@@ -1421,11 +1421,15 @@ TEST_CASE("3d: a triangle covers exactly the pixels its three edges pass")
         }
     } rng{0x7A51A9E5ull};
     u32 drawn = 0, onEdge = 0;
+    // One card for all of them (it carries 32 MB of video memory, which is
+    // not worth making four hundred times): the 64x64 target is wiped
+    // before each triangle.
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
     for (u32 iter = 0; iter < 400; ++iter) {
-        Rig3d r;
-        r.dst32();
-        r.openGate();
-        r.fpuSolidBoth();
+        std::memset(r.c.vram.data(), 0, 64u * 64u * 4u);
         double x[3], y[3];
         for (int k = 0; k < 3; ++k) {
             // -8..72 in quarter pixels: corners off every side of the
@@ -1495,16 +1499,20 @@ TEST_CASE("3d: texels read in place are the texels read byte by byte")
     // in AGP space lying across two pages: video memory must end the same,
     // and so must the counts.
     u32 cases = 0;
+    // Two cards for all the cases: each case programs everything it draws
+    // with and wipes the 64x64 target first.
+    AskEveryTime sink;
+    Rig3d inPlace, bytes;
+    bytes.snoop = &sink;
     for (u32 fmt : {3u, 4u, 6u, 15u})
         for (u32 wrap = 0; wrap < 4; ++wrap)
             for (u32 bilinear = 0; bilinear < 2; ++bilinear)
                 for (u32 agp = 0; agp < 2; ++agp) {
-                    AskEveryTime sink;
-                    Rig3d inPlace, bytes;
-                    bytes.snoop = &sink;
+                    sink.asked = 0;
                     u64 samples[2] = {};
                     int which = 0;
                     for (Rig3d* r : {&inPlace, &bytes}) {
+                        std::memset(r->c.vram.data(), 0, 64u * 64u * 4u);
                         r->dst32();
                         r->openGate();
                         r->fpuSolidBoth();

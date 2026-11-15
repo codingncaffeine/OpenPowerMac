@@ -241,6 +241,22 @@ bool Cpu::l2ReadLine(u32 pa, u8* out)
     return true;
 }
 
+bool Cpu::l2PeekLine(u32 pa, u8* out)
+{
+    if (!l2On() || l2Sets == 0 || l2Inert)
+        return false;
+    const u32 set = l2SetOf(pa);
+    const u32 tag = pa >> 5;
+    for (u32 w = 0; w < 2; ++w) {
+        const L2Line& e = l2[size_t(set) * 2 + w];
+        if (e.v && e.tag == tag) {
+            std::memcpy(out, e.b, 32);
+            return true;
+        }
+    }
+    return false;
+}
+
 void Cpu::l2Invalidate(u32 pa)
 {
     fetchDropAt(pa);
@@ -263,14 +279,18 @@ void Cpu::l2WipeAll()
         e = L2Line{};
 }
 
+// One word for the fetch path, as l2PeekLine reads a block: the L2's ages are
+// not touched. (This went through l2Find and stamped the line on every fetch,
+// so the machine with the fetch buffer switched off aged its L2 differently
+// from the machine with it on, and the two could not be compared.)
 bool Cpu::l2Peek32(u32 pa, u32& w)
 {
-    L2Line* e = l2Find(pa);
-    if (!e)
+    u8 line[32];
+    if (!l2PeekLine(pa & ~31u, line))
         return false;
     const u32 o = pa & 31u & ~3u;
-    w = (u32(e->b[o]) << 24) | (u32(e->b[o + 1]) << 16) |
-        (u32(e->b[o + 2]) << 8) | u32(e->b[o + 3]);
+    w = (u32(line[o]) << 24) | (u32(line[o + 1]) << 16) |
+        (u32(line[o + 2]) << 8) | u32(line[o + 3]);
     return true;
 }
 

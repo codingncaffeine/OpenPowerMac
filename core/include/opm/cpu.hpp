@@ -723,14 +723,26 @@ struct Cpu {
     //      1024      32 KB   96.3%           3,958,051   72.0
     //     4096     128 KB   99.0%           1,080,691   80.2
     //
-    // 4096 costs 208 KB and is where the curve flattens. ⚠ 16384 does NOT
-    // run: Cpu is ~1 MB then and the process cannot start, so the next step
-    // up needs Cpu off the stack first. The firmware era gains little from
-    // this (it was already at 97%) and loses nothing: 63.4 -> 66.2 MIPS.
-    static constexpr u32 kFetchLines = 4096;
+    // 4096 cost 208 KB and is where that curve flattened, at the desktop.
+    //
+    // ⚠⚠⚠ AND A GAME IS A THIRD MACHINE. In a 3D game's level 4096 lines
+    // hold 128 KB of a code working set near 2 MB: 9 M fills per 1.27 G
+    // instructions, each a block read and eight decodes. Measured in two
+    // games, real time, interleaved against 4096:
+    //
+    //     lines   coverage   speed
+    //     16384     512 KB   +4.1%, +3.8%
+    //     65536       2 MB   +5.9%, +6.0%
+    //
+    // What made the step possible is the layout below. The words and their
+    // decodes, the handlers and the gates are on the heap; what stays in the
+    // processor object is each slot's TAG (fetchBase), four bytes a line, so
+    // the object is no bigger than it was with 4096 whole lines in it (it
+    // lives on callers' stacks) and a compiled block still checks its line
+    // at a fixed distance from the object.
+    static constexpr u32 kFetchLines = 65536;
     static constexpr u16 kNoRow = 0xFFFFu; // decodes to nothing: illegal
     struct FetchLine {
-        u32 base = 1; // block base, or 1 — which no 32-byte base can be
         // The DECODE of each of the eight words, as an index into kIsa. Decode
         // is a pure function of the word, so it belongs with the word: it was
         // being recomputed on every execution of every instruction, and the
@@ -746,7 +758,11 @@ struct Cpu {
         // read about eighteen times, so the work belongs in the fill.
         u32 w[8] = {};
     };
-    FetchLine fetchLine[kFetchLines];
+    // The block each slot holds: its base, or 1 — which no 32-byte base can
+    // be. Set by the constructor (fetchDrop).
+    u32 fetchBase[kFetchLines];
+    std::unique_ptr<FetchLine[]> fetchLine =
+        std::make_unique<FetchLine[]>(kFetchLines);
     // ⭐ THE HANDLER OF EACH WORD, BOUND WHEN THE BLOCK IS FILLED. The line
     // executor used to get from a word to its handler in three loads and
     // three tests per instruction — the row, the gate byte for the row, the
@@ -1082,11 +1098,11 @@ struct Cpu {
             xlSr != st.sr[ea >> 28])
             return nullptr;
         const u32 pa = xlPa | (ea & 0xFFFu);
-        FetchLine& fl = fetchLine[fetchSlot(pa)];
-        if (fl.base != (pa & ~31u))
+        const u32 slot = fetchSlot(pa);
+        if (fetchBase[slot] != (pa & ~31u))
             return nullptr;
         word = (pa >> 2) & 7u;
-        return &fl;
+        return &fetchLine[slot];
     }
     // DIAGNOSTIC (--no-line-exec): take one instruction per trip through the
     // run loop, the way the machine did before whole blocks were executed in
@@ -1138,14 +1154,23 @@ struct Cpu {
                   "the JIT cache is slot-parallel to the fetch lines");
     void fetchDrop()
     {
-        for (FetchLine& e : fetchLine)
-            e.base = 1;
+        for (u32& b : fetchBase)
+            b = 1;
     }
     void fetchDropAt(u32 pa)
     {
-        FetchLine& e = fetchLine[fetchSlot(pa)];
-        if (e.base == (pa & ~31u))
-            e.base = 1;
+        u32& b = fetchBase[fetchSlot(pa)];
+        if (b == (pa & ~31u))
+            b = 1;
+    }
+    // icbi: every block that could be the one at this EFFECTIVE address. A
+    // line is kept by physical address and icbi is not translated here, but
+    // translation leaves the offset in the page alone, and the slot's low
+    // bits are that offset's block number: so one slot in every 128.
+    void fetchDropInPage(u32 ea)
+    {
+        for (u32 s = (ea >> 5) & 127u; s < kFetchLines; s += 128u)
+            fetchBase[s] = 1;
     }
     void fetchDropRange(u32 pa, u32 len)
     {
@@ -1204,6 +1229,10 @@ struct Cpu {
     L2Line* l2Find(u32 pa);
     void l2Install(u32 pa, const u8* bytes, bool dirty);
     bool l2ReadLine(u32 pa, u8* out);
+    // The same block for the fetch buffer, with the L2's own bookkeeping
+    // left alone: an instruction fetch must not reorder the replacement
+    // policy of a cache it only looks into, any more than l1dReadLine does.
+    bool l2PeekLine(u32 pa, u8* out);
     void l2Invalidate(u32 pa);
     void l2WipeAll();                // L2I global invalidate
     bool l2Peek32(u32 pa, u32& w);

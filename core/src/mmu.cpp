@@ -587,8 +587,9 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
     // it, so a hit here is the same word the long path below would produce.
     const u32 base = pa & ~31u;
     const u32 word = (pa >> 2) & 7u;
-    FetchLine& fl = fetchLine[fetchSlot(pa)];
-    if (fl.base == base) {
+    const u32 slot = fetchSlot(pa);
+    FetchLine& fl = fetchLine[slot];
+    if (fetchBase[slot] == base) {
         OPM_COUNT(fetchHits);
         insn = fl.w[word];
         row = fl.row[word];
@@ -606,7 +607,7 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
     } else if (l1dReadLine(base, raw)) {
         OPM_COUNT(fetchFillsL1);
         filled = true;
-    } else if (l2ReadLine(base, raw)) {
+    } else if (l2PeekLine(base, raw)) {
         OPM_COUNT(fetchFillsL2);
         filled = true;
     } else if (bus->memoryAt(base, 32)) {
@@ -615,7 +616,7 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         filled = true;
     }
     if (filled) {
-        fl.base = base;
+        fetchBase[slot] = base;
         // Assemble and decode the whole block while it is here. Eighteen
         // instructions are executed per fill on average, so the seven words
         // that were not asked for are paid off many times over — and decode
@@ -625,7 +626,6 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         // Cpu::fetchFn. A word keeps its handler if the only thing standing
         // between it and dispatch is MSR[FP] or MSR[VEC], and the gate word
         // says which those are.
-        const u32 slot = fetchSlot(pa);
         Handler* const fnp = &fetchFn[size_t(slot) * 8u];
         u32 gates = 0;
         for (u32 k = 0; k < 8; ++k) {
@@ -658,7 +658,7 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
         row = fl.row[word];
         return true;
     }
-    fl.base = 1; // a partial fill must not be left looking valid
+    fetchBase[slot] = 1; // a partial fill must not be left looking valid
     // Not memory: a device window, or nothing at all. Read exactly the word
     // that was asked for and cache nothing — see Bus::memoryAt.
     OPM_COUNT(fetchUncached);

@@ -1388,12 +1388,16 @@ void bindHandlers()
     setHandler("dcba", h_nop);
     setHandler("dcbi", h_dcbi);
     // icbi has no instruction cache to invalidate here — the fetch path reads
-    // through the D-cache and the L2 — but it must drop the one-block fetch
-    // buffer, which is the only thing in this model that can hold a stale
-    // instruction. Software issues icbi exactly after writing code.
-    setHandler("icbi", [](Cpu& c, u32, const InsnDesc&) {
+    // through the D-cache and the L2 — but it drops what the fetch buffer
+    // could be holding for the addressed block, which is the only thing in
+    // this model that can hold a stale instruction. Software issues icbi
+    // exactly after writing code, and the stores that wrote it have each
+    // dropped their own line already: this is the second lock on that door.
+    // It used to empty the whole buffer, which a 2 MB buffer cannot afford
+    // from a guest that issues icbi for every block of code it loads.
+    setHandler("icbi", [](Cpu& c, u32 i, const InsnDesc&) {
         OPM_COUNT(c.fetchDropIcbi);
-        c.fetchDrop();
+        c.fetchDropInPage(eaX(c, i));
     });
     setHandler("dcbz", h_dcbz);
     setHandler("dst", h_nop);

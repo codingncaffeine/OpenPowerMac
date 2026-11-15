@@ -1858,8 +1858,8 @@ void JitCache::bind(Cpu& c)
     offs.batchBreak = d32(&c.batchBreak);
     offs.msr = d32(&c.st.msr);
     offs.fpr0 = d32(&c.st.fpr[0]);
-    offs.fetchLine0 = d32(&c.fetchLine[0].base);
-    offs.flStride = i32(sizeof(Cpu::FetchLine));
+    offs.fetchLine0 = d32(&c.fetchBase[0]);
+    offs.flStride = i32(sizeof(c.fetchBase[0]));
     // Chain-gate fields (Stage B). The four pending bools are declared
     // adjacently; when the measured offsets confirm it, one dword compare
     // covers them all — measured, not assumed, so a reordered declaration
@@ -2009,21 +2009,22 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
     JitCache& J = *c.jit;
     const u64 tsc0 = J.tscOn ? __rdtsc() : 0;
     const Cpu::FetchLine& fl = c.fetchLine[slot];
+    const u32 flBase = c.fetchBase[slot];
     const u32 vaBase = c.st.pc & ~31u;
     JitLine* ways = &J.line[slot * JitCache::kWays];
     JitLine* jl = nullptr;
     for (u32 k = 0; k < JitCache::kWays; ++k)
-        if (ways[k].base == fl.base && ways[k].va == vaBase) {
+        if (ways[k].base == flBase && ways[k].va == vaBase) {
             jl = &ways[k];
             break;
         }
     if (!jl) {
-        if (!J.compileLine(c, slot, fl.base, fl.w, fl.row, vaBase)) {
+        if (!J.compileLine(c, slot, flBase, fl.w, fl.row, vaBase)) {
             ++J.bails;
             return false;
         }
         for (u32 k = 0; k < JitCache::kWays; ++k)
-            if (ways[k].base == fl.base && ways[k].va == vaBase) {
+            if (ways[k].base == flBase && ways[k].va == vaBase) {
                 jl = &ways[k];
                 break;
             }

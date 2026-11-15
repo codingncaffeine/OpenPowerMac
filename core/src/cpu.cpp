@@ -79,6 +79,7 @@ Cpu::Cpu()
     // after binding, so the pointers stay valid for the life of the process.
     dispFn = slots().data();
     dispPre = preGates().data();
+    fetchDrop(); // every slot's tag starts as "no block"
 }
 
 void Cpu::step()
@@ -378,9 +379,9 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
                 }
                 if (lxValid) {
                     const u32 pa = lxPa | (pc & 0xFFFu);
-                    FetchLine& cand = fetchLine[fetchSlot(pa)];
-                    if (cand.base == (pa & ~31u)) {
-                        fl = &cand;
+                    const u32 cand = fetchSlot(pa);
+                    if (fetchBase[cand] == (pa & ~31u)) {
+                        fl = &fetchLine[cand];
                         word = (pa >> 2) & 7u;
                     }
                 }
@@ -425,8 +426,8 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
         if (jitOn && until - i >= 8u && !(st.msr & msr::LE)) {
             OPM_PH(Exec);
             const bool ran =
-                jitRunLine(*this, static_cast<u32>(fl - fetchLine), word, i,
-                           until);
+                jitRunLine(*this, static_cast<u32>(fl - fetchLine.get()),
+                           word, i, until);
             OPM_PH(Loop);
             if (ran) {
                 lxValid = false; // blocks chain, and run privileged fallbacks
@@ -436,8 +437,9 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
             }
         }
         OPM_COUNT(lineEntries);
-        const u32 base = fl->base;
-        const u32 slot = static_cast<u32>(fl - fetchLine);
+        const u32 slot = static_cast<u32>(fl - fetchLine.get());
+        const u32* const tag = &fetchBase[slot];
+        const u32 base = *tag;
         const Handler* const fnp = &fetchFn[size_t(slot) * 8u];
         // Words of this line that may NOT take the fast path right now: the
         // FP words if MSR[FP] is clear, the vector words if MSR[VEC] is. Once
@@ -491,7 +493,7 @@ u64 Cpu::runSteps(u64 n, u64& stamp)
             ++i;
             if (batchBreak) // halt() sets it too
                 goto done;
-            if (--left == 0u || st.pc != cia + 4u || fl->base != base)
+            if (--left == 0u || st.pc != cia + 4u || *tag != base)
                 break;
             ++word;
         }

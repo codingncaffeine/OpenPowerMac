@@ -64,7 +64,7 @@ class JitCache {
     JitCache(const JitCache&) = delete;
     JitCache& operator=(const JitCache&) = delete;
 
-    static constexpr u32 kLines = 4096; // == Cpu::kFetchLines, asserted there
+    static constexpr u32 kLines = 65536; // == Cpu::kFetchLines, asserted there
     // ⚠ WAYS, BECAUSE THE FETCH SLOTS CONFLICT AND A CONFLICT IS NOT AN
     // INVALIDATION. In-game the code working set collides constantly in the
     // 4096 direct-mapped fetch slots, and a one-way JIT cache that dies with
@@ -129,7 +129,7 @@ class JitCache {
         i32 gpr0 = 0, pc = 0, cr = 0, xer = 0, lr = 0, ctr = 0;
         i32 pend = 0, curInsn = 0, halted = 0, batchBreak = 0;
         i32 msr = 0, fpr0 = 0;
-        i32 fetchLine0 = 0; // fetchLine[0].base; slot k at +k*sizeof(FetchLine)
+        i32 fetchLine0 = 0; // fetchBase[0]; slot k at +k*flStride
         i32 flStride = 0;
         // Chain-gate fields (Stage B): the dispatcher's own `slow` inputs,
         // the fetch-translation MSR word, the budget bound and the hop

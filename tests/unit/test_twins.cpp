@@ -1101,3 +1101,31 @@ TEST_CASE("direct memory: the guest's cache controls decide the mode")
     CHECK(m.cpu.excRingAt == 0u);
     CHECK(m.cpu.directReport().find("memory read directly") != std::string::npos);
 }
+
+// ---- the fetch buffer -----------------------------------------------------------
+
+TEST_CASE("fetch buffer: icbi drops the blocks at its address's offset, and no others")
+{
+    // icbi names an effective address and the buffer keeps blocks by their
+    // physical one; what the two share is the offset in the page. So icbi
+    // drops every block at that offset, whatever page it is in, and leaves
+    // the rest of the buffer alone (it used to empty all of it).
+    std::vector<u32> prog(8, 0x60000000u);   // 0x1000: a block of nops
+    prog.push_back(x31(0, 0, 5, 982));       // 0x1020: icbi 0, r5
+    prog.push_back(18u << 26);               // b .
+    Machine m(true);
+    REQUIRE(m.setUp(prog));
+    m.cpu.st.gpr[5] = 0x00777000u + 8u; // another page, the first block's offset
+    const u32 first = Cpu::fetchSlot(kCode), second = Cpu::fetchSlot(kCode + 32u);
+    m.run(8);
+    REQUIRE(m.cpu.fetchBase[first] == kCode);
+    while (m.stamp < 9)
+        m.run(9 - m.stamp);
+    CHECK(m.cpu.fetchBase[first] == 1u);            // dropped: same offset
+    CHECK(m.cpu.fetchBase[second] == kCode + 32u);  // kept: another offset
+    CHECK(m.cpu.excRingAt == 0u);
+    // ...and the dropped block fills again and runs as before.
+    m.cpu.st.pc = kCode;
+    m.run(8);
+    CHECK(m.cpu.fetchBase[first] == kCode);
+}

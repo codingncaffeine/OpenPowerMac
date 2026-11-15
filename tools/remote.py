@@ -41,6 +41,9 @@ Commands (one per argument; times are GUEST seconds unless they say host):
                     and the sound the guest produced against what a speaker
                     consumes in that second
   wav NAME | wav off   keep the sound the guest produces in OUT/NAME.wav
+  drop IMAGE        hand a volume image to the drop-box drive, as the app does
+                    after a drop (tools/mkhfs builds one from a folder);
+                    `drop` alone says what the drive holds
   quit
 """
 import argparse, ctypes, os, re, socket, struct, subprocess, sys, time, wave
@@ -91,6 +94,9 @@ opm_destroy = fn("opm_destroy", None, P)
 opm_set_realtime = fn("opm_set_realtime", None, P, i32)
 opm_ati_at = fn("opm_ati_at", None, P, u64)
 opm_drop_seat = fn("opm_drop_seat", i32, P)
+opm_drop_swap = fn("opm_drop_swap", i32, P, ctypes.c_char_p)
+opm_drop_state = fn("opm_drop_state", i32, P)
+opm_drop_reads = fn("opm_drop_reads", u64, P)
 opm_run = fn("opm_run", u64, P, u64)
 opm_halted = fn("opm_halted", i32, P)
 opm_tb = fn("opm_tb", u64, P)
@@ -285,6 +291,16 @@ def do(line):
         opm_set_realtime(m, 1 if state["rt"] else 0)
         return "clock paced from the host" if state["rt"] else f"clock paced from the instruction count (fast-tb {a.fast_tb})"
     if cmd == "perf": return perf(float(arg or 10))
+    if cmd == "drop":
+        names = ["no drive", "tray empty", "tray empty, a disc waiting to go in", "disc in, not read yet",
+                 "disc in and read (mounted)", "disc in and read, a newer one waiting for the guest to put it away"]
+        said = ""
+        if arg:
+            if not os.path.exists(arg):
+                return f"no such image: {arg}"
+            said = "handed over; " if opm_drop_swap(m, enc(arg)) else "REFUSED; "
+        st = opm_drop_state(m)
+        return f"{said}{names[st] if 0 <= st < len(names) else st}, {opm_drop_reads(m)} blocks read"
     if cmd == "wav":
         if state["wav"]:
             state["wav"].close(); state["wav"] = None

@@ -63,12 +63,17 @@ publish() {        # publish <rid> <native dir> <publish dir>
   grep -c CompiledAvaloniaXaml "$3/OpenPowerMac.dll" >/dev/null || { echo "!! $1: the published app has no compiled XAML" >&2; return 1; }
 }
 
+# The archive names no account of the machine it was made on: every entry belongs to 0:0.
+pack() {           # pack <folder under $OUT>
+  tar -C "$OUT" --owner=0 --group=0 --numeric-owner -czf "$OUT/$1.tar.gz" "$1"
+}
+
 if [ "$WHAT" = all ] || [ "$WHAT" = glibc ]; then
   echo "── native libraries for glibc ($GLIBC_IMAGE)"
   build_native "$GLIBC_IMAGE" "$OUT/native-glibc"
   echo "── publish $VER, linux-x64"
   publish linux-x64 "$OUT/native-glibc" "$OUT/OpenPowerMac-$VER-linux-x64"
-  tar -C "$OUT" -czf "$OUT/OpenPowerMac-$VER-linux-x64.tar.gz" "OpenPowerMac-$VER-linux-x64"
+  pack "OpenPowerMac-$VER-linux-x64"
 
   echo "── deb"
   DEB=$OUT/debroot
@@ -119,7 +124,7 @@ if [ "$WHAT" = all ] || [ "$WHAT" = musl ]; then
   echo "── publish $VER, linux-musl-x64"
   rm -rf gui/bin gui/obj
   publish linux-musl-x64 "$OUT/native-musl" "$OUT/OpenPowerMac-$VER-linux-musl-x64"
-  tar -C "$OUT" -czf "$OUT/OpenPowerMac-$VER-linux-musl-x64.tar.gz" "OpenPowerMac-$VER-linux-musl-x64"
+  pack "OpenPowerMac-$VER-linux-musl-x64"
 fi
 
 # The clean above removed the dev build's intermediates; nothing else is touched (bin/ still runs).

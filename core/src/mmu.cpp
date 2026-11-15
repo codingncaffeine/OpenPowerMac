@@ -28,6 +28,8 @@
 #include "opm/bits.hpp"
 #include "opm/prof.hpp"
 
+#include <cstring>
+
 namespace opm {
 
 namespace {
@@ -383,6 +385,23 @@ bool Cpu::xlateData(u32 ea, bool write, u32& pa, u32& wimg)
 
 bool Cpu::readVSlow(u32 ea, u32 len, u64& out)
 {
+    // The line memo: a block that is in the L1, which while memory is read
+    // directly is only ever a block of something else (the ROM, a device
+    // mapped cacheable).
+    {
+        const u32 line = ea >> 5;
+        const DmLine& m = dmLine[line & (kDmLines - 1u)];
+        if (m.eaLine == line && m.rkey == (dmLive | (st.msr & kDmMsr)) &&
+            (ea & 31u) + len <= 32u && dtlbStamp[m.slot] == m.stamp &&
+            l1x[m.set].tv[m.way] == m.tv) {
+            OPM_MARK(Read);
+            OPM_COUNT(dmHits);
+            dtlbLru[m.lruIdx] = m.lruVal;
+            l1x[m.set].age[m.way] = ++l1dClock;
+            out = lineLoadBE(&l1d[m.set][m.way].b[ea & 31u], len);
+            return true;
+        }
+    }
     out = 0;
     u32 pa;
     if (!leAlignCheck(ea, len))
@@ -412,7 +431,10 @@ bool Cpu::readVSlow(u32 ea, u32 len, u64& out)
         if (!xlateData(ea, false, pa, wimg))
             return false;
         out = memRead(pa, len, wimg);
-        dmNoteLine(ea, len, pa, wimg, false);
+        if (ramDirect(pa, len))
+            dpNotePage(ea, pa, false);
+        else
+            dmNoteLine(ea, len, pa, wimg, false);
         return true;
     }
     for (u32 i = 0; i < len; ++i) {
@@ -425,6 +447,23 @@ bool Cpu::readVSlow(u32 ea, u32 len, u64& out)
 
 bool Cpu::writeVSlow(u32 ea, u32 len, u64 v)
 {
+    { // the line memo, as in readVSlow
+        const u32 line = ea >> 5;
+        const DmLine& m = dmLine[line & (kDmLines - 1u)];
+        if (m.eaLine == line && m.wkey == (dmLive | (st.msr & kDmMsr)) &&
+            (ea & 31u) + len <= 32u && dtlbStamp[m.slot] == m.stamp &&
+            l1x[m.set].tv[m.way] == m.tv) {
+            OPM_MARK(Write);
+            OPM_COUNT(dmHits);
+            dtlbLru[m.lruIdx] = m.lruVal;
+            fetchDropAt(m.paLine << 5); // the store may land on fetched code
+            l1x[m.set].age[m.way] = ++l1dClock;
+            DLine& e = l1d[m.set][m.way];
+            lineStoreBE(&e.b[ea & 31u], len, v);
+            e.d = true;
+            return true;
+        }
+    }
     u32 pa;
     if (!leAlignCheck(ea, len))
         return false;
@@ -451,7 +490,10 @@ bool Cpu::writeVSlow(u32 ea, u32 len, u64 v)
         if (!xlateData(ea, true, pa, wimg))
             return false;
         memWrite(pa, len, v, wimg);
-        dmNoteLine(ea, len, pa, wimg, true);
+        if (ramDirect(pa, len))
+            dpNotePage(ea, pa, true);
+        else
+            dmNoteLine(ea, len, pa, wimg, true);
         return true;
     }
     for (u32 i = 0; i < len; ++i) {
@@ -557,7 +599,11 @@ bool Cpu::fetchDecoded(u32 ea, u32& insn, u32& row)
     // sweeps), never weaker — deterministic superset, RECEIPT.
     u8 raw[32];
     bool filled = false;
-    if (l1dReadLine(base, raw)) {
+    if (ramDirect(base, 32u)) { // memory read directly: no cache holds it
+        OPM_COUNT(fetchFillsMem);
+        std::memcpy(raw, dmRam + base, 32);
+        filled = true;
+    } else if (l1dReadLine(base, raw)) {
         OPM_COUNT(fetchFillsL1);
         filled = true;
     } else if (l2ReadLine(base, raw)) {

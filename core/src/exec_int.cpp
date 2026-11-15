@@ -993,10 +993,18 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         c.st.l2cr = v & ~1u & ~0x00000800u;
         if (hwf)
             c.l2FlushAll(true);
-        if (v & 0x00200000u)
+        if (v & 0x00200000u) {
+            if (c.dmDirect)
+                ++c.directFlashInv; // nothing of memory's is there to lose
             c.l2WipeAll(); // L2I global invalidate
+        }
         if (v & 0x80000000u)
             c.l2Resize(); // L2E: size the model per L2SIZ
+        // Whether memory is read directly rests on this register (the L2
+        // enabled, none of its test modes): decided again here, on the
+        // instruction that changed it, and the batch ends with it.
+        c.batchBreak = true;
+        c.cacheModeUpdate();
         { // L2 bring-up timeline. The pc and LR matter: "the backside L2 is
           // never enabled" only becomes actionable once the code that decided
           // so can be found and read.
@@ -1097,8 +1105,12 @@ void h_mtspr(Cpu& c, u32 i, const InsnDesc&)
         // HID0[DCE] decides whether a data access goes through the cache at
         // all, which the data memo takes as settled for a whole batch.
         c.batchBreak = true;
-        if (~old & v & 0x00000400u)
+        if (~old & v & 0x00000400u) {
+            if (c.dmDirect)
+                ++c.directFlashInv; // nothing of memory's is there to lose
             c.l1dFlushAll(false); // DCFI 0->1: flash invalidate, no wb
+        }
+        c.cacheModeUpdate(); // DCE and DLOCK decide the mode
         return;
     }
     // The instruction-translation cache holds one page's answer and validates

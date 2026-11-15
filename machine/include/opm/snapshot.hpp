@@ -38,6 +38,34 @@ class SawtoothBus;
 // and the layout digest refuses anything else.
 struct SnapWriter {
     std::vector<u8> buf;
+    // Where two things lie in `buf`, noted by their writers for
+    // snapshotFingerprints: the processor's two cache sections (first byte,
+    // one past the last) and main memory's bytes. Not part of the stream.
+    size_t cacheAt = 0, cacheEnd = 0, ramAt = 0, ramLen = 0;
+
+    // A LEAN writer does not copy the machine's big blocks (main memory,
+    // video memory): it notes where each belongs in the stream and leaves
+    // the bytes where they are. The stream it describes is the same one,
+    // byte for byte, and a fingerprint is taken by walking both. It exists
+    // because a fingerprint used to cost a second copy of the whole machine,
+    // and several machines fingerprinting at once took a host's memory with
+    // them. Never written to a file: a snapshot proper is not lean.
+    bool lean = false;
+    struct Big {
+        size_t at;   // the position in `buf` the block comes before
+        const u8* p;
+        size_t n;
+    };
+    std::vector<Big> bigs;
+    size_t ramBig = ~size_t(0); // which of `bigs` is main memory, if lean
+    void big(const void* p, size_t n)
+    {
+        if (!lean) {
+            raw(p, n);
+            return;
+        }
+        bigs.push_back({buf.size(), static_cast<const u8*>(p), n});
+    }
 
     void raw(const void* p, size_t n)
     {
@@ -78,7 +106,10 @@ struct SnapWriter {
     }
     void end(size_t at)
     {
-        const u64 n = static_cast<u64>(buf.size() - at - 8);
+        u64 n = static_cast<u64>(buf.size() - at - 8);
+        for (const Big& b : bigs) // blocks noted inside this section
+            if (b.at >= at + 8)
+                n += b.n;
         std::memcpy(buf.data() + at, &n, 8);
     }
 };
@@ -217,5 +248,34 @@ bool readSnapshotFile(const char* path, std::vector<u8>& blob);
 // with the same fingerprint hold the same architected AND device state.
 u64 snapshotFingerprint(const Cpu& cpu, const SawtoothBus& bus,
                         const HarnessState& h);
+
+// Two numbers from one serialization.
+//
+// `whole` is snapshotFingerprint: every byte of the stream.
+//
+// `guest` is the machine as a guest can know it. The stream holds the L1 and
+// L2 as arrays (which way a block sits in, how old it is) and main memory as
+// it lies under them, behind every modified block. None of that placement
+// can be read back by a program; what can is what a load returns. So this
+// one hashes the stream WITHOUT the two cache sections, with main memory as
+// it reads once every modified block is written back (the L2's copy first,
+// the L1's over it), and in the sections' place the blocks that are not main
+// memory's, by address: a modified block of a device or the ROM, with its
+// bytes, and an unmodified one of a device, which is a copy of registers
+// that may since have changed. Two machines with the same `guest` agree on
+// every register, the TLBs, every device and on what every address reads.
+//
+// It is what a machine that reads memory directly (Cpu::dmDirect) is held
+// to: against the full cache model its `whole` differs by design, and its
+// `guest` must not.
+//
+// `whole` is FNV-1a over every byte, as it always was, so it compares with
+// any earlier build's. `guest` hashes the big blocks eight bytes at a step:
+// it is this function's own number and compares only with itself.
+struct SnapFingerprints {
+    u64 whole = 0, guest = 0;
+};
+SnapFingerprints snapshotFingerprints(const Cpu& cpu, const SawtoothBus& bus,
+                                      const HarnessState& h);
 
 } // namespace opm

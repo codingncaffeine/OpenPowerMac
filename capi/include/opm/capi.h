@@ -54,6 +54,16 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns);
 // fastTb. Call it any time; it re-anchors. fastTb is ignored while it is on.
 OPM_API void opm_set_realtime(OpmMachine* m, int32_t on);
 
+// Keep the processor's L1 and L2 cache model in the path of every load and
+// store, as it was before memory was read directly. By default, once the
+// guest runs its caches in their normal mode, main memory is read and written
+// in place and the model keeps only what is not main memory; the firmware's
+// cache sizing and tests always get the full model. This switch is the
+// control for that: slower, and no different to any guest that does not
+// depend on losing a store. OPM_EXACT_CACHES=1 in the environment sets it at
+// creation. Takes effect before the next instruction.
+OPM_API void opm_set_exact_caches(OpmMachine* m, int32_t on);
+
 // Set the machine's clock chip: seconds since midnight, 1 January 1904, in
 // the local time the guest should show. Mac OS reads it once while starting
 // up, so call this before the first opm_run. A machine whose clock was never

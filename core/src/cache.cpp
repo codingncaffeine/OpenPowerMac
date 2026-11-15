@@ -17,7 +17,9 @@
 #include "opm/prof.hpp"
 
 #include <bit>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -339,6 +341,11 @@ u64 Cpu::memRead(u32 pa, u32 len, u32 wimg)
         else if (rpByLr.size() < 512)
             rpByLr[caller] = 1;
     }
+    // Main memory, read where it lies: see Cpu::dmDirect. No block of it is
+    // in either cache while the mode lasts, so this is also what the
+    // cache-inhibited arm below would have fetched from the bus.
+    if (ramDirect(pa, len))
+        return lineLoadBE(dmRam + pa, len);
     if (!dceOn() || (wimg & kWimgI) ||
         (diagUncachedBase && pa >= diagUncachedBase)) {
         noteL2Skew(pa, false);
@@ -430,6 +437,10 @@ void Cpu::memWrite(u32 pa, u32 len, u64 v, u32 wimg)
     fetchDropRange(pa, len);
     if (wpEnd && wpNote(pa, len, v) && wpForceSet && len == 4 && pa == wpPa)
         v = wpForce; // diagnostic
+    if (ramDirect(pa, len)) { // main memory, written where it lies
+        lineStoreBE(dmRam + pa, len, v);
+        return;
+    }
     if (!dceOn() || (wimg & kWimgI) ||
         (diagUncachedBase && pa >= diagUncachedBase)) {
         noteL2Skew(pa, true);
@@ -509,6 +520,10 @@ void Cpu::dcbzLine(u32 pa)
     // never written. That is this instrument's answer in its exact wrong
     // direction, and "why is this field zero" is the question being asked.
     if (wpEnd) wpNote(pa, 32u, 0);
+    if (ramDirect(pa & ~31u, 32u)) { // the zeros go straight to memory
+        std::memset(dmRam + (pa & ~31u), 0, 32);
+        return;
+    }
     const u32 set = setOf(pa);
     int w = lineWay(*this, pa);
     if (w < 0) { // conjured, not filled: no bus read, the zeros ARE the block
@@ -537,6 +552,11 @@ void Cpu::dcbClean(u32 pa, bool invalidate)
 
 void Cpu::dcbKill(u32 pa)
 {
+    // The one cache instruction whose effect on DATA a guest could see: the
+    // model throws a modified block away, and memory read directly already
+    // holds it. Counted, so a guest that does it is named (directReport).
+    if (ramDirect(pa & ~31u, 32u))
+        ++directDcbi;
     fetchDropAt(pa);
     const int w = lineWay(*this, pa);
     if (w >= 0)
@@ -570,6 +590,18 @@ void Cpu::snoopPush(u32 pa, u32 len, bool invalidate)
         OPM_COUNT(fetchDropSnoop);
     const u32 first = pa & ~31u;
     const u32 last = (pa + len - 1u) & ~31u;
+    // Memory read directly holds everything already: nothing to push, no
+    // copy of the processor's to kill, only fetched code a master writes
+    // over.
+    if (ramDirect(pa, len)) {
+        if (invalidate)
+            for (u32 a = first;; a += 32u) {
+                fetchDropAt(a);
+                if (a == last)
+                    break;
+            }
+        return;
+    }
     for (u32 a = first;; a += 32u) {
         if (invalidate)
             fetchDropAt(a);
@@ -612,7 +644,142 @@ void Cpu::dmDropAll()
         dmPage[k] = DmPage{};
     for (u32 k = 0; k < kImPages; ++k)
         imPage[k] = ImPage{};
+    for (u32 k = 0; k < kDpPages; ++k)
+        dpPage[k] = DpPage{};
     dmEpoch = kDmEpochStep;
+}
+
+// ---- memory read directly (Cpu::dmDirect) -----------------------------------
+
+// The mode the registers and the bus ask for, and the switch into it.
+//
+// Entering writes main memory's modified blocks back and takes every block
+// of main memory out of both arrays. The L2's copy goes first: a block
+// modified in both caches is newer in the L1 (the note on l1dFlushAll), so
+// the L1's bytes are the ones left standing. The bytes go where the bus
+// would have put them, without asking it: Bus::directRam has just said a
+// store there is nothing but the bytes. A fetched block is a copy of exactly
+// what these writes leave in memory, so the fetch buffer keeps what it has.
+void Cpu::cacheModeUpdate()
+{
+    u8* base = nullptr;
+    u32 size = 0;
+    const bool want =
+        !exactCaches && bus &&
+        (st.hid0 & (kHid0Dce | kHid0Dlock)) == kHid0Dce &&
+        (st.l2cr & (kL2crE | kL2crDo | kL2crI | kL2crTs)) == kL2crE &&
+        bus->directRam(base, size);
+    if (!want) {
+        if (!dmDirect)
+            return;
+        ++directLeaves;
+        dmDirect = false;
+        dmRam = nullptr;
+        dmRamSize = 0;
+    } else {
+        if (dmDirect && base == dmRam && size == dmRamSize)
+            return;
+        if (!dmDirect) {
+            ++directEnters;
+            for (L2Line& e : l2) {
+                if (!e.v)
+                    continue;
+                const u64 at = static_cast<u64>(e.tag) << 5;
+                if (at + 32u > size)
+                    continue; // not main memory: stays in the model
+                if (e.d) {
+                    std::memcpy(base + at, e.b, 32);
+                    ++directPushed;
+                }
+                e.v = false;
+                e.d = false;
+            }
+            for (u32 s = 0; s < 128; ++s)
+                for (u32 w = 0; w < 8; ++w) {
+                    const u32 tv = l1x[s].tv[w];
+                    if (!(tv & 1u))
+                        continue;
+                    const u64 at = (static_cast<u64>(tv >> 1) << 12) | (s << 5);
+                    if (at + 32u > size)
+                        continue;
+                    DLine& e = l1d[s][w];
+                    if (e.d) {
+                        std::memcpy(base + at, e.b, 32);
+                        ++directPushed;
+                    }
+                    l1x[s].tv[w] = 0;
+                    e.d = false;
+                }
+        }
+        // Already direct with memory somewhere else: the board was rebuilt
+        // around it. Nothing is held in a cache; only the address moved.
+        dmDirect = true;
+        dmRam = base;
+        dmRamSize = size;
+    }
+    // Every memo entry was made under the other mode's rules.
+    dmEpoch += kDmEpochStep;
+    if (!dmEpoch)
+        dmDropAll();
+    if (dmLive != kDmOff)
+        dmLive = dmEpoch;
+}
+
+// Remember where this page's access ended up, after the full path has taken
+// it there. The conditions are the ones a hit does not check again; see
+// Cpu::DpPage.
+void Cpu::dpNotePage(u32 ea, u32 pa, bool write)
+{
+    if (dmLive == kDmOff || (pa | 0xFFFu) >= dmRamSize ||
+        (st.msr & msr::LE) || (st.dabr & 3u))
+        return;
+    OPM_COUNT(dpMisses);
+    const u32 page = ea >> 12;
+    const u32 key = dmLive | (st.msr & kDmMsr);
+    const u8 slot = dmSlot;
+    const u32 stamp = dtlbStamp[slot];
+    DpPage& m = dpPage[page & (kDpPages - 1u)];
+    // A load re-making an entry a store had made good for stores: nothing
+    // that store proved has moved (same epoch and mode, same untouched TLB
+    // entry).
+    const bool keepW = m.page == page && m.wkey == key && m.slot == slot &&
+                       m.stamp == stamp;
+    m.page = page;
+    m.rkey = key;
+    m.wkey = (write || keepW) ? key : kDmNever;
+    m.stamp = stamp;
+    m.host = dmRam + (pa & ~0xFFFu);
+    m.paPage = pa & ~0xFFFu;
+    m.slot = slot;
+    m.lruIdx = static_cast<u8>(slot < 128u ? slot >> 1 : 64u);
+    m.lruVal = static_cast<u8>((slot & 1u) ^ 1u);
+}
+
+std::string Cpu::directReport() const
+{
+    char b[400];
+    const char* why = "";
+    if (!dmDirect) {
+        if (exactCaches)
+            why = " (the full model was asked for)";
+        else if ((st.hid0 & (kHid0Dce | kHid0Dlock)) != kHid0Dce)
+            why = " (data cache off or locked)";
+        else if ((st.l2cr & (kL2crE | kL2crDo | kL2crI | kL2crTs)) != kL2crE)
+            why = " (L2 off or in a test mode)";
+        else
+            why = " (the bus keeps memory to itself)";
+    }
+    snprintf(b, sizeof b,
+             "data caches: %s%s; entered %llu, left %llu, %llu modified "
+             "blocks written back on the way in; while direct: %llu dcbi on "
+             "memory, %llu flash invalidates",
+             dmDirect ? "memory read directly" : "modeled in full", why,
+             static_cast<unsigned long long>(directEnters),
+             static_cast<unsigned long long>(directLeaves),
+             static_cast<unsigned long long>(directPushed),
+             static_cast<unsigned long long>(directDcbi),
+             static_cast<unsigned long long>(directFlashInv));
+    return b;
 }
 
 // Called by runSteps before the first instruction of every batch. Two
@@ -622,6 +789,11 @@ void Cpu::dmDropAll()
 // segment register or a BAT between batches is then covered too.
 void Cpu::dmEnter()
 {
+    // The mode first: a harness may have changed what it rests on between
+    // batches (a snapshot loaded, the control switched, an instrument of
+    // the bus's armed). The guest's own changes were taken where they were
+    // made, in mtspr.
+    cacheModeUpdate();
     if (dxlCacheOff || mmuProbe || rpEnd || wpEnd || cwEnd ||
         diagUncachedBase) {
         dmLive = kDmOff;
@@ -709,7 +881,8 @@ void CpuSnoop::publish(u8* ram, u32 ramSize)
 // not before.
 void Cpu::publishModified(u8* ram, u32 ramSize) const
 {
-    if (ramSize < 32u)
+    // Read directly, memory is never behind a cache: nothing to copy out.
+    if (ramSize < 32u || dmDirect)
         return;
     for (const L2Line& e : l2) {
         if (!e.v || !e.d)

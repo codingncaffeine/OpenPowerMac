@@ -52,6 +52,11 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern void opm_set_realtime(IntPtr m, int on);
 
+    // Keep the processor's cache model in the path of every load and store
+    // (the control for reading memory directly; see capi.h).
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void opm_set_exact_caches(IntPtr m, int on);
+
     // Times the machine could not keep up and the debt was forgiven. Many
     // slips means it is not running at real time and its tick rate is a lie.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

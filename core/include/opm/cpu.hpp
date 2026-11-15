@@ -416,6 +416,7 @@ struct Cpu {
             jit->dropAll(); // compiled lines are derived from dropped lines
         tlbFlushAll();
         dmDropAll();
+        cacheModeUpdate(); // HID0 is clear again: the full model
     }
     void halt(std::string reason)
     {
@@ -870,6 +871,102 @@ struct Cpu {
     void dmEnter(); // runSteps: decide whether the memo may be used
     void dmNoteLine(u32 ea, u32 len, u32 pa, u32 wimg, bool write);
 
+    // ---- memory read directly ---------------------------------------------
+    //
+    // The L1 and L2 above are models of where a block of memory is held, and
+    // a guest can only tell that from memory itself in a handful of ways:
+    // by running with the data cache off or locked, by the L2's test and
+    // data-only modes, by throwing a modified block away, by mapping a
+    // device cacheable. The firmware does several of those on its way up
+    // (it sizes and tests the L2 with them). An operating system that has
+    // the caches in their NORMAL mode does none: every modified block gets
+    // back to memory, and what a load returns is what the last store put
+    // there. For such a guest the two arrays are a third of the processor's
+    // work that changes no answer.
+    //
+    // So while HID0 has the data cache enabled and unlocked, and L2CR has
+    // the L2 enabled with no test, data-only or invalidate bit, and the bus
+    // offers its memory (Bus::directRam), the machine is in DIRECT mode:
+    //
+    //   - main memory is the truth. Entering the mode writes every modified
+    //     block of main memory back and takes all of main memory's blocks
+    //     out of both arrays; while the mode lasts none is ever put in.
+    //   - a load or a store to main memory is the bytes at dmRam + pa. So
+    //     are the page table's own reads and writes, a fetch fill, a dcbz.
+    //     dcbf and dcbst find nothing to push; a bus master's snoop finds
+    //     nothing to push and only drops fetched code it writes over.
+    //   - EVERYTHING ELSE IS THE MODEL, UNCHANGED: the TLBs with their
+    //     replacement order and the page table's R and C bits, protection,
+    //     DABR, the reservation, and every block that is NOT main memory. A
+    //     device or the ROM mapped cacheable still lives in the L1 and L2
+    //     exactly as before, so a block conjured with dcbz, filled and
+    //     pushed at a device with dcbf arrives as one burst, as it must.
+    //
+    // Leaving the mode needs nothing: the arrays hold no block of main
+    // memory, which is a state the model can simply continue from.
+    //
+    // ⚠ WHAT A GUEST COULD SEE, each counted (directReport):
+    //   - dcbi, a flash invalidate (HID0[DCFI], L2CR[L2I]) or a reset throws
+    //     modified blocks away in the model; here memory already has them.
+    //   - switching the data cache or the L2 off without flushing first
+    //     leaves the model reading memory that is behind the cache; here
+    //     memory is current.
+    //   - a modified block of a cacheable DEVICE leaves the L1 when it is
+    //     pushed or when other blocks crowd it out. Main memory no longer
+    //     crowds anything out, so an unpushed one stays longer.
+    // Software that depends on any of these depends on losing a store or on
+    // when a cache happens to evict, which no cache promises.
+    //
+    // `exactCaches` (g4run --exact-caches, opm_set_exact_caches) keeps the
+    // model for everything: the control. The two must agree on every
+    // register, the TLBs, every device and on memory as it reads with all
+    // modified blocks written back (snapshotFingerprints' `guest`).
+    //
+    // dmRamSize is zero outside the mode, so "is this main memory, read
+    // directly" is the one compare in ramDirect().
+    static constexpr u32 kHid0Dce = 0x00004000u, kHid0Dlock = 0x00001000u;
+    static constexpr u32 kL2crE = 0x80000000u, kL2crDo = 0x00400000u,
+                         kL2crI = 0x00200000u, kL2crTs = 0x00040000u;
+    bool exactCaches = false;
+    bool dmDirect = false;
+    u8* dmRam = nullptr;
+    u32 dmRamSize = 0;
+    bool ramDirect(u32 pa, u32 len) const
+    {
+        return pa < dmRamSize && len <= dmRamSize - pa;
+    }
+    // Decide the mode from the registers and the bus, and switch. Called by
+    // the writers of HID0 and L2CR, before every batch, on reset and after a
+    // snapshot is loaded.
+    void cacheModeUpdate();
+    u64 directEnters = 0, directLeaves = 0; // mode switches
+    u64 directPushed = 0;    // modified blocks written back on entering
+    u64 directDcbi = 0;      // dcbi on main memory while direct
+    u64 directFlashInv = 0;  // DCFI or L2I while direct
+    std::string directReport() const;
+
+    // The direct mode's memo: one entry per page of main memory, in front of
+    // readV/writeV. It holds what the line memo above holds, less the L1's
+    // part: where the page translated to, as a host address, and the TLB
+    // entry that answer came from. A hit replays the TLB set's LRU write and
+    // moves the bytes. Covered exactly as the line memo's inputs are (the
+    // key, the epoch, dtlbStamp, a store rides only an entry a store made);
+    // the mode itself is in the epoch, so no entry outlives a switch. Made
+    // only for a page that lies wholly in main memory, never in
+    // little-endian mode or with DABR armed, and live only inside runSteps.
+    static constexpr u32 kDpPages = 4096;
+    struct DpPage {
+        u32 page = ~0u; // ea >> 12, or ~0
+        u32 rkey = kDmNever, wkey = kDmNever;
+        u32 stamp = 0;      // what dtlbStamp[slot] must still read
+        u8* host = nullptr; // the page's first byte
+        u32 paPage = 0;     // pa & ~0xFFF: a store drops fetched code there
+        u8 slot = 128, lruIdx = 64, lruVal = 0, rsv = 0;
+    };
+    std::unique_ptr<DpPage[]> dpPage = std::make_unique<DpPage[]>(kDpPages);
+    u64 dpHits = 0, dpMisses = 0; // census, profiling build only
+    void dpNotePage(u32 ea, u32 pa, bool write);
+
     // ---- …and the instruction side's ------------------------------------
     //
     // The same idea for the page an instruction is fetched from. The fetch
@@ -1145,43 +1242,38 @@ struct Cpu {
     // translate() through the memo's page table (see DmPage above). Guest
     // data accesses only — instruments and probes keep calling translate().
     bool xlateData(u32 ea, bool write, u32& pa, u32& wimg);
-    // ⭐ A GUEST LOAD / STORE. The memo's hit is here, inline, so that a
-    // handler's load is a table probe and a byte swap; everything else — the
-    // first touch of a line, a page crossing, a device, a fault — is the full
-    // path in readVSlow/writeVSlow, which is also the only path there is
-    // outside runSteps. See DmLine for what a hit replays and why that is
-    // the whole of what the full path would have done.
+    // ⭐ A GUEST LOAD / STORE. The direct mode's hit is here, inline, so
+    // that a handler's load is a table probe and a byte swap. Everything
+    // else is readVSlow/writeVSlow: the line memo's hit when the cache model
+    // is in the path (see DmLine for what that replays), then the first
+    // touch of a page, a page crossing, a device, a fault — the full path,
+    // which is also the only path there is outside runSteps.
     bool readV(u32 ea, u32 len, u64& out)
     {
-        const u32 line = ea >> 5;
-        const DmLine& m = dmLine[line & (kDmLines - 1u)];
-        if (m.eaLine == line && m.rkey == (dmLive | (st.msr & kDmMsr)) &&
-            (ea & 31u) + len <= 32u && dtlbStamp[m.slot] == m.stamp &&
-            l1x[m.set].tv[m.way] == m.tv) {
+        const u32 page = ea >> 12;
+        const DpPage& m = dpPage[page & (kDpPages - 1u)];
+        if (m.page == page && m.rkey == (dmLive | (st.msr & kDmMsr)) &&
+            (ea & 0xFFFu) + len <= 0x1000u && dtlbStamp[m.slot] == m.stamp) {
             OPM_MARK(Read);
-            OPM_COUNT(dmHits);
+            OPM_COUNT(dpHits);
             dtlbLru[m.lruIdx] = m.lruVal;
-            l1x[m.set].age[m.way] = ++l1dClock;
-            out = lineLoadBE(&l1d[m.set][m.way].b[ea & 31u], len);
+            out = lineLoadBE(m.host + (ea & 0xFFFu), len);
             return true;
         }
         return readVSlow(ea, len, out);
     }
     bool writeV(u32 ea, u32 len, u64 v)
     {
-        const u32 line = ea >> 5;
-        const DmLine& m = dmLine[line & (kDmLines - 1u)];
-        if (m.eaLine == line && m.wkey == (dmLive | (st.msr & kDmMsr)) &&
-            (ea & 31u) + len <= 32u && dtlbStamp[m.slot] == m.stamp &&
-            l1x[m.set].tv[m.way] == m.tv) {
+        const u32 page = ea >> 12;
+        const DpPage& m = dpPage[page & (kDpPages - 1u)];
+        if (m.page == page && m.wkey == (dmLive | (st.msr & kDmMsr)) &&
+            (ea & 0xFFFu) + len <= 0x1000u && dtlbStamp[m.slot] == m.stamp) {
             OPM_MARK(Write);
-            OPM_COUNT(dmHits);
+            OPM_COUNT(dpHits);
             dtlbLru[m.lruIdx] = m.lruVal;
-            fetchDropAt(m.paLine << 5); // the store may land on fetched code
-            l1x[m.set].age[m.way] = ++l1dClock;
-            DLine& e = l1d[m.set][m.way];
-            lineStoreBE(&e.b[ea & 31u], len, v);
-            e.d = true;
+            // the store may land on fetched code
+            fetchDropRange(m.paPage | (ea & 0xFFFu), len);
+            lineStoreBE(m.host + (ea & 0xFFFu), len, v);
             return true;
         }
         return writeVSlow(ea, len, v);

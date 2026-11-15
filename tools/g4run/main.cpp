@@ -576,6 +576,7 @@ int main(int argc, char** argv)
     // instruction translation cache (the control for all three).
     bool icache = true;
     bool dxlate = true;
+    bool exactCaches = false; // --exact-caches: see the option
     // --no-nap-skip: step an asleep processor one instruction at a time (the
     // control for machine/include/opm/pace.hpp).
     bool napSkipOn = true;
@@ -793,6 +794,10 @@ int main(int argc, char** argv)
         if (!strcmp(a, "--no-dev-gate")) { devGate = false; continue; }
         if (!strcmp(a, "--no-icache")) { icache = false; continue; }
         if (!strcmp(a, "--no-dxlate")) { dxlate = false; continue; }
+        // The control for memory read directly (Cpu::dmDirect): keep the L1
+        // and L2 model in the path of every access, as it always was. The
+        // two runs must print the same GFP lines.
+        if (!strcmp(a, "--exact-caches")) { exactCaches = true; continue; }
         // The control for the nap skip. Every other cache and gate in here
         // ships with the switch that turns it off, because that is the only
         // way a claim about one gets settled.
@@ -1560,6 +1565,7 @@ int main(int argc, char** argv)
     bus.devGateOff = !devGate;
     cpu.fetchCacheOff = !icache;
     cpu.dxlCacheOff = !dxlate;
+    cpu.exactCaches = exactCaches;
     cpu.lineExecOff = lineExecOff;
     if (jitOff)
         cpu.jitOn = false;
@@ -1848,9 +1854,15 @@ int main(int argc, char** argv)
             return;
         const HarnessState h{done,      fastTb,   fastTbUntil, parkSeen,
                              parkArmed, ataPoked, emPoked};
-        printf("FP @%llu %016llx\n", static_cast<unsigned long long>(done),
-               static_cast<unsigned long long>(
-                   snapshotFingerprint(cpu, bus, h)));
+        // FP is the whole stream; GFP is the machine as a guest can know it
+        // (opm/snapshot.hpp), the line that must not move between a run that
+        // reads memory directly and one under --exact-caches.
+        const SnapFingerprints fp = snapshotFingerprints(cpu, bus, h);
+        printf("FP @%llu %016llx\nGFP @%llu %016llx\n",
+               static_cast<unsigned long long>(done),
+               static_cast<unsigned long long>(fp.whole),
+               static_cast<unsigned long long>(done),
+               static_cast<unsigned long long>(fp.guest));
         fflush(stdout);
         // With --snapshot-out, the FIRST mark is also written out in full.
         // A fingerprint says two machines differ; two snapshots say WHERE,
@@ -5162,6 +5174,7 @@ int main(int argc, char** argv)
     // Accesses that went round the caches while the L2 still held the block.
     // Printed always, including the zero, because "the L2 is enabled and
     // nothing reads round it" is the reading that clears the whole class.
+    printf("-- %s\n", cpu.directReport().c_str());
     printf("-- l2 skew (bypassing access over a live L2 line): %llu reads, "
            "%llu writes by %zu pc%s\n",
            static_cast<unsigned long long>(cpu.l2SkewR),
@@ -5881,6 +5894,14 @@ int main(int argc, char** argv)
                    static_cast<unsigned long long>(cpu.dmPageHits),
                    static_cast<unsigned long long>(cpu.dmPageMisses),
                    static_cast<unsigned long long>(cpu.dmEpochs));
+        // The direct mode's memo (Cpu::DpPage), same two numbers per page.
+        if (cpu.dpHits + cpu.dpMisses)
+            printf("--   direct page memo: %.1f%% of covered accesses "
+                   "answered from an entry (%llu hits, %llu fills)\n",
+                   100.0 * static_cast<double>(cpu.dpHits) /
+                       static_cast<double>(cpu.dpHits + cpu.dpMisses),
+                   static_cast<unsigned long long>(cpu.dpHits),
+                   static_cast<unsigned long long>(cpu.dpMisses));
         // …and the instruction side's (Cpu::ImPage): a branch to another
         // page answered from an entry, against one that had to be walked.
         if (cpu.imHits + cpu.imMisses)

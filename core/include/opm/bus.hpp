@@ -110,6 +110,18 @@ public:
     // keeps the exact single-word behavior.
     virtual bool memoryAt(u32 /*pa*/, u32 /*len*/) const { return false; }
 
+    // Main memory as the host holds it: the bytes of physical addresses
+    // [0, size) at `base`, in the guest's order, `size` a whole number of
+    // 4 KB pages. True only while a load or a store there has no effect but
+    // the bytes themselves: nothing but memory answers in that range, and no
+    // instrument of the bus's is armed that has to be told about each
+    // access. The processor asks before every batch and, while the answer is
+    // yes and the guest runs its caches in their normal mode, reads and
+    // writes memory in place (Cpu::cacheModeUpdate). The default is no, so a
+    // bus that has not thought about the question keeps the full cache
+    // model.
+    virtual bool directRam(u8*& /*base*/, u32& /*size*/) { return false; }
+
     // Burst (cache-line) transactions, the 60x TBST-asserted class. Chipset
     // caches allocate on these but not on the single-beat accessors above
     // (MPC106 UM Table 5-2). pa is 32-byte aligned; the default falls back

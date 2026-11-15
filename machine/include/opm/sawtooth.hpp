@@ -1191,6 +1191,19 @@ private:
                static_cast<size_t>(pa - kRomBase) + len <= rom_.size();
     }
 
+    // Bus::directRam. Not while the write heatmap or the write watch is
+    // armed: both are told about every store that reaches write().
+    bool directRam(u8*& base, u32& size) override
+    {
+        if (wmapTo || watchPa)
+            return false;
+        const size_t n = ram_.size() < kDeviceWindowBase ? ram_.size()
+                                                         : kDeviceWindowBase;
+        base = ram_.data();
+        size = static_cast<u32>(n) & ~0xFFFu;
+        return size != 0;
+    }
+
     u32 read(u32 pa, u32 len)
     {
         if (ramFast(pa, len))

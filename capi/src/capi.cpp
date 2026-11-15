@@ -113,6 +113,8 @@ OPM_API OpmMachine* opm_create(const char* romPath, const char* cdPath,
     if (atiRomPath && *atiRomPath)
         m->bus->attachAtiRom(atiRomPath);
     m->fastTb = fastTb;
+    if (const char* env = getenv("OPM_EXACT_CACHES"))
+        m->cpu.exactCaches = env[0] == '1';
     wireMachine(m);
     return m;
 }
@@ -372,6 +374,11 @@ OPM_API void opm_set_realtime(OpmMachine* m, int32_t on)
     // Not under a frame recording, which needs the engine on this thread and
     // puts back the setting it found when it ends.
     r128AsyncEnable(m->realtime && !(env && env[0] == '0') && !r128RecOn());
+}
+
+OPM_API void opm_set_exact_caches(OpmMachine* m, int32_t on)
+{
+    m->cpu.exactCaches = on != 0; // taken before the next batch (dmEnter)
 }
 
 OPM_API uint64_t opm_rt_slips(const OpmMachine* m) { return m->pace.slips; }
@@ -891,6 +898,7 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
              static_cast<unsigned long long>(m->idle.skipped),
              static_cast<unsigned long long>(m->idle.overshootNs / 1000ull));
     s += b;
+    s += "--   " + m->cpu.directReport() + "\n";
     // How far behind the host's clock the guest's was found, and what became
     // of it: repaid in steps (held), or more than the guest could be told
     // about (lost). A machine that keeps up shows nothing past the first two

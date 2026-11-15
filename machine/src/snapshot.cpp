@@ -303,6 +303,7 @@ void saveCpu(SnapWriter& w, const Cpu& c)
     // was a cache-coherency bug: dirty L1D lines held values that RAM did
     // not, and a snapshot that dropped them would resume a different
     // machine while looking identical.
+    w.cacheAt = w.buf.size();
     const size_t l1 = w.begin("L1D ");
     w.u32v(c.l1dClock);
     for (u32 set = 0; set < 128; ++set)
@@ -329,6 +330,7 @@ void saveCpu(SnapWriter& w, const Cpu& c)
         w.raw(l.b, 32);
     }
     w.end(l2);
+    w.cacheEnd = w.buf.size();
 }
 
 void loadCpu(SnapReader& r, Cpu& c)
@@ -340,6 +342,13 @@ void loadCpu(SnapReader& r, Cpu& c)
     c.fetchDrop();
     c.xlDrop();
     c.dmDropAll();
+    // The arrays about to be loaded may hold blocks of main memory, which a
+    // machine reading memory directly never has: the full model until the
+    // registers are in and the mode is decided again (Cpu::cacheModeUpdate,
+    // before the next batch).
+    c.dmDirect = false;
+    c.dmRam = nullptr;
+    c.dmRamSize = 0;
     const u8* e = r.beginSection("CPU ");
     loadCpuState(r, c.st);
     c.extIrqLine = r.b();
@@ -931,7 +940,7 @@ void R128Cell::snapSave(SnapWriter& w) const
         w.b(ev.wr);
     }
     w.u64v(vram.size());
-    w.raw(vram.data(), vram.size());
+    w.big(vram.data(), vram.size());
 }
 
 void R128Cell::snapLoad(SnapReader& r)
@@ -1022,7 +1031,11 @@ void SawtoothBus::snapSave(SnapWriter& w) const
     // than trusting the command line to be repeated correctly.
     size_t sec = w.begin("MEM ");
     w.u64v(ram_.size());
-    w.raw(ram_.data(), ram_.size());
+    w.ramAt = w.buf.size();
+    w.ramLen = ram_.size();
+    if (w.lean)
+        w.ramBig = w.bigs.size();
+    w.big(ram_.data(), ram_.size());
     w.bytes(rom_);
     w.u64v(romBase_); // the ROM this run STARTED from - see snapLoad
     w.bytes(atiRom_);
@@ -1357,12 +1370,122 @@ bool loadSnapshot(Cpu& cpu, SawtoothBus& bus, HarnessState& h, SnapReader& r)
     return r.ok;
 }
 
+namespace {
+
+// A big block eight bytes at a step. Not FNV, and not meant to be: it is used
+// only inside the guest view, which is compared with nothing but itself.
+u64 hashWords(const u8* p, size_t n, u64 h)
+{
+    size_t k = 0;
+    for (; k + 8 <= n; k += 8) {
+        u64 v;
+        std::memcpy(&v, p + k, 8);
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 32;
+    }
+    for (; k < n; ++k)
+        h = (h ^ p[k]) * 0x100000001B3ull;
+    return h;
+}
+
+// FNV-1a over the stream a lean writer describes, from `from` to `to` in its
+// buffer: the buffer's bytes with each big block where it belongs.
+u64 fnvStream(const SnapWriter& w, size_t from, size_t to, u64 h)
+{
+    size_t at = from;
+    for (const SnapWriter::Big& b : w.bigs) {
+        if (b.at < from || b.at >= to)
+            continue;
+        h = fnv1a(w.buf.data() + at, b.at - at, h);
+        h = fnv1a(b.p, b.n, h);
+        at = b.at;
+    }
+    return fnv1a(w.buf.data() + at, to - at, h);
+}
+
+} // namespace
+
 u64 snapshotFingerprint(const Cpu& cpu, const SawtoothBus& bus,
                         const HarnessState& h)
 {
     SnapWriter w;
+    w.lean = true;
     saveSnapshot(cpu, bus, h, w);
-    return fnv1a(w.buf.data(), w.buf.size());
+    return fnvStream(w, 0, w.buf.size(), 1469598103934665603ull);
+}
+
+SnapFingerprints snapshotFingerprints(const Cpu& cpu, const SawtoothBus& bus,
+                                      const HarnessState& h)
+{
+    SnapWriter w;
+    w.lean = true; // main and video memory are hashed where they lie
+    saveSnapshot(cpu, bus, h, w);
+    SnapFingerprints f;
+    f.whole = fnvStream(w, 0, w.buf.size(), 1469598103934665603ull);
+    if (!w.cacheEnd || w.cacheEnd < w.cacheAt || w.ramBig >= w.bigs.size())
+        return f; // a stream without the sections: no second view of it
+
+    // What the caches hold, by address. The L1 is put in after the L2 and
+    // replaces it: a block held by both is newer there. A block of main
+    // memory matters only if it is modified (it is then what memory reads
+    // as); any other block is listed as itself.
+    struct Held {
+        const u8* bytes;
+        bool modified;
+    };
+    std::map<u32, Held> other, ram;
+    const auto note = [&](u64 at, const u8* bytes, bool modified) {
+        if (at + 32u <= w.ramLen) {
+            if (modified)
+                ram[static_cast<u32>(at)] = {bytes, true};
+            return;
+        }
+        if (!modified &&
+            static_cast<const Bus&>(bus).memoryAt(static_cast<u32>(at), 32))
+            return; // an unmodified copy of plain storage says nothing
+        other[static_cast<u32>(at)] = {bytes, modified};
+    };
+    for (const Cpu::L2Line& e : cpu.l2)
+        if (e.v)
+            note(static_cast<u64>(e.tag) << 5, e.b, e.d);
+    for (u32 s = 0; s < 128; ++s)
+        for (u32 k = 0; k < 8; ++k) {
+            const u32 tv = cpu.l1x[s].tv[k];
+            if (tv & 1u)
+                note((static_cast<u64>(tv >> 1) << 12) | (s << 5),
+                     cpu.l1d[s][k].b, cpu.l1d[s][k].d);
+        }
+
+    u64 g = fnv1a(w.buf.data(), w.cacheAt);
+    for (const auto& [at, e] : other) {
+        const u32 head[2] = {at, e.modified ? 1u : 0u};
+        g = fnv1a(head, sizeof head, g);
+        g = fnv1a(e.bytes, 32, g);
+    }
+    // The rest of the stream, the big blocks eight bytes at a step, and main
+    // memory as it READS: its own bytes, with each modified block in place
+    // of the 32 under it. Nothing is written anywhere.
+    size_t at = w.cacheEnd;
+    for (size_t k = 0; k < w.bigs.size(); ++k) {
+        const SnapWriter::Big& b = w.bigs[k];
+        if (b.at < w.cacheEnd)
+            continue;
+        g = fnv1a(w.buf.data() + at, b.at - at, g);
+        at = b.at;
+        if (k != w.ramBig) {
+            g = hashWords(b.p, b.n, g);
+            continue;
+        }
+        size_t done = 0;
+        for (const auto& [pa, e] : ram) {
+            g = hashWords(b.p + done, pa - done, g);
+            g = hashWords(e.bytes, 32, g);
+            done = static_cast<size_t>(pa) + 32u;
+        }
+        g = hashWords(b.p + done, b.n - done, g);
+    }
+    f.guest = fnv1a(w.buf.data() + at, w.buf.size() - at, g);
+    return f;
 }
 
 bool writeSnapshotFile(const char* path, const std::vector<u8>& blob)

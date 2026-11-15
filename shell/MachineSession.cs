@@ -596,6 +596,11 @@ public sealed class MachineSession
             // be, which instruction pacing cannot be.
             if (s.Realtime)
                 Native.opm_set_realtime(m, 1);
+            if (s.ExactCaches)
+            {
+                Native.opm_set_exact_caches(m, 1);
+                ConsoleQ.Enqueue("[shell] the processor's caches are modeled in full (ExactCaches)\n");
+            }
 
             // Report the CD from the DRIVE, not from the setting: attach can
             // refuse the image (a cue sheet naming a missing .bin, a .dmg in

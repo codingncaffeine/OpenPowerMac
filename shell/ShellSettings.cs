@@ -79,6 +79,13 @@ public sealed class ShellSettings
     // advance. Turn it off only for a deterministic run.
     public bool Realtime { get; set; } = true;
 
+    // Model the processor's L1 and L2 caches on every load and store, even
+    // once the guest runs them in their normal mode. Off, memory is then read
+    // directly, which is faster and no different to Mac OS; the firmware's
+    // cache tests get the model either way. On is the control: a fault that
+    // goes away with it is a fault in the direct path.
+    public bool ExactCaches { get; set; }
+
     // Extra timebase cycles per instruction, used when Realtime is off: the
     // machine advances the timebase (1 + FastTb)/4 ticks per instruction.
     //

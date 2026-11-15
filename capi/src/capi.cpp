@@ -929,7 +929,9 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  "-- card engine thread: %s; %llu stream(s) handed over, "
                  "%llu packets there, %llu here; the guest waited %llu "
                  "time(s), %.1f ms, %llu packets; it stopped for this "
-                 "thread %llu time(s); %llu FIFO words queued behind it\n",
+                 "thread %llu time(s); %llu FIFO words queued behind it; "
+                 "handed-over work was on the card %.1f ms, its thread "
+                 "executing %.1f ms\n",
                  r128AsyncEnabled() ? "on" : "off",
                  static_cast<unsigned long long>(as.handOffs),
                  static_cast<unsigned long long>(as.workerPkts),
@@ -937,7 +939,8 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  static_cast<unsigned long long>(as.drains), as.drainNs / 1e6,
                  static_cast<unsigned long long>(as.drainPkts),
                  static_cast<unsigned long long>(as.services),
-                 static_cast<unsigned long long>(as.inboxWords));
+                 static_cast<unsigned long long>(as.inboxWords),
+                 as.busyNs / 1e6, as.workNs / 1e6);
         s += b;
     }
     // 📓 WHAT IT HAS BEEN DOING, not just where it stopped. A handler entered

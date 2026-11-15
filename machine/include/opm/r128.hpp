@@ -788,6 +788,11 @@ struct R128AsyncStats {
     u64 drainPkts = 0;  // ...and how many packets the looking thread ran
     u64 services = 0;   // times the engine stopped for the machine's thread
     u64 inboxWords = 0; // FIFO words queued behind a running engine
+    // How long the card had handed-over work on it, from each hand-off to
+    // the moment nothing was left: what a guest that polls for its own
+    // marker in the stream (and so never "waits" above) is waiting through.
+    // And how long the engine's thread itself was executing.
+    u64 busyNs = 0, workNs = 0;
 };
 const R128AsyncStats& r128AsyncStats();
 // --no-ati-2d: put the card back the way it was before the engine existed,

@@ -903,6 +903,9 @@ struct Async {
     bool started = false;     // the machine's thread only
     std::thread th;
     R128AsyncStats st;
+    // When the busy flag last rose (under engMu, as its rise and fall are).
+    std::chrono::steady_clock::time_point busySince{};
+    bool busyTimed = false;
     u32 cause = kR128DrainOther; // the machine's thread only
     std::map<u32, R128DrainCause> causes;
     ~Async()
@@ -2024,6 +2027,13 @@ static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
                 gCceDepth = 64; // each of these was a guest-visible entry
                 continue;
             }
+            if (gAsync.busyTimed) {
+                gAsync.busyTimed = false;
+                gAsync.st.busyNs += static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - gAsync.busySince)
+                        .count());
+            }
             gR128AsyncBusy.store(false, std::memory_order_release);
             break;
         }
@@ -2168,8 +2178,13 @@ void asyncWorkerMain()
         });
         if (gAsync.quit)
             return;
-        if (cceRun(*gAsync.cell, gAsync.mem, CceMode::Worker) ==
-            CceRun::NeedsEmu)
+        const auto t0 = std::chrono::steady_clock::now();
+        const CceRun how = cceRun(*gAsync.cell, gAsync.mem, CceMode::Worker);
+        gAsync.st.workNs += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        if (how == CceRun::NeedsEmu)
             gR128AsyncNeedsEmu.store(true);
         // Empty: the run let the busy flag fall itself. Yield: the wait
         // above gives the lock up until the request is withdrawn.
@@ -2230,6 +2245,8 @@ void asyncSubmit(R128Cell& c, const CceMem& m)
     {
         std::lock_guard<std::mutex> lk(gAsync.engMu);
         asyncRelease(c, m);
+        gAsync.busySince = std::chrono::steady_clock::now();
+        gAsync.busyTimed = true;
         gR128AsyncBusy.store(true, std::memory_order_release);
     }
     gAsync.engCv.notify_one();
@@ -2296,6 +2313,7 @@ void r128AsyncAbandon(const R128Cell* c)
     {
         std::lock_guard<std::mutex> ib(gAsync.inboxMu);
         gAsync.inbox.clear();
+        gAsync.busyTimed = false;
         gR128AsyncBusy.store(false, std::memory_order_release);
     }
     gR128AsyncNeedsEmu.store(false);

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.codingncaffeine.OpenPowerMac</id>
+  <name>OpenPowerMac</name>
+  <summary>Power Macintosh G4 emulator written from scratch</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.codingncaffeine">
+    <name>codingncaffeine</name>
+  </developer>
+  <description>
+    <p>
+      OpenPowerMac emulates the Power Mac G4 (AGP Graphics): a PowerPC G4 processor with AltiVec,
+      the board's storage, USB and sound, and a Rage 128 Pro graphics card with 2D and 3D
+      acceleration, written from scratch from public documentation. It starts Mac OS 9 from an
+      installation CD, installs it on a disk it creates, and runs it from there, 3D games included.
+    </p>
+    <p>
+      OpenPowerMac contains no original Macintosh code. You supply the Boot ROM of the machine you
+      own, the graphics card's ROM and your own system disks. Files and folders dropped on the
+      window appear in the Mac with no restart.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.codingncaffeine.OpenPowerMac.desktop</launchable>
+  <url type="homepage">https://github.com/codingncaffeine/OpenPowerMac</url>
+  <url type="bugtracker">https://github.com/codingncaffeine/OpenPowerMac/issues</url>
+  <categories>
+    <category>System</category>
+    <category>Emulator</category>
+  </categories>
+  <provides>
+    <binary>openpowermac</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.0.3" date="2026-11-15">
+      <description>
+        <p>First alpha release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenPowerMac
+GenericName=Power Macintosh Emulator
+Comment=Emulates the Power Mac G4 (AGP Graphics) and runs Mac OS 9
+Exec=openpowermac
+Icon=openpowermac
+Terminal=false
+Categories=System;Emulator;
+Keywords=mac;macintosh;powermac;powerpc;g4;emulator;
+StartupWMClass=OpenPowerMac

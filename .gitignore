@@ -52,6 +52,10 @@ gui/bin/
 gui/obj/
 gui/native/
 
+# Release artifacts and the cached SDL3 build (packaging/build-release.sh)
+/packaging/out/
+/packaging/cache/
+
 # The runnable dev build (tools/build.sh) and local work files
 /bin/
 /scratch/

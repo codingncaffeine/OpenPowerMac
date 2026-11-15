@@ -1188,6 +1188,30 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                          : "written: the value is being lost or overwritten");
             s += b;
         }
+        // The video side of the card, which this model does not have: the
+        // overlay and its scaler (OV0_*, 0400-05FF), the capture port and
+        // the rest of the multimedia block (0900-09FF bar the surface
+        // registers the 3D unit reads), the front-end scaler's own registers
+        // (SCALE_*, 1A04-1AFF). A guest that plays video through them shows
+        // up here by name and count; an empty list means it drew its frames
+        // with the ordinary 2D operations.
+        {
+            std::string video;
+            for (const auto& [off, n] : a.writeCount) {
+                const bool overlay = off >= 0x0400u && off <= 0x05FFu;
+                const bool capture = off >= 0x0900u && off <= 0x09FFu;
+                const bool scaler = off >= 0x1A04u && off <= 0x1AFFu;
+                if (!overlay && !capture && !scaler)
+                    continue;
+                const char* nm = r128RegName(off);
+                snprintf(b, sizeof b, " %04x %s x%llu;", off,
+                         nm ? nm : "(unnamed)",
+                         static_cast<unsigned long long>(n));
+                video += b;
+            }
+            s += "-- overlay, capture and scaler registers written:" +
+                 (video.empty() ? std::string(" none") : video) + "\n";
+        }
         // 🔎 …AND WHAT THE GUEST ASKED FOR THAT NOTHING HERE READS: the
         // control bits it set outside what this model decodes, and the
         // values of the multi-valued settings its draws used, each marked

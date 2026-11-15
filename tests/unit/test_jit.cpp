@@ -879,3 +879,40 @@ TEST_CASE("jit chain: --no-jit-chain is v1 (control run, twins still match)")
     if (ji.cpu.jit)
         CHECK(ji.cpu.jitChainHops == 0);
 }
+
+TEST_CASE("jit direct: a floating-point operation that traps leaves the counts settled")
+{
+    // An enabled floating-point exception leaves the block from inside a
+    // called handler, with instructions before it in the block still counted
+    // only in the block's own register. They have to reach the instruction
+    // count and the clock on the way out, as every other exit's do.
+    const u32 fadds = 59u << 26 | 4u << 21 | 1u << 16 | 2u << 11 | 21u << 1;
+    std::vector<u32> prog = {
+        dform(14, 3, 3, 1), dform(14, 3, 3, 1), fadds, dform(14, 4, 4, 1),
+        dform(14, 4, 4, 1), dform(14, 4, 4, 1), dform(14, 4, 4, 1), b(0),
+    };
+    for (const bool fullGate : {false, true}) {
+    CAPTURE(fullGate);
+    Twin ji(true), in(false);
+    ji.cpu.jitFullGate = fullGate; // both forms of the handler call
+    for (Twin* t : {&ji, &in}) {
+        t->poke(prog);
+        // The program exception's handler: count, and stay.
+        t->bus.write32(0x700, dform(14, 5, 5, 1));
+        t->bus.write32(0x704, b(-4));
+        t->cpu.st.msr = msr::FP | msr::FE0;         // vectors at 0x00000700
+        t->cpu.st.fpscr = 0x00000008u;              // XE: inexact is enabled
+        t->cpu.st.fpr[1] = 0x3FF0000000000000ull;   // 1.0
+        t->cpu.st.fpr[2] = 0x3E10000000000000ull;   // 2^-30: the sum is inexact
+    }
+    ji.run(20);
+    in.run(20);
+    CHECK(in.cpu.st.srr0 == kBase + 8u); // it did trap, at the fadds
+    CHECK(in.cpu.st.gpr[4] == 0u);
+    CHECK_TWINS(ji, in);
+    CHECK(ji.cpu.st.srr0 == in.cpu.st.srr0);
+    CHECK(ji.cpu.st.srr1 == in.cpu.st.srr1);
+    CHECK(ji.cpu.st.fpscr == in.cpu.st.fpscr);
+    CHECK(ji.cpu.st.fpr[4] == in.cpu.st.fpr[4]);
+    }
+}

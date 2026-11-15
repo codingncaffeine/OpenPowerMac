@@ -708,6 +708,18 @@ struct Compiler {
         e.cmpEaxI(nextVa);
         e.jccTo(CC_NE, epi);
     }
+    // The same where instructions are still counted only in rbx: they are
+    // settled on the way out. (The pc is the handler's own: an exception's
+    // vector.)
+    void pcCheckSettling(u32 nextVa)
+    {
+        e.loadR(RAX, o.pc);
+        e.cmpEaxI(nextVa);
+        const size_t okJ = e.j8(CC_E);
+        flushNoPc();
+        e.jmpTo(epi);
+        e.patch8(okJ);
+    }
 
     // CR field from the FLAGS of a just-executed cmp/test: call zero3()
     // BEFORE the compare (xor clobbers flags), crInsert after. Mirrors
@@ -1085,6 +1097,10 @@ struct Compiler {
         // The line executor's exit tests, exactly as the generic path runs
         // them. (The instruction count is already carried: bump/chargeInc
         // above did what the generic path's `inc [r14]` does after execRow.)
+        // Every one of them leaves the block, so what rbx still holds is
+        // settled first.
+        if (keepBatch)
+            flushNoPc();
         byteCheck(o.halted);
         byteCheck(o.batchBreak);
         pcCheck(nextVa);
@@ -1142,7 +1158,7 @@ struct Compiler {
         e.callAbs(fn);
         if (keepBatch) {
             bump();
-            pcCheck(nextVa);
+            pcCheckSettling(nextVa); // a trap leaves with rbx still counting
         } else {
             chargeInc();
             byteCheck(o.batchBreak); // halt() sets it too

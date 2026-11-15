@@ -3233,6 +3233,30 @@ void R128Cell::ddcStep(bool scl, bool sda)
 
 // --- The scan-out (see the header for why this is the ONE copy) ------------
 
+// A tube of gamma 2.6 shown on an sRGB screen: entry t is
+// round(255 * sRGB((t / 255) ^ 2.6)), sRGB being IEC 61966-2-1's encoding
+// (12.92 L below 0.0031308, else 1.055 L^(1/2.4) - 0.055). Kept as numbers,
+// not computed: the picture is then the same on every host's maths library.
+static const u8 kMonitorCurve[256] = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   1,   1,   1,   1,   2,   2,
+      2,   3,   3,   4,   4,   5,   6,   6,   7,   8,   9,  10,  11,  12,  12,  13,
+     14,  15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,
+     30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,  42,  43,  44,  45,
+     46,  47,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,  58,  59,  61,  62,
+     63,  64,  65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,  77,  78,
+     79,  80,  81,  83,  84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,
+     96,  97,  98, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
+    113, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 128, 129, 130,
+    131, 132, 133, 134, 135, 136, 137, 138, 140, 141, 142, 143, 144, 145, 146, 147,
+    148, 149, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 162, 163, 164, 165,
+    166, 167, 168, 169, 170, 172, 173, 174, 175, 176, 177, 178, 179, 180, 182, 183,
+    184, 185, 186, 187, 188, 189, 191, 192, 193, 194, 195, 196, 197, 198, 199, 201,
+    202, 203, 204, 205, 206, 207, 208, 210, 211, 212, 213, 214, 215, 216, 217, 219,
+    220, 221, 222, 223, 224, 225, 227, 228, 229, 230, 231, 232, 233, 234, 236, 237,
+    238, 239, 240, 241, 242, 244, 245, 246, 247, 248, 249, 250, 252, 253, 254, 255,
+};
+const u8* r128MonitorCurve() { return kMonitorCurve; }
+
 R128Scan r128ScanDecode(const R128Cell& c)
 {
     R128Scan s;
@@ -3257,6 +3281,12 @@ R128Scan r128ScanDecode(const R128Cell& c)
     default: s.bypp = 0; break;
     }
     s.rowBytes = s.pitch8 * 8u * s.bypp;
+    for (u32 i = 0; i < 256u; ++i) {
+        const u32 e = c.pal(i);
+        s.lut[0][i] = kMonitorCurve[(e >> 16) & 0xFFu];
+        s.lut[1][i] = kMonitorCurve[(e >> 8) & 0xFFu];
+        s.lut[2][i] = kMonitorCurve[e & 0xFFu];
+    }
     return s;
 }
 
@@ -3281,13 +3311,13 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
         const size_t o = row + size_t(x) * s.bypp;
         if (s.bypp && o + s.bypp <= vr.size()) {
             switch (s.fmt) {
-            case 2u: {
-                const u32 p = c.pal(vr[o]);
-                r = static_cast<u8>(p >> 16);
-                g = static_cast<u8>(p >> 8);
-                b = static_cast<u8>(p);
+            // In every format the three values are TABLE INDICES, looked up
+            // once the switch is done (see "The DAC's table" in the header):
+            // the pixel itself in 8 bpp, a channel with zeros below it in
+            // the narrow formats.
+            case 2u:
+                r = g = b = vr[o];
                 break;
-            }
             // ⭐ THE BYTE ORDER IS A LESSON ALREADY PAID FOR. A Mac 32-bpp
             // pixel is big-endian xRGB: byte 0 is the unused/alpha lane and
             // R, G, B follow. Reading bytes 0,1,2 as B,G,R put the unused
@@ -3307,11 +3337,9 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
                 r = static_cast<u8>(((v >> 10) & 0x1Fu) << 3);
                 g = static_cast<u8>(((v >> 5) & 0x1Fu) << 3);
                 b = static_cast<u8>((v & 0x1Fu) << 3);
-                // Replicate the top bits into the low ones so full-scale
-                // 0x1F reads 0xFF, not 0xF8 — otherwise white is dim grey.
-                r |= r >> 5;
-                g |= g >> 5;
-                b |= b >> 5;
+                // Zeros below, as the chip indexes its table: full scale is
+                // entry 0xF8, and what that entry holds is the driver's
+                // business (Mac OS's ramp has 250 there).
                 break;
             }
             case 4u: { // RGB565
@@ -3319,9 +3347,6 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
                 r = static_cast<u8>(((v >> 11) & 0x1Fu) << 3);
                 g = static_cast<u8>(((v >> 5) & 0x3Fu) << 2);
                 b = static_cast<u8>((v & 0x1Fu) << 3);
-                r |= r >> 5;
-                g |= g >> 6;
-                b |= b >> 5;
                 break;
             }
             case 5u: // RGB888, big-endian: R,G,B
@@ -3337,9 +3362,9 @@ void r128ScanRow(const R128Cell& c, const R128Scan& s, u32 y, u8* out)
             default: break;
             }
         }
-        out[x * 4 + 0] = b;
-        out[x * 4 + 1] = g;
-        out[x * 4 + 2] = r;
+        out[x * 4 + 0] = s.lut[2][b];
+        out[x * 4 + 1] = s.lut[1][g];
+        out[x * 4 + 2] = s.lut[0][r];
         out[x * 4 + 3] = 0xFF;
     }
 }
@@ -3387,10 +3412,11 @@ void r128ScanCursor(const R128Cell& c, const R128Scan& s, u8* bgra)
                 px[1] = static_cast<u8>(~px[1]);
                 px[2] = static_cast<u8>(~px[2]);
             } else {
+                // Past the table, through the monitor: see the header.
                 const u32 p = clr[(xbits & bit) ? 1 : 0];
-                px[0] = static_cast<u8>(p);
-                px[1] = static_cast<u8>(p >> 8);
-                px[2] = static_cast<u8>(p >> 16);
+                px[0] = kMonitorCurve[p & 0xFFu];
+                px[1] = kMonitorCurve[(p >> 8) & 0xFFu];
+                px[2] = kMonitorCurve[(p >> 16) & 0xFFu];
             }
             px[3] = 0xFF;
         }

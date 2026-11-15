@@ -248,6 +248,29 @@ const std::map<u32, u64>& r128RegReadsUnbacked();
 //
 // Free functions, deliberately: a member would change sizeof(R128Cell) and
 // therefore sizeof(SawtoothBus), which the snapshot layout digest hashes.
+//
+// THE DAC'S TABLE, AND THE MONITOR BEHIND IT. Every pixel goes to the DAC
+// through the 256-entry table (PALETTE_INDEX / PALETTE_DATA), in every mode:
+// in 8 bpp the pixel is the index, and in the direct-colour modes each
+// channel indexes its own third of the entry. That is where Mac OS keeps its
+// gamma ramp (entry 128 holds 158), and where a game fades the screen, by
+// loading the ramp scaled down a step at a time.
+//
+// How a channel narrower than eight bits indexes the table is in none of the
+// manuals; a driver's usage pins it. Linux's aty128fb, the driver these
+// machines ran, writes exactly one entry for each value of a 5-bit channel,
+// at value * 8, and one for each value of the 6-bit green, at value * 4. So
+// the index is the channel's bits with zeros below them, and white in
+// thousands of colours is entry 248, not 255.
+//
+// What leaves the DAC drives a monitor, and the ramp was computed for one:
+// it is close to a 1/1.44 power, which on a tube of gamma 2.6 gives the Mac's
+// 1.8. A host screen is not that tube, so the last stage is the monitor: the
+// light a 2.6 tube makes of the value, expressed in the host's sRGB
+// (r128MonitorCurve). Net: the Mac's own tone, mid-grey 128 shown as 146.
+// The hardware cursor's two colours are "always 24 bpp, independent of
+// graphics mode" (guide, CUR_CLR0): they reach the DAC without the table,
+// and the monitor like everything else.
 struct R128Scan {
     bool enabled = false; // CRTC_GEN_CNTL bit 25: CRTC_EN
     u32 fmt = 0;          // CRTC_GEN_CNTL[11:8]: CRTC_PIX_WIDTH
@@ -256,6 +279,10 @@ struct R128Scan {
     u32 offset = 0;       // CRTC_OFFSET: byte address of the top-left pixel
     u32 bypp = 0;         // bytes per pixel; 0 = a format this cannot scan
     u32 rowBytes = 0;     // pitch8 * 8 * bypp
+    // What the screen shows for a table index, per channel (red, green,
+    // blue): the entry's channel, then the monitor. Filled by the decode, so
+    // a row conversion is three lookups a pixel.
+    u8 lut[3][256] = {};
     // CRTC_OFFSET_CNTL bit 15 (CRTC_TILE_EN): the scan-out is reading a
     // TILED surface. This model walks VRAM linearly, so a tiled framebuffer
     // comes out sheared into diagonal bands with scrambled colour — a
@@ -264,6 +291,8 @@ struct R128Scan {
     bool tiled = false;
 };
 R128Scan r128ScanDecode(const R128Cell& c);
+// The monitor stage alone: 256 entries, DAC level to host level.
+const u8* r128MonitorCurve();
 // A short name for the format, for reports: "8bpp CLUT", "15bpp 1555", ...
 const char* r128ScanFmtName(u32 fmt);
 // One display row, VRAM to host BGRA (B,G,R,X=FF per pixel; `out` holds

@@ -19,6 +19,10 @@
 # back with `ati bars: reg=00000000` and zero framebuffer writes — healthy in
 # every other respect, so it read as a finding rather than as a harness fault.
 # The app has always used 1 (shell.json's AtiAt); so does this now.
+# A test run volunteers to be the first thing the kernel kills if the host
+# runs short of memory: a sizing mistake must cost this run, never the
+# desktop's own programs. Inherited by everything started from here.
+echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
 cd "$(dirname "$0")/.." || exit 1
 . tools/paths.sh
 

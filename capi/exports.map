@@ -1,0 +1,6 @@
+/* What leaves the library: the C ABI declared in include/opm/capi.h, and
+   nothing else. */
+{
+  global: opm_*;
+  local: *;
+};

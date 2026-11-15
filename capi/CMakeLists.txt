@@ -8,6 +8,17 @@ if(MSVC)
   target_compile_definitions(opmcapi PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# Only the C ABI leaves the library. Everything else stays inside it, the C++
+# runtime's own instantiations included: a library loaded beside this one in the
+# app's process can then neither take over one of its calls nor have one of its
+# own taken. (Windows exports by name already: OPM_API.)
+if(UNIX AND NOT APPLE)
+  target_link_options(opmcapi PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+  set_property(TARGET opmcapi APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+endif()
+
 # The WPF shell picks the DLL up from shell/native/ (gitignored).
 #
 # MSVC ONLY, and the guard is load-bearing: MinGW is also WIN32, so a

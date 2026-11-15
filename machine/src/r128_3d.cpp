@@ -584,8 +584,20 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
         t.on = u ? ((P.texCntl >> 5) & 1u) && ((P.texCntl >> 4) & 1u)
                  : ((P.texCntl >> 4) & 1u);
         const u32 f = u ? (sp >> 16) : sp;
+        // ⭐ THE WIDTH IS THE PITCH FIELD; THE "SIZE" FIELD IS THE LARGER OF
+        // THE TWO DIMENSIONS. r128_reg.h names the four fields PITCH, SIZE,
+        // HEIGHT and MIN_SIZE and says no more. A driver's own traffic
+        // settles it: over three frames of a game, 3,469 uses of a unit,
+        // SIZE was max(PITCH, HEIGHT) every time, and in 1,012 of them the
+        // texture was taller than wide (PITCH below SIZE): 2 by 16, 8 by 16,
+        // 32 by 128. So SIZE counts the maps (it is the offset slot of the
+        // largest, below, and with MIN_SIZE the number of smaller ones) and
+        // the width in texels is the pitch. Reading SIZE as the width was
+        // right for every square or wide texture and scaled S by the height
+        // for a tall one: its rows ran into each other, which on a light map
+        // is bands of every color.
         t.pitchTex = 1u << log2Field(f, 0);
-        t.wTex = 1u << log2Field(f, 4);
+        t.wTex = t.pitchTex;
         t.hTex = 1u << log2Field(f, 8);
         const u32 szl2 = log2Field(f, 4), minl2 = log2Field(f, 12);
         t.maxLevel = szl2 > minl2 ? szl2 - minl2 : 0;

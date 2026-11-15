@@ -1761,3 +1761,54 @@ TEST_CASE("3d: a triangle's rows drawn by several threads are the rows drawn "
     r128SetRasterThreads(0);
     CHECK(ran == 10u);
 }
+
+TEST_CASE("3d: a texture taller than wide has its width in the pitch field")
+{
+    // TEX_SIZE_PITCH_C for a 2-wide, 4-tall texture as a driver writes it:
+    // pitch 2^1, size 2^2 (the larger dimension: the offset slot and the
+    // number of maps), height 2^2. Eight texels, each its own color, drawn
+    // one texel to a 4x4 block of pixels; reading the size as the width
+    // would take every second column from the next row.
+    Rig3d r;
+    r.dst32();
+    r.openGate();
+    r.fpuSolidBoth();
+    const u32 texel[8] = {0xF800u, 0x07E0u,  // row 0: red, green
+                          0x001Fu, 0xFFFFu,  // row 1: blue, white
+                          0xFFE0u, 0xF81Fu,  // row 2: yellow, magenta
+                          0x07FFu, 0x0000u}; // row 3: cyan, black
+    for (u32 i = 0; i < 8; ++i) {
+        r.c.vram[0x80000u + i * 2u] = static_cast<u8>(texel[i] >> 8);
+        r.c.vram[0x80000u + i * 2u + 1u] = static_cast<u8>(texel[i]);
+    }
+    r.reg(0x1C9Cu, 1u << 4);
+    r.reg(0x1CB0u, (4u << 16) | (1u << 7)); // 565, nearest, one map
+    r.reg(0x1CB8u, 0x0221u);                // pitch 2, size 4, height 4
+    r.reg(0x1CC4u, 0x80000u);               // slot 2: the size's
+    std::vector<u32> v;
+    auto vtxSt = [&](float x, float y, float s, float t) {
+        v.push_back(f2u(x));
+        v.push_back(f2u(y));
+        v.push_back(f2u(0.5f));
+        v.push_back(f2u(1.0f));
+        v.push_back(0xFFFFFFFFu);
+        v.push_back(f2u(s));
+        v.push_back(f2u(t));
+    };
+    vtxSt(0, 0, 0, 0); // 8x16 pixels over the whole map
+    vtxSt(8, 0, 1, 0);
+    vtxSt(0, 16, 0, 1);
+    vtxSt(8, 0, 1, 0);
+    vtxSt(8, 16, 1, 1);
+    vtxSt(0, 16, 0, 1);
+    r.prim(0x9u | 0x80u, 4u, 6u, v);
+    const u32 want[8] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFFFFu,
+                         0xFFFFFF00u, 0xFFFF00FFu, 0xFF00FFFFu, 0xFF000000u};
+    for (u32 ty = 0; ty < 4; ++ty)
+        for (u32 tx = 0; tx < 2; ++tx) {
+            CAPTURE(tx);
+            CAPTURE(ty);
+            CHECK(r.pix32(tx * 4u + 1u, ty * 4u + 1u) == want[ty * 2u + tx]);
+            CHECK(r.pix32(tx * 4u + 2u, ty * 4u + 2u) == want[ty * 2u + tx]);
+        }
+}

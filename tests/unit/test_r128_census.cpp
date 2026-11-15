@@ -106,12 +106,13 @@ TEST_CASE("r128 census: a setting's value is named when a draw uses it, and "
     CHECK(!has(notDrawn(r), "solid (13)")); // drawn: not in the short list
     CHECK(has(r, "8x8 mono (0) NOT DRAWN"));
 
-    // A field whose ZERO is the request: the master control's bit 27.
-    CHECK(!has(notDrawn(r), "on the 3D function"));
+    // A value of ZERO is a value like any other: the master control's bit
+    // 27 was written as one so far, and only that is listed.
+    CHECK(has(r, "leave it (1)"));
+    CHECK(!has(r, "clear it (0)"));
     fill(c, 13u, 0);
     r = r128SettingsReport();
-    CHECK(has(notDrawn(r), "2D master control, on the 3D function"));
-    CHECK(has(notDrawn(r), "clear it (0)"));
+    CHECK(has(r, "clear it (0); leave it (1)"));
 
     r128SettingsReset();
     CHECK(has(r128SettingsReport(), "nothing has been drawn"));

@@ -346,7 +346,8 @@ int main(int argc, char** argv)
     const R128EngStats& es = r128EngStats();
     std::printf("  drawn: %llu triangles (%llu pixels, %llu texture samples), "
                 "%llu 2D operations (%llu pixels); %llu ring and %llu "
-                "indirect words, %llu memory-map misses\n",
+                "indirect words, %llu memory-map misses, %llu 3D register "
+                "writes refused\n",
                 static_cast<unsigned long long>(es.tris),
                 static_cast<unsigned long long>(es.triPixels),
                 static_cast<unsigned long long>(es.texSamples),
@@ -356,7 +357,8 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(es.cceIndWords),
                 static_cast<unsigned long long>(es.cceGartMiss +
                                                 es.vtxGartMiss +
-                                                es.texGartMiss));
+                                                es.texGartMiss),
+                static_cast<unsigned long long>(es.gated3d));
     if (census)
         std::printf("%s%s", r128UndecodedReport(*cell).c_str(),
                     r128SettingsReport().c_str());

@@ -82,9 +82,20 @@ constexpr Setting kSettings[] = {
     {"2D source, through the registers", bit(2),
      "||video memory|host data|host data, byte aligned"},
     {"2D rectangle tiling", bit(0), "off|across|down|across and down"},
-    // DP_GUI_MASTER_CNTL bit 27, at the write: zero is an ACTION (clear the
-    // 3D function and the depth and stencil enables), which is not taken.
-    {"2D master control, on the 3D function", bit(1), "clear it|leave it"},
+    // DP_GUI_MASTER_CNTL bit 27, at the write. Zero is an ACTION: clear the
+    // 3D function and the depth and stencil enables. It is not taken, and
+    // counted as drawn all the same: nothing the 2D engine draws reads those,
+    // and the Mac driver, which asks for it with every 2D operation, sets
+    // them again before it draws in 3D. MEASURED on six recorded scenes of
+    // two games: taking the action through this model's write gate
+    // (r128Eng3dWrite) changed no picture, and refused 16 to 20 of the
+    // driver's own 3D register writes per three frames, because each burst
+    // carries the depth and texture registers ahead of the function. A
+    // driver that ships cannot be losing those on the chip, so the gate as
+    // modelled is stricter than the chip toward this sequence, and the
+    // action stays out until something says what the chip does there.
+    {"2D master control, on the 3D function", bit(0) | bit(1),
+     "clear it|leave it"},
     // ── the 3D pipeline (gatherPipe) ─────────────────────────────────────
     {"3D destination format", bit(3) | bit(4) | bit(6),
      "||8 bpp palette|15 bpp|16 bpp|24 bpp|32 bpp|8 bpp RGB332|Y8|RGB8"},

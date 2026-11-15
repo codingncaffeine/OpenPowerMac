@@ -44,6 +44,32 @@ jobs:
       - name: The app carries the core
         run: test -f gui/bin/Release/net10.0/libopmcapi.so
 
+  # musl: an Alpine user builds from source with Alpine's own compiler and
+  # .NET SDK. Every push proves that still works, and that what was built runs.
+  linux-musl:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    timeout-minutes: 15
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+    steps:
+      - name: Alpine packages
+        run: >
+          apk add --no-cache build-base cmake samurai dotnet10-sdk bash git icu-libs fontconfig
+          ttf-dejavu sdl3 libx11 libice libsm libxi libxfixes libxcursor libxrandr libxext xvfb dbus
+      - uses: actions/checkout@v4
+      - name: Build the core and its tools
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 4
+      - name: Build the Linux app
+        run: dotnet build gui -c Release --nologo
+      - name: The app starts, loads the core and SDL3, and opens its window
+        run: bash tools/headless.sh bash tools/launch-check.sh gui/bin/Release/net10.0/OpenPowerMac
+
   linux-oracle:
     runs-on: ubuntu-latest
     steps:

@@ -394,6 +394,26 @@ OPM_API uint64_t opm_tb(const OpmMachine* m) { return m->cpu.st.tb; }
 // The shared folder: pack a host folder into a classic HFS image the CD
 // slot can serve. Host-side only — the machine is not involved, so the
 // shell calls it before opm_create.
+static int hfsBuildReport(bool ok, std::string& e, std::string& w, char* err,
+                          uint32_t errCap);
+
+OPM_API int opm_hfs_build2(const char* folderUtf8, const char* secondUtf8,
+                           const char* outPathUtf8, const char* volName,
+                           char* err, uint32_t errCap)
+{
+    std::string e, w;
+    std::vector<std::string> folders;
+    if (folderUtf8 && *folderUtf8)
+        folders.emplace_back(folderUtf8);
+    if (secondUtf8 && *secondUtf8)
+        folders.emplace_back(secondUtf8);
+    const bool ok =
+        !folders.empty() && outPathUtf8 &&
+        hfsBuildImage(folders, outPathUtf8,
+                      volName && *volName ? volName : "Shared", e, &w);
+    return hfsBuildReport(ok, e, w, err, errCap);
+}
+
 OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
                           const char* volName, char* err, uint32_t errCap)
 {
@@ -402,6 +422,12 @@ OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
         folderUtf8 && outPathUtf8 &&
         hfsBuildImage(folderUtf8, outPathUtf8,
                       volName && *volName ? volName : "Shared", e, &w);
+    return hfsBuildReport(ok, e, w, err, errCap);
+}
+
+static int hfsBuildReport(bool ok, std::string& e, std::string& w, char* err,
+                          uint32_t errCap)
+{
     // One buffer, two meanings: on failure it names what refused; on
     // success it carries the builder's warnings (files the share left
     // out), empty when the pack was clean. The shell prints either. A
@@ -544,6 +570,11 @@ OPM_API void opm_drop_eject(OpmMachine* m)
 OPM_API int32_t opm_drop_state(const OpmMachine* m)
 {
     return driveState(m->bus->drop());
+}
+
+OPM_API uint32_t opm_drop_guest_ejects(const OpmMachine* m)
+{
+    return m->bus->drop().guestEjects();
 }
 
 OPM_API uint64_t opm_drop_reads(const OpmMachine* m)

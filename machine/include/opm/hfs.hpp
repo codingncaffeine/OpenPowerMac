@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace opm {
 
@@ -65,6 +66,15 @@ struct HfsLimits {
 bool hfsBuildImage(const std::string& folder, const std::string& outPath,
                    const std::string& volName, std::string& err,
                    std::string* warn = nullptr,
+                   const HfsLimits& limits = {});
+// The same volume from several folders, whose items sit side by side at its
+// top level. Every folder named must exist. Within one folder two items with
+// one Mac name are refused, as above; an item of a LATER folder whose name an
+// earlier folder already uses is left out with a line in `warn`, because the
+// folders belong to different owners and neither should stop the other.
+bool hfsBuildImage(const std::vector<std::string>& folders,
+                   const std::string& outPath, const std::string& volName,
+                   std::string& err, std::string* warn = nullptr,
                    const HfsLimits& limits = {});
 
 } // namespace opm

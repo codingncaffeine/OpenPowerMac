@@ -366,6 +366,78 @@ TEST_CASE("hfs: the root carries a Mac volume's own Desktop Folder and Trash")
     fs::remove_all(d);
 }
 
+TEST_CASE("hfs: two folders become one volume, the first keeping a name both use")
+{
+    // The drop box: what was dropped, and a folder lent beside it. Both sit
+    // at the top level; on a name both use, the first folder's item is the
+    // one on the volume, the other is left out and named, and what was
+    // inside the one left out is not on the volume either.
+    const fs::path d = scratchDir();
+    fs::create_directories(d / "dropped" / "Game");
+    fs::create_directories(d / "lent" / "game" / "Inner"); // same Mac name
+    fs::create_directories(d / "lent" / "Tools");
+    writeFile(d / "dropped" / "Game" / "a.txt", {1});
+    writeFile(d / "dropped" / "Read Me", {2, 2});
+    writeFile(d / "lent" / "game" / "Inner" / "lost.txt", {3});
+    writeFile(d / "lent" / "read me", {4, 4, 4, 4}); // same Mac name, a file
+    writeFile(d / "lent" / "Tools" / "t.txt", {5});
+    writeFile(d / "lent" / "Notes", {6});
+    const fs::path img = d / "out.img";
+    std::string err, warn;
+    REQUIRE(hfsBuildImage({(d / "dropped").string(), (d / "lent").string()},
+                          img.string(), "Drop Box", err, &warn));
+    CHECK(warn.find("\"game\"") != std::string::npos);
+    CHECK(warn.find("\"read me\"") != std::string::npos);
+    const Vol v = load(img);
+    const auto recs = walkCatalog(v);
+    for (size_t i = 1; i < recs.size(); ++i)
+        CHECK(keyLess(recs[i - 1], recs[i]));
+    std::map<std::string, int> top; // name -> record type
+    std::map<u32, int> idUses;
+    u32 rootValence = 0;
+    bool lostThere = false, readMeIsFirst = false;
+    for (const auto& r : recs) {
+        if (r.payload[0] == 1)
+            ++idUses[g32(r.payload, 6)];
+        if (r.payload[0] == 2)
+            ++idUses[g32(r.payload, 20)];
+        if (r.parent == 1 && r.payload[0] == 1)
+            rootValence = g16(r.payload, 4);
+        if (r.parent == 2 && (r.payload[0] == 1 || r.payload[0] == 2))
+            top[r.name] = r.payload[0];
+        if (r.name == "lost.txt" || r.name == "Inner")
+            lostThere = true;
+        if (r.parent == 2 && r.name == "Read Me" && r.payload[0] == 2)
+            readMeIsFirst = g32(r.payload, 26) == 2; // data fork length
+    }
+    CHECK(top.size() == 6); // Game, Read Me, Tools, Notes, and its own two
+    CHECK(top.count("Game") == 1);
+    CHECK(top.count("game") == 0);
+    CHECK(top.count("Tools") == 1);
+    CHECK(top.count("Notes") == 1);
+    CHECK(rootValence == 6);
+    CHECK(!lostThere);
+    CHECK(readMeIsFirst);
+    for (const auto& [id, uses] : idUses)
+        CHECK_MESSAGE(uses == 1, "catalog ID " << id << " is used twice");
+    const auto mdb = v.sector(2);
+    CHECK(g32(mdb, 84) == 4); // files: a.txt, Read Me, t.txt, Notes
+    CHECK(g32(mdb, 88) == 4); // folders: Game, Tools, and its own two
+
+    // One folder of the two missing is a refusal, not a smaller volume.
+    CHECK(!hfsBuildImage({(d / "dropped").string(), (d / "nowhere").string()},
+                         img.string(), "Drop Box", err));
+    // The same folders the other way round keep the OTHER items.
+    REQUIRE(hfsBuildImage({(d / "lent").string(), (d / "dropped").string()},
+                          img.string(), "Drop Box", err, &warn));
+    bool innerThere = false;
+    for (const auto& r : walkCatalog(load(img)))
+        if (r.name == "lost.txt")
+            innerThere = true;
+    CHECK(innerThere);
+    fs::remove_all(d);
+}
+
 TEST_CASE("hfs: a shared item named like the volume's own folders is refused")
 {
     // The guest would take it for the volume's Trash and never show it.

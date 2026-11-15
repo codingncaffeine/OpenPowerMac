@@ -571,12 +571,29 @@ std::vector<u8> emptyExtentsTree(u32 fileNodes)
 
 bool hfsBuildImage(const std::string& folder, const std::string& outPath,
                    const std::string& volName, std::string& err,
-                   std::string* warn, const HfsLimits& limits) try {
+                   std::string* warn, const HfsLimits& limits)
+{
+    return hfsBuildImage(std::vector<std::string>{folder}, outPath, volName,
+                         err, warn, limits);
+}
+
+bool hfsBuildImage(const std::vector<std::string>& folders,
+                   const std::string& outPath, const std::string& volName,
+                   std::string& err, std::string* warn,
+                   const HfsLimits& limits) try {
     err.clear();
-    const fs::path root = pathFromUtf8(folder);
     std::error_code ec;
-    if (!fs::is_directory(root, ec)) {
-        err = "not a folder: " + folder;
+    std::vector<fs::path> roots;
+    for (const std::string& folder : folders) {
+        fs::path root = pathFromUtf8(folder);
+        if (!fs::is_directory(root, ec)) {
+            err = "not a folder: " + folder;
+            return false;
+        }
+        roots.push_back(std::move(root));
+    }
+    if (roots.empty()) {
+        err = "no folder was named";
         return false;
     }
     // ── Scan ─────────────────────────────────────────────────────────────
@@ -586,9 +603,18 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
     struct Pending {
         fs::path dir;
         u32 cnid;
+        size_t root; // which of `roots` this is, for a top-level folder
     };
-    std::vector<Pending> stack{{root, 2u}};
+    // The first folder is scanned first (the stack is taken from its end),
+    // so on a name both use, the first folder's item is the one kept.
+    std::vector<Pending> stack;
+    for (size_t k = roots.size(); k-- > 0;)
+        stack.push_back({roots[k], 2u, k});
     u64 totalBytes = 0;
+    // The top level's names, across every folder: fold -> (host name, root).
+    std::map<std::string, std::pair<std::string, size_t>> topSeen;
+    for (const auto& sf : kRootSystemFolders)
+        topSeen[foldName(sf.name)] = {"", 0}; // the volume's own: see above
     while (!stack.empty()) {
         const Pending cur = stack.back();
         stack.pop_back();
@@ -598,9 +624,7 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
         // one key. A clash is refused with both names so the user renames
         // one, rather than one file silently shadowing another.
         std::map<std::string, std::string> seen;
-        if (cur.cnid == 2u)
-            for (const auto& sf : kRootSystemFolders)
-                seen[foldName(sf.name)] = ""; // the volume's own: see above
+        const bool top = cur.cnid == 2u;
         for (fs::directory_iterator it(cur.dir, ec), end; it != end;
              it.increment(ec)) {
             if (ec) {
@@ -619,7 +643,7 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
                 item.cnid = nextCnid++;
                 item.mac = toMacRoman(decodeUtf8(host8));
                 item.host = p;
-                stack.push_back({p, item.cnid});
+                stack.push_back({p, item.cnid, cur.root});
             } else if (it->is_regular_file(ec)) {
                 const u64 sz = static_cast<u64>(it->file_size(ec));
                 item.cnid = nextCnid++;
@@ -676,13 +700,41 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
             if (item.mac.empty())
                 item.mac = "_";
             const std::string folded = foldName(item.mac);
-            auto clash = seen.find(folded);
-            if (clash != seen.end() && clash->second.empty()) {
-                err = "'" + host8 + "' at the top level has the name of a "
-                      "hidden folder every Mac volume keeps there, and would "
-                      "not be shown: rename it";
-                return false;
+            if (top) {
+                auto clash = topSeen.find(folded);
+                if (clash != topSeen.end() && clash->second.first.empty()) {
+                    err = "'" + host8 + "' at the top level has the name of a "
+                          "hidden folder every Mac volume keeps there, and "
+                          "would not be shown: rename it";
+                    return false;
+                }
+                if (clash != topSeen.end() &&
+                    clash->second.second != cur.root) {
+                    // Another folder already gave the volume this name.
+                    if (warn)
+                        *warn += "left out \"" + host8 + "\" of " +
+                                 utf8Of(cur.dir) + ": \"" +
+                                 clash->second.first +
+                                 "\" is already on the volume under that "
+                                 "name\n";
+                    if (item.isDir)
+                        stack.pop_back(); // pushed just above: not scanned
+                    else
+                        totalBytes -= item.dataLen + item.rsrcLen;
+                    continue;
+                }
+                if (clash != topSeen.end()) {
+                    err = "name clash after Mac conversion: '" +
+                          clash->second.first + "' and '" + host8 +
+                          "' are one name on a Mac volume ('" + item.mac +
+                          "', case ignored)";
+                    return false;
+                }
+                topSeen[folded] = {host8, cur.root};
+                items.push_back(std::move(item));
+                continue;
             }
+            auto clash = seen.find(folded);
             if (clash != seen.end()) {
                 err = "name clash after Mac conversion: '" + clash->second +
                       "' and '" + host8 + "' are one name on a Mac volume ('" +

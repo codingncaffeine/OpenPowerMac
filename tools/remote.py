@@ -108,6 +108,7 @@ opm_frame_record_state = fn("opm_frame_record_state", u32, P, ctypes.c_char_p, u
 opm_drop_swap = fn("opm_drop_swap", i32, P, ctypes.c_char_p)
 opm_drop_state = fn("opm_drop_state", i32, P)
 opm_drop_reads = fn("opm_drop_reads", u64, P)
+opm_drop_guest_ejects = fn("opm_drop_guest_ejects", u32, P)
 opm_run = fn("opm_run", u64, P, u64)
 opm_halted = fn("opm_halted", i32, P)
 opm_powered_off = fn("opm_powered_off", i32, P)
@@ -362,7 +363,8 @@ def do(line):
                 return f"no such image: {arg}"
             said = "handed over; " if opm_drop_swap(m, enc(arg)) else "REFUSED; "
         st = opm_drop_state(m)
-        return f"{said}{names[st] if 0 <= st < len(names) else st}, {opm_drop_reads(m)} blocks read"
+        return (f"{said}{names[st] if 0 <= st < len(names) else st}, {opm_drop_reads(m)} blocks read, "
+                f"put away by the guest {opm_drop_guest_ejects(m)} time(s)")
     if cmd == "wav":
         if state["wav"]:
             state["wav"].close(); state["wav"] = None

@@ -151,6 +151,13 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap);
 OPM_API int opm_hfs_build(const char* folderUtf8, const char* outPathUtf8,
                           const char* volName, char* err,
                           uint32_t errCap);
+// The same volume from two folders: the items of both sit side by side at its
+// top level. Either may be null or empty (then it is left out). An item of
+// the second folder whose name the first already uses is left out and named
+// in the warnings; the volume is still built.
+OPM_API int opm_hfs_build2(const char* folderUtf8, const char* secondUtf8,
+                           const char* outPathUtf8, const char* volName,
+                           char* err, uint32_t errCap);
 
 // 📥 The drop box: a second CD-class drive on the Sawtooth's third ATA
 // channel (ata-3@21000 — the Zip bay on the real board), whose disc is an
@@ -185,6 +192,9 @@ OPM_API int32_t opm_drop_swap(OpmMachine* m, const char* imgPath);
 OPM_API void opm_drop_eject(OpmMachine* m);
 OPM_API int32_t opm_drop_state(const OpmMachine* m);
 OPM_API uint64_t opm_drop_reads(const OpmMachine* m);
+// How many times the guest itself has put the drop volume away (its own
+// eject command) since the machine was created or last restarted.
+OPM_API uint32_t opm_drop_guest_ejects(const OpmMachine* m);
 OPM_API uint32_t opm_drop_error(const OpmMachine* m, char* buf, uint32_t cap);
 
 // 💿 Whether a CD is actually in the drive, and if attach refused, why.

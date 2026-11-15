@@ -2430,7 +2430,8 @@ int main(int argc, char** argv)
                frameRecPath);
     }
     if (bench)
-        while (executed < maxInsns && !cpu.halted) {
+        while (executed < maxInsns && !cpu.halted &&
+               !bus.pmuHost().powerOff) {
             // The scripted pointer advances between batches: a batch is
             // bounded by the next device deadline (the vblank at the
             // longest), so stage latency stays under a frame.
@@ -2488,7 +2489,8 @@ int main(int argc, char** argv)
     // Everything from here on reads the card as a finished thing.
     bus.atiDrain();
     r128AsyncEnable(false);
-    while (!bench && executed < maxInsns && !cpu.halted) {
+    while (!bench && executed < maxInsns && !cpu.halted &&
+           !bus.pmuHost().powerOff) {
         const u32 pc = cpu.st.pc;
         // A machine that cannot restart. Open Firmware's `reset-all` sends
         // PMU_RESET and then spins until the world comes back; without this
@@ -6223,6 +6225,11 @@ int main(int argc, char** argv)
             }
         }
     }
+    // The guest's Shut Down ends the run: it asked the PMU to cut the power
+    // and waits for that in a loop there is nothing to learn from.
+    if (bus.pmuHost().powerOff)
+        printf("-- PMU power off @%llu: the guest shut the machine down\n",
+               static_cast<unsigned long long>(executed));
     {
         const auto& pl = bus.pmu().log;
         u64 cmdCount[256] = {};

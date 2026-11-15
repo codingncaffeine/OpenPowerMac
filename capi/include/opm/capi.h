@@ -95,6 +95,12 @@ OPM_API uint32_t opm_frame_record_state(const OpmMachine* m, char* buf,
 // discs — so this is only for a front end that wants to say it happened.
 OPM_API uint64_t opm_restarts(const OpmMachine* m);
 
+// 🔌 Whether the guest turned the machine off (Special > Shut Down: Mac OS
+// puts its volumes away and then asks the PMU to cut the power). From then on
+// opm_run runs nothing. A front end ends its session and destroys the
+// machine, which closes the disc images; the next start is a new machine.
+OPM_API int32_t opm_powered_off(const OpmMachine* m);
+
 // How many times the machine could not keep up and the debt was forgiven. A
 // run with many slips is not running at real time and its tick rate is a lie.
 OPM_API uint64_t opm_rt_slips(const OpmMachine* m);

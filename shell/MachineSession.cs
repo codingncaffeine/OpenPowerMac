@@ -564,6 +564,18 @@ public sealed class MachineSession
                     break;
                 }
 
+                // 🔌 Special ▸ Shut Down. Mac OS has put its volumes away
+                // and asked the machine to turn itself off; it is waiting in
+                // a loop for that and would wait forever. The session ends
+                // as it does on Stop, which closes the disc images, so the
+                // next start finds a disk that was shut down properly.
+                if (Native.opm_powered_off(m) != 0)
+                {
+                    ConsoleQ.Enqueue($"\n[shell] the guest shut the machine down @{executed:N0}\n");
+                    reason = "shut down";
+                    break;
+                }
+
                 // A restart the guest asked for (Special ▸ Restart, the end
                 // of an installation) is carried out inside opm_run. Say so:
                 // the screen keeps its last picture until the firmware has

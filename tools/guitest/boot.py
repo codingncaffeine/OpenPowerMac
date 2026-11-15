@@ -4,7 +4,7 @@
     tools/headless.sh python3 tools/guitest/boot.py --rom FILE --ati-rom FILE
         [--hard-disk FILE] [--cd FILE] [--ram MB] [--seconds N] [--shots DIR] [--sound]
         [--mouse] [--keys] [--cd-later FILE] [--app FILE]
-        [--drop-box DIR] [--drop-later DIR]
+        [--drop-box DIR] [--drop-later DIR] [--shutdown]
 
 Writes a scratch shell.json (never the real profile: it refuses to run outside
 tools/headless.sh), copies the hard disk into the scratch profile so the
@@ -17,7 +17,9 @@ the guest's picture must change where its cursor moved. With --keys it also
 presses a key while captured and then asks for Machine > Diagnostics, whose
 USB section must show the guest taking the keyboard's reports. With --cd-later
 it chooses a CD image from the File menu while the machine runs, through the
-file dialog, and the console must say the guest mounted it. Passes when the
+file dialog, and the console must say the guest mounted it. With --shutdown
+it shuts the guest down from the guest's own dialog; the machine must stop by
+itself and the window stay open. Passes when the
 window shows a guest picture by the end, the mouse moved the guest's cursor
 if asked, the app exits by itself after File > Exit, and its log holds no
 error.
@@ -51,6 +53,9 @@ ap.add_argument("--drop-later", metavar="DIR",
                      "user would; the console must report its volume packed and mounted, with no new start")
 ap.add_argument("--keys", action="store_true",
                 help="with --mouse: while captured, press a key; the guest must take the keyboard reports")
+ap.add_argument("--shutdown", action="store_true",
+                help="at the end: shut the guest down from its own dialog (the keyboard's power key, then "
+                     "Return); the machine must stop by itself and the window stay open")
 ap.add_argument("--app", default=os.path.join(ROOT, "bin", "openpowermac"))
 a = ap.parse_args()
 
@@ -187,6 +192,32 @@ if a.mouse:
                            before, after, "null:"], capture_output=True, text=True)
     moved = int(float((diff.stderr.strip().split() or ["0"])[0]))
     print(f"boot test: pixels changed by the mouse = {moved}")
+shut_ok = None
+if a.shutdown:
+    # The guest's own Shut Down, asked for the way a Mac's keyboard asks: the
+    # power key brings up "shut down now?", whose default button is Shut Down.
+    # (X key code 124 is the kernel's KEY_POWER; no keymap is consulted.) A
+    # program still open may ask once more before it quits: a second Return.
+    click(520, 340); time.sleep(1.0)    # capture
+    xtest.fake_input(d, X.KeyPress, 124); xtest.fake_input(d, X.KeyRelease, 124); d.sync()
+    time.sleep(8.0); shot("93-power-key")
+    key("Return"); time.sleep(16.0); shot("94-after-return")
+    key("Return")
+    t1 = time.time(); shut_ok = False
+    console_path = os.path.join(os.path.dirname(log_path), "console.log")
+    while time.time() - t1 < 90:
+        time.sleep(3)
+        try:
+            if "the guest shut the machine down" in open(console_path, errors="replace").read():
+                shut_ok = True; break
+        except OSError:
+            pass
+    time.sleep(2.0); shot("95-shut-down")
+    # The machine stopped itself; the window is still there, and Start is
+    # offered again. The capture went with the session.
+    shut_ok = shut_ok and app.poll() is None
+    print("boot test: guest Shut Down: " + ("the machine STOPPED by itself, the window stayed"
+                                            if shut_ok else "the machine did NOT stop"))
 # File > Exit by mouse, the way a user quits: while the machine runs, Alt goes
 # to the guest (Command), so Alt+F is not a way into the menu. The window sits
 # at the server's origin with no window manager; File is the first menu title.
@@ -248,6 +279,6 @@ if a.keys:
     print(f"boot test: keyboard handed over {injected} event(s), the guest took {delivered} report(s): "
           + ("TAKEN" if keys_ok else "NOT TAKEN"))
 ok = (exited and colors > 40 and not errors and (moved is None or moved > 0) and keys_ok is not False
-      and cd_ok is not False and drop_ok is not False)
+      and cd_ok is not False and drop_ok is not False and shut_ok is not False)
 print("boot test:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

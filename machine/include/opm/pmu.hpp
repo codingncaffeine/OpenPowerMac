@@ -25,6 +25,16 @@ struct SnapReader;
 // fingerprint stands.
 struct PmuHost {
     bool rtcSet = false;
+    // 🔌 THE GUEST TURNED THE MACHINE OFF. PMU_SHUTDOWN (0x7E, with its four
+    // signature bytes) is the last thing Mac OS does after Special > Shut
+    // Down: it has put its volumes away, it asks the PMU to cut the power,
+    // and it waits for that in a loop that never ends. A board cannot cut
+    // its own power; the session that owns the board can stop running it and
+    // close its discs, which is the same thing to the guest. Set here, where
+    // a front end reads it, and never cleared: off is off, and the next
+    // power-on is a new machine. (It sits in the padding after rtcSet, so
+    // nothing a snapshot's layout digest measures has moved.)
+    bool powerOff = false;
     u32 rtcSeconds = 0; // the clock's reading…
     u64 rtcAtTb = 0;    // …at this timebase value
     // The timebase runs at 25 MHz (bus / 4), paced from the host in the app,
@@ -55,6 +65,16 @@ struct PmuHost {
 // bytes on receive edges, and LOGS everything — the boot ROM's framing
 // behavior against this shell is what pins the command set. Replies are
 // generated for the commands the boot demands, added as they surface.
+// How a command is framed on the wire: the bytes the host sends after the
+// command byte, and the bytes the PMU answers. -1 = a count byte comes first
+// and says how many follow. The PMU99's own table, as the Linux driver keeps
+// it (drivers/macintosh/via-pmu.c, pmu_data_len); the guest's stream agrees
+// wherever it has been watched (0x30 four bytes, 0x31 twenty, 0x38 four back).
+struct PmuLen {
+    int send, reply;
+};
+PmuLen pmuCommandLen(u8 cmd);
+
 class PmuVia {
 public:
     u8 read(u32 off, u64 now);        // off: 0..0x1FFF within the cell

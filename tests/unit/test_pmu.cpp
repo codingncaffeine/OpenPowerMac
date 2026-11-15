@@ -114,3 +114,88 @@ TEST_CASE("pmu clock: the chip keeps time through a system reset")
     CHECK(next->pmuHost().rtcNow(0) == 0xE71D2A00u + 120u);
     CHECK(next->pmuHost().rtcNow(25000000ull * 5) == 0xE71D2A00u + 125u);
 }
+
+// ── Framing ──────────────────────────────────────────────────────────────
+//
+// A command the PMU answers is closed by the answer being read. A command it
+// does not answer is closed by its own last byte, and the PMU has to know
+// where that is, or the command that follows is taken for more data.
+
+TEST_CASE("pmu framing: a command with no answer ends with its last byte")
+{
+    Rig r;
+    r.host.rtcSetTo(0x12345678u, 0);
+    // Twenty bytes of parameter RAM, written and not answered…
+    r.send(0x31, &r.host);
+    for (int k = 0; k < 20; ++k)
+        r.send(static_cast<u8>(0xA0 + k), &r.host);
+    // …and the next byte is a command again: the clock answers.
+    CHECK(r.readRtc(&r.host) == 0x12345678u);
+    // The same with a count byte in front of the data (0x20 takes one).
+    r.send(0x20, &r.host);
+    r.send(0x02, &r.host);
+    r.send(0x38, &r.host); // data, though it has a command's value
+    r.send(0x7E, &r.host); // and so is this
+    CHECK(!r.host.powerOff);
+    CHECK(r.readRtc(&r.host) == 0x12345678u);
+    // A command of one byte, no data and no answer.
+    r.send(0x21, &r.host);
+    CHECK(r.readRtc(&r.host) == 0x12345678u);
+}
+
+TEST_CASE("pmu framing: the lengths of the commands a guest has been seen to "
+          "send")
+{
+    CHECK(pmuCommandLen(0x30).send == 4);
+    CHECK(pmuCommandLen(0x30).reply == 0);
+    CHECK(pmuCommandLen(0x31).send == 20);
+    CHECK(pmuCommandLen(0x31).reply == 0);
+    CHECK(pmuCommandLen(0x38).send == 0);
+    CHECK(pmuCommandLen(0x38).reply == 4);
+    CHECK(pmuCommandLen(0x39).reply == 20);
+    CHECK(pmuCommandLen(0x7E).send == 4);
+    CHECK(pmuCommandLen(0x7E).reply == 1);
+    CHECK(pmuCommandLen(0xD0).send == 0);
+    CHECK(pmuCommandLen(0xD0).reply == 0);
+    // The regular part of the table: counted data, and a counted answer in
+    // the upper half of each row of sixteen.
+    CHECK(pmuCommandLen(0x04).send == -1);
+    CHECK(pmuCommandLen(0x04).reply == 0);
+    CHECK(pmuCommandLen(0xBA).send == -1);
+    CHECK(pmuCommandLen(0xBA).reply == -1);
+}
+
+TEST_CASE("pmu power: the power-off command, with its signature, turns the "
+          "machine off")
+{
+    // As Mac OS sends it at Shut Down: the parameter RAM first, read and
+    // written back, then the power-off.
+    Rig r;
+    r.send(0x39, &r.host);
+    for (int k = 0; k < 20; ++k)
+        r.recv(&r.host);
+    r.send(0x31, &r.host);
+    for (int k = 0; k < 20; ++k)
+        r.send(0x00, &r.host);
+    CHECK(!r.host.powerOff);
+    r.send(0x7E, &r.host);
+    for (const char ch : {'M', 'A', 'T'})
+        r.send(static_cast<u8>(ch), &r.host);
+    CHECK(!r.host.powerOff); // not until the signature is whole
+    r.send(static_cast<u8>('T'), &r.host);
+    CHECK(r.host.powerOff);
+
+    // Without the signature it is not a power-off.
+    Rig wrong;
+    wrong.send(0x7E, &wrong.host);
+    for (const char ch : {'M', 'A', 'T', 'S'})
+        wrong.send(static_cast<u8>(ch), &wrong.host);
+    CHECK(!wrong.host.powerOff);
+
+    // A PMU with nothing behind it takes the command and nothing happens.
+    Rig bare;
+    bare.send(0x7E, nullptr);
+    for (const char ch : {'M', 'A', 'T', 'T'})
+        bare.send(static_cast<u8>(ch), nullptr);
+    CHECK(!bare.host.powerOff);
+}

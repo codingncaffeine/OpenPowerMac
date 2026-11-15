@@ -82,6 +82,7 @@ opm_ati_at = fn("opm_ati_at", None, P, u64)
 opm_drop_seat = fn("opm_drop_seat", i32, P)
 opm_run = fn("opm_run", u64, P, u64)
 opm_halted = fn("opm_halted", i32, P)
+opm_powered_off = fn("opm_powered_off", i32, P)
 opm_tb = fn("opm_tb", u64, P)
 opm_idle_ns = fn("opm_idle_ns", u64, P)
 opm_rt_slips = fn("opm_rt_slips", u64, P)
@@ -186,6 +187,9 @@ while True:
     dt = (time.monotonic() - c0) * 1000
     if opm_halted(m):
         print(f"-- machine HALTED @{executed:,}")
+        break
+    if opm_powered_off(m):
+        print(f"-- the guest SHUT DOWN the machine @{executed:,}")
         break
     if dt < 8 and executed != prev: chunk = min(chunk * 2, 40_000_000)
     elif dt > 30: chunk = max(chunk // 2, 100_000)

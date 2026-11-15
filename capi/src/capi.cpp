@@ -173,6 +173,13 @@ static void takeRestart(OpmMachine* m)
 
 OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
 {
+    // 🔌 OFF IS OFF. The guest asked the PMU to cut the power (Special > Shut
+    // Down ends with that) and is now in a loop waiting for it. Running that
+    // loop is running a machine that is not there: the loops below end the
+    // moment the request lands, and no later call runs anything. The caller
+    // asks opm_powered_off and closes the machine.
+    if (m->bus->pmuHost().powerOff)
+        return m->executed;
     if (m->bus->pmu().resetRequest)
         takeRestart(m);
     const uint64_t until = m->executed + insns;
@@ -214,7 +221,7 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         constexpr uint64_t kMaxIdleNsPerCall = 15000000; // 15 ms
         uint64_t idleNs = 0;
         while (m->executed < until && !cpu.halted &&
-               !bus.pmu().resetRequest) {
+               !bus.pmu().resetRequest && !bus.pmuHost().powerOff) {
             // 1. THE CLOCK, FROM OUTSIDE. Nothing else moves it now.
             m->pace.sync(cpu, m->executed, napDeadlineTb(cpu, bus));
             // 2. The devices, in the same breath, because the clock just
@@ -253,7 +260,8 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
         }
         return m->executed;
     }
-    while (m->executed < until && !cpu.halted && !bus.pmu().resetRequest) {
+    while (m->executed < until && !cpu.halted && !bus.pmu().resetRequest &&
+           !bus.pmuHost().powerOff) {
         // An asleep core executes nothing, and nothing that could wake it can
         // happen before the deadlines this asks about — so charge the whole
         // run of sleeping steps at once. At the Finder desktop that is most
@@ -276,6 +284,11 @@ OPM_API uint64_t opm_run(OpmMachine* m, uint64_t insns)
 }
 
 OPM_API uint64_t opm_restarts(const OpmMachine* m) { return m->restarts; }
+
+OPM_API int32_t opm_powered_off(const OpmMachine* m)
+{
+    return m->bus->pmuHost().powerOff ? 1 : 0;
+}
 
 OPM_API int32_t opm_ati_pixel_watch(OpmMachine* m, uint32_t x, uint32_t y,
                                     uint32_t budget)
@@ -1726,11 +1739,13 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             ++shown;
         }
         snprintf(b, sizeof b,
-                 "-- pmu: %llu restart(s) performed, reset %s; last commands "
-                 "(oldest first, byte@tb):%s\n",
+                 "-- pmu: %llu restart(s) performed, reset %s, power %s; last "
+                 "commands (oldest first, byte@tb):%s\n",
                  static_cast<unsigned long long>(m->restarts),
                  m->bus->pmu().resetRequest ? "REQUESTED AND NOT YET TAKEN"
                                             : "not pending",
+                 m->bus->pmuHost().powerOff ? "OFF (the guest shut down)"
+                                            : "on",
                  cmds.empty() ? " (none)" : cmds.c_str());
         s += b;
     }

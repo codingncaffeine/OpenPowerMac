@@ -85,7 +85,13 @@ internal static class HidKeys
     /// <summary>The usage for a Linux kernel (evdev) key code, which is what
     /// the X11 keyboard grab delivers.</summary>
     public static uint UsageForEvdev(int code) =>
-        code >= 0 && code < Evdev.Length ? Usage(Evdev[code]) : 0;
+        code == EvdevPower ? UsagePower
+        : code >= 0 && code < Evdev.Length ? Usage(Evdev[code]) : 0;
+
+    /// <summary>A keyboard's power key (KEY_POWER), which no PhysicalKey
+    /// names. On the Mac it is the key that asks "shut down?": usage 0x66.</summary>
+    public const int EvdevPower = 116;
+    public const uint UsagePower = 0x66;
 
     /// <summary>Escape's kernel code: releases the capture.</summary>
     public const int EvdevEscape = 1;

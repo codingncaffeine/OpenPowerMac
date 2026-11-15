@@ -59,6 +59,12 @@ internal static class Native
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong opm_restarts(IntPtr m);
 
+    // Whether the guest turned the machine off (Special > Shut Down). From
+    // then on opm_run runs nothing; the session ends and the machine is
+    // destroyed, which closes its disc images.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_powered_off(IntPtr m);
+
     // Whether the machine STOPPED — which is not the same question as whether
     // it executed anything. An idle guest legitimately runs no instructions
     // for a whole opm_run call, because the machine spends the time waiting

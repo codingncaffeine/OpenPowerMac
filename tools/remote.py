@@ -110,6 +110,7 @@ opm_drop_state = fn("opm_drop_state", i32, P)
 opm_drop_reads = fn("opm_drop_reads", u64, P)
 opm_run = fn("opm_run", u64, P, u64)
 opm_halted = fn("opm_halted", i32, P)
+opm_powered_off = fn("opm_powered_off", i32, P)
 opm_tb = fn("opm_tb", u64, P)
 opm_idle_ns = fn("opm_idle_ns", u64, P)
 opm_rt_slips = fn("opm_rt_slips", u64, P)
@@ -169,6 +170,10 @@ def drain():
             break
     return got
 
+def stopped():
+    """Halted, or turned off by the guest: nothing more will run."""
+    return opm_halted(m) or opm_powered_off(m)
+
 def step(insns):
     before = opm_executed(m)
     opm_run(m, insns)
@@ -177,7 +182,7 @@ def step(insns):
 
 def run_secs(s, host_cap=600.0):
     target, t0 = opm_tb(m) + int(s * 25e6), time.monotonic()
-    while opm_tb(m) < target and not opm_halted(m) and time.monotonic() - t0 < host_cap:
+    while opm_tb(m) < target and not stopped() and time.monotonic() - t0 < host_cap:
         step(2_000_000)
 
 def diag_text():
@@ -224,7 +229,7 @@ def perf(secs):
     next_line, last_shot = 1.0, 0.0
     while True:
         now = time.monotonic() - t0
-        if now >= secs or opm_halted(m):
+        if now >= secs or stopped():
             break
         c0 = time.monotonic()
         moved = step(chunk)
@@ -259,7 +264,7 @@ def bright(secs):
     next_sample = 0.0
     while True:
         now = time.monotonic() - t0
-        if now >= secs or opm_halted(m):
+        if now >= secs or stopped():
             break
         c0 = time.monotonic()
         moved = step(chunk)
@@ -371,7 +376,8 @@ def do(line):
 
 def stat():
     return (f"{opm_executed(m):,} insns, guest {opm_tb(m) / 25e6:.1f} s, pc={opm_pc(m):08x}, slips {opm_rt_slips(m)}"
-            + (", HALTED" if opm_halted(m) else ""))
+            + (", HALTED" if opm_halted(m) else "")
+            + (", POWERED OFF by the guest" if opm_powered_off(m) else ""))
 
 if os.path.exists(SOCK):
     os.unlink(SOCK)

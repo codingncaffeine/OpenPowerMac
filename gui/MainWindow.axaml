@@ -19,11 +19,14 @@
                 <MenuItem x:Name="miShared" Header="Choose Shared Folder…" Click="OnChooseShared" />
                 <MenuItem x:Name="miSharedClear" Header="Stop Sharing Folder" Click="OnClearShared" />
                 <!-- Files dropped on the display go to the guest on a second CD
-                     drive with no restart. -->
+                     drive with no restart, and stay there until the guest puts
+                     the Drop Box away: that empties it. -->
                 <MenuItem x:Name="miDrop" Header="Drop _Box">
                     <MenuItem Header="_Open Drop Box Folder" Click="OnOpenDropFolder" />
-                    <MenuItem Header="_Choose Drop Box Folder…" Click="OnChooseDropFolder" />
-                    <MenuItem Header="Use _Default Folder" Click="OnDefaultDropFolder" />
+                    <MenuItem Header="Put a _Folder in the Drop Box…" Click="OnChooseDropFolder" />
+                    <MenuItem x:Name="miDropFolderOut" Header="_Take the Folder Out" Click="OnDefaultDropFolder" />
+                    <Separator />
+                    <MenuItem Header="_Empty the Drop Box" Click="OnEmptyDropBox" />
                 </MenuItem>
                 <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
                 <Separator />

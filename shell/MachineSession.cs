@@ -111,26 +111,57 @@ public sealed class MachineSession
     private volatile string? _snapWanted;
     public void RequestSnapshot(string path) => _snapWanted = path;
 
-    // 📥 The drop box. Files dropped on the display are copied into the drop
-    // folder on a worker thread, the folder is packed into a fresh HFS image
-    // there too (a big share takes seconds, and the machine must not stall
-    // for it), and only the hand-over — opm_drop_swap — runs here, between
+    // 📥 The drop box. It holds two things: what was dropped on the display,
+    // kept as copies in the app's own folder (DropBoxStore), and at most one
+    // folder the user lent (the DropBoxPath setting), shown as it is with
+    // nothing copied. Both are packed into one fresh HFS image on a worker
+    // thread (a big share takes seconds, and the machine must not stall for
+    // it), and only the hand-over — opm_drop_swap — runs here, between
     // chunks, like every other request. The core decides what is safe:
     // an empty tray takes the image now; a disc the guest has read waits
     // for the guest's own Put Away (state 5), because a swap under a
     // mounted volume makes Mac OS read the new disc through the old
     // catalog (measured: a file opened afterwards shows garbage).
+    //
+    // ⭐ HOW THINGS LEAVE IT. The volume is a read-only disc to the guest, so
+    // the Finder will not move a single item of it to the Trash ("the disk is
+    // locked"). What the guest CAN do is put the whole Drop Box away, and
+    // that is the gesture: a Put Away with nothing new waiting empties it.
+    // The copies of dropped files go to this computer's Trash (TrashItem,
+    // recoverable), the lent folder is let go with nothing in it touched, and
+    // the next drop starts a volume holding only what is dropped then. A Put
+    // Away the user was ASKED for (a newer volume is waiting to go in) is not
+    // that: it brings the old items and the new ones.
+    // Mac OS ejects the disc for a Put Away only — neither Shut Down nor
+    // Restart does (measured) — so what was not put away is there again at
+    // the next start.
     private volatile string? _dropWanted;
+    private volatile bool _dropEmptyWanted;
     private int _dropSeq;
-    private int _dropBusy; // a copy+build in flight (Interlocked)
+    private int _dropBusy; // a copy+build or an emptying in flight (Interlocked)
     private readonly List<string> _dropImages = new(); // run-thread only
-    public static string DropBoxFolder(ShellSettings s) =>
-        string.IsNullOrWhiteSpace(s.DropBoxPath)
+    /// <summary>The app's own folder: copies of what was dropped on the
+    /// display, until the Drop Box is put away.</summary>
+    public static string DropBoxStore(ShellSettings s) =>
+        string.IsNullOrWhiteSpace(s.DropStorePath)
             ? Path.Combine(Environment.GetFolderPath(
                                Environment.SpecialFolder.MyDocuments),
                            "OpenPowerMac", "Drop Box")
-            : s.DropBoxPath;
-    private string _dropFolder = "";
+            : s.DropStorePath;
+    /// <summary>The folder lent to the Drop Box, or "" when none is.</summary>
+    public static string DropBoxLent(ShellSettings s) =>
+        string.IsNullOrWhiteSpace(s.DropBoxPath) ? "" : s.DropBoxPath;
+    private string _dropStore = "";
+    private volatile string _dropLent = "";
+    /// <summary>Moves one file or folder to this computer's Trash; returns
+    /// null when it did, or why it could not. Set by the front end before
+    /// Start (the Trash is the platform's). Left unset, nothing is ever
+    /// removed from the Drop Box folder.</summary>
+    public Func<string, string?>? TrashItem;
+    /// <summary>The Drop Box was emptied and the lent folder's setting set
+    /// back to none: the front end saves its settings. Raised off the UI
+    /// thread.</summary>
+    public event Action? DropBoxEmptied;
 
     /// <summary>Copy the dropped files/folders into the drop folder, rebuild
     /// the volume and hand it to the guest. Returns false when the machine
@@ -145,7 +176,8 @@ public sealed class MachineSession
                              + "try again in a moment\n");
             return false;
         }
-        var folder = _dropFolder;
+        var folder = _dropStore;
+        var lent = _dropLent;
         Task.Run(() =>
         {
             try
@@ -177,7 +209,7 @@ public sealed class MachineSession
                 }
                 if (n == 0)
                     return;
-                var img = BuildDropImage(folder, out var note);
+                var img = BuildDropImage(folder, lent, out var note);
                 if (img == null)
                 {
                     ConsoleQ.Enqueue($"[drop box] volume NOT built: {note}\n");
@@ -197,24 +229,26 @@ public sealed class MachineSession
         return true;
     }
 
-    /// <summary>Pack a folder into a drop volume off the caller's thread and
-    /// leave it for the run loop to hand to the drive (see _dropWanted).
-    /// False if a pack is already under way; the caller tries again.</summary>
-    private bool PackDropFolder(string folder, string said)
+    /// <summary>Pack the Drop Box (the dropped copies and the folder `lent`)
+    /// into a volume off the caller's thread and leave it for the run loop
+    /// to hand to the drive (see _dropWanted). With nothing to pack it says
+    /// `saidEmpty` and leaves the drive alone. False if a pack is already
+    /// under way; the caller tries again.</summary>
+    private bool PackDrop(string lent, string said, string saidEmpty)
     {
         if (Interlocked.CompareExchange(ref _dropBusy, 1, 0) != 0)
             return false;
+        var store = _dropStore;
         Task.Run(() =>
         {
             try
             {
-                if (!FolderHasContent(folder))
+                if (!FolderHasContent(store) && !FolderHasContent(lent))
                 {
-                    ConsoleQ.Enqueue($"[drop box] {folder} is empty — drop files "
-                                     + "on the display, or put some in it\n");
+                    ConsoleQ.Enqueue($"[drop box] {saidEmpty}\n");
                     return;
                 }
-                var img = BuildDropImage(folder, out var note);
+                var img = BuildDropImage(store, lent, out var note);
                 if (img == null)
                 {
                     ConsoleQ.Enqueue($"[drop box] volume NOT built: {note}\n");
@@ -233,6 +267,75 @@ public sealed class MachineSession
         return true;
     }
 
+    /// <summary>Empty the Drop Box from the menu. A running machine does it
+    /// between chunks and says what it did on the console; with the Drop Box
+    /// open in the guest it says to put it away there instead.</summary>
+    public void RequestEmptyDropBox() => _dropEmptyWanted = true;
+
+    /// <summary>Move every item of the Drop Box's own folder to this
+    /// computer's Trash. Returns how many went and, in `kept`, a line for
+    /// each that could not be moved (it stays in the Drop Box).</summary>
+    public static int TrashDropStore(string store, Func<string, string?>? trash,
+                                     out string kept)
+    {
+        var sb = new StringBuilder();
+        int moved = 0;
+        try
+        {
+            if (Directory.Exists(store))
+                foreach (var item in Directory.EnumerateFileSystemEntries(store).ToList())
+                {
+                    string? why = trash == null
+                        ? "this build has no Trash to move it to"
+                        : trash(item);
+                    if (why == null)
+                        moved++;
+                    else
+                        sb.Append($"{Path.GetFileName(item)} stays in the Drop Box: {why}\n");
+                }
+        }
+        catch (Exception ex)
+        {
+            sb.Append($"{store}: {ex.Message}\n");
+        }
+        kept = sb.ToString();
+        return moved;
+    }
+
+    // The emptying itself, off the run thread: file work. `lentWas` is the
+    // folder that was just let go, for the message only.
+    private bool EmptyDropBox(string lentWas, string why)
+    {
+        if (Interlocked.CompareExchange(ref _dropBusy, 1, 0) != 0)
+            return false;
+        var store = _dropStore;
+        var trash = TrashItem;
+        Task.Run(() =>
+        {
+            try
+            {
+                int moved = TrashDropStore(store, trash, out var kept);
+                // One fact a line: the console pane does not wrap.
+                bool nothing = moved == 0 && lentWas.Length == 0 && kept.Length == 0;
+                ConsoleQ.Enqueue($"[drop box] {why}: "
+                                 + (nothing ? "there was nothing in it\n" : "emptied\n"));
+                if (moved > 0)
+                    ConsoleQ.Enqueue($"[drop box]   {moved} item(s) moved to the Trash "
+                                     + "on this computer\n");
+                if (lentWas.Length > 0)
+                    ConsoleQ.Enqueue($"[drop box]   let go, nothing in it touched: {lentWas}\n");
+                foreach (var line in kept.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                    ConsoleQ.Enqueue($"[drop box]   {line}\n");
+                DropBoxEmptied?.Invoke();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _dropBusy, 0);
+            }
+        });
+        return true;
+    }
+
     private static void CopyTree(string src, string dst)
     {
         Directory.CreateDirectory(dst);
@@ -242,17 +345,28 @@ public sealed class MachineSession
             CopyTree(d, Path.Combine(dst, Path.GetFileName(d)));
     }
 
-    // Pack the drop folder into a fresh image (a new name every time: the
+    // Pack the Drop Box into a fresh image (a new name every time: the
     // core holds the previous one open until the new disc is in, and
     // Windows will not let an open file be overwritten). Null = refused,
     // with the reason in `note`; on success `note` carries the builder's
     // warnings (files it had to leave out).
-    private string? BuildDropImage(string folder, out string note)
+    private string? BuildDropImage(string folder, string lent, out string note)
     {
         var img = Path.Combine(Path.GetTempPath(),
             $"opm_drop_{Environment.ProcessId}_{Interlocked.Increment(ref _dropSeq)}.img");
-        var err = new StringBuilder(512);
-        if (Native.opm_hfs_build(folder, img, "Drop Box", err, 512) == 0)
+        var err = new StringBuilder(1024);
+        // An empty folder is left out rather than named: the builder refuses
+        // a folder with nothing in it, and one of the two usually is empty.
+        bool hasOwn = FolderHasContent(folder);
+        bool hasLent = lent.Length > 0 && FolderHasContent(lent);
+        if (!hasOwn && !hasLent)
+        {
+            note = "there is nothing in the Drop Box";
+            return null;
+        }
+        string first = hasOwn ? folder : lent;
+        string? second = hasOwn && hasLent ? lent : null;
+        if (Native.opm_hfs_build2(first, second, img, "Drop Box", err, 1024) == 0)
         {
             note = err.ToString();
             try { File.Delete(img); } catch { }
@@ -266,7 +380,7 @@ public sealed class MachineSession
     {
         try
         {
-            return Directory.Exists(folder)
+            return !string.IsNullOrEmpty(folder) && Directory.Exists(folder)
                    && Directory.EnumerateFileSystemEntries(folder).Any();
         }
         catch { return false; }
@@ -306,8 +420,8 @@ public sealed class MachineSession
         2 => "tray open, the new volume goes in",
         3 => "volume in, not read yet",
         4 => "volume mounted",
-        5 => "updated — put away the Drop Box in the guest (drag it to the "
-             + "Trash, or select it and press Cmd-Y) to receive the new files",
+        5 => "new files are waiting: put the Drop Box away in the Mac to receive "
+             + "them (drag it to the Trash)",
         _ => st.ToString(),
     };
 
@@ -441,16 +555,21 @@ public sealed class MachineSession
             // the folder the disc is in from power-on (mounted during boot,
             // measured); otherwise the tray is empty and the guest polls it
             // every ~1.7 s until a drop lands.
-            _dropFolder = DropBoxFolder(s);
+            _dropStore = DropBoxStore(s);
+            _dropLent = DropBoxLent(s);
             {
-                string? img = FolderHasContent(_dropFolder)
-                    ? BuildDropImage(_dropFolder, out var dropNote)
-                    : null;
+                string? img = BuildDropImage(_dropStore, _dropLent, out var dropNote);
+                bool nothing = img == null && !FolderHasContent(_dropStore)
+                               && !FolderHasContent(_dropLent);
                 if (img != null && Native.opm_drop_attach(m, img) != 0)
                 {
                     _dropImages.Add(img);
-                    ConsoleQ.Enqueue($"[drop box] volume attached from "
-                                     + $"{_dropFolder}\n");
+                    if (dropNote.Length > 0)
+                        ConsoleQ.Enqueue($"[drop box] {dropNote}\n");
+                    ConsoleQ.Enqueue("[drop box] volume attached: what was not put away "
+                                     + "last time\n"
+                                     + "[drop box]   to empty it, put the Drop Box away in "
+                                     + "the Mac (drag it to the Trash)\n");
                 }
                 else
                 {
@@ -462,10 +581,12 @@ public sealed class MachineSession
                         ConsoleQ.Enqueue("[drop box] volume REFUSED: "
                             + Encoding.UTF8.GetString(eb, 0, (int)n) + "\n");
                     }
+                    else if (!nothing)
+                        ConsoleQ.Enqueue($"[drop box] volume NOT built: {dropNote}\n");
                     Native.opm_drop_seat(m);
-                    ConsoleQ.Enqueue($"[drop box] drive ready, tray empty — "
+                    ConsoleQ.Enqueue("[drop box] drive ready, tray empty — "
                                      + "drop files on the display to hand "
-                                     + $"them to the guest ({_dropFolder})\n");
+                                     + "them to the guest\n");
                 }
             }
 
@@ -531,8 +652,11 @@ public sealed class MachineSession
             long lastShotMs = 0, lastStatMs = 0, lastStatInsns = 0;
             ulong executed = 0;
             int dropState = Native.opm_drop_state(m);
+            uint dropEjects = Native.opm_drop_guest_ejects(m);
             ulong restarts = 0;
-            bool dropRepack = false; // pack the drop folder again at the next look
+            bool dropRepack = false; // pack the Drop Box again at the next look
+            bool dropPutAway = false; // the guest put it away: empty it at the next look
+            string dropEmptyWhy = "put away in the Mac";
             // 💿 The CD the user has chosen, as last handed to the machine.
             // The settings object is the window's own and changes under this
             // thread when a disc is chosen or ejected from the menu; the
@@ -593,8 +717,12 @@ public sealed class MachineSession
                     // a tray the guest had emptied (the volume put away before
                     // the restart) would otherwise stay empty until the next
                     // drop. Packed where a change of folder is, below.
-                    if (Native.opm_drop_state(m) == 1 && FolderHasContent(_dropFolder))
+                    if (Native.opm_drop_state(m) == 1
+                        && (FolderHasContent(_dropStore) || FolderHasContent(_dropLent)))
                         dropRepack = true;
+                    // The restarted machine's drive counts from zero.
+                    dropEjects = Native.opm_drop_guest_ejects(m);
+                    dropPutAway = false;
                 }
 
                 // Aim each chunk at ~15 ms so serial input and stop stay snappy.
@@ -804,19 +932,75 @@ public sealed class MachineSession
                     // mount — each a thing they can act on or stop waiting
                     // for. Retired images go once the core has let go of
                     // them (the open one cannot be deleted; try again).
-                    // 📥 The Drop Box folder follows the setting too. Choosing
-                    // another folder from the menu packs it and hands it to
-                    // the drive now; it used to wait for the next Start, and
-                    // the message that said so read as if restarting the
-                    // guest were enough, which it was not.
-                    string dropFolderWanted = DropBoxFolder(s);
-                    bool dropFolderChanged = dropFolderWanted != _dropFolder;
-                    if ((dropFolderChanged || dropRepack)
-                        && PackDropFolder(dropFolderWanted, dropFolderChanged
-                               ? $"folder is now {dropFolderWanted}; volume packed"
-                               : "volume packed for the restarted guest"))
+                    // 📥 The guest put the Drop Box away (its own eject, which
+                    // Mac OS issues for a Put Away and for nothing else). With
+                    // a newer volume on its way in, that was the Put Away the
+                    // user was asked for and the items stay; otherwise it is
+                    // the user saying they are done with them.
+                    uint ejectsNow = Native.opm_drop_guest_ejects(m);
+                    if (ejectsNow != dropEjects)
                     {
-                        _dropFolder = dropFolderWanted;
+                        dropEjects = ejectsNow;
+                        dropPutAway = Native.opm_drop_state(m) == 1
+                                      && _dropWanted == null && !dropRepack
+                                      && Volatile.Read(ref _dropBusy) == 0;
+                    }
+                    // Empty the Drop Box from the menu: at once with an empty
+                    // tray; a volume the guest has not read yet is taken out
+                    // first; one the guest has open is the guest's to put away.
+                    if (_dropEmptyWanted)
+                    {
+                        int st = Native.opm_drop_state(m);
+                        if (st == 4 || st == 5)
+                        {
+                            _dropEmptyWanted = false;
+                            ConsoleQ.Enqueue("[drop box] the Mac has the Drop Box open: put it "
+                                             + "away there and it is emptied\n"
+                                             + "[drop box]   (drag it to the Trash, or select it "
+                                             + "and press Cmd-Y)\n");
+                        }
+                        else if ((st == 1 || st == 3)
+                                 && Volatile.Read(ref _dropBusy) == 0 && _dropWanted == null)
+                        {
+                            // (A volume on its way in, state 2, is waited out.)
+                            _dropEmptyWanted = false;
+                            if (st == 3)
+                                Native.opm_drop_eject(m);
+                            dropPutAway = true;
+                            dropEmptyWhy = "emptied from the menu";
+                            dropRepack = false;
+                        }
+                    }
+                    if (dropPutAway)
+                    {
+                        string lentWas = _dropLent;
+                        if (EmptyDropBox(lentWas, dropEmptyWhy))
+                        {
+                            dropPutAway = false;
+                            dropEmptyWhy = "put away in the Mac";
+                            // Let the lent folder go here, on this thread, so
+                            // the look below does not see it as newly chosen.
+                            _dropLent = "";
+                            s.DropBoxPath = "";
+                        }
+                    }
+                    // 📥 The lent folder follows the setting. Choosing one from
+                    // the menu packs the Drop Box and hands it to the drive
+                    // now; taking it out packs what is left.
+                    string lentWanted = DropBoxLent(s);
+                    bool lentChanged = lentWanted != _dropLent;
+                    if ((lentChanged || dropRepack) && !dropPutAway
+                        && PackDrop(lentWanted,
+                               !lentChanged ? "volume packed for the restarted guest"
+                               : lentWanted.Length > 0
+                                   ? $"{lentWanted} is in the Drop Box; volume packed"
+                                   : "the folder is out of the Drop Box; volume packed",
+                               lentChanged && Native.opm_drop_state(m) >= 4
+                                   ? "the folder is out; put the Drop Box away in the Mac "
+                                     + "(drag it to the Trash) and it is gone"
+                                   : "there is nothing in the Drop Box"))
+                    {
+                        _dropLent = lentWanted;
                         dropRepack = false;
                     }
                     string cdWanted = s.CdPath ?? "";

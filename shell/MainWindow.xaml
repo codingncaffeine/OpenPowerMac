@@ -25,14 +25,18 @@
                 <MenuItem x:Name="miShared" Header="Choose Shared Folder…" Click="OnChooseShared" />
                 <MenuItem x:Name="miSharedClear" Header="Stop Sharing Folder" Click="OnClearShared" />
                 <!-- The drop box: drop files on the display while the machine
-                     runs; they are copied into this folder, packed into an HFS
-                     volume and handed to the guest on a second CD drive with
-                     no restart. A volume the guest has mounted is replaced
-                     only after the guest puts it away (the console says so). -->
+                     runs; they are copied into the Drop Box folder, packed
+                     into an HFS volume and handed to the guest on a second CD
+                     drive with no restart. A volume the guest has mounted is
+                     replaced only after the guest puts it away (the console
+                     says so), and a Put Away with nothing new waiting empties
+                     the Drop Box. -->
                 <MenuItem x:Name="miDrop" Header="Drop _Box">
                     <MenuItem Header="_Open Drop Box Folder" Click="OnOpenDropFolder" />
-                    <MenuItem Header="_Choose Drop Box Folder…" Click="OnChooseDropFolder" />
-                    <MenuItem Header="Use _Default Folder" Click="OnDefaultDropFolder" />
+                    <MenuItem Header="Put a _Folder in the Drop Box…" Click="OnChooseDropFolder" />
+                    <MenuItem Header="_Take the Folder Out" Click="OnDefaultDropFolder" />
+                    <Separator />
+                    <MenuItem Header="_Empty the Drop Box" Click="OnEmptyDropBox" />
                 </MenuItem>
                 <MenuItem x:Name="miAti" Header="Choose ATI Card ROM…" Click="OnChooseAti" />
                 <Separator />

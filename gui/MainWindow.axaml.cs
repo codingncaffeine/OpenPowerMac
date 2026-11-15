@@ -516,6 +516,11 @@ public partial class MainWindow : Window
             return;
         var session = new MachineSession();
         session.Ended += reason => Dispatcher.UIThread.Post(() => OnSessionEnded(session, reason));
+        // What the guest puts away leaves the Drop Box for this computer's
+        // Trash; the session let the lent folder go in the settings object,
+        // which is saved here.
+        session.TrashItem = Trash.Move;
+        session.DropBoxEmptied += () => Dispatcher.UIThread.Post(() => _settings.Save());
         _session = session;
         session.Start(_settings);
         miStart.IsEnabled = false;
@@ -755,7 +760,7 @@ public partial class MainWindow : Window
 
     private void OnOpenDropFolder(object? sender, RoutedEventArgs e)
     {
-        string folder = MachineSession.DropBoxFolder(_settings);
+        string folder = MachineSession.DropBoxStore(_settings);
         // Process start and folder creation are file work: off the UI thread.
         Task.Run(() =>
         {
@@ -774,33 +779,70 @@ public partial class MainWindow : Window
         });
     }
 
+    // A folder lent to the Drop Box: the guest sees what is in it, nothing is
+    // copied, and it is let go when the guest puts the Drop Box away.
     private void OnChooseDropFolder(object? sender, RoutedEventArgs e)
     {
+        string lent = MachineSession.DropBoxLent(_settings);
         string? folder = FilePicker.OpenFolder(this,
-            "Choose the drop box folder (dropped files are copied here and handed to the guest)",
-            MachineSession.DropBoxFolder(_settings));
+            "Choose a folder to put in the Drop Box (its contents appear in the Mac; nothing is copied)",
+            lent.Length > 0 ? lent : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
         if (folder == null)
             return;
         _settings.DropBoxPath = folder;
         _settings.Save();
-        NoteDropFolderChange();
+        if (_session is { Running: true })
+            Notice("The folder is in the Drop Box. The running machine gets it now.\n\n"
+                   + "If a Drop Box is already on the Mac's desktop, put it away there "
+                   + "(drag it to the Trash) and the new one takes its place.\n\n"
+                   + "When you are done with it, put the Drop Box away again: that empties it. "
+                   + "Nothing in your folder is touched.", "Drop Box");
+        else
+            Notice("The folder is in the Drop Box and appears in the Mac when the machine starts.\n\n"
+                   + "When you are done with it, put the Drop Box away in the Mac (drag it to the "
+                   + "Trash): that empties it. Nothing in your folder is touched.", "Drop Box");
     }
 
     private void OnDefaultDropFolder(object? sender, RoutedEventArgs e)
     {
+        if (MachineSession.DropBoxLent(_settings).Length == 0)
+        {
+            Notice("No folder is in the Drop Box.", "Drop Box");
+            return;
+        }
         _settings.DropBoxPath = "";
         _settings.Save();
-        NoteDropFolderChange();
+        // A running machine follows the setting and says on the console what
+        // the guest has to do, if anything.
     }
 
-    private void NoteDropFolderChange()
+    // The Drop Box's own way out is the guest putting it away; this is the
+    // same thing from the menu, for when the Mac is not running or the Drop
+    // Box is not on its desktop.
+    private void OnEmptyDropBox(object? sender, RoutedEventArgs e)
     {
-        // The running machine is given the folder now (MachineSession follows
-        // the setting); the one thing the user may have to do is in the guest.
-        if (_session is { Running: true })
-            Notice("Drop box folder set. The running machine gets it now.\n\n"
-                   + "If a Drop Box is already on the Mac's desktop, put it away there "
-                   + "(drag it to the Trash) and the new one takes its place.", "Drop Box");
+        if (_session is { Running: true } s)
+        {
+            s.RequestEmptyDropBox(); // the console says what was done
+            return;
+        }
+        string store = MachineSession.DropBoxStore(_settings);
+        string lent = MachineSession.DropBoxLent(_settings);
+        _settings.DropBoxPath = "";
+        _settings.Save();
+        Task.Run(() =>
+        {
+            int moved = MachineSession.TrashDropStore(store, Trash.Move, out var kept);
+            string said = moved > 0
+                ? $"{moved} item(s) moved to the Trash on this computer."
+                : lent.Length > 0 ? "" : "There was nothing in the Drop Box.";
+            if (lent.Length > 0)
+                said += (said.Length > 0 ? "\n\n" : "") + $"{lent} is let go; nothing in it was touched.";
+            if (kept.Length > 0)
+                said += "\n\n" + kept.TrimEnd();
+            Dispatcher.UIThread.Post(() => Notice(said, "Drop Box",
+                kept.Length > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information));
+        });
     }
 
     private void OnDiagnostics(object? sender, RoutedEventArgs e)

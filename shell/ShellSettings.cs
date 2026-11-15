@@ -50,11 +50,17 @@ public sealed class ShellSettings
     // An explicitly chosen CD image wins the slot; the console says so.
     public string SharedFolderPath { get; set; } = "";
 
-    // 📥 The drop box folder: files dropped on the display land here, the
-    // folder is packed into an HFS volume and handed to the guest on its
-    // second CD-class drive — no restart. Empty = the default under
-    // Documents/OpenPowerMac/Drop Box (see MachineSession.DropBoxFolder).
+    // 📥 A folder lent to the drop box: its contents appear in the guest as
+    // they are, beside whatever was dropped on the display, with nothing
+    // copied. It is let go (set back to empty, nothing in it touched) when the
+    // guest puts the Drop Box away. Empty = no folder is lent.
     public string DropBoxPath { get; set; } = "";
+
+    // Where the copies of dropped files are kept until the guest puts the
+    // Drop Box away. Empty = Documents/OpenPowerMac/Drop Box (see
+    // MachineSession.DropBoxStore). No menu sets this; the window tests do,
+    // so that they never read or fill the user's own folder.
+    public string DropStorePath { get; set; } = "";
 
     // Required for any picture. Without the card's FCode there is no display
     // node, so the OS has nothing to bind a driver to.

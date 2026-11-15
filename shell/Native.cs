@@ -27,6 +27,17 @@ internal static class Native
         [MarshalAs(UnmanagedType.LPUTF8Str)] System.Text.StringBuilder err,
         uint errCap);
 
+    // The same volume from two folders side by side (the drop box: what was
+    // dropped, and a folder lent beside it). `second` may be null.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int opm_hfs_build2(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string folder,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? second,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string outPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string volName,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] System.Text.StringBuilder err,
+        uint errCap);
+
     // Defer PCI visibility of the ATI card: the practiced boot hides it past
     // OF's console choice (~228M insns) so the serial console stays owned.
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -141,6 +152,16 @@ internal static class Native
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint opm_drop_error(IntPtr m, byte[] buf, uint cap);
+
+    // Times the guest itself has put the drop volume away since the machine
+    // was created or last restarted. Mac OS does this only for a Put Away
+    // (measured: neither Shut Down nor Restart ejects the disc).
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint opm_drop_guest_ejects(IntPtr m);
+
+    // Take an unread disc out of the drop drive, as the host.
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void opm_drop_eject(IntPtr m);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void opm_serial(IntPtr m, string text);

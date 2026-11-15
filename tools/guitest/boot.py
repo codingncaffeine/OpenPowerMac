@@ -4,7 +4,7 @@
     tools/headless.sh python3 tools/guitest/boot.py --rom FILE --ati-rom FILE
         [--hard-disk FILE] [--cd FILE] [--ram MB] [--seconds N] [--shots DIR] [--sound]
         [--mouse] [--keys] [--cd-later FILE] [--app FILE]
-        [--drop-box DIR] [--drop-later DIR] [--shutdown]
+        [--drop-box DIR] [--drop-later DIR] [--dropped FILE]... [--put-away] [--shutdown]
 
 Writes a scratch shell.json (never the real profile: it refuses to run outside
 tools/headless.sh), copies the hard disk into the scratch profile so the
@@ -17,7 +17,10 @@ the guest's picture must change where its cursor moved. With --keys it also
 presses a key while captured and then asks for Machine > Diagnostics, whose
 USB section must show the guest taking the keyboard's reports. With --cd-later
 it chooses a CD image from the File menu while the machine runs, through the
-file dialog, and the console must say the guest mounted it. With --shutdown
+file dialog, and the console must say the guest mounted it. With --put-away
+it puts the Drop Box away in the guest (its icon selected by name, then
+Command-Y): the app must empty it, with the copies of dropped files in the
+Trash and a lent folder let go untouched. With --shutdown
 it shuts the guest down from the guest's own dialog; the machine must stop by
 itself and the window stay open. Passes when the
 window shows a guest picture by the end, the mouse moved the guest's cursor
@@ -26,7 +29,7 @@ error.
 --sound plays through SDL's dummy driver: the wall makes real sound impossible.
 Needs python-xlib and ImageMagick.
 """
-import argparse, json, os, shutil, subprocess, sys, time
+import argparse, json, os, shutil, subprocess, sys, time, urllib.parse
 from Xlib import X, XK, display
 from Xlib.ext import xtest
 
@@ -46,11 +49,18 @@ ap.add_argument("--cd-later", metavar="FILE",
                 help="once the machine is up: File > Choose CD Image, pick FILE in the file dialog; "
                      "the console must report the disc mounted")
 ap.add_argument("--drop-box", metavar="DIR",
-                help="the Drop Box folder the app starts with (default: an empty one); with something in it "
-                     "the console must report its volume mounted")
+                help="a folder lent to the Drop Box before the start (the DropBoxPath setting); with something "
+                     "in it the console must report the volume mounted")
 ap.add_argument("--drop-later", metavar="DIR",
-                help="once the machine is up, choose DIR from File > Drop Box > Choose Drop Box Folder, as a "
-                     "user would; the console must report its volume packed and mounted, with no new start")
+                help="once the machine is up, choose DIR from File > Drop Box > Put a Folder in the Drop Box, as "
+                     "a user would; the console must report its volume packed and mounted, with no new start")
+ap.add_argument("--dropped", metavar="FILE", action="append", default=[],
+                help="a file an earlier drop left in the Drop Box: copied into the app's own Drop Box folder "
+                     "before the start (may be given more than once)")
+ap.add_argument("--put-away", action="store_true",
+                help="once the Drop Box is on the guest's desktop, put it away there (Command-Q for whatever is "
+                     "in front, the icon selected by typing its name, Command-Y); the console must report it "
+                     "emptied, the dropped copies must be in the Trash and a lent folder untouched and let go")
 ap.add_argument("--keys", action="store_true",
                 help="with --mouse: while captured, press a key; the guest must take the keyboard reports")
 ap.add_argument("--shutdown", action="store_true",
@@ -71,11 +81,15 @@ if a.hard_disk:
 settings = {"RomPath": os.path.abspath(a.rom), "AtiRomPath": os.path.abspath(a.ati_rom),
             "HdPath": hd, "CdPath": os.path.abspath(a.cd) if a.cd else "",
             "RamMb": a.ram, "Sound": a.sound, "AutoBoot": True,
-            # The default drop box is ~/Documents, which the wall does not move.
-            "DropBoxPath": os.path.abspath(a.drop_box) if a.drop_box else os.path.join(profile, "Drop Box")}
-# The folder exists, as it does once the app has run: the folder picker opens
-# in it, and opens in "Recent" (where a typed path is not taken) if it is missing.
-os.makedirs(settings["DropBoxPath"], exist_ok=True)
+            # The app's own Drop Box folder is under ~/Documents by default,
+            # which the wall does not move: the test gives it one of its own.
+            "DropStorePath": os.path.join(profile, "Drop Box"),
+            "DropBoxPath": os.path.abspath(a.drop_box) if a.drop_box else ""}
+store = settings["DropStorePath"]
+os.makedirs(store, exist_ok=True)
+for f in a.dropped:
+    shutil.copy(f, store)
+lent_before = sorted(os.listdir(a.drop_box)) if a.drop_box else None
 with open(os.path.join(profile, "shell.json"), "w") as f:
     json.dump(settings, f, indent=2)
 shots = a.shots or os.path.join(os.environ.get("OPM_TEST_TMP", "/tmp"), "shots")
@@ -168,6 +182,21 @@ if a.drop_later:
     # and opens the picker a second time.
     click(726, 499); time.sleep(20.0)
     shot("87-drop-box")
+put_ok = None
+if a.put_away:
+    # In the guest, as a user would without the mouse: quit whatever program
+    # is in front (a first start has the Setup Assistant up; Return answers
+    # its "quit?"), which leaves the Finder with the desktop active; type the
+    # icon's name to select it; Command-Y puts it away. Alt is Command.
+    click(520, 340); time.sleep(1.0)    # capture
+    key("q", ["Alt_L"]); time.sleep(6.0); shot("88-quit-asked")
+    key("Return"); time.sleep(10.0)
+    for ch in "drop":
+        key(ch)
+    time.sleep(2.0); shot("88-selected")
+    key("y", ["Alt_L"]); time.sleep(20.0); shot("89-put-away")
+    click(520, 340, button=2)           # middle-click releases
+    time.sleep(1.0)
 final = shot("99-final")
 moved = None
 if a.mouse:
@@ -253,20 +282,50 @@ drop_ok = None
 drop_lines = [l for l in console.splitlines() if l.startswith("[drop box]")]
 if a.drop_box:
     # From power-on: attached before the first instruction, mounted during the boot.
-    drop_ok = any("volume attached from" in l for l in drop_lines) and any("volume mounted" in l for l in drop_lines)
-    print("boot test: Drop Box folder set before the start: " + ("MOUNTED by the guest" if drop_ok else "NOT mounted"))
+    drop_ok = any("volume attached" in l for l in drop_lines) and any("volume mounted" in l for l in drop_lines)
+    print("boot test: folder lent to the Drop Box before the start: " + ("MOUNTED by the guest" if drop_ok else "NOT mounted"))
 if a.drop_later:
     try:
         saved = json.load(open(os.path.join(profile, "shell.json"))).get("DropBoxPath", "")
     except Exception as ex:
         saved = f"(unreadable: {ex})"
     print(f"boot test: the app saved DropBoxPath = {saved!r}")
-    at = next((i for i, l in enumerate(drop_lines) if "folder is now" in l), None)
+    at = next((i for i, l in enumerate(drop_lines) if "is in the Drop Box; volume packed" in l), None)
     later_ok = at is not None and any("volume mounted" in l for l in drop_lines[at:])
-    print("boot test: Drop Box folder chosen while running: "
+    print("boot test: folder put in the Drop Box while running: "
           + ("PACKED and MOUNTED by the guest" if later_ok else "NOT mounted"))
     drop_ok = later_ok and drop_ok is not False
-if a.drop_box or a.drop_later:
+if a.put_away:
+    # What the user is told, and what is true on this computer afterwards.
+    said = any("put away in the Mac: emptied" in l for l in drop_lines)
+    left = sorted(os.listdir(store))
+    trash = os.path.join(os.environ.get("XDG_DATA_HOME", ""), "Trash")
+    in_trash, recorded = [], []
+    for f in a.dropped:
+        name = os.path.basename(f)
+        in_trash.append(os.path.exists(os.path.join(trash, "files", name)))
+        try:
+            info = open(os.path.join(trash, "info", name + ".trashinfo")).read()
+        except OSError:
+            info = ""
+        # The record names where the item came from, each name of the path
+        # percent-encoded (the Trash specification's "URL-escaped").
+        want = "Path=" + "/".join(urllib.parse.quote(p, safe="") for p in os.path.join(store, name).split("/"))
+        recorded.append(info.startswith("[Trash Info]\n") and want in info.splitlines() and "DeletionDate=" in info)
+    lent_ok = True
+    if a.drop_box:
+        try:
+            saved = json.load(open(os.path.join(profile, "shell.json"))).get("DropBoxPath", None)
+        except Exception as ex:
+            saved = f"(unreadable: {ex})"
+        lent_ok = saved == "" and sorted(os.listdir(a.drop_box)) == lent_before
+        print(f"boot test: after the Put Away the app's DropBoxPath = {saved!r}; the lent folder holds "
+              f"{len(os.listdir(a.drop_box))} item(s), {len(lent_before)} before")
+    put_ok = said and not left and all(in_trash) and all(recorded) and lent_ok
+    print(f"boot test: Drop Box put away in the guest: console said so={said}, left in the Drop Box folder={left}, "
+          f"dropped copies in the Trash={in_trash}, their records written={recorded}: "
+          + ("EMPTIED" if put_ok else "NOT emptied"))
+if a.drop_box or a.drop_later or a.put_away or a.dropped:
     for l in drop_lines: print("    " + l)
 keys_ok = None
 if a.keys:
@@ -279,6 +338,6 @@ if a.keys:
     print(f"boot test: keyboard handed over {injected} event(s), the guest took {delivered} report(s): "
           + ("TAKEN" if keys_ok else "NOT TAKEN"))
 ok = (exited and colors > 40 and not errors and (moved is None or moved > 0) and keys_ok is not False
-      and cd_ok is not False and drop_ok is not False and shut_ok is not False)
+      and cd_ok is not False and drop_ok is not False and put_ok is not False and shut_ok is not False)
 print("boot test:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

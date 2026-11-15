@@ -736,7 +736,7 @@ inline bool r128AsyncBusy()
 }
 inline bool r128AsyncNeedsService()
 {
-    return gR128AsyncNeedsEmu.load(std::memory_order_relaxed);
+    return gR128AsyncNeedsEmu.load(std::memory_order_acquire);
 }
 // Execute everything still queued, on the calling thread. On return the
 // engine is idle and the caller owns the card outright until it next submits.

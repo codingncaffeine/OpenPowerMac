@@ -741,7 +741,38 @@ struct Compiler {
         e.i32le(u32(o.chainHops));
     }
 
-    void chainChecks() // the dispatcher's own gate, in test form
+    // ⭐ THE GATE AT A HOP, AS THE LINE EXECUTOR HAS IT. Leaving a block for
+    // the next one skips the dispatcher, so whatever the dispatcher would
+    // have checked has to hold. It checks a list (chainChecksFull below:
+    // the executor's `slow`, the fetch translation's MSR key, a deliverable
+    // interrupt), and the first version of this gate re-tested that list
+    // term by term at every hop, every 4.2 instructions in a game.
+    //
+    // The line executor does not. Its own entry to the next line asks one
+    // thing, "is MSR what it was when the list was last checked" (lxValid
+    // in Cpu::runSteps), because every other term of the list has a writer
+    // that ends the batch: MMCR0 and IABR in mtspr, a nap in mtmsr, an
+    // interrupt line through the device access that raised it, the
+    // decrementer through the batch's own length. Same batch and same MSR,
+    // same answers. So a hop tests that the batch has not ended (halt()
+    // ends it too), that MSR is the dispatcher's (Cpu::jitMsr), and that a
+    // line's worth of budget remains. --jit-full-gate compiles the list.
+    void chainChecks()
+    {
+        if (c.jitFullGate) {
+            chainChecksFull();
+            return;
+        }
+        byteCheck(o.batchBreak);
+        e.loadR(RAX, o.msr);
+        e.mem13(0x3B, RAX, o.jitMsr);      // cmp eax, [r13+jitMsr]
+        e.jccTo(CC_NE, epi);
+        e.bytes({0x48, 0x89, 0xE8});       // mov rax, rbp (until)
+        e.bytes({0x49, 0x2B, 0x06});       // sub rax, [r14]
+        e.bytes({0x48, 0x83, 0xF8, 0x08}); // cmp rax, 8
+        e.jccTo(CC_B, epi);                // budget < a line: dispatcher
+    }
+    void chainChecksFull() // the dispatcher's own gate, in test form
     {
         byteCheck(o.halted);      // post-run break test
         byteCheck(o.batchBreak);  // (provably false here, checked anyway)
@@ -2152,6 +2183,7 @@ void JitCache::bind(Cpu& c)
                    offs.pmP == offs.extIrq + 3;
     offs.until = d32(&c.jitUntil);
     offs.chainHops = d32(&c.jitChainHops);
+    offs.jitMsr = d32(&c.jitMsr);
     offs.dmLive = d32(&c.dmLive);
     offs.dtlbStamp0 = d32(&c.dtlbStamp[0]);
     offs.dtlbLru0 = d32(&c.dtlbLru[0]);
@@ -2311,6 +2343,7 @@ bool jitRunLine(Cpu& c, u32 slot, u32 word, u64& stamp, u64 until)
     }
     ++J.enters;
     c.jitUntil = until; // the trampoline pins it in rbp for the chain hops
+    c.jitMsr = c.st.msr; // what runSteps just checked its entry conditions under
     const u64 before = stamp;
     if (J.tscOn) {
         // The split the report's "cycles per …" lines are built from:

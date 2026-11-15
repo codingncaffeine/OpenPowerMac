@@ -146,6 +146,7 @@ class JitCache {
         // and LRU bytes a hit compares and writes, and where the memo's
         // table is (it is the processor's for life, so its address is a
         // constant of the compiled code).
+        i32 jitMsr = 0; // Cpu::jitMsr, for the hop gate
         i32 dmLive = 0, dtlbStamp0 = 0, dtlbLru0 = 0;
         u64 dpTable = 0;
     } offs;

@@ -1144,6 +1144,14 @@ struct Cpu {
     // --jit-tsc, carried here because the cache is created on first use and
     // the harness sets its flags before the machine runs.
     bool jitTscOn = false;
+    // MSR as the dispatcher found it when it last entered compiled code,
+    // which is the MSR its entry conditions were checked under. A hop from
+    // block to block compares against it: see Compiler::chainChecks.
+    u32 jitMsr = 0;
+    // DIAGNOSTIC (--jit-full-gate): at every hop between blocks re-test each
+    // of the dispatcher's entry conditions by name, as the hops did before
+    // they compared the MSR instead. The control for that.
+    bool jitFullGate = false;
     // DIAGNOSTIC (--no-jit-inline-mem): compile every load and store as a
     // call to its shim, as before memory could be read directly. The control
     // for the inline form (Compiler::memProbe in jit.cpp).

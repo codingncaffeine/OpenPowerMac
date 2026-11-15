@@ -2745,8 +2745,8 @@ bool R128Cell::engWrite(u32 off, u32 v)
         }
         if (v & 0x10000000u) // GMC_CLR_CMP_CNTL_DIS
             regs_[kClrCmpCntl] = 0;
-        if (v & 0x20000000u) // GMC_AUX_CLIP_DIS: clear every AUXn_SC_ENB
-            regs_[kAuxScCntl] = rd(kAuxScCntl) & ~0x00010101u;
+        if (v & 0x20000000u) // GMC_AUX_CLIP_DIS: clear every AUXn_SC_ENB,
+            regs_[kAuxScCntl] = rd(kAuxScCntl) & ~0x15u; // bits 0, 2 and 4
         if (v & 0x40000000u) { // GMC_WR_MSK_DIS
             regs_[kDpWriteMsk] = 0xFFFFFFFFu;
             regs_[kClrCmpMsk] = 0xFFFFFFFFu;

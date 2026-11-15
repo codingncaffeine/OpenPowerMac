@@ -128,6 +128,17 @@ TEST_CASE("r128 2d: a solid fill lands in the right pixels, most significant "
     CHECK(c.vram[static_cast<size_t>(1) * kStride + 2 * 4 + 3] == 0x44);
 }
 
+TEST_CASE("r128 2d: GMC_AUX_CLIP_DIS clears the three auxiliary scissor "
+          "enables and leaves their modes")
+{
+    // AUX_SC_CNTL in the register guide: the enables are bits 0, 2 and 4, each
+    // followed by its scissor's mode bit.
+    R128Cell c;
+    wr(c, 0x1660, 0x3Fu);
+    wr(c, kGmc, gmc(0xF0u, 0u, 2u) | (1u << 29));
+    CHECK(c.peek(0x1660) == 0x2Au);
+}
+
 TEST_CASE("r128 2d: BLACKNESS and WHITENESS ignore the brush colour")
 {
     R128Cell c;

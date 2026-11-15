@@ -121,6 +121,34 @@ struct WalkLatch {
     bool valid = false;
     u32 vloff = 0, vsize = 0, fmt = 0, cntl = 0;
 } gWalk;
+// ── Dithering (SDK 6-53) ─────────────────────────────────────────────────
+//
+// With TEX_CNTL_C:DITHER_EN set, a 15 or 16 bpp destination is dithered by
+// one of two methods, SCALE_3D_CNTL:SCALE_DITHER choosing: 0 = error
+// diffusion, 1 = a table lookup. The manual gives no table, so table dither
+// stays as it was (the colour rounded to 8 bits and cut to the channel's
+// width) and the census marks it. Error diffusion it describes by its
+// register: "the current contents of the error register" are used at the
+// start of a scanline, or the error is reset to zero there, as DITHER_INIT
+// says. One register, carried along the line: the dither is one-dimensional.
+//
+// This is that mechanism in its plainest form, and NOT a claim to match the
+// chip pixel for pixel, because three things are not stated anywhere:
+//   - the register's width: taken as the bits the channel drops (three for a
+//     5-bit channel, two for the 6-bit green), which is what an adder that
+//     keeps its remainder holds;
+//   - what happens at full scale: the sum is held at 255;
+//   - the order pixels meet the register: this rasteriser's own, each
+//     primitive's rows top to bottom and left to right, the register going
+//     from one primitive to the next, and only a pixel that is written
+//     moving it.
+// What it does guarantee is what dithering is for: along a span the mean of
+// what is stored equals the colour asked for, where cutting the low bits
+// stored a level too dark by half a step on average.
+struct DitherError {
+    u32 r = 0, g = 0, b = 0;
+} gDither;
+
 int gLogBudget = 24; // first-N prints for declines, so a busy path cannot spam
 // --tri-dump: a print budget for real triangles, plus the VC_FORMAT/prim of
 // the packet currently being walked (rasterTriangle cannot see the packet
@@ -262,6 +290,9 @@ struct Pipe {
     u32 texCntl = 0, misc = 0;
     bool blendEn = false, alphaTestEn = false, fogEn = false, fogTable = false;
     bool specEn = false, chromaEn = false, ditherEn = false;
+    // Dithering by error diffusion is in force (see gDither), and whether
+    // the error is cleared where a scanline of a primitive begins.
+    bool ditherDiffuse = false, ditherReset = false;
     bool alphaMask = false;   // TEX_CNTL_C bit 13: see shadeFragment
     u32 blendSrc = 1, blendDst = 0, blendComb = 0, alphaOp = 7, refAlpha = 0;
     float fogR = 0, fogG = 0, fogB = 0;
@@ -427,6 +458,11 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     P.alphaMask = (P.texCntl >> 13) & 0x1u;
     P.fogEn = (P.texCntl >> 7) & 0x1u;
     P.ditherEn = (P.texCntl >> 8) & 0x1u;
+    {
+        const u32 sc = c.peek(kScale3dCntl);
+        P.ditherDiffuse = P.ditherEn && !((sc >> 1) & 1u) && P.bypp == 2u;
+        P.ditherReset = (sc >> 3) & 1u;
+    }
     P.fogTable = (P.misc >> 14) & 0x1u;
     P.blendSrc = (P.misc >> 16) & 0xFu;
     P.blendDst = (P.misc >> 20) & 0xFu;
@@ -1028,12 +1064,39 @@ Rgba dstDecode(const Pipe& P, u32 v)
     return o;
 }
 
+// A scanline of a primitive begins: DITHER_INIT decides what the error
+// register starts it with.
+inline void ditherLineStart(const Pipe& P)
+{
+    if (P.ditherDiffuse && P.ditherReset)
+        gDither = DitherError{};
+}
+
+// One channel through the error register: the level plus what the last
+// pixel left, the channel taking the top bits and the register the rest.
+inline u32 ditherStep(u32 level, u32& carried, u32 dropBits)
+{
+    u32 sum = level + carried;
+    if (sum > 255u)
+        sum = 255u;
+    carried = sum & ((1u << dropBits) - 1u);
+    return sum >> dropBits;
+}
+
 u32 dstEncode(const Pipe& P, const Rgba& c)
 {
     const u32 r = static_cast<u32>(clamp255(c.r) + 0.5f);
     const u32 g = static_cast<u32>(clamp255(c.g) + 0.5f);
     const u32 b = static_cast<u32>(clamp255(c.b) + 0.5f);
     const u32 a = static_cast<u32>(clamp255(c.a) + 0.5f);
+    if (P.ditherDiffuse) {
+        const u32 r5 = ditherStep(r, gDither.r, 3);
+        const u32 g56 = ditherStep(g, gDither.g, P.dstType == 4u ? 2u : 3u);
+        const u32 b5 = ditherStep(b, gDither.b, 3);
+        return P.dstType == 4u ? (r5 << 11) | (g56 << 5) | b5
+                               : ((a >> 7) << 15) | (r5 << 10) | (g56 << 5) |
+                                     b5;
+    }
     if (P.dstType == 4u)
         return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
     if (P.dstType == 3u)
@@ -1491,6 +1554,7 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
          (((P.tex[0].cntl >> 1) & 1u) != ((P.tex[0].cntl >> 4) & 1u)));
     for (int py = minY; py <= maxY; ++py) {
         const double cy = py + 0.5;
+        ditherLineStart(P);
         // Per-row bases: value at (cx,cy) = plane.a * cx + rowBase. One
         // multiply-add per attribute per pixel instead of two multiplies
         // and two adds. (The EDGE functions below keep their original
@@ -1868,6 +1932,7 @@ void r128Cce3dReset()
 {
     std::memset(gFog.t, 0xFF, sizeof gFog.t); // f=255: no fog
     std::memset(gPalette, 0, sizeof gPalette);
+    gDither = DitherError{};
     gWalk = WalkLatch{};
     gGate3d = -1;
     gLogBudget = 24;
@@ -1890,6 +1955,9 @@ void r128Cce3dStateSave(SnapWriter& w)
     w.u32v(gWalk.fmt);
     w.u32v(gWalk.cntl);
     w.i32v(gGate3d);
+    w.u32v(gDither.r);
+    w.u32v(gDither.g);
+    w.u32v(gDither.b);
 }
 void r128Cce3dStateLoad(SnapReader& r)
 {
@@ -1902,6 +1970,13 @@ void r128Cce3dStateLoad(SnapReader& r)
     gWalk.fmt = r.u32v();
     gWalk.cntl = r.u32v();
     gGate3d = r.i32v();
+    // A recording made before the error register existed ends here.
+    gDither = DitherError{};
+    if (r.ok && r.p < r.end) {
+        gDither.r = r.u32v();
+        gDither.g = r.u32v();
+        gDither.b = r.u32v();
+    }
 }
 
 int r128Gate3dState() { return gGate3d; }

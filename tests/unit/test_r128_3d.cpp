@@ -976,3 +976,144 @@ TEST_CASE("3d: points and lines land with their attributes")
     CHECK(r.pix32(9, 20) == 0xFFFF0000u);
     CHECK(r.pix32(5, 20) == 0xFFFF0000u);
 }
+
+// ── Dithering (SDK 6-53; r128_3d.cpp "Dithering" says what is and is not
+// claimed) ────────────────────────────────────────────────────────────────
+
+namespace {
+
+// A flat 30x8 rectangle of one colour, as two triangles, into the 565
+// destination. Returns the sums over its 240 pixels of each channel put
+// back on the 0..255 scale.
+struct Sums {
+    u32 r = 0, g = 0, b = 0;
+};
+Sums flatRect(Rig3d& r, u32 argb)
+{
+    std::vector<u32> v;
+    Rig3d::vtx(v, 0, 0, 0.5f, argb);
+    Rig3d::vtx(v, 30, 0, 0.5f, argb);
+    Rig3d::vtx(v, 0, 8, 0.5f, argb);
+    Rig3d::vtx(v, 30, 0, 0.5f, argb);
+    Rig3d::vtx(v, 30, 8, 0.5f, argb);
+    Rig3d::vtx(v, 0, 8, 0.5f, argb);
+    r.prim(0x9u, 4u, 6u, v);
+    Sums s;
+    for (u32 y = 0; y < 8; ++y)
+        for (u32 x = 0; x < 30; ++x) {
+            const u32 p = r.pix16(x, y);
+            s.r += ((p >> 11) & 0x1Fu) * 8u;
+            s.g += ((p >> 5) & 0x3Fu) * 4u;
+            s.b += (p & 0x1Fu) * 8u;
+        }
+    return s;
+}
+
+constexpr u32 kTexCntlC = 0x1C9Cu, kScale3dCntl = 0x1A00u;
+constexpr u32 kDitherEn = 1u << 8;
+
+} // namespace
+
+TEST_CASE("3d: error diffusion stores a flat colour's mean, where cutting the "
+          "low bits stored it too dark")
+{
+    // Red 100, green 101, blue 7 of 255: none of them a level the 565
+    // destination has.
+    const u32 colour = 0xFF646507u;
+    {
+        Rig3d r;
+        r.dst16();
+        r.openGate();
+        r.fpuSolidBoth();
+        const Sums cut = flatRect(r, colour); // dithering off: as before
+        CHECK(cut.r == 240u * 96u);
+        CHECK(cut.g == 240u * 100u);
+        CHECK(cut.b == 0u);
+        CHECK(r.pix16(3, 3) == ((12u << 11) | (25u << 5) | 0u));
+    }
+    Rig3d r;
+    r.dst16();
+    r.openGate();
+    r.fpuSolidBoth();
+    r.reg(kTexCntlC, kDitherEn); // SCALE_3D_CNTL is zero: error diffusion
+    const Sums d = flatRect(r, colour);
+    // What is stored plus what the register still holds is exactly what was
+    // asked for, so the sums are short by less than one step.
+    CHECK(d.r <= 240u * 100u);
+    CHECK(d.r > 240u * 100u - 8u);
+    CHECK(d.g <= 240u * 101u);
+    CHECK(d.g > 240u * 101u - 4u);
+    CHECK(d.b <= 240u * 7u);
+    CHECK(d.b > 240u * 7u - 8u);
+    // And it is a dither: both neighbouring levels are in the picture.
+    bool low = false, high = false;
+    for (u32 x = 0; x < 30; ++x) {
+        const u32 r5 = (r.pix16(x, 0) >> 11) & 0x1Fu;
+        low = low || r5 == 12u;
+        high = high || r5 == 13u;
+        CHECK((r5 == 12u || r5 == 13u));
+    }
+    CHECK(low);
+    CHECK(high);
+}
+
+TEST_CASE("3d: DITHER_INIT resets the error where each scanline begins")
+{
+    // A right triangle with its upright edge at x = 0: every row's span
+    // starts there. Red 101 leaves 5 of 8 in the register per pixel, so the
+    // pattern along a row depends on what the row began with.
+    auto draw = [](Rig3d& r, u32 scale3d) {
+        r.dst16();
+        r.openGate();
+        r.fpuSolidBoth();
+        r.reg(kScale3dCntl, scale3d);
+        r.reg(kTexCntlC, kDitherEn);
+        std::vector<u32> v;
+        Rig3d::vtx(v, 0, 0, 0.5f, 0xFF650000u);
+        Rig3d::vtx(v, 30, 0, 0.5f, 0xFF650000u);
+        Rig3d::vtx(v, 0, 30, 0.5f, 0xFF650000u);
+        r.prim(0x9u, 4u, 3u, v);
+    };
+    auto rowsAlike = [](const Rig3d& r) {
+        for (u32 y = 1; y < 12; ++y)
+            for (u32 x = 0; x < 12; ++x)
+                if (r.pix16(x, y) != r.pix16(x, 0))
+                    return false;
+        return true;
+    };
+    Rig3d reset;
+    draw(reset, 1u << 3); // DITHER_INIT = 1
+    CHECK(rowsAlike(reset));
+    Rig3d kept;
+    draw(kept, 0u); // DITHER_INIT = 0: the register runs on from row to row
+    CHECK(!rowsAlike(kept));
+}
+
+TEST_CASE("3d: table dither and a 32 bpp destination are drawn as with "
+          "dithering off")
+{
+    const u32 colour = 0xFF646507u;
+    Rig3d table;
+    table.dst16();
+    table.openGate();
+    table.fpuSolidBoth();
+    table.reg(kScale3dCntl, 1u << 1); // SCALE_DITHER = 1: the table method
+    table.reg(kTexCntlC, kDitherEn);
+    const Sums t = flatRect(table, colour);
+    CHECK(t.r == 240u * 96u);
+    CHECK(t.g == 240u * 100u);
+    CHECK(t.b == 0u);
+
+    Rig3d deep;
+    deep.dst32();
+    deep.openGate();
+    deep.fpuSolidBoth();
+    deep.reg(kTexCntlC, kDitherEn);
+    std::vector<u32> v;
+    Rig3d::vtx(v, 0, 0, 0.5f, colour);
+    Rig3d::vtx(v, 30, 0, 0.5f, colour);
+    Rig3d::vtx(v, 0, 8, 0.5f, colour);
+    deep.prim(0x9u, 4u, 3u, v);
+    for (u32 x = 0; x < 8; ++x)
+        CHECK(deep.pix32(x, 1) == colour);
+}

@@ -110,10 +110,10 @@ constexpr Setting kSettings[] = {
     {"blend, how the two are combined", upTo(3),
      "add, clamp|add|subtract, clamp|subtract"},
     {"alpha test", upTo(7), kCompare},
-    // Both methods round to the nearest level here: the picture bands where
-    // the card's does not.
-    {"dither method", 0, "error diffusion|table"},
-    {"dither, error at the start of a line", 0, "kept|reset"},
+    // The manual gives no table for the second method: it is drawn as if
+    // dithering were off (r128_3d.cpp, "Dithering").
+    {"dither method", bit(0), "error diffusion|table"},
+    {"dither, error at the start of a line", upTo(1), "kept|reset"},
     // Vertices are used at the precision they arrive with.
     {"vertex position precision", 0, "quarter pixel|sixteenth of a pixel"},
     {"texture coordinates", bit(1), "multiplied by W|as given"},

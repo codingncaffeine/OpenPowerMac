@@ -2,8 +2,8 @@
 # The whole release check in one command: builds every artifact from clean trees,
 # launches the glibc ones here, and installs and launches each one in clean
 # containers (the .deb on Debian 12 and 13 and Ubuntu 22.04 and 24.04, the glibc
-# tarball on Fedora and Arch, the musl tarball on Alpine). The container runs go
-# three at a time. Logs land in packaging/out/logs/.
+# tarball on Fedora and Arch, the musl tarball on Alpine 3.22 and the latest
+# Alpine). The container runs go three at a time. Logs land in packaging/out/logs/.
 #
 #   packaging/release-check.sh          exit 0 = every artifact passed everything
 #
@@ -45,7 +45,8 @@ start deb-ubuntu-22.04      packaging/install-test.sh "$DEB" docker.io/library/u
 start deb-ubuntu-24.04      packaging/install-test.sh "$DEB" docker.io/library/ubuntu:24.04
 start tarball-fedora        packaging/install-test.sh "$TAR" registry.fedoraproject.org/fedora:latest
 start tarball-arch          packaging/install-test.sh "$TAR" docker.io/library/archlinux:latest
-start tarball-musl-alpine   packaging/install-test.sh "$MUSL"
+start tarball-musl-alpine-3.22    packaging/install-test.sh "$MUSL" docker.io/library/alpine:3.22
+start tarball-musl-alpine-latest  packaging/install-test.sh "$MUSL" docker.io/library/alpine:latest
 
 failed=0
 for name in $(printf '%s\n' "${!runs[@]}" | sort); do

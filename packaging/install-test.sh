@@ -8,7 +8,7 @@
 # Default images by artifact:
 #   openpowermac_*.deb                       Debian 12, Debian 13, Ubuntu 22.04, Ubuntu 24.04 (apt resolves the Depends)
 #   OpenPowerMac-*-linux-x64.tar.gz          Fedora, Arch
-#   OpenPowerMac-*-linux-musl-x64.tar.gz     Alpine
+#   OpenPowerMac-*-linux-musl-x64.tar.gz     Alpine 3.22 (the one it is built on) and the latest Alpine
 # Exit: 0 every image passed | 1 something failed | 2 no container runtime
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -19,7 +19,7 @@ if (( ! ${#images[@]} )); then
     case $artifact in
         *.deb) images=(docker.io/library/debian:bookworm docker.io/library/debian:trixie
                        docker.io/library/ubuntu:22.04 docker.io/library/ubuntu:24.04) ;;
-        *linux-musl-x64.tar.gz) images=(docker.io/library/alpine:3.22) ;;
+        *linux-musl-x64.tar.gz) images=(docker.io/library/alpine:3.22 docker.io/library/alpine:latest) ;;
         *) images=(registry.fedoraproject.org/fedora:latest docker.io/library/archlinux:latest) ;;
     esac
 fi

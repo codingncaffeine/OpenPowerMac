@@ -1332,12 +1332,14 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
                  "--   2d not drawn: %llu pattern brush, %llu one-bit "
                  "source, %llu to system memory, %llu off video memory, "
                  "%llu zero pitch; %llu colour compares not applied; %llu "
-                 "clipped away\n",
+                 "clipped away; %llu host-data rasters with a word count of no "
+                 "known layout\n",
                  (unsigned long long)e.brushUnimpl,
                  (unsigned long long)e.monoSrc, (unsigned long long)e.agpTarget,
                  (unsigned long long)e.offVram, (unsigned long long)e.zeroPitch,
                  (unsigned long long)e.colorCompare,
-                 (unsigned long long)e.clippedOut);
+                 (unsigned long long)e.clippedOut,
+                 (unsigned long long)e.hostShape);
         s += b;
         if (e.cceRingKicks || e.cceRingStall) {
             snprintf(b, sizeof b,

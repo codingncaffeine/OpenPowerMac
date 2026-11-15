@@ -430,6 +430,117 @@ TEST_CASE("cce: HOSTDATA_BLT colour honours the source colour key")
     }
 }
 
+// A 256-color screen: one byte a pixel, and the byte is a palette index.
+// A program that draws its own frames pushes them as color host data, in
+// strips. The pixels run on from row to row with no padding, so a width
+// that is not a multiple of four puts a row's start in the middle of a
+// DWORD; the count the driver gives is each row rounded up to a DWORD all
+// the same, and the DWORDs past the last pixel are slack.
+TEST_CASE("cce: HOSTDATA_BLT color at one byte a pixel lands byte for byte, "
+          "rows end to end")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    const u32 gc = 2u | 8u | (15u << 4) | (2u << 8) | (3u << 12) |
+                   (0xCCu << 16);
+    r.body({
+        0xC0009400u | (12u << 16), // header: 13-DWord body
+        gc,
+        0x00800000u, // DST_PITCH_OFFSET: 32 pixels, so 32 bytes, a row
+        0x00000000u, // SC_TOP_LEFT
+        0x001F001Fu, // SC_BOT_RITE
+        0xAA55AA55u, // FRGD (ineffective for color)
+        0x00000000u, // BKGD (ineffective)
+        0x00020003u, // BaseY=2 | BaseX=3
+        0x00020005u, // HEIGHT=2 | WIDTH=5: ten bytes
+        0x00000004u, // counted as two rows of two DWORDs
+        0x14131211u, // memory bytes 11 12 13 14
+        0x23222115u, // 15, then the second row: 21 22 23
+        0xEEEE2524u, // 24 25, and the slack
+        0xEEEEEEEEu,
+    });
+    r.fifo(0x000101CEu);
+    r.fifo(0x00101000u);
+    r.fifo(0x0000000Eu); // 14 DWORDs
+    const auto& e = r128EngStats();
+    CHECK(e.blits - before.blits == 1);
+    CHECK(e.pixels - before.pixels == 10);
+    CHECK(e.badBpp == before.badBpp);       // not declined
+    CHECK(e.hostShape == before.hostShape); // and the count is the raster's
+    CHECK(r128CceP3Skipped().count(0x94u) == 0);
+    const size_t stride = 32u;
+    for (u32 x = 0; x < 5; ++x) {
+        CAPTURE(x);
+        CHECK(r.c.vram[stride * 2u + 3u + x] == 0x11u + x);
+        CHECK(r.c.vram[stride * 3u + 3u + x] == 0x21u + x);
+    }
+    CHECK(r.c.vram[stride * 2u + 2u] == 0x00); // nothing beside the rectangle
+    CHECK(r.c.vram[stride * 2u + 8u] == 0x00);
+}
+
+// One-bit pixels expanded onto the same screen: the two colors the packet
+// carries are palette indices, and each lands as its one byte.
+TEST_CASE("cce: HOSTDATA_BLT expands one-bit pixels to palette indices")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    const u32 gc = 2u | 8u | (15u << 4) | (2u << 8) | (0u << 12) |
+                   (0xCCu << 16);
+    r.fifo(0xC0009400u | (9u << 16)); // 10-DWord body
+    r.fifo(gc);
+    r.fifo(0x00800000u); // DST_PITCH_OFFSET
+    r.fifo(0x00000000u); // SC_TOP_LEFT
+    r.fifo(0x001F001Fu); // SC_BOT_RITE
+    r.fifo(0x000000D7u); // FRGD: index D7
+    r.fifo(0x0000002Au); // BKGD: index 2A
+    r.fifo(0x00010001u); // BaseY=1 | BaseX=1
+    r.fifo(0x00020008u); // HEIGHT=2 | WIDTH=8
+    r.fifo(0x00000001u); // one DWORD
+    r.fifo(0xF00F0000u); // rows 11110000, 00001111
+    const auto& e = r128EngStats();
+    CHECK(e.blits - before.blits == 1);
+    CHECK(e.pixels - before.pixels == 16);
+    CHECK(e.badBpp == before.badBpp);
+    const size_t stride = 32u;
+    CHECK(r.c.vram[stride * 1u + 1u] == 0xD7); // (1,1) set
+    CHECK(r.c.vram[stride * 1u + 5u] == 0x2A); // (5,1) clear
+    CHECK(r.c.vram[stride * 2u + 1u] == 0x2A); // (1,2) clear
+    CHECK(r.c.vram[stride * 2u + 8u] == 0xD7); // (8,2) set
+    CHECK(r.c.vram[stride * 1u + 9u] == 0x00); // past the glyph
+}
+
+TEST_CASE("cce: SMALL_TEXT and NEXTCHAR draw glyphs in a palette index")
+{
+    CceRig r;
+    const auto before = r128EngStats();
+    const size_t stride = 32u;
+    const u32 gc = 2u | 8u | (15u << 4) | (2u << 8) | (0xCCu << 16);
+    r.fifo(0xC0009300u | (7u << 16)); // 8-DWord body
+    r.fifo(gc);
+    r.fifo(0x00800000u);                              // DST_PITCH_OFFSET
+    r.fifo(0x00000000u);                              // SC_TOP_LEFT
+    r.fifo(0x001F001Fu);                              // SC_BOT_RITE
+    r.fifo(0x000000E3u);                              // FRGD: index E3
+    r.fifo(0x000A0005u);                              // BAS_Y=10 | BAS_X=5
+    r.fifo((2u << 25) | (2u << 16) | (2u << 8) | 0u); // H=2 W=2 dy=2 dx=0
+    r.fifo(0xD0000000u);                              // bits 1101
+    const auto& e = r128EngStats();
+    CHECK(e.pixels - before.pixels == 3);
+    CHECK(e.badBpp == before.badBpp);
+    CHECK(r.c.vram[8 * stride + 5] == 0xE3); // (5,8)
+    CHECK(r.c.vram[8 * stride + 6] == 0xE3); // (6,8)
+    CHECK(r.c.vram[9 * stride + 5] == 0x00); // (5,9) untouched
+    CHECK(r.c.vram[9 * stride + 6] == 0xE3); // (6,9)
+    r.fifo(0xC0001900u | (2u << 16)); // NEXTCHAR, 3-DWord body
+    r.fifo(0x0014000Cu);              // DST_Y=20 | DST_X=12
+    r.fifo(0x00010002u);              // DST_H=1 | DST_W=2
+    r.fifo(0x80000000u);              // one set bit -> (12,20)
+    CHECK(r.c.vram[20 * stride + 12] == 0xE3);
+    CHECK(r.c.vram[20 * stride + 13] == 0x00);
+    CHECK(r128CceP3Skipped().count(0x93u) == 0);
+    CHECK(r128CceP3Skipped().count(0x19u) == 0);
+}
+
 TEST_CASE("cce: BITBLT_MULTI (0x9B) copies through the engine's blit path")
 {
     CceRig r;

@@ -445,6 +445,7 @@ struct R128EngStats {
     u64 linePixels = 0;  // ...and the pixels they wrote
     u64 lineDeclined = 0; // a line asked for with a brush or ROP not drawn
     u64 hostData = 0;    // source is HOST_DATA (stage 3, not built yet)
+    u64 hostShape = 0;   // color host data with a word count of no known layout
     u64 colorCompare = 0; // a colour compare this engine did not apply
     u64 waitUntil = 0;   // WAIT_UNTIL events, all satisfiable at once here
     u64 cacheFlushes = 0; // PC_GUI_CTLSTAT flush/invalidate pulses answered

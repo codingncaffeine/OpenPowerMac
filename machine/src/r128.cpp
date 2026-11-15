@@ -1373,6 +1373,7 @@ ClrCmp clrCmpDecode(u32 cntl, u32 keySrc, u32 keyDst, u32 mask, u32 bypp)
 // honouring the engine's CURRENT destination state: pitch/offset from the
 // DST registers, the scissor, and the destination type from GUI_CONTROL.
 // FRGD/BKGD arrive as RGBQUAD and are converted to the destination format.
+static u32 ccePixelBytes(u32 dstType);
 static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
 {
     const u32 i0 = cceSettings(c, body, n);
@@ -1387,12 +1388,8 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
         ++gEng.hostData; // reserved encoding — decline loudly
         return false;
     }
-    u32 bpp = 0;
-    switch (dstType) {
-    case 3u:
-    case 4u: bpp = 2; break;
-    case 6u: bpp = 4; break;
-    default:
+    const u32 bpp = ccePixelBytes(dstType);
+    if (!bpp) {
         ++gEng.badBpp;
         return false;
     }
@@ -1442,7 +1439,14 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
         if (srcType == 3u) {
             // COLOUR host data: the raster is packed destination-format
             // pixels, rows continuous — an icon/pixmap push, copied
-            // byte-for-byte. ⚠ The stream's DWORDs are LITTLE-ENDIAN
+            // byte-for-byte. ⚠ THE COUNT IS NOT THE LAYOUT. For a width
+            // whose row is not a whole number of DWORDs the Mac driver
+            // counts every row rounded up (a 490x33 push at one byte a
+            // pixel says 4059 = 33 x 123 DWORDs) and still sends the pixels
+            // end to end, in the first 4043 of them; the rest is slack.
+            // Starting each row on its own DWORD, as that count suggests,
+            // shears the picture two pixels a row, and did.
+            // ⚠ The stream's DWORDs are LITTLE-ENDIAN
             // (both the FIFO ingest and the GART fetch compose them LE),
             // so stream byte s is lane (s & 3), LSB FIRST. Extracting
             // MSB-first reverses every pixel: a white menu bar's
@@ -1451,6 +1455,15 @@ static bool cceOpHostBlt(R128Cell& c, const u32* body, u32 n)
             // desktop byte-order bug, caught by the user's eyes in the
             // first interactive session.
             const u64 availB = static_cast<u64>(m) * 4u;
+            // The two counts seen: the raster's bytes rounded up to a DWORD,
+            // and each row rounded up. Any other is a packing this does not
+            // know; it is counted, so the report says so.
+            const u64 rowB = static_cast<u64>(wPx) * bpp;
+            if (m != (rowB * hPx + 3u) / 4u && m != (rowB + 3u) / 4u * hPx &&
+                ++gEng.hostShape <= 2)
+                printf("-- cce host data %ux%u, %u bytes a pixel, in %u "
+                       "words: a count this engine has no layout for\n",
+                       wPx, hPx, bpp, m);
             u64 sb = 0;
             for (u32 yy = 0; yy < hPx; ++yy) {
                 for (u32 xx = 0; xx < wPx; ++xx, sb += bpp) {
@@ -1743,13 +1756,30 @@ static bool cceOpTransBitblt(R128Cell& c, const u32* body, u32 n)
     return true;
 }
 
-static bool cceDstState(R128Cell& c, u32 dstType, CceDst& d)
+// How many bytes a pixel takes for the packets that write video memory
+// themselves (SDK Table F-3, by GUI_CONTROL's destination type): 2 and 7 one
+// byte, 3 and 4 two, 6 four. A one-byte pixel is a palette index (type 2) or
+// RGB 3:3:2 (type 7), and a color a packet carries for one is that byte: no
+// conversion from an RGBQUAD can make an index. Type 5, three bytes, stays
+// declined: nothing says how its host data is packed into DWORDs.
+static u32 ccePixelBytes(u32 dstType)
 {
     switch (dstType) {
+    case 2u:
+    case 7u: return 1;
     case 3u:
-    case 4u: d.bpp = 2; break;
-    case 6u: d.bpp = 4; break;
-    default: ++gEng.badBpp; return false;
+    case 4u: return 2;
+    case 6u: return 4;
+    default: return 0;
+    }
+}
+
+static bool cceDstState(R128Cell& c, u32 dstType, CceDst& d)
+{
+    d.bpp = ccePixelBytes(dstType);
+    if (!d.bpp) {
+        ++gEng.badBpp;
+        return false;
     }
     d.dstOff = c.peek(0x1404u);
     d.pitchBytes = c.peek(0x1408u) * 8u * d.bpp;

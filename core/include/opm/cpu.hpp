@@ -1329,6 +1329,7 @@ struct CpuSnoop final : SnoopSink {
     void snoopRead(u32 pa, u32 len) override;
     void snoopWrite(u32 pa, u32 len) override;
     void publish(u8* ram, u32 ramSize) override;
+    bool memoryCurrent() const override { return cpu && cpu->dmDirect; }
 };
 
 // Binds every implemented handler into the dispatch used by Cpu::step.

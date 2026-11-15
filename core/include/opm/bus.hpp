@@ -40,6 +40,11 @@ struct SnoopSink {
     // of what a cache is for; the machine that never publishes (a run with
     // no device thread) keeps the exact behavior.
     virtual void publish(u8* /*ram*/, u32 /*ramSize*/) {}
+    // True while main memory is never behind a cache of the processor's: a
+    // master may then read it without asking first, and reads it as the
+    // snoop would have left it. (A processor that reads memory directly,
+    // Cpu::dmDirect.) The default is no: ask every time.
+    virtual bool memoryCurrent() const { return false; }
 };
 
 // Physical-address bus. The 7400 has a 32-bit physical address space (52-bit

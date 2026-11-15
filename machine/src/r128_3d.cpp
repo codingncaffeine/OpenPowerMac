@@ -39,7 +39,24 @@
 #include "opm/r128rec.hpp"
 #include "opm/snapshot.hpp"
 
+#include <climits>
 #include <cmath>
+// The fragment path works on a pixel's four channels at once (F4, below):
+// with SSE2 where the target has it, which every x86-64 does, and as plain
+// loops elsewhere. Lane by lane the two are the same IEEE operations in the
+// same order, so they draw the same picture.
+#if !defined(OPM_F4_SCALAR) && \
+    (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64))
+#define OPM_F4_SSE 1
+#include <emmintrin.h>
+#else
+#define OPM_F4_SSE 0
+#endif
+#if defined(_MSC_VER)
+#define OPM_FORCE_INLINE __forceinline
+#else
+#define OPM_FORCE_INLINE inline __attribute__((always_inline))
+#endif
 #include <cstdio>
 #include <cstring>
 
@@ -308,8 +325,24 @@ struct Pipe {
     float fogR = 0, fogG = 0, fogB = 0;
     u32 chromaClr = 0, chromaMsk = 0;
     float constA = 255, constR = 255, constG = 255, constB = 255;
+    // The same two colors as F4 loads them: alpha, red, green, blue (the
+    // fog color has no alpha).
+    float constC[4] = {255, 255, 255, 255}, fogC[4] = {0, 0, 0, 0};
     TexUnit tex[2];
     bool texAny = false;
+    // ── Texel memory, decided once a packet (texSpan) ──
+    // Video memory as a pointer and its end; whether system memory may be
+    // read in place; and the pages of AGP space this packet's texels have
+    // been found in so far, each walked through the GART once.
+    const u8* vram = nullptr;
+    u32 vramEnd = 0;
+    bool fastMem = false;
+    static constexpr u32 kAgpPages = 64;
+    struct AgpPage {
+        u32 page = ~0u;
+        const u8* host = nullptr; // null: not plainly there, ask byte by byte
+    };
+    mutable AgpPage agp[kAgpPages];
 };
 
 int sx14c(u32 v)
@@ -403,6 +436,16 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
 {
     P.c = &c;
     P.m = m;
+    P.vram = c.vram.data();
+    P.vramEnd = c.vram.size() < kAgpWindow ? static_cast<u32>(c.vram.size())
+                                           : kAgpWindow;
+    // System memory in place: not under a frame recording, which is told of
+    // every read, and not while a read has to be snooped against the
+    // processor's caches first. On the engine's own thread and in a replay
+    // there is nothing to ask; a processor that reads memory directly says
+    // so (SnoopSink::memoryCurrent).
+    P.fastMem = m.ram && !r128RecOn() &&
+                (!m.snoop || m.snoop->memoryCurrent());
     const u32 dt = c.peek(kDpDatatype) & 0xFu;
     r128SettingUsed(R128Setting::Dst3d, dt);
     switch (dt) {
@@ -498,6 +541,13 @@ bool gatherPipe(R128Cell& c, const CceMem& m, Pipe& P)
     P.constR = static_cast<float>((cc >> 16) & 0xFFu);
     P.constG = static_cast<float>((cc >> 8) & 0xFFu);
     P.constB = static_cast<float>(cc & 0xFFu);
+    P.constC[0] = P.constA;
+    P.constC[1] = P.constR;
+    P.constC[2] = P.constG;
+    P.constC[3] = P.constB;
+    P.fogC[1] = P.fogR;
+    P.fogC[2] = P.fogG;
+    P.fogC[3] = P.fogB;
     // texture units
     const u32 sp = c.peek(kTexSizePitchC);
     for (int u = 0; u < 2; ++u) {
@@ -591,6 +641,117 @@ struct Rgba {
 
 float clamp255(float v) { return v < 0 ? 0.0f : v > 255.0f ? 255.0f : v; }
 
+// ── Four channels at once ─────────────────────────────────────────────────
+//
+// A color in the order Rgba holds it: alpha, red, green, blue. Everything
+// the fragment path does to a color it does to each channel alike, or to the
+// three colors alike and to alpha apart; written a channel at a time that
+// was four of every operation and, worse, four small stores followed by one
+// wide load wherever the compiler had joined them up. Here a color stays in
+// one register from the texels to the pixel.
+//
+// ⚠ EACH OPERATION IS THE SCALAR ONE, PER LANE: no fused multiply-add, no
+// reciprocal, no reordering. clamped() is clamp255 with its comparisons the
+// same way round, so that a NaN and a negative zero come out as they did.
+static_assert(sizeof(Rgba) == 16, "F4 loads an Rgba as four floats");
+struct F4 {
+#if OPM_F4_SSE
+    __m128 v;
+    static F4 set(float a, float r, float g, float b)
+    {
+        return {_mm_set_ps(b, g, r, a)};
+    }
+    static F4 splat(float x) { return {_mm_set1_ps(x)}; }
+    static F4 of(const Rgba& c) { return {_mm_loadu_ps(&c.a)}; }
+    static F4 of(const float c[4]) { return {_mm_loadu_ps(c)}; }
+    // static_cast<float>(m[k] * x + c[k]) in each lane: four attribute
+    // planes stepped to one pixel, in double as the planes are held.
+    static F4 affine(const double m[4], double x, const double c[4])
+    {
+        const __m128d vx = _mm_set1_pd(x);
+        const __m128 lo = _mm_cvtpd_ps(_mm_add_pd(
+            _mm_mul_pd(_mm_loadu_pd(m), vx), _mm_loadu_pd(c)));
+        const __m128 hi = _mm_cvtpd_ps(_mm_add_pd(
+            _mm_mul_pd(_mm_loadu_pd(m + 2), vx), _mm_loadu_pd(c + 2)));
+        return {_mm_movelh_ps(lo, hi)};
+    }
+    void store(float out[4]) const { _mm_storeu_ps(out, v); }
+    float a() const { return _mm_cvtss_f32(v); }
+    F4 withA(float x) const { return {_mm_move_ss(v, _mm_set_ss(x))}; }
+    F4 clamped() const
+    {
+        // max(0, v) is "0 > v ? 0 : v" and min(255, t) is "255 < t ? 255 :
+        // t": clamp255's two tests, each keeping its second operand when
+        // the comparison is false.
+        return {_mm_min_ps(_mm_set1_ps(255.0f),
+                           _mm_max_ps(_mm_setzero_ps(), v))};
+    }
+    // static_cast<u32>(lane + 0.5f) for a CLAMPED color: a level 0..255, and
+    // 0 for a NaN, which is what that cast makes of one.
+    void levels(u32 out[4]) const
+    {
+        const __m128i i = _mm_and_si128(
+            _mm_cvttps_epi32(_mm_add_ps(v, _mm_set1_ps(0.5f))),
+            _mm_set1_epi32(0x7FFFFFFF));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out), i);
+    }
+    friend F4 operator+(F4 x, F4 y) { return {_mm_add_ps(x.v, y.v)}; }
+    friend F4 operator-(F4 x, F4 y) { return {_mm_sub_ps(x.v, y.v)}; }
+    friend F4 operator*(F4 x, F4 y) { return {_mm_mul_ps(x.v, y.v)}; }
+    friend F4 operator/(F4 x, F4 y) { return {_mm_div_ps(x.v, y.v)}; }
+#else
+    float v[4];
+    static F4 set(float a, float r, float g, float b) { return {{a, r, g, b}}; }
+    static F4 splat(float x) { return {{x, x, x, x}}; }
+    static F4 of(const Rgba& c) { return {{c.a, c.r, c.g, c.b}}; }
+    static F4 of(const float c[4]) { return {{c[0], c[1], c[2], c[3]}}; }
+    static F4 affine(const double m[4], double x, const double c[4])
+    {
+        return {{static_cast<float>(m[0] * x + c[0]),
+                 static_cast<float>(m[1] * x + c[1]),
+                 static_cast<float>(m[2] * x + c[2]),
+                 static_cast<float>(m[3] * x + c[3])}};
+    }
+    void store(float out[4]) const
+    {
+        for (int k = 0; k < 4; ++k)
+            out[k] = v[k];
+    }
+    float a() const { return v[0]; }
+    F4 withA(float x) const { return {{x, v[1], v[2], v[3]}}; }
+    F4 clamped() const
+    {
+        return {{clamp255(v[0]), clamp255(v[1]), clamp255(v[2]),
+                 clamp255(v[3])}};
+    }
+    void levels(u32 out[4]) const
+    {
+        for (int k = 0; k < 4; ++k)
+            out[k] = v[k] == v[k] ? static_cast<u32>(v[k] + 0.5f) : 0u;
+    }
+    friend F4 operator+(F4 x, F4 y)
+    {
+        return {{x.v[0] + y.v[0], x.v[1] + y.v[1], x.v[2] + y.v[2],
+                 x.v[3] + y.v[3]}};
+    }
+    friend F4 operator-(F4 x, F4 y)
+    {
+        return {{x.v[0] - y.v[0], x.v[1] - y.v[1], x.v[2] - y.v[2],
+                 x.v[3] - y.v[3]}};
+    }
+    friend F4 operator*(F4 x, F4 y)
+    {
+        return {{x.v[0] * y.v[0], x.v[1] * y.v[1], x.v[2] * y.v[2],
+                 x.v[3] * y.v[3]}};
+    }
+    friend F4 operator/(F4 x, F4 y)
+    {
+        return {{x.v[0] / y.v[0], x.v[1] / y.v[1], x.v[2] / y.v[2],
+                 x.v[3] / y.v[3]}};
+    }
+#endif
+};
+
 Rgba yuvToRgb(float y, float u, float v, float a)
 {
     // BT.601 full-swing, the convention every overlay-era part used.
@@ -605,8 +766,13 @@ Rgba yuvToRgb(float y, float u, float v, float a)
 // Fetch and decode ONE texel at integer coordinates (already wrapped),
 // mip level l. False = unreadable (off VRAM / GART miss) — the border
 // color stands in, which keeps a bad fetch visible without a crash.
-bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
-                Rgba& out)
+//
+// Byte by byte through texByte: every format, every corner (a texel across
+// the end of video memory or across two pages of AGP space, a page the GART
+// does not map, a read that has to be snooped or recorded). fetchTexel below
+// answers the common formats from a pointer and comes here for the rest.
+bool fetchTexelBytes(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
+                     Rgba& out)
 {
     const u32 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
     const u32 base = t.offs[l] & 0x07FFFFFFu; // 31:30 are tiling flags
@@ -780,34 +946,174 @@ bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
     }
 }
 
-// Wrap one coordinate per the unit's clamp mode. Returns false when border
-// color applies instead of a fetch.
-bool wrapCoord(u32 mode, int i, u32 n, u32& out)
+// ── Texels read in place ──────────────────────────────────────────────────
+//
+// A sample is one to eight texels and a texel was one to four calls of
+// texByte, each a bounds test and, in AGP space, a walk of the GART: that
+// was half of the engine's time in a game. A texel's bytes are consecutive
+// wherever they lie, so they are found once: video memory by one bounds
+// test, a page of AGP space by one walk a packet (Pipe::agp; nothing the
+// walk reads can change while a packet is drawn). Whatever is not plainly
+// there (see fetchTexelBytes) says no, and the byte-by-byte path answers as
+// it always did, counters and all.
+
+// The page of AGP space as the walk in r128.cpp (cceGartRead) finds it, or
+// null where that walk would not succeed for every byte of the page.
+const u8* texAgpPage(const Pipe& P, u32 page)
 {
-    const int size = static_cast<int>(n);
+    const CceMem& m = P.m;
+    u32 agp = page << 12;
+    const u32 aper = m.aperBase & 0xFFFFF000u;
+    if (aper) {
+        if (agp < aper)
+            return nullptr;
+        agp -= aper;
+    }
+    const u32 base = m.gartBase & ~0xFFFu;
+    const u64 ea = static_cast<u64>(base) + static_cast<u64>(agp >> 12) * 4u;
+    if (!base || ea + 4u > m.ramSize)
+        return nullptr;
+    const u8* e = m.ram + ea;
+    const u32 entry = u32(e[0]) | (u32(e[1]) << 8) | (u32(e[2]) << 16) |
+                      (u32(e[3]) << 24);
+    const u64 pa = entry & 0xFFFFF000u;
+    if (!(entry & 1u) || pa + 0x1000u > m.ramSize)
+        return nullptr;
+    return m.ram + pa;
+}
+
+inline bool texSpan(const Pipe& P, u32 addr, u32 n, const u8*& p)
+{
+    if (addr < kAgpWindow) {
+        if (static_cast<u64>(addr) + n > P.vramEnd)
+            return false;
+        p = P.vram + addr;
+        return true;
+    }
+    if (!P.fastMem)
+        return false;
+    const u32 agp = addr - kAgpWindow;
+    if ((agp ^ (agp + n - 1u)) >> 12)
+        return false; // the texel lies across two pages
+    Pipe::AgpPage& e = P.agp[(agp >> 12) & (Pipe::kAgpPages - 1u)];
+    if (e.page != (agp >> 12)) {
+        e.page = agp >> 12;
+        e.host = texAgpPage(P, agp >> 12);
+    }
+    if (!e.host)
+        return false;
+    p = e.host + (agp & 0xFFFu);
+    return true;
+}
+
+// A 5-, 6- or 4-bit channel as the level of 255 the byte path computes for
+// it: the same integer division, done once.
+struct ChannelLevels {
+    float k5[32], k6[64], k4[16];
+    ChannelLevels()
+    {
+        for (u32 i = 0; i < 32; ++i)
+            k5[i] = static_cast<float>(i * 255u / 31u);
+        for (u32 i = 0; i < 64; ++i)
+            k6[i] = static_cast<float>(i * 255u / 63u);
+        for (u32 i = 0; i < 16; ++i)
+            k4[i] = static_cast<float>(i * 17u);
+    }
+};
+const ChannelLevels kLevels;
+
+inline bool fetchTexel(const Pipe& P, const TexUnit& t, u32 l, u32 x, u32 y,
+                       Rgba& out)
+{
+    const u32 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
+    const u32 base = t.offs[l] & 0x07FFFFFFu;
+    const u8* p;
+    switch (t.fmt) {
+    case 3u: { // ARGB1555
+        if (!texSpan(P, base + (y * pitch + x) * 2u, 2u, p))
+            break;
+        const u32 v = (static_cast<u32>(p[0]) << 8) | p[1];
+        out.a = (v & 0x8000u) ? 255.0f : 0.0f;
+        out.r = kLevels.k5[(v >> 10) & 0x1Fu];
+        out.g = kLevels.k5[(v >> 5) & 0x1Fu];
+        out.b = kLevels.k5[v & 0x1Fu];
+        goto counted;
+    }
+    case 4u: { // RGB565
+        if (!texSpan(P, base + (y * pitch + x) * 2u, 2u, p))
+            break;
+        const u32 v = (static_cast<u32>(p[0]) << 8) | p[1];
+        out.a = 255;
+        out.r = kLevels.k5[(v >> 11) & 0x1Fu];
+        out.g = kLevels.k6[(v >> 5) & 0x3Fu];
+        out.b = kLevels.k5[v & 0x1Fu];
+        goto counted;
+    }
+    case 6u: { // ARGB8888
+        if (!texSpan(P, base + (y * pitch + x) * 4u, 4u, p))
+            break;
+        out.a = p[0];
+        out.r = p[1];
+        out.g = p[2];
+        out.b = p[3];
+        goto counted;
+    }
+    case 15u: { // ARGB4444
+        if (!texSpan(P, base + (y * pitch + x) * 2u, 2u, p))
+            break;
+        const u32 v = (static_cast<u32>(p[0]) << 8) | p[1];
+        out.a = kLevels.k4[(v >> 12) & 0xFu];
+        out.r = kLevels.k4[(v >> 8) & 0xFu];
+        out.g = kLevels.k4[(v >> 4) & 0xFu];
+        out.b = kLevels.k4[v & 0xFu];
+        goto counted;
+    }
+    default:
+        break;
+    }
+    return fetchTexelBytes(P, t, l, x, y, out);
+counted: {
+    auto& es = eng(); // what fetchTexelBytes counts before it reads
+    if (t.tileCount[l])
+        ++es.texUnimpl;
+    ++es.texSamples;
+    return true;
+}
+}
+
+// floor() of a float as an int, without the library call: the truncation,
+// less one where that went up. Out of an int's range and for a NaN it is
+// what the cast of floor() gave.
+inline int floorInt(float f)
+{
+    const int i = static_cast<int>(f);
+    return (static_cast<float>(i) > f && i != INT_MIN) ? i - 1 : i;
+}
+
+// Wrap one coordinate per the unit's clamp mode. Returns false when border
+// color applies instead of a fetch. A level's size is a power of two, so
+// the remainder of the division is a mask (for a negative coordinate too:
+// the mask of the two's complement is the positive remainder).
+inline bool wrapPow2(u32 mode, int i, u32 n, u32& out)
+{
     switch (mode) {
     case 1u: { // mirror
-        int p = i % (2 * size);
-        if (p < 0)
-            p += 2 * size;
-        out = static_cast<u32>(p < size ? p : 2 * size - 1 - p);
+        const u32 q = static_cast<u32>(i) & (2u * n - 1u);
+        out = q < n ? q : 2u * n - 1u - q;
         return true;
     }
     case 2u: // clamp to edge
-        out = static_cast<u32>(i < 0 ? 0 : i >= size ? size - 1 : i);
+        out = i < 0 ? 0u
+                    : static_cast<u32>(i) >= n ? n - 1u : static_cast<u32>(i);
         return true;
     case 3u: // border color beyond the edge
-        if (i < 0 || i >= size)
+        if (i < 0 || static_cast<u32>(i) >= n)
             return false;
         out = static_cast<u32>(i);
         return true;
-    default: { // wrap (tile)
-        int p = i % size;
-        if (p < 0)
-            p += size;
-        out = static_cast<u32>(p);
+    default: // wrap (tile)
+        out = static_cast<u32>(i) & (n - 1u);
         return true;
-    }
     }
 }
 
@@ -823,8 +1129,8 @@ Rgba borderColor(const TexUnit& t)
 
 // Sample one unit at (s,t) in texture space (0..1 per tile), mip level l,
 // point or bilinear.
-Rgba sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
-                 bool bilinear)
+F4 sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
+               bool bilinear)
 {
     const u32 w = t.wTex >> l ? t.wTex >> l : 1u;
     const u32 h = t.hTex >> l ? t.hTex >> l : 1u;
@@ -845,41 +1151,120 @@ Rgba sampleLevel(const Pipe& P, const TexUnit& t, u32 l, float s, float tt,
     // see opm_snapshot_save.
     const float fx = s * static_cast<float>(w) - (bilinear ? 0.5f : 0.0f);
     const float fy = tt * static_cast<float>(h) - (bilinear ? 0.5f : 0.0f);
-    const int x0 = static_cast<int>(std::floor(fx));
-    const int y0 = static_cast<int>(std::floor(fy));
+    const int x0 = floorInt(fx);
+    const int y0 = floorInt(fy);
     if (!bilinear) {
         u32 xi, yi;
         Rgba o;
-        if (!wrapCoord(clampS, x0, w, xi) || !wrapCoord(clampT, y0, h, yi) ||
+        if (!wrapPow2(clampS, x0, w, xi) || !wrapPow2(clampT, y0, h, yi) ||
             !fetchTexel(P, t, l, xi, yi, o))
-            return borderColor(t);
-        return o;
+            return F4::of(borderColor(t));
+        return F4::of(o);
     }
     const float ax = fx - static_cast<float>(x0);
     const float ay = fy - static_cast<float>(y0);
-    Rgba q[2][2];
-    for (int dy = 0; dy < 2; ++dy)
-        for (int dx = 0; dx < 2; ++dx) {
-            u32 xi, yi;
-            if (!wrapCoord(clampS, x0 + dx, w, xi) ||
-                !wrapCoord(clampT, y0 + dy, h, yi) ||
-                !fetchTexel(P, t, l, xi, yi, q[dy][dx]))
-                q[dy][dx] = borderColor(t);
+    F4 q00, q01, q10, q11;
+    // ⭐ THE FOUR TEXELS READ IN PLACE, when all four are inside the map's
+    // own rules (no border color) and plainly in memory (texSpan), in one of
+    // the formats fetchTexel answers from a pointer. They are decoded
+    // straight into registers. Anything else takes the general way below,
+    // texel by texel, which is also what this replaces: the same four
+    // texels, the same counts.
+    u32 xs[2], ys[2];
+    const bool inMap = wrapPow2(clampS, x0, w, xs[0]) &&
+                       wrapPow2(clampS, x0 + 1, w, xs[1]) &&
+                       wrapPow2(clampT, y0, h, ys[0]) &&
+                       wrapPow2(clampT, y0 + 1, h, ys[1]);
+    bool direct = false;
+    if (inMap) {
+        const u32 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
+        const u32 base = t.offs[l] & 0x07FFFFFFu;
+        const u32 n = t.fmt == 6u ? 4u : 2u;
+        const auto at = [&](u32 x, u32 y) { return base + (y * pitch + x) * n; };
+        const u8 *p00, *p01, *p10, *p11;
+        switch (t.fmt) {
+        case 3u: case 4u: case 6u: case 15u:
+            direct = texSpan(P, at(xs[0], ys[0]), n, p00) &&
+                     texSpan(P, at(xs[1], ys[0]), n, p01) &&
+                     texSpan(P, at(xs[0], ys[1]), n, p10) &&
+                     texSpan(P, at(xs[1], ys[1]), n, p11);
+            break;
+        default:
+            break;
         }
-    Rgba o;
-    auto lerp2 = [&](float c00, float c01, float c10, float c11) {
-        const float top = c00 + (c01 - c00) * ax;
-        const float bot = c10 + (c11 - c10) * ax;
-        return top + (bot - top) * ay;
-    };
-    o.a = lerp2(q[0][0].a, q[0][1].a, q[1][0].a, q[1][1].a);
-    o.r = lerp2(q[0][0].r, q[0][1].r, q[1][0].r, q[1][1].r);
-    o.g = lerp2(q[0][0].g, q[0][1].g, q[1][0].g, q[1][1].g);
-    o.b = lerp2(q[0][0].b, q[0][1].b, q[1][0].b, q[1][1].b);
-    return o;
+        if (direct) {
+            const auto be16 = [](const u8* p) {
+                return (static_cast<u32>(p[0]) << 8) | p[1];
+            };
+            switch (t.fmt) {
+            case 3u: { // ARGB1555
+                const auto dec = [&](const u8* p) {
+                    const u32 v = be16(p);
+                    return F4::set((v & 0x8000u) ? 255.0f : 0.0f,
+                                   kLevels.k5[(v >> 10) & 0x1Fu],
+                                   kLevels.k5[(v >> 5) & 0x1Fu],
+                                   kLevels.k5[v & 0x1Fu]);
+                };
+                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+                break;
+            }
+            case 4u: { // RGB565
+                const auto dec = [&](const u8* p) {
+                    const u32 v = be16(p);
+                    return F4::set(255.0f, kLevels.k5[(v >> 11) & 0x1Fu],
+                                   kLevels.k6[(v >> 5) & 0x3Fu],
+                                   kLevels.k5[v & 0x1Fu]);
+                };
+                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+                break;
+            }
+            case 6u: { // ARGB8888
+                const auto dec = [](const u8* p) {
+                    return F4::set(p[0], p[1], p[2], p[3]);
+                };
+                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+                break;
+            }
+            default: { // 15: ARGB4444
+                const auto dec = [&](const u8* p) {
+                    const u32 v = be16(p);
+                    return F4::set(kLevels.k4[(v >> 12) & 0xFu],
+                                   kLevels.k4[(v >> 8) & 0xFu],
+                                   kLevels.k4[(v >> 4) & 0xFu],
+                                   kLevels.k4[v & 0xFu]);
+                };
+                q00 = dec(p00); q01 = dec(p01); q10 = dec(p10); q11 = dec(p11);
+                break;
+            }
+            }
+            auto& es = eng(); // four fetches' worth, as fetchTexel counts
+            if (t.tileCount[l])
+                es.texUnimpl += 4;
+            es.texSamples += 4;
+        }
+    }
+    if (!direct) {
+        Rgba q[2][2];
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                u32 xi, yi;
+                if (!wrapPow2(clampS, x0 + dx, w, xi) ||
+                    !wrapPow2(clampT, y0 + dy, h, yi) ||
+                    !fetchTexel(P, t, l, xi, yi, q[dy][dx]))
+                    q[dy][dx] = borderColor(t);
+            }
+        q00 = F4::of(q[0][0]);
+        q01 = F4::of(q[0][1]);
+        q10 = F4::of(q[1][0]);
+        q11 = F4::of(q[1][1]);
+    }
+    const F4 fax = F4::splat(ax);
+    const F4 top = q00 + (q01 - q00) * fax;
+    const F4 bot = q10 + (q11 - q10) * fax;
+    return top + (bot - top) * F4::splat(ay);
 }
 
-Rgba sampleTex(const Pipe& P, const TexUnit& t, float s, float tt, float lod)
+F4 sampleTex(const Pipe& P, const TexUnit& t, float s, float tt, float lod)
 {
     // LOD bias: TEX_CNTL_C 31:24, signed 4.4 fixed point. The field width is
     // r128_reg.h's; the fixed-point split is this model's reading — revisit
@@ -921,14 +1306,9 @@ Rgba sampleTex(const Pipe& P, const TexUnit& t, float s, float tt, float lod)
         const u32 l0 = static_cast<u32>(lod);
         const u32 l1 = l0 + 1u > t.maxLevel ? t.maxLevel : l0 + 1u;
         const float fr = lod - static_cast<float>(l0);
-        const Rgba a = sampleLevel(P, t, l0, s, tt, true);
-        const Rgba b = sampleLevel(P, t, l1, s, tt, true);
-        Rgba o;
-        o.a = a.a + (b.a - a.a) * fr;
-        o.r = a.r + (b.r - a.r) * fr;
-        o.g = a.g + (b.g - a.g) * fr;
-        o.b = a.b + (b.b - a.b) * fr;
-        return o;
+        const F4 a = sampleLevel(P, t, l0, s, tt, true);
+        const F4 b = sampleLevel(P, t, l1, s, tt, true);
+        return a + (b - a) * F4::splat(fr);
     }
     }
 }
@@ -938,66 +1318,70 @@ Rgba sampleTex(const Pipe& P, const TexUnit& t, float s, float tt, float lod)
 // factor selections resolve to RGBA operands; the combine function folds the
 // two into the unit's output. `tex` is this unit's sample, `interp` the
 // iterated vertex color, `prev` the previous unit's output (secondary only).
-Rgba pickColorFactor(const Pipe& P, u32 sel, const Rgba& tex,
-                     const Rgba& interp, const Rgba& prev)
+// The three colors go through these as one value; a factor's alpha lane is
+// whatever fell there, because alpha has its own selections below and takes
+// nothing from here.
+inline F4 pickColorFactor(const Pipe& P, u32 sel, F4 tex, F4 interp, F4 prev)
 {
-    Rgba o;
+    const F4 k255 = F4::splat(255.0f);
     switch (sel) {
-    case 0u: o.r = P.constR; o.g = P.constG; o.b = P.constB; break;
-    case 1u:
-        o.r = 255 - P.constR; o.g = 255 - P.constG; o.b = 255 - P.constB;
-        break;
-    case 4u: o = tex; break;
-    case 5u: o.r = 255 - tex.r; o.g = 255 - tex.g; o.b = 255 - tex.b; break;
-    case 6u: o.r = o.g = o.b = tex.a; break;
-    case 7u: o.r = o.g = o.b = 255 - tex.a; break;
-    case 8u: o = prev; break;
-    default: o = interp; break; // unnamed selections read as the iterator
+    case 0u: return F4::of(P.constC);
+    case 1u: return k255 - F4::of(P.constC);
+    case 4u: return tex;
+    case 5u: return k255 - tex;
+    case 6u: return F4::splat(tex.a());
+    case 7u: return F4::splat(255.0f - tex.a());
+    case 8u: return prev;
+    default: return interp; // unnamed selections read as the iterator
     }
-    return o;
 }
 
-Rgba pickInputFactor(const Pipe& P, u32 sel, const Rgba& interp,
-                     const Rgba& prev)
+inline F4 pickInputFactor(const Pipe& P, u32 sel, F4 interp, F4 prev)
 {
-    Rgba o;
     switch (sel) {
-    case 2u: o.r = P.constR; o.g = P.constG; o.b = P.constB; break;
-    case 3u: o.r = o.g = o.b = P.constA; break;
-    case 4u: o = interp; break;
-    case 5u: o.r = o.g = o.b = interp.a; break;
-    case 8u: o = prev; break;
-    case 9u: o.r = o.g = o.b = prev.a; break;
-    default: o = interp; break;
+    case 2u: return F4::of(P.constC);
+    case 3u: return F4::splat(P.constA);
+    case 4u: return interp;
+    case 5u: return F4::splat(interp.a());
+    case 8u: return prev;
+    case 9u: return F4::splat(prev.a());
+    default: return interp;
     }
-    return o;
 }
 
-float combChannel(u32 fn, float cf, float inf, float texA, float intA,
-                  float constA, float texC, float cfConst)
+// The combine function on the three colors: cf the color factor, inf the
+// input factor, texC the unit's texel, cfConst the constant color.
+inline F4 combColors(u32 fn, F4 cf, F4 inf, float texA, float intA,
+                     float constA, F4 texC, F4 cfConst)
 {
+    const F4 k255 = F4::splat(255.0f);
     switch (fn) {
     case 1u: return cf;
     case 2u: return inf;
-    case 3u: return cf * inf / 255.0f;
-    case 4u: return cf * inf / 127.5f;
-    case 5u: return cf * inf / 63.75f;
+    case 3u: return cf * inf / k255;
+    case 4u: return cf * inf / F4::splat(127.5f);
+    case 5u: return cf * inf / F4::splat(63.75f);
     case 6u: return cf + inf;
-    case 7u: return cf + inf - 128.0f;
-    case 8u: return (cf * intA + inf * (255.0f - intA)) / 255.0f;
-    case 9u: return (cf * texA + inf * (255.0f - texA)) / 255.0f;
-    case 10u: return (cf * constA + inf * (255.0f - constA)) / 255.0f;
-    case 11u: return cf + inf * (255.0f - texA) / 255.0f;
-    case 12u: return (cf * texA + inf * (255.0f - texA)) / 255.0f;
-    case 13u: return cf + inf * texA / 255.0f;
-    case 14u: return (cf + inf - 128.0f) * 2.0f;
-    case 15u: return (cf * cfConst + inf * (255.0f - cfConst)) / 255.0f;
+    case 7u: return cf + inf - F4::splat(128.0f);
+    case 8u:
+        return (cf * F4::splat(intA) + inf * F4::splat(255.0f - intA)) / k255;
+    case 9u:
+        return (cf * F4::splat(texA) + inf * F4::splat(255.0f - texA)) / k255;
+    case 10u:
+        return (cf * F4::splat(constA) + inf * F4::splat(255.0f - constA)) /
+               k255;
+    case 11u: return cf + inf * F4::splat(255.0f - texA) / k255;
+    case 12u:
+        return (cf * F4::splat(texA) + inf * F4::splat(255.0f - texA)) / k255;
+    case 13u: return cf + inf * F4::splat(texA) / k255;
+    case 14u: return (cf + inf - F4::splat(128.0f)) * F4::splat(2.0f);
+    case 15u: return (cf * cfConst + inf * (k255 - cfConst)) / k255;
     default: return texC; // 0: disabled — the unit passes its texel through
     }
 }
 
-Rgba combineUnit(const Pipe& P, const TexUnit& t, const Rgba& tex,
-                 const Rgba& interp, const Rgba& prev)
+inline F4 combineUnit(const Pipe& P, const TexUnit& t, F4 tex, F4 interp,
+                      F4 prev)
 {
     const u32 comb = t.comb & 0xFu;
     const u32 cfSel = (t.comb >> 4) & 0xFu;
@@ -1005,32 +1389,29 @@ Rgba combineUnit(const Pipe& P, const TexUnit& t, const Rgba& tex,
     const u32 combA = (t.comb >> 14) & 0xFu;
     const u32 afSel = (t.comb >> 18) & 0xFu;
     const u32 inASel = (t.comb >> 25) & 0x7u;
-    const Rgba cf = pickColorFactor(P, cfSel, tex, interp, prev);
-    const Rgba inf = pickInputFactor(P, inSel, interp, prev);
-    const float af = afSel == 7u ? 255.0f - tex.a : tex.a;
+    const float texA = tex.a(), intA = interp.a();
+    const F4 cf = pickColorFactor(P, cfSel, tex, interp, prev);
+    const F4 inf = pickInputFactor(P, inSel, interp, prev);
+    const float af = afSel == 7u ? 255.0f - texA : texA;
     const float inA = inASel == 1u ? P.constA
-                      : inASel == 4u ? prev.a
-                                     : interp.a;
-    Rgba o;
-    o.r = clamp255(combChannel(comb, cf.r, inf.r, tex.a, interp.a, P.constA,
-                               tex.r, P.constR));
-    o.g = clamp255(combChannel(comb, cf.g, inf.g, tex.a, interp.a, P.constA,
-                               tex.g, P.constG));
-    o.b = clamp255(combChannel(comb, cf.b, inf.b, tex.a, interp.a, P.constA,
-                               tex.b, P.constB));
+                      : inASel == 4u ? prev.a()
+                                     : intA;
+    const F4 o = combColors(comb, cf, inf, texA, intA, P.constA, tex,
+                            F4::of(P.constC))
+                     .clamped();
+    float a;
     switch (combA) {
-    case 1u: o.a = af; break;
-    case 2u: o.a = inA; break;
-    case 3u: o.a = af * inA / 255.0f; break;
-    case 4u: o.a = af * inA / 127.5f; break;
-    case 5u: o.a = af * inA / 63.75f; break;
-    case 6u: o.a = af + inA; break;
-    case 7u: o.a = af + inA - 128.0f; break;
-    case 14u: o.a = (af + inA - 128.0f) * 2.0f; break;
-    default: o.a = tex.a; break; // 0: disabled — texture alpha through
+    case 1u: a = af; break;
+    case 2u: a = inA; break;
+    case 3u: a = af * inA / 255.0f; break;
+    case 4u: a = af * inA / 127.5f; break;
+    case 5u: a = af * inA / 63.75f; break;
+    case 6u: a = af + inA; break;
+    case 7u: a = af + inA - 128.0f; break;
+    case 14u: a = (af + inA - 128.0f) * 2.0f; break;
+    default: a = texA; break; // 0: disabled — texture alpha through
     }
-    o.a = clamp255(o.a);
-    return o;
+    return o.withA(clamp255(a));
 }
 
 // TEX_LIGHT_FN / ALPHA_LIGHT_FN (Tables 6-15/6-16): the post-multitexture
@@ -1038,40 +1419,39 @@ Rgba combineUnit(const Pipe& P, const TexUnit& t, const Rgba& tex,
 // reads 4 bits wide (17:14) — the SDK's table runs to state 15 and the gap
 // to ALPHA_LIGHT at 18 is exactly four bits; r128_reg.h names only 0..7 and
 // both readings agree there.
-Rgba texLight(const Pipe& P, const Rgba& tex, const Rgba& interp)
+inline F4 texLight(const Pipe& P, F4 tex, F4 interp)
 {
     const u32 fn = (P.texCntl >> 14) & 0xFu;
     const u32 fnA = (P.texCntl >> 18) & 0x7u;
-    Rgba o;
-    o.r = clamp255(combChannel(fn, tex.r, interp.r, tex.a, interp.a,
-                               P.constA, tex.r, P.constR));
-    o.g = clamp255(combChannel(fn, tex.g, interp.g, tex.a, interp.a,
-                               P.constA, tex.g, P.constG));
-    o.b = clamp255(combChannel(fn, tex.b, interp.b, tex.a, interp.a,
-                               P.constA, tex.b, P.constB));
+    const float texA = tex.a(), intA = interp.a();
+    const F4 o = combColors(fn, tex, interp, texA, intA, P.constA, tex,
+                            F4::of(P.constC))
+                     .clamped();
+    float a;
     switch (fnA) {
-    case 1u: o.a = tex.a; break;
-    case 2u: o.a = interp.a; break;
-    case 3u: o.a = tex.a * interp.a / 255.0f; break;
-    case 4u: o.a = clamp255(tex.a * interp.a / 127.5f); break;
-    case 5u: o.a = clamp255(tex.a * interp.a / 63.75f); break;
-    case 6u: o.a = clamp255(tex.a + interp.a); break;
-    case 7u: o.a = clamp255(tex.a + interp.a - 128.0f); break;
-    default: o.a = tex.a; break;
+    case 1u: a = texA; break;
+    case 2u: a = intA; break;
+    case 3u: a = texA * intA / 255.0f; break;
+    case 4u: a = clamp255(texA * intA / 127.5f); break;
+    case 5u: a = clamp255(texA * intA / 63.75f); break;
+    case 6u: a = clamp255(texA + intA); break;
+    case 7u: a = clamp255(texA + intA - 128.0f); break;
+    default: a = texA; break;
     }
-    return o;
+    return o.withA(a);
 }
 
 // ── Destination pixels (MSB-first, the engine-wide convention) ────────────
-u32 dstRead(const Pipe& P, u64 at)
+inline u32 dstRead(const Pipe& P, u64 at)
 {
-    u32 v = 0;
-    for (u32 k = 0; k < P.bypp; ++k)
-        v = (v << 8) | P.c->vram[at + k];
-    return v;
+    const u8* p = P.vram + at;
+    if (P.bypp == 2u)
+        return (static_cast<u32>(p[0]) << 8) | p[1];
+    return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
+           (static_cast<u32>(p[2]) << 8) | p[3];
 }
 
-void dstWrite(const Pipe& P, u64 at, u32 v)
+inline void dstWrite(const Pipe& P, u64 at, u32 v)
 {
     if (P.planeMask != 0xFFFFFFFFu)
         v = (dstRead(P, at) & ~P.planeMask) | (v & P.planeMask);
@@ -1083,30 +1463,31 @@ void dstWrite(const Pipe& P, u64 at, u32 v)
             static_cast<unsigned long long>(gTriSeq), P.texCntl, P.misc,
             P.tex[0].wTex, P.tex[0].hTex, P.tex[0].fmt, P.tex[0].cntl,
             P.tex[0].comb, v);
-    for (u32 k = 0; k < P.bypp; ++k)
-        P.c->vram[at + k] = static_cast<u8>(v >> (8u * (P.bypp - 1u - k)));
+    u8* p = P.c->vram.data() + at;
+    if (P.bypp == 2u) {
+        p[0] = static_cast<u8>(v >> 8);
+        p[1] = static_cast<u8>(v);
+    } else {
+        p[0] = static_cast<u8>(v >> 24);
+        p[1] = static_cast<u8>(v >> 16);
+        p[2] = static_cast<u8>(v >> 8);
+        p[3] = static_cast<u8>(v);
+    }
 }
 
-Rgba dstDecode(const Pipe& P, u32 v)
+inline F4 dstDecode(const Pipe& P, u32 v)
 {
-    Rgba o;
-    if (P.dstType == 4u) {
-        o.a = 255;
-        o.r = static_cast<float>(((v >> 11) & 0x1Fu) * 255u / 31u);
-        o.g = static_cast<float>(((v >> 5) & 0x3Fu) * 255u / 63u);
-        o.b = static_cast<float>((v & 0x1Fu) * 255u / 31u);
-    } else if (P.dstType == 3u) {
-        o.a = (v & 0x8000u) ? 255.0f : 0.0f;
-        o.r = static_cast<float>(((v >> 10) & 0x1Fu) * 255u / 31u);
-        o.g = static_cast<float>(((v >> 5) & 0x1Fu) * 255u / 31u);
-        o.b = static_cast<float>((v & 0x1Fu) * 255u / 31u);
-    } else {
-        o.a = static_cast<float>(v >> 24);
-        o.r = static_cast<float>((v >> 16) & 0xFFu);
-        o.g = static_cast<float>((v >> 8) & 0xFFu);
-        o.b = static_cast<float>(v & 0xFFu);
-    }
-    return o;
+    if (P.dstType == 4u)
+        return F4::set(255.0f, kLevels.k5[(v >> 11) & 0x1Fu],
+                       kLevels.k6[(v >> 5) & 0x3Fu], kLevels.k5[v & 0x1Fu]);
+    if (P.dstType == 3u)
+        return F4::set((v & 0x8000u) ? 255.0f : 0.0f,
+                       kLevels.k5[(v >> 10) & 0x1Fu],
+                       kLevels.k5[(v >> 5) & 0x1Fu], kLevels.k5[v & 0x1Fu]);
+    return F4::set(static_cast<float>(v >> 24),
+                   static_cast<float>((v >> 16) & 0xFFu),
+                   static_cast<float>((v >> 8) & 0xFFu),
+                   static_cast<float>(v & 0xFFu));
 }
 
 // A scanline of a primitive begins: DITHER_INIT decides what the error
@@ -1128,12 +1509,11 @@ inline u32 ditherStep(u32 level, u32& carried, u32 dropBits)
     return sum >> dropBits;
 }
 
-u32 dstEncode(const Pipe& P, const Rgba& c)
+inline u32 dstEncode(const Pipe& P, F4 c)
 {
-    const u32 r = static_cast<u32>(clamp255(c.r) + 0.5f);
-    const u32 g = static_cast<u32>(clamp255(c.g) + 0.5f);
-    const u32 b = static_cast<u32>(clamp255(c.b) + 0.5f);
-    const u32 a = static_cast<u32>(clamp255(c.a) + 0.5f);
+    u32 lv[4]; // each channel clamped and rounded: alpha, red, green, blue
+    c.clamped().levels(lv);
+    const u32 a = lv[0], r = lv[1], g = lv[2], b = lv[3];
     if (P.ditherDiffuse) {
         const u32 r5 = ditherStep(r, gDither.r, 3);
         const u32 g56 = ditherStep(g, gDither.g, P.dstType == 4u ? 2u : 3u);
@@ -1151,7 +1531,7 @@ u32 dstEncode(const Pipe& P, const Rgba& c)
 }
 
 // ── Z / stencil cells ─────────────────────────────────────────────────────
-bool zAddr(const Pipe& P, int px, int py, u64& at)
+inline bool zAddr(const Pipe& P, int px, int py, u64& at)
 {
     const u32 zb = P.zw == 16u ? 2u : 4u;
     at = static_cast<u64>(P.zOff) +
@@ -1159,23 +1539,30 @@ bool zAddr(const Pipe& P, int px, int py, u64& at)
     return P.zStride != 0 && at + zb <= P.c->vram.size();
 }
 
-u32 zRead(const Pipe& P, u64 at)
+inline u32 zRead(const Pipe& P, u64 at)
 {
-    const u32 zb = P.zw == 16u ? 2u : 4u;
-    u32 v = 0;
-    for (u32 k = 0; k < zb; ++k)
-        v = (v << 8) | P.c->vram[at + k];
-    return v;
+    const u8* p = P.vram + at;
+    if (P.zw == 16u)
+        return (static_cast<u32>(p[0]) << 8) | p[1];
+    return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
+           (static_cast<u32>(p[2]) << 8) | p[3];
 }
 
-void zStore(const Pipe& P, u64 at, u32 v)
+inline void zStore(const Pipe& P, u64 at, u32 v)
 {
-    const u32 zb = P.zw == 16u ? 2u : 4u;
-    for (u32 k = 0; k < zb; ++k)
-        P.c->vram[at + k] = static_cast<u8>(v >> (8u * (zb - 1u - k)));
+    u8* p = P.c->vram.data() + at;
+    if (P.zw == 16u) {
+        p[0] = static_cast<u8>(v >> 8);
+        p[1] = static_cast<u8>(v);
+    } else {
+        p[0] = static_cast<u8>(v >> 24);
+        p[1] = static_cast<u8>(v >> 16);
+        p[2] = static_cast<u8>(v >> 8);
+        p[3] = static_cast<u8>(v);
+    }
 }
 
-bool cmp8(u32 fn, u32 src, u32 ref)
+inline bool cmp8(u32 fn, u32 src, u32 ref)
 {
     switch (fn) {
     case 0u: return false;
@@ -1189,7 +1576,7 @@ bool cmp8(u32 fn, u32 src, u32 ref)
     }
 }
 
-u32 stencilOp(u32 op, u32 cur, u32 ref)
+inline u32 stencilOp(u32 op, u32 cur, u32 ref)
 {
     switch (op) {
     case 1u: return 0;
@@ -1202,62 +1589,61 @@ u32 stencilOp(u32 op, u32 cur, u32 ref)
 }
 
 // ── Blend factors (Tables 6-17/6-18, enumerants per r128_reg.h) ───────────
-void blendFactor(u32 sel, const Rgba& s, const Rgba& d, bool isSrc,
-                 float f[4])
+inline F4 blendFactor(u32 sel, F4 s, F4 d, bool isSrc)
 {
-    auto set = [&](float r, float g, float b, float a) {
-        f[0] = r; f[1] = g; f[2] = b; f[3] = a;
-    };
+    const F4 k255 = F4::splat(255.0f);
     switch (sel) {
-    case 0u: set(0, 0, 0, 0); break;
-    case 2u: set(s.r, s.g, s.b, s.a); break;
-    case 3u: set(255 - s.r, 255 - s.g, 255 - s.b, 255 - s.a); break;
-    case 4u: set(s.a, s.a, s.a, s.a); break;
-    case 5u: set(255 - s.a, 255 - s.a, 255 - s.a, 255 - s.a); break;
-    case 6u: set(d.a, d.a, d.a, d.a); break;
-    case 7u: set(255 - d.a, 255 - d.a, 255 - d.a, 255 - d.a); break;
-    case 8u: set(d.r, d.g, d.b, d.a); break;
-    case 9u: set(255 - d.r, 255 - d.g, 255 - d.b, 255 - d.a); break;
+    case 0u: return F4::splat(0.0f);
+    case 2u: return s;
+    case 3u: return k255 - s;
+    case 4u: return F4::splat(s.a());
+    case 5u: return F4::splat(255.0f - s.a());
+    case 6u: return F4::splat(d.a());
+    case 7u: return F4::splat(255.0f - d.a());
+    case 8u: return d;
+    case 9u: return k255 - d;
     case 10u: { // SRCALPHASAT: (f,f,f,1), f = min(As, 1-Ad)
-        const float m = s.a < 255 - d.a ? s.a : 255 - d.a;
-        set(m, m, m, 255);
-        break;
+        const float sa = s.a(), da = d.a();
+        const float m = sa < 255 - da ? sa : 255 - da;
+        return F4::splat(m).withA(255.0f);
     }
     case 11u: // BOTHSRCALPHA: src=As, forces dst=1-As (caller handles pair)
-        if (isSrc) set(s.a, s.a, s.a, s.a);
-        else set(255 - s.a, 255 - s.a, 255 - s.a, 255 - s.a);
-        break;
+        return isSrc ? F4::splat(s.a()) : F4::splat(255.0f - s.a());
     case 12u: // BOTHINVSRCALPHA
-        if (isSrc) set(255 - s.a, 255 - s.a, 255 - s.a, 255 - s.a);
-        else set(s.a, s.a, s.a, s.a);
-        break;
-    default: set(255, 255, 255, 255); break; // 1: ONE
+        return isSrc ? F4::splat(255.0f - s.a()) : F4::splat(s.a());
+    default: return k255; // 1: ONE
     }
 }
 
 // ── Interpolated fragment attributes handed to the shader ─────────────────
 struct Frag {
     float z = 0;
-    Rgba diffuse, spec;
+    F4 diffuse = F4::set(255, 0, 0, 0), spec = F4::set(255, 0, 0, 0);
     float fog = 255;
     float s1 = 0, t1 = 0, s2 = 0, t2 = 0; // perspective-resolved
     float lod1 = 0, lod2 = 0;
 };
 
 // The whole per-pixel back end. False = fragment rejected before the write.
-bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
+// In line in the triangle's pixel loop, where it is nearly all of the work;
+// points and lines call the one copy below.
+OPM_FORCE_INLINE bool shadeFragmentIn(const Pipe& P, int px, int py,
+                                      const Frag& fr)
 {
-    Rgba color = fr.diffuse;
+    const F4 diffuse = fr.diffuse;
+    F4 color = diffuse;
     if (P.texAny) {
         const TexUnit& t0 = P.tex[0];
-        const Rgba tex0 = sampleTex(P, t0, fr.s1, fr.t1, fr.lod1);
+        const F4 tex0 = sampleTex(P, t0, fr.s1, fr.t1, fr.lod1);
         if (P.chromaEn) {
             // Texture chroma key: a texel matching CLR_CMP through the mask
             // kills the fragment. Compared in ARGB8888 space.
-            const u32 t32 = (static_cast<u32>(tex0.a + 0.5f) << 24) |
-                            (static_cast<u32>(tex0.r + 0.5f) << 16) |
-                            (static_cast<u32>(tex0.g + 0.5f) << 8) |
-                            static_cast<u32>(tex0.b + 0.5f);
+            float c[4];
+            tex0.store(c);
+            const u32 t32 = (static_cast<u32>(c[0] + 0.5f) << 24) |
+                            (static_cast<u32>(c[1] + 0.5f) << 16) |
+                            (static_cast<u32>(c[2] + 0.5f) << 8) |
+                            static_cast<u32>(c[3] + 0.5f);
             if ((t32 & P.chromaMsk) == (P.chromaClr & P.chromaMsk))
                 return false;
         }
@@ -1278,24 +1664,21 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
         // leaves a bilinear sample on the shape's edge its darkened rim.
         // ⚠ That last choice is this model's: nothing here says whether the
         // chip decides from the filtered alpha or from the nearest texel's.
-        if (P.alphaMask && tex0.a < 127.5f)
+        if (P.alphaMask && tex0.a() < 127.5f)
             return false;
-        Rgba out = combineUnit(P, t0, tex0, fr.diffuse, fr.diffuse);
+        F4 out = combineUnit(P, t0, tex0, diffuse, diffuse);
         if (P.tex[1].on) {
             const TexUnit& t1 = P.tex[1];
             const float s = t1.useSecondSt ? fr.s2 : fr.s1;
             const float tt = t1.useSecondSt ? fr.t2 : fr.t1;
-            const Rgba tex1 =
+            const F4 tex1 =
                 sampleTex(P, t1, s, tt, t1.useSecondSt ? fr.lod2 : fr.lod1);
-            out = combineUnit(P, t1, tex1, fr.diffuse, out);
+            out = combineUnit(P, t1, tex1, diffuse, out);
         }
-        color = texLight(P, out, fr.diffuse);
+        color = texLight(P, out, diffuse);
     }
-    if (P.specEn) {
-        color.r = clamp255(color.r + fr.spec.r);
-        color.g = clamp255(color.g + fr.spec.g);
-        color.b = clamp255(color.b + fr.spec.b);
-    }
+    if (P.specEn) // the three colors; alpha is not lit
+        color = (color + fr.spec).clamped().withA(color.a());
     if (P.fogEn) {
         // f=255 is "all primitive color". Vertex fog interpolates the
         // specular alpha (SDK's own definition); table fog indexes the
@@ -1308,12 +1691,13 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
         } else {
             f = fr.fog;
         }
-        color.r = (color.r * f + P.fogR * (255.0f - f)) / 255.0f;
-        color.g = (color.g * f + P.fogG * (255.0f - f)) / 255.0f;
-        color.b = (color.b * f + P.fogB * (255.0f - f)) / 255.0f;
+        color = ((color * F4::splat(f) +
+                  F4::of(P.fogC) * F4::splat(255.0f - f)) /
+                 F4::splat(255.0f))
+                    .withA(color.a());
     }
     if (P.alphaTestEn &&
-        !cmp8(P.alphaOp, static_cast<u32>(clamp255(color.a) + 0.5f),
+        !cmp8(P.alphaOp, static_cast<u32>(clamp255(color.a()) + 0.5f),
               P.refAlpha))
         return false;
     // Z + stencil, evaluated together because the stencil result depends on
@@ -1369,32 +1753,28 @@ bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
         return false;
     }
     if (P.blendEn) {
-        const Rgba dst = dstDecode(P, dstRead(P, at));
-        float fs[4], fd[4];
-        blendFactor(P.blendSrc, color, dst, true, fs);
+        const F4 dst = dstDecode(P, dstRead(P, at));
+        const F4 fs = blendFactor(P.blendSrc, color, dst, true);
         // The BOTH* source selections force the destination factor; the
         // guest's own dst field is ignored then (Table 6-17's wording).
-        if (P.blendSrc == 11u || P.blendSrc == 12u)
-            blendFactor(P.blendSrc, color, dst, false, fd);
-        else
-            blendFactor(P.blendDst, color, dst, true, fd);
-        const bool sub = P.blendComb >= 2u;
-        const bool clamp = !(P.blendComb & 1u);
-        auto ch = [&](float sc, float dc, float sf, float df) {
-            float v = sub ? (sc * sf - dc * df) / 255.0f
-                          : (sc * sf + dc * df) / 255.0f;
-            if (clamp)
-                v = clamp255(v);
-            return v;
-        };
-        color.r = ch(color.r, dst.r, fs[0], fd[0]);
-        color.g = ch(color.g, dst.g, fs[1], fd[1]);
-        color.b = ch(color.b, dst.b, fs[2], fd[2]);
-        color.a = ch(color.a, dst.a, fs[3], fd[3]);
+        const F4 fd = (P.blendSrc == 11u || P.blendSrc == 12u)
+                          ? blendFactor(P.blendSrc, color, dst, false)
+                          : blendFactor(P.blendDst, color, dst, true);
+        const F4 k255 = F4::splat(255.0f);
+        F4 v = P.blendComb >= 2u ? (color * fs - dst * fd) / k255
+                                 : (color * fs + dst * fd) / k255;
+        if (!(P.blendComb & 1u))
+            v = v.clamped();
+        color = v;
     }
     dstWrite(P, at, dstEncode(P, color));
     ++eng().triPixels;
     return true;
+}
+
+bool shadeFragment(const Pipe& P, int px, int py, const Frag& fr)
+{
+    return shadeFragmentIn(P, px, py, fr);
 }
 
 // ── Triangle rasterizer ───────────────────────────────────────────────────
@@ -1597,6 +1977,10 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
         P.tex[0].on &&
         ((!((P.tex[0].cntl >> 7) & 1u) && P.tex[0].maxLevel > 0) ||
          (((P.tex[0].cntl >> 1) & 1u) != ((P.tex[0].cntl >> 4) & 1u)));
+    // The four colors' planes side by side, and the specular three, for
+    // F4::affine: one step along the row for all of them.
+    const double colA[4] = {pa.a, pr.a, pg.a, pb.a};
+    const double specA[4] = {0.0, psr.a, psg.a, psb.a};
     for (int py = minY; py <= maxY; ++py) {
         const double cy = py + 0.5;
         ditherLineStart(P);
@@ -1619,26 +2003,63 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
         const double t1RB = pt1.b * cy + pt1.c0;
         const double s2RB = ps2.b * cy + ps2.c0;
         const double t2RB = pt2.b * cy + pt2.c0;
-        for (int px = minX; px <= maxX; ++px) {
+        const double colRB[4] = {aRB, rRB, gRB, bRB};
+        const double specRB[4] = {0.0, srRB, sgRB, sbRB};
+        // ⭐ THE ROW'S PIXELS, FOUND WITHOUT VISITING THE REST OF THE BOX.
+        // A pixel is inside when all three edge functions pass at its
+        // center. Along a row each is e.a * cx + (a row's constant): in
+        // floating point as in arithmetic that never turns back as cx
+        // grows (a product by a fixed number, and a sum with one, both
+        // round in order), so the pixels an edge passes are everything from
+        // some pixel on (e.a > 0), everything up to one (e.a < 0), or the
+        // whole row or none of it (e.a == 0). The three together are one
+        // run, lo..hi. Each end is guessed from the edge's crossing and then
+        // settled by `inside`, which is the function itself, written as it
+        // always was; the guess only decides how few steps that takes. The
+        // same pixels as testing every one in the box, in the same order.
+        const auto inside = [&](int k, int px) {
             const double cx = px + 0.5;
-            bool in = true;
-            for (int k = 0; k < 3 && in; ++k) {
-                const double ev = e[k].a * cx + e[k].b * cy + e[k].c;
-                in = ev > 0.0 || (ev == 0.0 && e[k].topLeft);
-            }
-            if (!in)
+            const double ev = e[k].a * cx + e[k].b * cy + e[k].c;
+            return ev > 0.0 || (ev == 0.0 && e[k].topLeft);
+        };
+        int lo = minX, hi = maxX;
+        for (int k = 0; k < 3 && lo <= hi; ++k) {
+            const double a = e[k].a;
+            if (a == 0.0) {
+                if (!inside(k, lo))
+                    hi = lo - 1;
                 continue;
+            }
+            // Where the edge crosses this row, as a pixel index; anything
+            // that is not a number inside the row becomes one of its ends.
+            const double cross = -(e[k].b * cy + e[k].c) / a - 0.5;
+            if (a > 0.0) { // passes from some pixel on
+                int g = !(cross > lo) ? lo
+                        : cross > hi ? hi + 1
+                                     : static_cast<int>(cross) + 1;
+                while (g > lo && inside(k, g - 1))
+                    --g;
+                while (g <= hi && !inside(k, g))
+                    ++g;
+                lo = g;
+            } else { // passes up to some pixel (and a NaN passes nowhere)
+                int g = !(cross >= lo) ? lo - 1
+                        : cross > hi ? hi
+                                     : static_cast<int>(cross);
+                while (g < hi && inside(k, g + 1))
+                    ++g;
+                while (g >= lo && !inside(k, g))
+                    --g;
+                hi = g;
+            }
+        }
+        for (int px = lo; px <= hi; ++px) {
+            const double cx = px + 0.5;
             Frag fr;
             fr.z = static_cast<float>(pz.a * cx + zRB);
-            fr.diffuse.a = clamp255(static_cast<float>(pa.a * cx + aRB));
-            fr.diffuse.r = clamp255(static_cast<float>(pr.a * cx + rRB));
-            fr.diffuse.g = clamp255(static_cast<float>(pg.a * cx + gRB));
-            fr.diffuse.b = clamp255(static_cast<float>(pb.a * cx + bRB));
-            if (wantSpec) {
-                fr.spec.r = clamp255(static_cast<float>(psr.a * cx + srRB));
-                fr.spec.g = clamp255(static_cast<float>(psg.a * cx + sgRB));
-                fr.spec.b = clamp255(static_cast<float>(psb.a * cx + sbRB));
-            }
+            fr.diffuse = F4::affine(colA, cx, colRB).clamped();
+            if (wantSpec) // its alpha lane is nothing: specular has none
+                fr.spec = F4::affine(specA, cx, specRB).clamped();
             if (wantFog)
                 fr.fog = clamp255(static_cast<float>(pfog.a * cx + fogRB));
             const double w = pw.a * cx + wRB;
@@ -1682,7 +2103,7 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
                 if (P.tex[1].on)
                     fr.lod2 = fr.lod1; // second set: same footprint model
             }
-            shadeFragment(P, px, py, fr);
+            shadeFragmentIn(P, px, py, fr);
         }
     }
 }
@@ -1697,8 +2118,8 @@ void rasterPoint(const Pipe& P, const Vtx& v)
         return;
     Frag fr;
     fr.z = v.z;
-    fr.diffuse = {v.ca, v.cr, v.cg, v.cb};
-    fr.spec = {255, v.sr, v.sg, v.sb};
+    fr.diffuse = F4::set(v.ca, v.cr, v.cg, v.cb);
+    fr.spec = F4::set(255, v.sr, v.sg, v.sb);
     fr.fog = v.fog;
     // Stream S,T are premultiplied numerators (rasterTriangle's receipt);
     // resolving a single vertex is one divide by its own rhw.
@@ -1758,8 +2179,8 @@ void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b)
             continue;
         Frag fr;
         fr.z = v.z;
-        fr.diffuse = {v.ca, v.cr, v.cg, v.cb};
-        fr.spec = {255, v.sr, v.sg, v.sb};
+        fr.diffuse = F4::set(v.ca, v.cr, v.cg, v.cb);
+        fr.spec = F4::set(255, v.sr, v.sg, v.sb);
         fr.fog = v.fog;
         const float iw = v.rhw != 0.0f ? 1.0f / v.rhw : 1.0f;
         fr.s1 = persp0 ? v.s1 * iw : v.s1;

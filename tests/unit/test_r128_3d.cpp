@@ -10,6 +10,7 @@
 // header — the same shelf r128_3d.cpp is built from.
 
 #include "doctest.h"
+#include "opm/bus.hpp" // SnoopSink
 #include "opm/r128.hpp"
 
 #include <cstring>
@@ -54,10 +55,15 @@ struct Rig3d {
     {
         put32(kGart + (agpOff >> 12) * 4u, (pa & 0xFFFFF000u) | 1u);
     }
+    // Who the card asks before it reads system memory. None, as on the
+    // engine's own thread: texels are then read in place. A sink that does
+    // not say memory is current puts every texel back on the byte-by-byte
+    // path.
+    SnoopSink* snoop = nullptr;
     void fifo(u32 w)
     {
         r128CceFifoWord(c, be(w), 4, ram.data(),
-                        static_cast<u32>(ram.size()), kGart, 0, nullptr);
+                        static_cast<u32>(ram.size()), kGart, 0, snoop);
     }
     void reg(u32 off, u32 v) { c.write(off, be(v), 4); }
 
@@ -1392,4 +1398,178 @@ TEST_CASE("3d: with TEXTURE_ST_MULT_W the chip multiplies plain S and T by W")
     vtxW(0, 16, 0, 1.0f);
     r.prim(0x9u | 0x80u, 4u, 3u, v);
     CHECK(r.pix32(12, 0) == 0xFF00FF00u);
+}
+
+// ---- the rasterizer's shortcuts against what they stand for ----------------
+
+TEST_CASE("3d: a triangle covers exactly the pixels its three edges pass")
+{
+    // The rasterizer finds each row's run of pixels from where the edges
+    // cross it, and visits nothing else. What it must draw is still the
+    // definition: a pixel whose center passes all three edge functions, an
+    // edge through a center counting when it is a top or a left one. Corners
+    // sit on the quarter-pixel grid the chip uses, so centers on an edge are
+    // common and every product here is exact.
+    struct Xs {
+        u64 s;
+        u32 next()
+        {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            return static_cast<u32>(s >> 32);
+        }
+    } rng{0x7A51A9E5ull};
+    u32 drawn = 0, onEdge = 0;
+    for (u32 iter = 0; iter < 400; ++iter) {
+        Rig3d r;
+        r.dst32();
+        r.openGate();
+        r.fpuSolidBoth();
+        double x[3], y[3];
+        for (int k = 0; k < 3; ++k) {
+            // -8..72 in quarter pixels: corners off every side of the
+            // 64x64 scissor, slivers, and small triangles alike.
+            const u32 span = iter % 3u == 0u ? 64u : 320u;
+            const u32 base = iter % 3u == 0u ? 100u + (rng.next() % 64u) : 0u;
+            x[k] = (static_cast<double>((base + rng.next() % span) % 320u) -
+                    32.0) / 4.0;
+            y[k] = (static_cast<double>((base + rng.next() % span) % 320u) -
+                    32.0) / 4.0;
+        }
+        std::vector<u32> v;
+        for (int k = 0; k < 3; ++k)
+            Rig3d::vtx(v, static_cast<float>(x[k]), static_cast<float>(y[k]),
+                       0.5f, 0xFFFFFFFFu);
+        r.prim(0x9u, 4u, 3u, v);
+
+        double area2 = (x[1] - x[0]) * (y[2] - y[0]) -
+                       (x[2] - x[0]) * (y[1] - y[0]);
+        if (area2 < 0.0) {
+            std::swap(x[1], x[2]);
+            std::swap(y[1], y[2]);
+        }
+        u32 wrong = 0;
+        for (u32 py = 0; py < 64; ++py)
+            for (u32 px = 0; px < 64; ++px) {
+                const double cx = px + 0.5, cy = py + 0.5;
+                bool in = area2 != 0.0;
+                for (int k = 0; k < 3 && in; ++k) {
+                    const double ax = x[k], ay = y[k];
+                    const double bx = x[(k + 1) % 3], by = y[(k + 1) % 3];
+                    const double ev = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+                    const bool topLeft = (by - ay == 0.0 && bx - ax > 0.0) ||
+                                         by - ay < 0.0;
+                    if (ev == 0.0)
+                        ++onEdge;
+                    in = ev > 0.0 || (ev == 0.0 && topLeft);
+                }
+                const bool got = r.pix32(px, py) != 0u;
+                wrong += got != in;
+                drawn += got;
+            }
+        CAPTURE(iter);
+        CHECK(wrong == 0u);
+    }
+    // The comparison was of something: pixels were drawn, and centers did
+    // fall exactly on edges.
+    CHECK(drawn > 20000u);
+    CHECK(onEdge > 500u);
+}
+
+namespace {
+struct AskEveryTime final : SnoopSink { // never says memory is current
+    u64 asked = 0;
+    void snoopRead(u32, u32) override { ++asked; }
+    void snoopWrite(u32, u32) override {}
+};
+} // namespace
+
+TEST_CASE("3d: texels read in place are the texels read byte by byte")
+{
+    // The same textured quad drawn twice: once with nobody to ask before
+    // system memory is read (texels come from a pointer, four at a time for
+    // a bilinear sample), once with a snoop sink (every texel byte by byte,
+    // the path that was the only one). Every format the pointer path knows,
+    // each addressing rule, both filters, a texture in video memory and one
+    // in AGP space lying across two pages: video memory must end the same,
+    // and so must the counts.
+    u32 cases = 0;
+    for (u32 fmt : {3u, 4u, 6u, 15u})
+        for (u32 wrap = 0; wrap < 4; ++wrap)
+            for (u32 bilinear = 0; bilinear < 2; ++bilinear)
+                for (u32 agp = 0; agp < 2; ++agp) {
+                    AskEveryTime sink;
+                    Rig3d inPlace, bytes;
+                    bytes.snoop = &sink;
+                    u64 samples[2] = {};
+                    int which = 0;
+                    for (Rig3d* r : {&inPlace, &bytes}) {
+                        r->dst32();
+                        r->openGate();
+                        r->fpuSolidBoth();
+                        // An 8x8 texture of every byte value in turn, at
+                        // video memory 0x80000, or at AGP offset 0x300F80:
+                        // the last 128 bytes of one page and on into the
+                        // next, which are far apart in memory.
+                        const u32 n = fmt == 6u ? 4u : 2u;
+                        r->mapPage(0x00300000u, 0x00200000u);
+                        r->mapPage(0x00301000u, 0x00500000u);
+                        for (u32 k = 0; k < 64u * n; ++k) {
+                            const u8 b = static_cast<u8>(k * 37u + fmt * 11u);
+                            if (!agp)
+                                r->c.vram[0x80000u + k] = b;
+                            else if (0xF80u + k < 0x1000u)
+                                r->ram[0x00200F80u + k] = b;
+                            else
+                                r->ram[0x00500000u + (0xF80u + k - 0x1000u)] = b;
+                        }
+                        r->reg(0x1C9Cu, 1u << 4);
+                        r->reg(0x1CB0u, (fmt << 16) | (bilinear << 1) |
+                                            (bilinear << 4) | (wrap << 8) |
+                                            (wrap << 11));
+                        r->reg(0x1CB8u, (3u << 8) | (3u << 4) | 3u); // 8x8
+                        r->reg(0x1CC8u, agp ? 0x02000000u + 0x00300F80u
+                                            : 0x80000u); // slot 3
+                        r->reg(0x1D38u, 0x80402010u); // the border color
+                        std::vector<u32> v;
+                        auto vtxSt = [&](float x, float y, float s, float t) {
+                            v.push_back(f2u(x));
+                            v.push_back(f2u(y));
+                            v.push_back(f2u(0.5f));
+                            v.push_back(f2u(1.0f));
+                            v.push_back(0xFFFFFFFFu);
+                            v.push_back(f2u(s));
+                            v.push_back(f2u(t));
+                        };
+                        // S and T run from -0.7 to 1.9 across the quad: off
+                        // both ends of the map, so the rule decides.
+                        vtxSt(0, 0, -0.7f, -0.7f);
+                        vtxSt(64, 0, 1.9f, -0.7f);
+                        vtxSt(0, 64, -0.7f, 1.9f);
+                        vtxSt(64, 0, 1.9f, -0.7f);
+                        vtxSt(64, 64, 1.9f, 1.9f);
+                        vtxSt(0, 64, -0.7f, 1.9f);
+                        const u64 before = r128EngStats().texSamples;
+                        r->prim(0x9u | 0x80u, 4u, 6u, v);
+                        samples[which++] = r128EngStats().texSamples - before;
+                    }
+                    CAPTURE(fmt);
+                    CAPTURE(wrap);
+                    CAPTURE(bilinear);
+                    CAPTURE(agp);
+                    CHECK(std::memcmp(inPlace.c.vram.data(), bytes.c.vram.data(),
+                                      64u * 64u * 4u) == 0);
+                    CHECK(samples[0] == samples[1]);
+                    // Sampled all over (the border rule fetches nothing
+                    // beyond the map's edge, so not every pixel).
+                    CHECK(samples[0] > 500u);
+                    // The byte path did ask (it is the other path), and only
+                    // where there is system memory to ask about.
+                    CHECK((sink.asked > 0) == (agp != 0));
+                    // Not one flat color: the texture was really sampled.
+                    CHECK(inPlace.pix32(5, 5) != inPlace.pix32(40, 23));
+                    ++cases;
+                }
+    CHECK(cases == 64u);
 }

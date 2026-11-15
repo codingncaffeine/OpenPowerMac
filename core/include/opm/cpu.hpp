@@ -5,6 +5,7 @@
 #include "bits.hpp" // the line byte helpers the inline load/store use
 #include "jit.hpp"  // compiled-line cache; pure derived state, see the header
 #include "prof.hpp" // markers on the inline execution path; compiled away
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>

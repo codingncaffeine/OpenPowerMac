@@ -191,6 +191,82 @@ TEST_CASE("engine thread: a handed-over stream leaves the card as the "
     CHECK(got.vram == want.vram);
 }
 
+TEST_CASE("engine thread: a marker in the stream is not there to be read "
+          "before the triangles ahead of it are drawn")
+{
+    // A driver ends a buffer with a write to a scratch register and polls
+    // for it: when the value appears, the card is done with the buffer, and
+    // the driver goes on to change the textures and vertices the buffer
+    // used. Large triangles are queued for the drawing threads and the
+    // packet loop runs ahead of them, so the marker's write has to wait for
+    // the queue. Here the guest's side polls as a driver does, and at the
+    // moment it reads the marker the picture must be the finished one.
+    AsyncOff restore;
+    constexpr u32 kW = 512, kH = 256, kMark = 0xD0C0FFEEu;
+    const auto target = [](Rig& r) {
+        r.reg(0x142Cu, (kW / 8u) << 21);
+        r.reg(0x16F0u, ((kH - 1u) << 16) | (kW - 1u));
+        r.reg(0x1C9Cu, 1u << 9); // blended: every triangle reads what is there
+        r.reg(0x1CA0u, (2u << 8) | (4u << 16) | (5u << 20));
+    };
+    std::vector<u32> w;
+    for (u32 i = 0; i < 90u; ++i) {
+        w.push_back(0xC0002500u | ((2u + 15u - 1u) << 16));
+        w.push_back(0x9u);
+        w.push_back(4u | (3u << 4) | (3u << 16));
+        const float ox = static_cast<float>((i * 37u) % 120u);
+        const float oy = static_cast<float>((i * 23u) % 60u);
+        const auto vtx = [&](float x, float y, u32 argb) {
+            w.push_back(f2u(x));
+            w.push_back(f2u(y));
+            w.push_back(f2u(0.5f));
+            w.push_back(f2u(1.0f));
+            w.push_back(argb);
+        };
+        vtx(ox, oy, 0x60000000u | (i * 0x030507u));
+        vtx(ox + 380.0f, oy + 10.0f, 0x90000000u | (i * 0x070305u));
+        vtx(ox + 20.0f, oy + 190.0f, 0xC0000000u | (i * 0x050703u));
+    }
+    w.push_back(0x15E0u >> 2);
+    w.push_back(kMark);
+
+    r128AsyncEnable(false);
+    r128SetRasterThreads(1);
+    std::vector<u8> want;
+    {
+        Rig r;
+        target(r);
+        r.dispatch(0, w);
+        REQUIRE(r.c.peek(0x15E0u) == kMark);
+        want.assign(r.c.vram.begin(), r.c.vram.begin() + kW * kH * 4u);
+    }
+    for (int round = 0; round < 3; ++round) {
+        r128AsyncEnable(true);
+        r128SetRasterThreads(4);
+        Rig r;
+        target(r);
+        const R128AsyncStats st0 = r128AsyncStats();
+        const u64 queued0 = r128EngStats().crewTris;
+        r.dispatch(0, w);
+        REQUIRE(r128AsyncStats().handOffs == st0.handOffs + 1);
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        u32 seen = 0;
+        while (seen != kMark && std::chrono::steady_clock::now() < until) {
+            R128RegLock lock; // a guest's read of the register
+            seen = r.c.peek(0x15E0u);
+        }
+        REQUIRE(seen == kMark);
+        // The marker is the last thing in the stream: nothing draws now.
+        const std::vector<u8> got(r.c.vram.begin(),
+                                  r.c.vram.begin() + kW * kH * 4u);
+        CHECK(got == want);
+        REQUIRE(waitFor([] { return !r128AsyncBusy(); }));
+        CHECK(r128EngStats().crewTris - queued0 >= 80u);
+    }
+    r128SetRasterThreads(0);
+}
+
 TEST_CASE("engine thread: a short stream is executed where it is submitted")
 {
     AsyncOff restore;

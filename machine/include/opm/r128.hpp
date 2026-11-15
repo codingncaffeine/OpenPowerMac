@@ -392,6 +392,22 @@ struct R128TexSeen {
 extern bool gR128TexCensusOn;
 void r128TextureSeen(const R128TexSeen& t);
 
+// --- Triangles waiting to be drawn ------------------------------------------
+//
+// The 3D unit does not draw a large triangle where it meets it: it queues it
+// for its drawing threads and goes on (r128_3d.cpp, RowQueue). Whoever
+// executes the packets must have the queue drawn before anything looks at
+// video memory or changes what a waiting triangle reads: a 2D operation, a
+// register write that is more than 3D state, the end of the stream. The
+// flag belongs to that thread, like the engine itself.
+extern bool gR128RowsPending;
+void r128RowsFlush();
+inline void r128RowsSettle()
+{
+    if (gR128RowsPending)
+        r128RowsFlush();
+}
+
 // --- Who wrote this pixel ---------------------------------------------------
 //
 // A wrong pixel has three possible authors — the processor storing through
@@ -511,9 +527,14 @@ struct R128EngStats {
     u64 triPixels = 0;    // pixels the 3D pipe wrote
     u64 triCulled = 0;    // triangles removed by the winding cull
     u64 triDegen = 0;     // zero-area or fully-clipped triangles
-    // Triangles whose rows several threads drew at once, and their pixels
-    // (r128SetRasterThreads): how much of the drawing that reached.
+    // Triangles that waited in the row queue for the drawing threads, and
+    // their pixels (r128SetRasterThreads): how much of the drawing that
+    // reached.
     u64 crewTris = 0, crewPixels = 0;
+    // The row queue: times it was settled with something waiting, how long
+    // the settling thread waited in all, and how often a primitive that
+    // could not wait forced it.
+    u64 rowSettles = 0, rowSettleNs = 0, rowRefused = 0;
     u64 vtxFetched = 0;   // vertices decoded, all walk modes
     u64 vtxGartMiss = 0;  // vertex-walker fetches that missed the GART
     u64 prim3dDecline = 0; // a 3D primitive packet refused whole
@@ -653,10 +674,11 @@ int r128Gate3dState();
 // convention questions are settled from the stream itself, offline, rather
 // than from a picture. File-static budget; snapshots unaffected.
 void r128Set3dTriDump(int n);
-// How many threads draw the rows of a large triangle, the calling one among
-// them: 1 = that one alone, 0 = the default (the environment's
-// OPM_RASTER_THREADS, or a number from the host's processors). The picture is
-// the same for every value; this is a speed setting and a test's control.
+// How many threads draw queued triangles, the one executing the packets
+// among them: 1 = that one alone and nothing is queued, 0 = the default (the
+// environment's OPM_RASTER_THREADS, or a number from the host's processors).
+// Taken up where the queue next starts from empty. The picture is the same
+// for every value; this is a speed setting and a test's control.
 void r128SetRasterThreads(int n);
 int r128RasterThreads();
 // The CCE ring: a PM4_BUFFER_DL_WPTR or PM4_MICRO_CNTL write may hand the

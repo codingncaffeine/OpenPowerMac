@@ -1969,9 +1969,36 @@ void r128CceIndirect(R128Cell& c, u32 sizeDwords, const u8* ram, u32 ramSize,
     asyncSubmit(c, m);
 }
 
+// A register a stream may write while triangles are still waiting to be
+// drawn (opm/r128.hpp, "Triangles waiting to be drawn"): its write stores
+// state that the next primitive is gathered from and does nothing else. The
+// 3D context block with its four 2D-shared cells, SCALE_3D_CNTL, the two
+// pixel cache flushes a driver sends with every block of state, which this
+// model has no cache to act on, and the pair that dispatches an indirect
+// buffer, which is more stream and no drawing. Anything else is settled for
+// first: a 2D operation's trigger, the fog table, a scratch register the
+// guest is polling for.
+static bool cceWriteIsState(u32 off)
+{
+    off &= 0x3FFCu;
+    return (off >= 0x1C80u && off < 0x1D48u) || off == 0x1A00u ||
+           off == kPcGuiCtlstat || off == 0x171Cu || off == kIwIndOff ||
+           off == kIwIndSize;
+}
+
+static CceRun cceRunLoop(R128Cell& c, const CceMem& m, CceMode mode);
+
 // The packet loop. Every CCE packet — 2D blits and the whole 3D rasterizer —
-// executes inside it, on whichever thread `mode` says is running it.
+// executes inside it, on whichever thread `mode` says is running it. However
+// it is left, no triangle is still waiting to be drawn.
 static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
+{
+    const CceRun how = cceRunLoop(c, m, mode);
+    r128RowsSettle();
+    return how;
+}
+
+static CceRun cceRunLoop(R128Cell& c, const CceMem& m, CceMode mode)
 {
     const bool worker = mode == CceMode::Worker;
     for (;;) {
@@ -2027,6 +2054,9 @@ static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
                 gCceDepth = 64; // each of these was a guest-visible entry
                 continue;
             }
+            // Idle means drawn: the guest may touch video memory, and read
+            // its own markers, the moment the flag falls.
+            r128RowsSettle();
             if (gAsync.busyTimed) {
                 gAsync.busyTimed = false;
                 gAsync.st.busyNs += static_cast<u64>(
@@ -2041,6 +2071,31 @@ static CceRun cceRun(R128Cell& c, const CceMem& m, CceMode mode)
             ++gCceHead;
             ++gEng.ccePkt2;
             continue;
+        }
+        // Triangles still waiting to be drawn are drawn before any packet
+        // but a 3D primitive (which waits behind them, or settles for itself)
+        // and a write of plain 3D state. Here, before the register lock: the
+        // wait is the drawing threads', and a guest polling a register
+        // should not stand behind it.
+        if (gR128RowsPending) {
+            bool state;
+            if (type == 0u) {
+                const u32 base = (w & 0x7FFu) << 2;
+                state = true;
+                if ((w >> 15) & 1u)
+                    state = cceWriteIsState(base);
+                else
+                    for (u32 i = 0; i < n && state; ++i)
+                        state = cceWriteIsState(base + 4u * i);
+            } else if (type == 1u) {
+                state = cceWriteIsState((w & 0x7FFu) << 2) &&
+                        cceWriteIsState(((w >> 11) & 0x7FFu) << 2);
+            } else {
+                const u32 op = (w >> 8) & 0xFFu;
+                state = op == 0x25u || op == 0x23u || op == 0x2Eu;
+            }
+            if (!state)
+                r128RowsSettle();
         }
         // The engine's thread holds the register lock for a packet's register
         // work; the 3D unit lets it go while it rasterizes.

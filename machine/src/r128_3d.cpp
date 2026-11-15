@@ -61,6 +61,9 @@
 // "marked as __forceinline not inlined": the request is a hint about speed,
 // and a compiler that declines it has still built the right program.
 #pragma warning(disable : 4714)
+// "structure was padded due to alignment specifier": the row queue's lanes
+// are a processor cache line apart on purpose.
+#pragma warning(disable : 4324)
 #else
 #define OPM_FORCE_INLINE inline __attribute__((always_inline))
 #endif
@@ -310,7 +313,8 @@ struct TexUnit {
     bool useSecondSt = false; // SEC_SRC_SEL_ST
 };
 
-struct Pipe {
+// What a packet's primitives are drawn with: the state, gathered once.
+struct PipeState {
     R128Cell* c = nullptr;
     CceMem m;
     // destination
@@ -359,17 +363,25 @@ struct Pipe {
     const u8* vram = nullptr;
     u32 vramEnd = 0;
     bool fastMem = false;
+};
+
+// That state as one thread draws from it: with what the thread counts and
+// what it has found of texel memory, which are its own. A thread drawing
+// queued triangles takes each one's state into its own record (RowQueue) and
+// keeps the rest.
+struct Pipe : PipeState {
     // What the pixel path counts, kept here and added to the engine's
-    // statistics when the packet is drawn (flushTally): a thread drawing
-    // rows of a triangle has its own copy of this record (drawTriangleRows),
-    // and with it its own counts and its own page cache below.
+    // statistics when the packet is drawn (flushTally).
     struct Tally {
         u64 triPixels = 0, offVram = 0, texSamples = 0, texUnimpl = 0;
     };
     mutable Tally tally;
-    // Set in the copies several threads draw from at once: the rare paths
+    // Set in the records several threads draw from at once: the rare paths
     // that touch state all threads share take a lock then (texByte).
     bool crowd = false;
+    // Which copy of this record's state the row queue holds (RowQueue), once
+    // a triangle of this packet has been queued.
+    mutable u64 queued = ~0ull;
     static constexpr u32 kAgpPages = 64;
     struct AgpPage {
         u32 page = ~0u;
@@ -1993,11 +2005,12 @@ struct TriSetup {
     int minX, maxX;
 };
 
-// Rows yFrom..yTo of a triangle. Nothing a row draws depends on another row
-// of the same triangle except through what both may touch in memory and the
-// dither's error register; rowsApart says when neither can happen, and then
-// the rows may be drawn in any order, or at once (RowCrew).
-void drawRows(const Pipe& P, const TriSetup& T, int yFrom, int yTo)
+// Rows yFrom..yTo of a triangle, every yStep-th. Nothing a row draws depends
+// on another row of the same triangle except through what both may touch in
+// memory and the dither's error register; RowQueue::admit says when neither
+// can happen, and then the rows may be drawn in any order, or at once.
+void drawRows(const Pipe& P, const TriSetup& T, int yFrom, int yTo,
+              int yStep = 1)
 {
     // Copies, on purpose: pixels are stored through byte pointers, which a
     // compiler has to assume might be T itself, and it would read every
@@ -2013,7 +2026,7 @@ void drawRows(const Pipe& P, const TriSetup& T, int yFrom, int yTo)
     const bool lodLive = T.lodLive;
     const bool lodSignOnly = T.lodSignOnly, lodNoBias = T.lodNoBias;
     const int minX = T.minX, maxX = T.maxX;
-    for (int py = yFrom; py <= yTo; ++py) {
+    for (int py = yFrom; py <= yTo; py += yStep) {
         const double cy = py + 0.5;
         ditherLineStart(P);
         // Per-row bases: value at (cx,cy) = plane.a * cx + rowBase. One
@@ -2154,68 +2167,37 @@ void drawRows(const Pipe& P, const TriSetup& T, int yFrom, int yTo)
     }
 }
 
-// ── A triangle's rows on several threads ──────────────────────────────────
+// ── Triangles queued, their rows dealt to lanes ───────────────────────────
 //
-// A large triangle is nearly all of a frame's work at a high resolution, and
-// one thread drew it while the processor's waited. Its rows share nothing
-// (rowsApart), so a few threads draw them at once: the same pixels, written
-// with the same values, and only the order in time between rows differs,
-// which nothing can see.
+// At a high resolution drawing is nearly all of the card's work, and a guest
+// that waits for the card waits for one thread. A triangle's rows share
+// nothing with each other (admit, below, says when), so rows can be drawn at
+// once; and a row of the screen shares nothing with another row whatever
+// triangle draws it. So the screen's rows are dealt to LANES, two rows at a
+// time, lane after lane and round again, and a triangle is not drawn where
+// it is met but queued. A lane is drawn by one thread at a time, whichever
+// takes it, and always in the order of the queue: within a row the triangles
+// land in the order the guest sent them, as they always did. Between rows
+// the order in time differs, which nothing can see. The pixels are the same
+// pixels with the same values.
 //
-// Each thread draws from its own copy of the pipe: its own counts, added up
-// afterwards, and its own cache of texture pages. The threads are started
-// once and kept; between triangles they spin briefly, because large
-// triangles come in runs, and then sleep.
-
-// Whether rows minY..maxY of a triangle, columns minX..maxX, can be drawn in
-// any order: what one row writes, no other row reads or writes.
-bool rowsApart(const Pipe& P, int minX, int maxX, int minY, int maxY)
-{
-    // The error a dithered pixel leaves for the next crosses rows, and the
-    // pixel watch reports in the order pixels are drawn.
-    if (P.ditherDiffuse || gR128PwHi != 0u || !P.fastMem)
-        return false;
-    const u64 cols = static_cast<u64>(maxX) + 1u;
-    // The destination's rows, and the depth buffer's, each within its own
-    // stride; and the two buffers apart from each other.
-    if (cols * P.bypp > P.dstStride)
-        return false;
-    const u64 dLo = static_cast<u64>(P.dstOff) +
-                    static_cast<u64>(minY) * P.dstStride +
-                    static_cast<u64>(minX) * P.bypp;
-    const u64 dHi = static_cast<u64>(P.dstOff) +
-                    static_cast<u64>(maxY) * P.dstStride + cols * P.bypp;
-    u64 zLo = 0, zHi = 0; // empty unless depth or stencil is in use
-    if (P.zEn || (P.stEn && P.zw == 24u)) {
-        const u64 zb = P.zw == 16u ? 2u : 4u;
-        if (cols * zb > P.zStride)
-            return false;
-        zLo = static_cast<u64>(P.zOff) + static_cast<u64>(minY) * P.zStride +
-              static_cast<u64>(minX) * zb;
-        zHi = static_cast<u64>(P.zOff) + static_cast<u64>(maxY) * P.zStride +
-              cols * zb;
-        if (zLo < dHi && dLo < zHi)
-            return false;
-    }
-    // No texture of this triangle lies where it draws. A level's extent is
-    // taken generously: its rows at their pitch, four bytes a texel.
-    if (P.texAny)
-        for (const TexUnit& t : P.tex) {
-            if (!t.on)
-                continue;
-            for (u32 l = 0; l <= t.maxLevel && l < 11u; ++l) {
-                const u64 base = t.offs[l] & 0x07FFFFFFu;
-                if (base >= kAgpWindow)
-                    continue; // system memory: never the frame buffer
-                const u64 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
-                const u64 h = t.hTex >> l ? t.hTex >> l : 1u;
-                const u64 end = base + (pitch * h + 4u) * 4u;
-                if ((base < dHi && dLo < end) || (base < zHi && zLo < end))
-                    return false;
-            }
-        }
-    return true;
-}
+// The thread that executes the packets goes on decoding and setting up while
+// the others draw. It joins them only where something is about to look at
+// what they produce or change what they read (settle): a 2D operation, a
+// register that is not plain 3D state, a palette or fog table load, a
+// primitive that cannot be queued, the end of the stream. Every exit of the
+// packet loop settles, so outside it the queue is always empty.
+//
+// There are more lanes than threads, and no lane is any thread's own: one
+// that is slow, or that the host has taken off its processor, holds up the
+// few triangles of the one lane it has and nothing else.
+//
+// A queued triangle carries its packet's state (one copy a packet), so later
+// state writes do not reach it. Each thread draws from its own record: the
+// triangle's state taken into it, its own counts, added up when the queue
+// settles, and its own cache of texture pages. The threads are started once
+// and kept; with nothing to take they spin briefly, because triangles come
+// in runs, and then sleep.
 
 inline void rowsRelax()
 {
@@ -2226,8 +2208,9 @@ inline void rowsRelax()
 #endif
 }
 
-// How many threads draw a large triangle, the caller among them. 0 = not
-// set: OPM_RASTER_THREADS, or a number from the host's processors.
+// How many threads draw queued triangles, the one executing the packets
+// among them (it draws while it settles). 0 = not set: OPM_RASTER_THREADS,
+// or a number from the host's processors. 1 = nothing is queued.
 std::atomic<int> gRowThreads{0};
 
 int rowThreadsDefault()
@@ -2237,21 +2220,25 @@ int rowThreadsDefault()
         if (n >= 1)
             return n;
     }
-    // The processor's thread and this one are busy already; a small host
-    // keeps to that.
+    // The processor's thread is busy already, and this one between the
+    // settles: a small host keeps to that, and a large one keeps a few
+    // processors for everything else. Measured on sixteen cores with two
+    // textures at 1024x768: three frames drawn in 204 ms on one thread, 38
+    // on six, 23.5 on twelve.
     const unsigned hw = std::thread::hardware_concurrency();
-    return hw >= 12u ? 6 : hw >= 8u ? 4 : hw >= 4u ? 2 : 1;
+    return hw >= 32u ? 12 : hw >= 24u ? 8 : hw >= 12u ? 6 : hw >= 8u ? 4
+           : hw >= 4u ? 2 : 1;
 }
 
-class RowCrew {
+class RowQueue {
   public:
     static constexpr int kMax = 16;
     // Never destroyed: its threads live as long as the process, and one that
     // is asleep when the process leaves must not find its lock gone.
-    static RowCrew& get()
+    static RowQueue& get()
     {
-        static RowCrew* const crew = new RowCrew;
-        return *crew;
+        static RowQueue* const q = new RowQueue;
+        return *q;
     }
     static int threads()
     {
@@ -2261,150 +2248,377 @@ class RowCrew {
         return n > kMax ? kMax : n;
     }
 
-    // Whether a thread of the crew is awake and waiting for rows: a small
-    // triangle is worth sharing with it, and not worth waking it for.
-    bool hot() const { return spinners_.load(std::memory_order_relaxed) > 0; }
-
-    // Rows minY..maxY on `n` threads, this one among them; returns when
-    // every row is drawn. `rouse`: wake the threads that are asleep (and
-    // start them, the first time); without it only those already waiting
-    // take part. One caller at a time: the engine draws one triangle at a
-    // time.
-    void draw(const Pipe& P, const TriSetup& T, int minY, int maxY, int n,
-              bool rouse)
+    // Whether this triangle may wait in the queue behind what is there:
+    // what one of its rows writes no other row reads or writes, and the same
+    // holds between it and every triangle already waiting.
+    bool admit(const Pipe& P, int maxX, int minY, int maxY)
     {
-        const int rows = maxY - minY + 1;
-        int chunk = rows / (n * 8);
-        chunk = chunk < 1 ? 1 : chunk > 32 ? 32 : chunk;
-        bool wake;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            while (rouse && static_cast<int>(crew_.size()) < n - 1) {
-                const int me = static_cast<int>(crew_.size()) + 1;
-                crew_.emplace_back([this, me] { work(me); });
-                crew_.back().detach();
+        // The error a dithered pixel leaves for the next crosses rows, the
+        // pixel watch and the triangle dump report in the order of drawing,
+        // and memory that is not read in place is asked for under a lock.
+        if (P.ditherDiffuse || gR128PwHi != 0u || !P.fastMem || gTriDump > 0)
+            return false;
+        const u64 cols = static_cast<u64>(maxX) + 1u;
+        // The destination's rows, and the depth buffer's, each within its
+        // own stride.
+        if (minY < 0 || cols * P.bypp > P.dstStride)
+            return false;
+        Reach r = reach_;
+        const bool zUsed = P.zEn || (P.stEn && P.zw == 24u);
+        const u64 zb = P.zw == 16u ? 2u : 4u;
+        if (zUsed && cols * zb > P.zStride)
+            return false;
+        // One destination and one depth buffer for everything waiting: a row
+        // of either is the same lane's whichever triangle touches it.
+        if (pending_) {
+            if (r.dstOff != P.dstOff || r.dstStride != P.dstStride ||
+                r.bypp != P.bypp)
+                return false;
+            if (zUsed && r.zSeen &&
+                (r.zOff != P.zOff || r.zStride != P.zStride || r.zb != zb))
+                return false;
+        } else {
+            r = Reach{};
+            r.dstOff = P.dstOff;
+            r.dstStride = P.dstStride;
+            r.bypp = P.bypp;
+        }
+        const auto widen = [](u64& lo, u64& hi, u64 a, u64 b) {
+            if (lo == hi) {
+                lo = a;
+                hi = b;
+            } else {
+                lo = a < lo ? a : lo;
+                hi = b > hi ? b : hi;
             }
-            job_.P = &P;
-            job_.T = &T;
-            job_.yEnd = maxY + 1;
-            job_.chunk = chunk;
-            job_.threads = n;
+        };
+        widen(r.dLo, r.dHi,
+              static_cast<u64>(P.dstOff) +
+                  static_cast<u64>(minY) * P.dstStride,
+              static_cast<u64>(P.dstOff) +
+                  (static_cast<u64>(maxY) + 1u) * P.dstStride);
+        if (zUsed) {
+            r.zSeen = true;
+            r.zOff = P.zOff;
+            r.zStride = P.zStride;
+            r.zb = zb;
+            widen(r.zLo, r.zHi,
+                  static_cast<u64>(P.zOff) +
+                      static_cast<u64>(minY) * P.zStride,
+                  static_cast<u64>(P.zOff) +
+                      (static_cast<u64>(maxY) + 1u) * P.zStride);
+        }
+        // Every texture in video memory that anything waiting reads, as one
+        // stretch. A level's extent is taken generously: its rows at their
+        // pitch, four bytes a texel. System memory is never the frame
+        // buffer.
+        if (P.texAny)
+            for (const TexUnit& t : P.tex) {
+                if (!t.on)
+                    continue;
+                for (u32 l = 0; l <= t.maxLevel && l < 11u; ++l) {
+                    const u64 base = t.offs[l] & 0x07FFFFFFu;
+                    if (base >= kAgpWindow)
+                        continue;
+                    const u64 pitch = t.pitchTex >> l ? t.pitchTex >> l : 1u;
+                    const u64 h = t.hTex >> l ? t.hTex >> l : 1u;
+                    widen(r.tLo, r.tHi, base, base + (pitch * h + 4u) * 4u);
+                }
+            }
+        // The three stretches apart from each other: what is drawn, the
+        // depths, and what is read.
+        const auto meet = [](u64 aLo, u64 aHi, u64 bLo, u64 bHi) {
+            return aLo < bHi && bLo < aHi;
+        };
+        if (meet(r.dLo, r.dHi, r.zLo, r.zHi) ||
+            meet(r.dLo, r.dHi, r.tLo, r.tHi) ||
+            meet(r.zLo, r.zHi, r.tLo, r.tHi))
+            return false;
+        reach_ = r;
+        return true;
+    }
+
+    // Queue an admitted triangle. One caller at a time: whoever executes the
+    // packets.
+    void add(const Pipe& P, const TriSetup& T, int minY, int maxY)
+    {
+        if (!pending_) {
+            const int want = threads() - 1;
+            if (static_cast<int>(crew_.size()) < want) {
+                std::lock_guard<std::mutex> lk(mu_);
+                while (static_cast<int>(crew_.size()) < want) {
+                    crew_.emplace_back([this] { work(); });
+                    crew_.back().detach();
+                }
+            }
+        }
+        // Room: a place in the ring is free once every lane has passed the
+        // job that was in it. Short of room, the caller draws too.
+        while (posted_ - passed_ >= kJobs) {
+            u64 least = posted_;
+            for (const Lane& l : lane_) {
+                const u64 d = l.done.load(std::memory_order_acquire);
+                least = d < least ? d : least;
+            }
+            passed_ = least;
+            if (posted_ - passed_ >= kJobs && !pull(mine_, posted_))
+                rowsRelax();
+        }
+        if (P.queued == ~0ull) {
+            pipes_[pipeAt_ & (kJobs - 1u)] = P; // its state alone
+            P.queued = pipeAt_++;
+        }
+        Job& j = jobs_[posted_ & (kJobs - 1u)];
+        j.pipe = P.queued;
+        j.batch = batch_;
+        j.minY = minY;
+        j.maxY = maxY;
 #if OPM_ROWS_X86
-            job_.csr = _mm_getcsr();
+        j.csr = _mm_getcsr();
 #endif
-            next_.store(minY, std::memory_order_relaxed);
-            joined_ = 0;
-            open_ = true;
-            ++gen_;
-            genSeen_.store(gen_, std::memory_order_release);
-            wake = rouse && sleepers_ > 0;
-        }
-        if (wake)
+        j.T = T;
+        pending_ = true;
+        gR128RowsPending = true;
+        ++posted_;
+        postedSeen_.store(posted_);
+        if (sleepers_.load() > 0) {
+            // Through the lock, so that a thread between its last look at
+            // the queue and its sleep cannot miss this.
+            { std::lock_guard<std::mutex> lk(mu_); }
             wake_.notify_all();
-        drain(0);
-        u32 joined;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            open_ = false; // nobody joins from here on
-            joined = joined_;
         }
-        // Those who joined finish the rows they hold.
-        for (int spins = 0; active_.load() != 0; ++spins) {
-            if (spins < 4096)
+    }
+
+    // Draw with the others until everything queued is drawn, and take the
+    // counts.
+    void settle()
+    {
+        if (!pending_)
+            return;
+        const auto t0 = std::chrono::steady_clock::now();
+#if OPM_ROWS_X86
+        const unsigned csr = _mm_getcsr();
+        mine_.csr = csr;
+#endif
+        for (int spins = 0;;) {
+            if (pull(mine_, posted_)) {
+                spins = 0;
+                continue;
+            }
+            bool all = true;
+            for (const Lane& l : lane_)
+                if (l.done.load(std::memory_order_acquire) != posted_) {
+                    all = false;
+                    break;
+                }
+            if (all)
+                break;
+            // What is left is in lanes other threads hold.
+            if (++spins < 20000)
                 rowsRelax();
             else
                 std::this_thread::yield();
         }
-        for (int k = 0; k < kMax; ++k)
-            if (k == 0 || (joined >> k) & 1u) {
-                P.tally.triPixels += tally_[k].triPixels;
-                P.tally.offVram += tally_[k].offVram;
-                P.tally.texSamples += tally_[k].texSamples;
-                P.tally.texUnimpl += tally_[k].texUnimpl;
-            }
+#if OPM_ROWS_X86
+        _mm_setcsr(csr);
+#endif
+        passed_ = posted_;
+        auto& es = eng();
+        ++es.rowSettles;
+        es.rowSettleNs += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        // Every lane stands at what was posted, so nobody is writing these.
+        for (Lane& l : lane_) {
+            es.triPixels += l.tally.triPixels;
+            es.crewPixels += l.tally.triPixels;
+            es.offVram += l.tally.offVram;
+            es.texSamples += l.tally.texSamples;
+            es.texUnimpl += l.tally.texUnimpl;
+            l.tally = Pipe::Tally{};
+        }
+        pending_ = false;
+        gR128RowsPending = false;
+        ++batch_;
+    }
+
+    bool pending() const { return pending_; }
+    // Whether a drawing thread is awake with nothing to do: a small triangle
+    // is worth handing to it, and not worth waking it for.
+    bool hot() const
+    {
+        return !crew_.empty() &&
+               sleepers_.load(std::memory_order_relaxed) <
+                   static_cast<int>(crew_.size());
     }
 
   private:
+    // Powers of two: a job's place is its number's low bits, a band's lane
+    // its number's.
+    static constexpr u64 kJobs = 1024;
+    static constexpr u32 kLanes = 32;
+    static constexpr int kBandShift = 1; // rows to a band, as a shift
+    // Jobs a thread draws of one lane before it lets the lane go and looks
+    // for the one furthest behind.
+    static constexpr u64 kTake = 64;
     struct Job {
-        const Pipe* P = nullptr;
-        const TriSetup* T = nullptr;
-        int yEnd = 0, chunk = 1, threads = 1;
+        u64 pipe = 0;
+        u32 batch = 0;
+        int minY = 0, maxY = 0;
+        unsigned csr = 0;
+        TriSetup T;
+    };
+    // What everything waiting draws into and reads from, in video memory.
+    struct Reach {
+        u32 dstOff = 0, dstStride = 0, bypp = 0;
+        bool zSeen = false;
+        u32 zOff = 0, zStride = 0;
+        u64 zb = 0;
+        u64 dLo = 0, dHi = 0, zLo = 0, zHi = 0, tLo = 0, tHi = 0;
+    };
+    struct alignas(64) Lane {
+        // Taken by one thread at a time. `done`, the jobs this lane has
+        // passed, and `tally`, what was counted drawing them, are the
+        // holder's to write: the counts before the number.
+        std::atomic<u32> held{0};
+        std::atomic<u64> done{0};
+        Pipe::Tally tally;
+    };
+    // One thread's own: the record it draws from, which state is in it, the
+    // batch its page cache belongs to, and where it looks for a lane next.
+    struct Hand {
+        Pipe pipe;
+        u64 pipeHeld = ~0ull;
+        u32 batch = ~0u;
+        u32 next = 0;
         unsigned csr = 0;
     };
 
-    void drain(int me)
+    // Take a lane that is behind and that nobody holds, and draw what waits
+    // in it, up to kTake jobs. False if there was none to take.
+    bool pull(Hand& h, u64 posted)
     {
-        const Job j = job_;
-        Pipe mine = *j.P;
-        mine.crowd = true;
-        mine.tally = Pipe::Tally{};
-        for (;;) {
-            const int y = next_.fetch_add(j.chunk);
-            if (y >= j.yEnd)
-                break;
-            const int to = y + j.chunk < j.yEnd ? y + j.chunk : j.yEnd;
-            drawRows(mine, *j.T, y, to - 1);
+        for (u32 i = 0; i < kLanes; ++i) {
+            const u32 c = (h.next + i) & (kLanes - 1u);
+            Lane& lane = lane_[c];
+            if (lane.done.load(std::memory_order_relaxed) >= posted ||
+                lane.held.exchange(1u, std::memory_order_acquire) != 0u)
+                continue;
+            u64 at = lane.done.load(std::memory_order_relaxed);
+            if (at >= posted) { // it caught up between the look and the take
+                lane.held.store(0u, std::memory_order_release);
+                continue;
+            }
+            const u64 end = posted - at > kTake ? at + kTake : posted;
+            h.pipe.tally = Pipe::Tally{};
+            for (; at < end; ++at) {
+                const Job& j = jobs_[at & (kJobs - 1u)];
+                // This lane's bands of the triangle: band b is rows
+                // b << kBandShift onward, in lane b mod kLanes.
+                const int first = j.minY >> kBandShift;
+                int b = first + static_cast<int>(
+                                    (c - static_cast<u32>(first)) &
+                                    (kLanes - 1u));
+                if ((b << kBandShift) > j.maxY)
+                    continue;
+                if (h.pipeHeld != j.pipe) {
+                    static_cast<PipeState&>(h.pipe) =
+                        pipes_[j.pipe & (kJobs - 1u)];
+                    h.pipe.crowd = true;
+                    h.pipeHeld = j.pipe;
+                }
+                // Texture pages found stay found while a batch lasts:
+                // nothing a walk reads changes under a stream.
+                if (h.batch != j.batch) {
+                    h.batch = j.batch;
+                    for (Pipe::AgpPage& e : h.pipe.agp)
+                        e = Pipe::AgpPage{};
+                }
+#if OPM_ROWS_X86
+                // The caller's rounding and exception masks, whatever they
+                // are: the same arithmetic on every thread.
+                if (h.csr != j.csr) {
+                    h.csr = j.csr;
+                    _mm_setcsr(j.csr);
+                }
+#endif
+                for (; (b << kBandShift) <= j.maxY;
+                     b += static_cast<int>(kLanes)) {
+                    const int top = b << kBandShift;
+                    const int bottom = top + (1 << kBandShift) - 1;
+                    drawRows(h.pipe, j.T, top < j.minY ? j.minY : top,
+                             bottom > j.maxY ? j.maxY : bottom);
+                }
+            }
+            lane.tally.triPixels += h.pipe.tally.triPixels;
+            lane.tally.offVram += h.pipe.tally.offVram;
+            lane.tally.texSamples += h.pipe.tally.texSamples;
+            lane.tally.texUnimpl += h.pipe.tally.texUnimpl;
+            lane.done.store(at, std::memory_order_release);
+            lane.held.store(0u, std::memory_order_release);
+            h.next = c + 1u;
+            return true;
         }
-        tally_[me] = mine.tally;
+        return false;
     }
 
-    void work(int me)
+    void work()
     {
-        u64 seen = 0;
+        auto hand = std::make_unique<Hand>();
+        Hand& h = *hand;
+#if OPM_ROWS_X86
+        h.csr = _mm_getcsr();
+#endif
         for (;;) {
-            // Awake for a moment after a job: triangles come in runs.
-            spinners_.fetch_add(1, std::memory_order_relaxed);
+            const u64 posted = postedSeen_.load(std::memory_order_acquire);
+            if (pull(h, posted))
+                continue;
+            // Nothing to take. Awake for a moment: triangles come in runs.
             const auto until = std::chrono::steady_clock::now() + kAwake;
-            while (genSeen_.load(std::memory_order_acquire) == seen) {
+            bool more = false;
+            while (!more) {
                 for (int i = 0; i < 32; ++i)
                     rowsRelax();
+                more = pull(h, postedSeen_.load(std::memory_order_acquire));
                 if (std::chrono::steady_clock::now() >= until)
                     break;
             }
-            spinners_.fetch_sub(1, std::memory_order_relaxed);
-            bool mine = false;
-            {
-                std::unique_lock<std::mutex> lk(mu_);
-                ++sleepers_;
-                wake_.wait(lk, [&] { return gen_ != seen; });
-                --sleepers_;
-                seen = gen_;
-                if (open_ && me < job_.threads) {
-                    active_.fetch_add(1);
-                    joined_ |= 1u << me;
-                    mine = true;
-                }
-            }
-            if (!mine)
+            if (more)
                 continue;
-#if OPM_ROWS_X86
-            // The caller's rounding and exception masks, whatever they are:
-            // the same arithmetic on every thread.
-            _mm_setcsr(job_.csr);
-#endif
-            drain(me);
-            active_.fetch_sub(1);
+            std::unique_lock<std::mutex> lk(mu_);
+            sleepers_.fetch_add(1);
+            wake_.wait(lk, [&] { return postedSeen_.load() != posted; });
+            sleepers_.fetch_sub(1);
         }
     }
 
     std::mutex mu_;
     std::condition_variable wake_;
-    std::vector<std::thread> crew_;
-    // Under mu_: the job and who may still join it.
-    Job job_;
-    u64 gen_ = 0;
-    u32 joined_ = 0;
-    int sleepers_ = 0;
-    bool open_ = false;
-    // The job's number again, for a thread that is spinning; the next row
-    // nobody has taken; and how many threads besides the caller are drawing.
-    std::atomic<u64> genSeen_{0};
-    std::atomic<int> next_{0};
-    std::atomic<int> active_{0};
-    std::atomic<int> spinners_{0};
+    std::vector<std::thread> crew_; // grown by the caller only
+    std::atomic<int> sleepers_{0};
+    // The caller's: jobs posted, jobs every lane is known to have passed,
+    // states copied, the batch's number, whether anything waits, and what it
+    // reaches.
+    u64 posted_ = 0, passed_ = 0, pipeAt_ = 0;
+    u32 batch_ = 0;
+    bool pending_ = false;
+    Reach reach_;
+    Hand mine_; // the caller's own, for when it draws
+    // `posted_` again, for the threads.
+    alignas(64) std::atomic<u64> postedSeen_{0};
+    Lane lane_[kLanes];
+    std::vector<Job> jobs_ = std::vector<Job>(kJobs);
+    std::vector<PipeState> pipes_ = std::vector<PipeState>(kJobs);
     static constexpr std::chrono::microseconds kAwake{200};
-    Pipe::Tally tally_[kMax];
 };
+
+// Everything queued is drawn before the caller goes on (see RowQueue).
+inline void rowsSettle()
+{
+    if (gR128RowsPending)
+        RowQueue::get().settle();
+}
 
 // The pixel path's counts, into the engine's statistics: once a packet.
 void flushTally(const Pipe& P)
@@ -2417,14 +2631,14 @@ void flushTally(const Pipe& P)
     P.tally = Pipe::Tally{};
 }
 
-// The size of a triangle, in pixels, from which the crew's sleeping threads
-// are woken for it, and from which it is shared with those already awake.
-// Measured on a game's frames at 1024x768 with two textures: three frames in
-// 218 ms on one thread, 114 ms on six when only triangles of 4096 pixels were
-// shared, 55 ms with these two numbers. Waking costs the caller several
-// microseconds, which a smaller triangle does not repay.
-constexpr double kCrewPixels = 2048.0;
-constexpr double kCrewHotPixels = 64.0;
+// The size of a triangle, in pixels, from which an empty queue is started
+// for it: with the drawing threads asleep, and with one of them awake.
+// Waking a thread costs the caller several microseconds, which a smaller
+// triangle does not repay. Once something waits, whatever can wait behind it
+// does, at any size, because the order within a row is the order of the
+// queue.
+constexpr double kQueuePixels = 2048.0;
+constexpr double kQueueHotPixels = 64.0;
 
 void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
 {
@@ -2617,20 +2831,23 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
     // one much smaller while some are awake anyway (they stay so for a
     // moment after a job, and a scene's triangles come in runs); and only
     // where its rows share nothing.
-    const int crew = RowCrew::threads();
-    if (crew > 1 && maxY - minY >= 7) {
-        const double box = (static_cast<double>(maxX) - minX + 1.0) *
-                           (static_cast<double>(maxY) - minY + 1.0);
-        const double est = area2 * 0.5 < box ? area2 * 0.5 : box;
-        const bool rouse = est >= kCrewPixels;
-        if ((rouse || (est >= kCrewHotPixels && RowCrew::get().hot())) &&
-            rowsApart(P, minX, maxX, minY, maxY)) {
-            const u64 before = P.tally.triPixels;
-            RowCrew::get().draw(P, T, minY, maxY, crew, rouse);
-            auto& es = eng();
-            ++es.crewTris;
-            es.crewPixels += P.tally.triPixels - before;
+    if (RowQueue::threads() > 1) {
+        RowQueue& q = RowQueue::get();
+        bool start = q.pending();
+        if (!start) {
+            const double box = (static_cast<double>(maxX) - minX + 1.0) *
+                               (static_cast<double>(maxY) - minY + 1.0);
+            const double est = area2 * 0.5 < box ? area2 * 0.5 : box;
+            start = est >= kQueuePixels || (est >= kQueueHotPixels && q.hot());
+        }
+        if (start && q.admit(P, maxX, minY, maxY)) {
+            q.add(P, T, minY, maxY);
+            ++eng().crewTris;
             return;
+        }
+        if (q.pending()) {
+            ++eng().rowRefused;
+            q.settle(); // this one is drawn here, behind everything waiting
         }
     }
     drawRows(P, T, minY, maxY);
@@ -2639,6 +2856,7 @@ void rasterTriangle(const Pipe& P, Vtx v0, Vtx v1, Vtx v2, bool flipFacing)
 // ── Lines and points ──────────────────────────────────────────────────────
 void rasterPoint(const Pipe& P, const Vtx& v)
 {
+    rowsSettle();
     const int px = static_cast<int>(std::floor(v.x + P.winX));
     const int py = static_cast<int>(std::floor(v.y + P.winY));
     if (px < P.scL || px > P.scR || py < P.scT || py > P.scB || px < 0 ||
@@ -2664,6 +2882,7 @@ void rasterPoint(const Pipe& P, const Vtx& v)
 
 void rasterLine(const Pipe& P, const Vtx& a, const Vtx& b)
 {
+    rowsSettle();
     // A DDA over the major axis. The hardware's exact traversal rule is not
     // documented in anything on the shelf; this draws the segment with
     // correct endpoints and attribute interpolation, which is what a game's
@@ -3014,9 +3233,13 @@ void r128Set3dTriDump(int n) { gTriDump = n; }
 
 void r128SetRasterThreads(int n)
 {
+    // Taken up where the queue next starts from empty.
     gRowThreads.store(n < 0 ? 0 : n, std::memory_order_relaxed);
 }
-int r128RasterThreads() { return RowCrew::threads(); }
+int r128RasterThreads() { return RowQueue::threads(); }
+
+bool gR128RowsPending = false;
+void r128RowsFlush() { RowQueue::get().settle(); }
 
 // Which bits of each 3D state register this file reads — the second statement
 // of gatherPipe and the samplers that r128RegDecodedBits is built from. A bit
@@ -3168,6 +3391,8 @@ bool r128Cce3dOp(R128Cell& c, u32 op, const u32* body, u32 n, const CceMem& m)
     if (op == 0x2Cu) { // LOAD_PALETTE (F.21)
         if (n < 1u)
             return false;
+        rowsSettle(); // triangles still waiting read the palette (the packet
+                      // loop has settled already; this is the rule, here)
         const u32 kind = body[0];
         const u32 count = kind == 1u ? 16u : kind == 2u ? 256u : 0u;
         if (!count || n < 1u + count)

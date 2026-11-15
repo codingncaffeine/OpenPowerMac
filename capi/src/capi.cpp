@@ -1431,9 +1431,13 @@ OPM_API uint32_t opm_diag(OpmMachine* m, char* buf, uint32_t cap)
             s += b;
             snprintf(b, sizeof b,
                      "--   3d rows: %llu tris and %llu px drawn on %d "
-                     "threads\n",
+                     "threads from the queue; it was drawn out %llu times, "
+                     "%llu of them for a primitive that could not wait, "
+                     "%.1f ms spent there\n",
                      (unsigned long long)e.crewTris,
-                     (unsigned long long)e.crewPixels, r128RasterThreads());
+                     (unsigned long long)e.crewPixels, r128RasterThreads(),
+                     (unsigned long long)e.rowSettles,
+                     (unsigned long long)e.rowRefused, e.rowSettleNs / 1e6);
             s += b;
         }
         for (const auto& [op, n] : r128CceP3Skipped()) {

@@ -324,7 +324,7 @@ int main(int argc, char** argv)
                      "usage: framereplay FILE [--out DIR] [--strict] [--census] "
                      "[--textures DIR]\n"
                      "       (any of these with --threads N: the threads that "
-                     "draw a large triangle)\n"
+                     "draw queued triangles)\n"
                      "       framereplay FILE --hashes\n"
                      "       framereplay FILE --bench N [--profile-host HZ OUT]\n"
                      "       framereplay --diff A.png B.png [MAP.png]\n");
@@ -356,8 +356,9 @@ int main(int argc, char** argv)
         const R128EngStats& es = r128EngStats();
         std::printf("%s: %u frames drawn %u times: best %.2f ms, median %.2f ms "
                     "a pass; %llu triangles and %llu pixels a pass (%llu and "
-                    "%llu of them on %d threads); video memory ends as "
-                    "%016llx\n",
+                    "%llu of them on %d threads; the queue settled %llu "
+                    "times, %.2f ms waited, %llu forced); video memory ends "
+                    "as %016llx\n",
                     file.c_str(), rep.edges, bench, ns.front() / 1e6,
                     ns[ns.size() / 2] / 1e6,
                     static_cast<unsigned long long>(es.tris / bench),
@@ -365,6 +366,9 @@ int main(int argc, char** argv)
                     static_cast<unsigned long long>(es.crewTris / bench),
                     static_cast<unsigned long long>(es.crewPixels / bench),
                     r128RasterThreads(),
+                    static_cast<unsigned long long>(es.rowSettles / bench),
+                    es.rowSettleNs / 1e6 / bench,
+                    static_cast<unsigned long long>(es.rowRefused / bench),
                     static_cast<unsigned long long>(r128VramHash(*cell)));
         return 0;
     }

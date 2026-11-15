@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <memory>
 #include <vector>
 
 using namespace opm;
@@ -1739,11 +1740,250 @@ struct DrawCounts {
 };
 } // namespace
 
+TEST_CASE("3d: triangles waiting in the queue land in the order they were "
+          "sent, whatever comes between them")
+{
+    // One long stream, executed in one go as a driver's indirect buffers are:
+    // some 3,500 triangles, large and small, each packet under its own state
+    // (depth, blending, fog by table, a paletted texture in video memory, a
+    // 1555 one in AGP space), and between them everything a stream can do
+    // that the triangles before it must be drawn for: a 2D fill, a fog table
+    // and a palette loaded again, a line, a write to a scratch register, the
+    // destination's pitch changed and changed back; and in the middle 1,600
+    // triangles with nothing between them, more than the queue has places
+    // for, sent faster than they can be drawn. Drawn on one thread it is
+    // the picture; on four and on nine it must be that picture byte for byte,
+    // depth cells included, with the same counts. Every pixel here depends on
+    // what was drawn before it and on the state of its own packet, so a
+    // triangle out of its place, drawn twice, dropped, or drawn under a
+    // neighbor's state is a different picture.
+    constexpr u32 kW = 640, kH = 256;
+    constexpr u32 kZAt = 0x00100000u, kCi8At = 0x00180000u;
+    constexpr u32 kCompared = 0x00200000u;
+    constexpr u32 kChunkWords = 0x3F00u;
+    u32 seed = 0x1B873593u;
+    auto rnd = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    auto frac = [&]() { return static_cast<float>(rnd() & 0xFFFFu) / 65535.0f; };
+    // The stream, in pieces no longer than an indirect buffer may be.
+    std::vector<std::vector<u32>> chunks(1);
+    auto room = [&](size_t words) {
+        if (chunks.back().size() + words > kChunkWords)
+            chunks.emplace_back();
+    };
+    auto reg = [&](u32 off, u32 v) {
+        room(2);
+        chunks.back().push_back(off >> 2);
+        chunks.back().push_back(v);
+    };
+    u32 triangles = 0, forced = 0;
+    auto tris = [&](u32 count, float least, float span) {
+        room(3u + count * 21u);
+        auto& w = chunks.back();
+        w.push_back(0xC0002500u | ((2u + count * 21u - 1u) << 16));
+        w.push_back(0x9u | 0x80u);
+        w.push_back(4u | (3u << 4) | ((count * 3u) << 16));
+        for (u32 t = 0; t < count; ++t) {
+            const float cx = -20.0f + 680.0f * frac();
+            const float cy = -20.0f + 296.0f * frac();
+            const float reach = least + span * frac();
+            for (u32 k = 0; k < 3u; ++k) {
+                w.push_back(f2u(cx + reach * (frac() - 0.5f)));
+                w.push_back(f2u(cy + reach * (frac() - 0.5f)));
+                w.push_back(f2u(frac()));
+                w.push_back(f2u(1.0f));
+                w.push_back(rnd() << 8 | (rnd() & 0xFFu));
+                w.push_back(f2u(-0.5f + 3.0f * frac()));
+                w.push_back(f2u(-0.5f + 3.0f * frac()));
+            }
+            ++triangles;
+        }
+    };
+    auto fogTable = [&](u32 salt) {
+        reg(0x1A14u, 0);
+        room(257);
+        chunks.back().push_back((0x1A18u >> 2) | (1u << 15) | (255u << 16));
+        for (u32 i = 0; i < 256u; ++i)
+            chunks.back().push_back((i * 3u + salt) & 0xFFu);
+        ++forced;
+    };
+    auto palette = [&](u32 salt) {
+        room(258);
+        chunks.back().push_back(0xC0002C00u | (256u << 16));
+        chunks.back().push_back(2u);
+        for (u32 i = 0; i < 256u; ++i)
+            chunks.back().push_back(0xFF000000u | ((i * 5u + salt) & 0xFFu) << 16 |
+                                    ((i * 11u + salt * 3u) & 0xFFu) << 8 |
+                                    ((255u - i + salt) & 0xFFu));
+        ++forced;
+    };
+    auto target = [&](u32 pitch8) {
+        reg(0x1C80u, pitch8 << 21);
+        reg(0x1C88u, 0);
+        reg(0x1C8Cu, ((kH - 1u) << 16) | (pitch8 * 8u - 1u));
+    };
+    fogTable(7u);
+    palette(1u);
+    for (u32 n = 0; n < 2000u; ++n) {
+        const bool run = n >= 700u && n < 1500u; // nothing between these
+        // This packet's state: all of it plain 3D state, none of it a reason
+        // to wait for the triangles before.
+        const u32 pick = rnd();
+        const bool ci8 = (pick >> 3) & 1u;
+        reg(0x1C9Cu, (pick & 1u ? 0x3u : 0u) | (pick & 2u ? 1u << 4 : 0u) |
+                         (pick & 4u ? 1u << 7 : 0u) |
+                         ((pick >> 4) & 3u ? 1u << 9 : 0u));
+        reg(0x1CA0u, (2u << 8) | (1u << 14) | (4u << 16) | (5u << 20));
+        reg(0x1CB0u, ci8 ? (2u << 16) : (3u << 16) | (1u << 1) | (1u << 4));
+        reg(0x1CB8u, ci8 ? 0x6666u : 0x5555u); // one map each, no smaller
+        reg(0x1CACu, rnd() & 0x00FFFFFFu);
+        if (run)
+            tris(2u, 30.0f, 100.0f);
+        else if (n == 0u || ((pick >> 8) & 7u) < 2u)
+            tris(1u + (pick >> 6) % 2u, 60.0f, 300.0f);
+        else
+            tris(1u + (pick >> 6) % 2u, 3.0f, 22.0f);
+        if (run)
+            continue;
+        // Between the triangles, now and then.
+        if (n % 200u == 37u) { // a 2D fill across the middle of the picture
+            room(8);
+            auto& w = chunks.back();
+            w.push_back(0xC0009100u | (6u << 16));
+            w.push_back(2u | 8u | (13u << 4) | (6u << 8) | (0xF0u << 16));
+            w.push_back((kW / 8u) << 21);
+            w.push_back(0);
+            w.push_back(((kH - 1u) << 16) | (kW - 1u));
+            w.push_back(0x00102030u + n);
+            w.push_back((60u + n / 10u) << 16 | 100u);
+            w.push_back((140u + n / 10u) << 16 | 540u);
+            ++forced;
+        }
+        if (n % 200u == 83u)
+            fogTable(n);
+        if (n % 200u == 121u)
+            palette(n);
+        if (n % 200u == 150u) { // a line from corner to corner
+            room(13);
+            auto& w = chunks.back();
+            w.push_back(0xC0002500u | ((2u + 10u - 1u) << 16));
+            w.push_back(0x9u);
+            w.push_back(2u | (3u << 4) | (2u << 16));
+            for (u32 k = 0; k < 2u; ++k) {
+                w.push_back(f2u(k ? 630.0f : 5.0f));
+                w.push_back(f2u(k ? 250.0f : 3.0f));
+                w.push_back(f2u(0.25f));
+                w.push_back(f2u(1.0f));
+                w.push_back(0xFFFFFFFFu - n);
+            }
+            ++forced;
+        }
+        if (n % 200u == 170u) {
+            reg(0x15E0u, n); // the marker a driver polls for
+            ++forced;
+        }
+        // The same memory as a narrower picture for a while: its rows are
+        // not the rows the waiting triangles were dealt by.
+        if (n % 400u == 190u) {
+            target(40u);
+            ++forced;
+        }
+        if (n % 400u == 215u) {
+            target(kW / 8u);
+            ++forced;
+        }
+    }
+    CHECK(triangles > 3000u);
+    CHECK(chunks.size() >= 5u);
+    struct Run {
+        std::unique_ptr<Rig3d> rig;
+        DrawCounts got;
+        u64 settles = 0, refused = 0;
+    };
+    Run runs[3];
+    const int threadsOf[3] = {1, 4, 9};
+    for (int k = 0; k < 3; ++k) {
+        runs[k].rig = std::make_unique<Rig3d>();
+        Rig3d& r = *runs[k].rig;
+        r128SetRasterThreads(threadsOf[k]);
+        r128CceReset();
+        u32 fill = 0x85EBCA6Bu;
+        for (u32 i = 0; i < kCompared; ++i) {
+            fill = fill * 1664525u + 1013904223u;
+            r.c.vram[i] = static_cast<u8>(fill >> 24);
+        }
+        // The 1555 texture in AGP space, and the stream after it: a master
+        // buffer that dispatches each piece in turn.
+        r.mapPage(0x00300000u, 0x00200000u);
+        for (u32 i = 0; i < 0x1000u; ++i)
+            r.ram[0x00200000u + i] = static_cast<u8>(i * 13u + 5u);
+        std::vector<u32> master;
+        for (size_t c = 0; c < chunks.size(); ++c) {
+            const u32 at = 0x00600000u + static_cast<u32>(c) * 0x10000u;
+            for (u32 pg = 0; pg < 0x10000u; pg += 0x1000u)
+                r.mapPage(at + pg, at + pg);
+            for (size_t i = 0; i < chunks[c].size(); ++i)
+                r.put32(at + static_cast<u32>(i) * 4u, chunks[c][i]);
+            master.push_back(0x000101CEu); // PM4_IW_INDOFF, PM4_IW_INDSIZE
+            master.push_back(at);
+            master.push_back(static_cast<u32>(chunks[c].size()));
+        }
+        r.mapPage(0x00700000u, 0x00700000u);
+        for (size_t i = 0; i < master.size(); ++i)
+            r.put32(0x00700000u + static_cast<u32>(i) * 4u, master[i]);
+        // A 640-wide 32-bit target at 0, depth at 1 MB, both textures' slots.
+        r.reg(0x146Cu, (1u << 30) | (1u << 28) | 0x0Fu | (6u << 8));
+        r.reg(0x142Cu, (kW / 8u) << 21);
+        r.reg(0x16ECu, 0);
+        r.reg(0x16F0u, ((kH - 1u) << 16) | (kW - 1u));
+        r.reg(0x1CA0u, 2u << 8);
+        r.fpuSolidBoth();
+        r.reg(0x1C90u, kZAt);
+        r.reg(0x1C94u, kW / 8u);
+        r.reg(0x1C98u, 1u << 4);
+        r.reg(0x1CB4u, 3u | (4u << 4) | (4u << 10) | (3u << 14) | (6u << 18) |
+                           (2u << 25));
+        r.reg(0x1CBCu + 4u * 6u, kCi8At);
+        r.reg(0x1CBCu + 4u * 5u, 0x02000000u + 0x00300000u);
+        r.reg(0x0738u, 0x00700000u);
+        const DrawCounts before = DrawCounts::now();
+        const u64 settles = r128EngStats().rowSettles;
+        const u64 refused = r128EngStats().rowRefused;
+        r128CceIndirect(r.c, static_cast<u32>(master.size()), r.ram.data(),
+                        static_cast<u32>(r.ram.size()), Rig3d::kGart, 0,
+                        nullptr);
+        runs[k].got = DrawCounts::now().since(before);
+        runs[k].settles = r128EngStats().rowSettles - settles;
+        runs[k].refused = r128EngStats().rowRefused - refused;
+    }
+    r128SetRasterThreads(0);
+    for (int k = 1; k < 3; ++k) {
+        CAPTURE(threadsOf[k]);
+        CHECK(std::memcmp(runs[0].rig->c.vram.data(),
+                          runs[k].rig->c.vram.data(), kCompared) == 0);
+        CHECK(runs[0].got.pixels == runs[k].got.pixels);
+        CHECK(runs[0].got.samples == runs[k].got.samples);
+        // Most triangles waited in the queue (not those of the narrow
+        // picture that reach past its pitch), and the queue was
+        // drawn out where something made it, not at every packet: the
+        // stream holds 2,000 packets of state and some forty reasons.
+        CHECK(runs[k].got.crewTris * 10u > triangles * 7u);
+        CHECK(runs[k].settles >= forced / 2u);
+        CHECK(runs[k].settles <= forced + 8u);
+    }
+    // One thread queues nothing; and the picture is a picture.
+    CHECK(runs[0].got.crewTris == 0u);
+    CHECK(runs[0].settles == 0u);
+    CHECK(runs[0].got.pixels > 500000u);
+}
+
 TEST_CASE("3d: a triangle's rows drawn by several threads are the rows drawn "
           "by one")
 {
     // The same scene of large overlapping triangles on two cards, one drawing
-    // every row on the calling thread and one handing the rows of a large
+    // every row on the calling thread and one queueing the rows of a large
     // triangle to four. Video memory must end the same byte for byte, depth
     // and stencil cells included, and so must every count the pixel path
     // keeps. The scene is drawn with each kind of state a pixel can depend

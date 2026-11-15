@@ -561,9 +561,11 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
     while (!stack.empty()) {
         const Pending cur = stack.back();
         stack.pop_back();
-        // Names must be unique per folder AFTER MacRoman folding; a clash
-        // is refused with both names so the user renames one, rather than
-        // one file silently shadowing another.
+        // Names must be unique per folder AFTER MacRoman folding, and as
+        // the catalog compares them, which ignores case: a host that keeps
+        // "ReadMe" and "README" apart would otherwise put two records under
+        // one key. A clash is refused with both names so the user renames
+        // one, rather than one file silently shadowing another.
         std::map<std::string, std::string> seen;
         for (fs::directory_iterator it(cur.dir, ec), end; it != end;
              it.increment(ec)) {
@@ -639,13 +641,17 @@ bool hfsBuildImage(const std::string& folder, const std::string& outPath,
             }
             if (item.mac.empty())
                 item.mac = "_";
-            auto clash = seen.find(item.mac);
+            std::string folded = item.mac;
+            for (char& c : folded)
+                c = static_cast<char>(foldByte(static_cast<u8>(c)));
+            auto clash = seen.find(folded);
             if (clash != seen.end()) {
                 err = "name clash after Mac conversion: '" + clash->second +
-                      "' and '" + host8 + "' both become '" + item.mac + "'";
+                      "' and '" + host8 + "' are one name on a Mac volume ('" +
+                      item.mac + "', case ignored)";
                 return false;
             }
-            seen[item.mac] = host8;
+            seen[folded] = host8;
             items.push_back(std::move(item));
         }
     }

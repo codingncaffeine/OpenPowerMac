@@ -306,6 +306,30 @@ TEST_CASE("hfs: a name clash after Mac conversion is refused with both names")
     fs::remove_all(d);
 }
 
+TEST_CASE("hfs: two names that differ only in case are refused as a clash")
+{
+    // The catalog's comparator ignores case, so the two would share a key.
+    const fs::path d = scratchDir();
+    fs::create_directories(d / "share");
+    writeFile(d / "share" / "ReadMe.txt", {1});
+    writeFile(d / "share" / "README.TXT", {2});
+    size_t n = 0;
+    for (const auto& e : fs::directory_iterator(d / "share")) {
+        (void)e;
+        ++n;
+    }
+    const fs::path img = d / "out.img";
+    std::string err;
+    if (n == 2) { // a host that folds case itself kept one file: nothing to refuse
+        CHECK(!hfsBuildImage((d / "share").string(), img.string(), "Shared",
+                             err));
+        CHECK(err.find("case ignored") != std::string::npos);
+        CHECK(err.find("ReadMe.txt") != std::string::npos);
+        CHECK(err.find("README.TXT") != std::string::npos);
+    }
+    fs::remove_all(d);
+}
+
 TEST_CASE("hfs: an empty folder is refused rather than shared as nothing")
 {
     const fs::path d = scratchDir();
